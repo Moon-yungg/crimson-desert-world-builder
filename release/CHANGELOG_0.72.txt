@@ -1,0 +1,16 @@
+World Builder 0.72
+
+New
+- Mouse gizmo while placing. Press Numpad 5 to hand the mouse to World Builder: an axis cross with three rings appears on the object. Drag the red / blue arrows to move along the object's axes, the green arrow up / down, the center dot to slide over the ground, the cubes to scale. Numpad 5 again gives the mouse back to the camera. The numpad keys keep working alongside.
+- Full rotation. The green ring turns the object, the red and blue rings tilt it (pitch and roll). Numpad * levels it again. The details pane has two new tilt sliders and a "level" button; tilted objects show a * behind their yaw in the Scene list.
+- Snapping (Numpad .) applies to gizmo drags as well: grid steps for moving, angle steps for turning and tilting.
+- Undo / redo, copy / paste, duplicate, line and circle tools and groups carry the tilt along.
+- Projects (v3) store pitch and roll. Older project files still load; their objects stay upright.
+- The gizmo reads the game's current field of view, so it stays aligned while zooming. Settings tab: the manual value remains as a fallback, plus a horizontal mirror option and a calibration marker.
+
+Changed
+- Placement help shows the key lines only.
+
+Internal
+- Rotation is passed to the game as a quaternion (yaw, then pitch, then roll). Without tilt it is identical to the previous yaw-only rotation, so existing objects behave exactly as before.
+- The C API (cdk_spawn / cdk_move / cdk_get) still uses yaw only.

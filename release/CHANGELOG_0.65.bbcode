@@ -1,0 +1,36 @@
+[b]World Builder 0.65[/b]
+
+[b]New[/b]
+[list]
+[*]Multi-select (Ctrl / Shift + click, Ctrl+A) and groups (Ctrl+G). Groups show as collapsible rows in the Scene list and move as one.
+[*]Undo / redo (Ctrl+Z / Ctrl+Y) for spawning, moving, placing and deleting.
+[*]Copy / paste with orientation (Ctrl+C / Ctrl+V), Duplicate does both in one step.
+[*]Snapping: grid steps (0.1 to 2 m) and angle steps (5 to 90 degrees). Numpad . toggles it while placing; every key press then moves exactly one step.
+[*]Mass spawn: place a row (Line) or a ring (Circle) of the selected prefab in front of you, grouped and ready to move.
+[*]"Front = camera view": objects spawn and move relative to where the camera looks, not where you last walked.
+[*]Rotation and scaling in placement mode happen about the object's center instead of its corner pivot.
+[*]Browser: "meshes only" hides prefabs that spawn nothing visible (skinned characters, logic prefabs). Right-click a row for favorites and collections. Your own named collections live under the categories.
+[*]Projects keep groups and can be imported from a .cdproj file shared by someone else (absolute world coordinates).
+[/list]
+
+[b]Fixed[/b]
+[list]
+[*]Objects no longer drift on their own after using Shift with the numpad (key state is now tracked from window messages).
+[*]Placement keys stay responsive while holding several keys; movement is smooth again.
+[*]Snapping applied inconsistently and changed direction depending on where you stood.
+[*]Line tool placed walls diagonally; the yaw now follows the line.
+[*]SPAWN put large objects inside the character; the spawn spot now accounts for the object's footprint.
+[*]Left / right were mirrored in camera view.
+[/list]
+
+[b]Removed[/b]
+[list]
+[*]"Live preview" (the checkbox that spawned the selected prefab in the world). The 2D preview image stays.
+[*]Mouse wheel rotation (conflicted with the game's zoom).
+[/list]
+
+[b]Internal[/b]
+[list]
+[*]The mod no longer contains any archive code or keys: it asks the game's own resource loader for the files it needs for the preview images.
+[*]Preview cache entries from older versions are measured again on first start (a few minutes in the background, no re-rendering) so rotation about the center works for all prefabs.
+[/list]

@@ -1,0 +1,15 @@
+World Builder 0.75
+
+New
+- Remove duplicates (Scene tab): deletes every object that sits exactly on an identical one (same prefab, position, rotation, scale), e.g. after a project was loaded twice. The earlier copy stays, Ctrl+Z brings them back.
+- Dock: four buttons choose one to four cards per row; the tile size follows the window width instead of a pixel slider.
+
+Changed
+- Placing ends without Enter: place the next asset, click another placed object, or double-click into the open and the carried object stays where it is (one undo step). A missed gizmo click does nothing. Enter still works, Backspace cancels while you hold it.
+- Outline and gizmo center follow pitch and roll; a tilted object gets a tilted box, its center stays under the gizmo. A single object now turns about its box center for pitch and roll as well. Snap to ground uses the lowest corner of the tilted box.
+- The Load button in the Project tab says that it adds the project to the scene (Replace all removes the current objects first).
+
+Fixed
+- Autoload loaded the project a second time when you had already loaded it by hand, and it came late (up to two minutes after entering the world). It now runs 3 seconds after the player is in the world and is skipped once you loaded anything yourself.
+- PLACE or a double-click on a card while already carrying an object spawned a second copy. The carried object is dropped first now; a repeated double-click on the same card is ignored.
+- The tooltips of Grab and To ground were swapped.

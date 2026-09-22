@@ -1,0 +1,23 @@
+// In-game thumbnail generator: renders prefab previews from the installed pack files on a background thread.
+// Nothing is spawned in the world and no game assets have to ship with the mod.
+#pragma once
+#include <string>
+#include <vector>
+namespace thumbgen {
+    void Start();                                   // called once after the prefab index is loaded
+    void Request(const std::string& prefabPath);    // render this prefab next (no-op when done or already queued)
+    void Refresh(const std::string& prefabPath);    // render again even if it was done before
+    bool Pending(const std::string& prefabPath);    // queued or currently rendering
+    bool Processed(const std::string& prefabPath);  // rendered before (success or failure)
+    bool Ready();                                   // pack index opened, worker running
+    bool Idle();                                    // nothing queued and the background pass has reached the end (a few prefabs may stay unrenderable)
+    void SetBackground(bool on);                    // false: only render what the browser asks for
+    bool Background();
+    int  Done();                                    // prefabs with a rendered image
+    int  Failed();                                  // prefabs without usable geometry
+    int  Total();
+    int  Generation();                              // increments whenever a new png is written (texture cache retries on change)
+    std::vector<std::string> TakeRefreshed();       // image files overwritten by a re-render (the texture cache drops them)
+    bool Lz4Decode(const unsigned char* src, size_t n, std::vector<unsigned char>& out, size_t expect);   // LZ4 block (also used for the embedded prefab index)
+    const char* Error();                            // "" or why the pack files could not be opened
+}

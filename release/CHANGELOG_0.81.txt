@@ -1,0 +1,23 @@
+World Builder 0.81
+
+New (experimental)
+- Interactive objects through the game's own spawn path. Page Up spawns a gimmick two meters in front of you the way
+  the game spawns its field objects: a stand torch by default, or any prefab path typed into the "replay prefab path
+  override" box in the Log tab (the game knows 13,941 gimmick prefabs: torches, lamps, doors, chests, campfires ...).
+  A torch spawned this way can be lit and put out like a real one. "remove" in the Log tab's "spawned by replay" list
+  takes an object away again, exactly as the game removes a picked-up item.
+  The spawn needs a template: the mod copies the parameters of a spawn the game itself made and swaps prefab, position
+  and identity. Such spawns happen all the time while you walk (level streaming), so a few steps after loading are
+  enough; before the first one Page Up says "walk a few meters first". This is research-grade: not saved in projects
+  yet, no rotation yet, no gizmo, and a game update may switch it off (the log then says which hook is missing).
+
+Fixed
+- Hooks could fail at startup ("hooks missing" in the editor, MH_ERROR_MEMORY_ALLOC in the log) when no free memory was
+  left within 2 GB of the game image. The mod now reserves that space at attach time and hands it out hook by hook.
+- The selection outline and the gizmo center follow the game's real render camera (its view and projection matrices are
+  located in memory), so they stay on the object when the camera moves or the field of view changes (town vs. field).
+  The old camera model is still used for the first seconds until the matrices are found.
+- The one-time re-rendering of preview images after an update remembers its progress in cdmodkit\thumbs_pass.txt and
+  resumes after a restart instead of starting over.
+- A crash now writes the call chain and the registers into the log ([fault] lines), which makes reports much more useful.
+- Error codes the game returns are decoded to their names in the log (cdmodkit\errnames.txt).

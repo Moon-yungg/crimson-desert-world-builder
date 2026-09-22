@@ -1,0 +1,20 @@
+World Builder 0.74
+
+New
+- Dock window: a narrow side panel with the search box, your collections as chips, the matching prefabs as small cards (size adjustable) and a big PLACE button. Switch with "dock" in the full editor and "full editor" in the dock. The dock stays open while you place, so the next asset is one click or a double-click away.
+- Click to select: in edit mode a click on a placed object selects it (Ctrl adds to the selection), a double-click grabs it. Selected objects get an orange outline, the one under the mouse a white one.
+- Snap to ground: while placing, one key (Numpad / by default) drops the object onto the surface below it; "To ground" in the Scene tab does the same for the selection. Uses the game's own physics probe, so it lands on terrain, floors and other objects, for small props and 36 m towers alike.
+- Scene tab as tiles: the placed objects with their preview image, number and distance; click selects, double-click grabs, right-click for Grab / To ground / Duplicate / Group / Delete. Groups are framed blocks with their own colour and a header that selects or collapses them.
+- Every placement key can be rebound in the Settings tab or settings.txt (key_move_fwd= ...): keyboards without a numpad can use WASD, arrows or anything else. "Fast" can be Shift, Ctrl or Alt.
+
+Changed
+- Placement first: PLACE is the main button, double-click on a row or card places right away, "spawn only" is the small alternative. Offset, yaw, scale, direction and the line / circle tools live in collapsible sections below.
+- After dropping an object the full editor comes back without taking the input; press Home when you want to click again.
+- Two mouse states while placing: with a window open the mouse belongs either to World Builder (window and gizmo) or to the game (camera); the mouse key and Home both switch. The separate gizmo toggle only remains when no window is open.
+- Card view: the details pane no longer repeats the preview image.
+- Scene list shows objects in creation order.
+- The Home / End / Page keys no longer move or rotate the carried object (they share scan codes with the numpad); Insert and Delete neither.
+- Developer toggles (live drag, re-create, move method) moved from the Scene tab to the Log tab.
+
+Fixed
+- Coordinates on a mount are the world position again (parent transform of the horse composed in).

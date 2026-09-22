@@ -1,0 +1,12 @@
+World Builder 0.70
+
+- Hotkeys for the editor (Insert) and edit/play mode (Home) can be changed in the new Settings tab or in bin64\cdmodkit\settings.txt.
+- The F9 position hotkey is gone; the position is shown in the window.
+- The console window is off by default. settings.txt (now included, console=0) or the Settings tab turn it back on; the log file is always written.
+- Placement: rotation is about the object's center again for all prefabs (older preview cache entries are measured again on first start, no re-rendering).
+- Placement keys no longer stick or lag after using Shift; movement is smooth again.
+- Snapping moves one grid step per key press along fixed world axes.
+- Camera view direction is used for "in front of you" (toggle in the Browser), left/right fixed.
+- Line/circle tool: labels before the inputs, separate orientation defaults (line across, circle towards the center).
+- Mass spawn section labelled, taller details area, live preview checkbox removed (the 2D preview image stays).
+- Discord server link on the mod page.

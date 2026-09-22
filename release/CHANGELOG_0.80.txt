@@ -1,0 +1,19 @@
+World Builder 0.80
+
+New
+- Objects remember which project they came from. The Scene tab has a row of tabs - "all", "new" and one per project
+  that is loaded - so you can click through the projects and see exactly which objects belong to which one. A project
+  with unsaved changes is marked with a star; "Save the changes" on its tab writes those objects back into its own
+  .cdproj and leaves every other project alone.
+- Save has a scope: "everything in the scene" (as before) or "only the new objects (N)" - the ones you placed by hand
+  since the last save. Building a second project inside a loaded one no longer means deleting the first one, and with
+  several autoloaded projects each one still saves back into its own file.
+- The project list marks which projects are currently in the scene and which of them have unsaved changes.
+
+Changed
+- "Save back" replaces "Overwrite" for a project that is loaded in the scene: it writes that project's own objects
+  plus the new ones. For a project that is not in the scene the button stays "Overwrite" and behaves as before.
+- Undo of a delete puts the object back into the project it belonged to.
+- Snap to ground no longer depends on a hardcoded address for the game's collision collector. The class is located by
+  signature and verified by the shape of its function table, so a game patch does not silently switch the feature off.
+  settings.txt probe_vtable=<rva> is there as a manual override if a future build needs one.

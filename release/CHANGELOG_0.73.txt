@@ -1,0 +1,18 @@
+World Builder 0.73
+
+New
+- Card view: the browser can show its matches as tiles with the preview image instead of the list (button "cards" next to the search box, tile size adjustable). Same search, filters, favorites and collections.
+- Textured preview images: previews are now rendered with the game's own textures and materials instead of flat shading. Existing images are rendered again once in the background after the update, the tiles you are looking at go first.
+- Info tooltips for the line and circle orientation modes.
+
+Fixed
+- Missing assets when installing via DMM: the prefab list is now built into the plugin and written out if the file is missing. (Thanks LiangWood)
+- Wrong coordinates when mounted or when playing a character other than Kliff. (Thanks dofo7777 again, and Alduin1991)
+- Preview images of prefabs with compressed mesh data were garbage (about one in eight); they decode correctly now.
+- Large meshes were drawn with holes in the preview; they are drawn completely.
+- Decal layers no longer show up as flat patches in the previews.
+- Small lag spikes while scrolling the card view (images are decoded on a background thread now).
+- Preview counter could show more done than total.
+
+Notes
+- The one-time re-render of the preview cache runs at low priority and takes about 20 to 30 minutes; the old images stay until they are replaced.

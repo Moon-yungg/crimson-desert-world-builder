@@ -1,0 +1,2 @@
+// Embedded prefab index (see scripts/pack_index.py): written to bin64\cdmodkit\prefabs.tsv on start when the file is missing.
+101 RCDATA "build/prefabs.lz4"

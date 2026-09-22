@@ -1,0 +1,8 @@
+World Builder 0.78
+
+Fixed
+- autoload.txt is read again when it was saved with a UTF-8 BOM (Notepad's "UTF-8 with BOM"). Those three bytes used to swallow the first project name in the list.
+- Saving a project cuts spaces at the start and end of the name. Such a project could be saved, but never autoloaded, because the autoload list trims blanks around each line. Spaces inside the name ("my big build") are untouched and work everywhere.
+
+Note
+- Project names are best kept to plain ASCII (letters, digits, spaces, _ -). Umlauts show up correctly in the mod, but the file gets a mangled name in Explorer. Chinese, Cyrillic or emoji names work inside the mod as well, yet they are drawn as empty boxes, and renaming such a file outside the game makes the mod lose it.

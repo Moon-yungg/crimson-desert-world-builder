@@ -1,0 +1,17 @@
+World Builder 0.79
+
+New
+- "New" in the Project tab empties the scene for a fresh project, after a confirmation. Save always writes every object
+  that is currently placed - a loaded or autoloaded project included - so a project that should contain only your new
+  objects starts from an empty world. The Save tooltip says so now, and Save is greyed out while the name is empty.
+
+Fixed
+- Thumbnails: when the graphics driver refused a texture, the decoded image was released twice. That corrupted the
+  mod's own heap and could take the game down later somewhere entirely unrelated. The same paths leaked two GPU
+  resources per failed thumbnail.
+- The internal pattern search could never match a signature that begins with a wildcard byte.
+
+Changed
+- The log line at startup and the "Game functions not resolved" panel now name the game build (e.g. 1.0.0.2944).
+  That is the number to include in a bug report after a game patch; the mod itself keeps locating every game
+  function by signature, so a patch either works or disables the mod with a clear message.

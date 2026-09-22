@@ -1,0 +1,22 @@
+extracted/
+notes/packctx.pkl
+notes/filelist.txt
+notes/*.json
+tools/
+asi/**/build/
+release/*/
+release/*.zip
+asi/cdmodkit/data/thumbs/
+
+# IDE, Python and MSVC by-products
+.idea/
+__pycache__/
+*.exp
+*.lib
+# local research output (logs, disassembly, runtime dumps)
+notes/*.log
+notes/*.err
+notes/*_disasm.txt
+notes/rtti_runtime.txt
+notes/rtti_hierarchy.txt
+notes/rtti_dump.txt

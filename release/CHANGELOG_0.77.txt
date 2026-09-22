@@ -1,0 +1,9 @@
+World Builder 0.77
+
+Changed
+- Autoload takes any number of projects. Tick as many as you like in the Project tab; they are all loaded into the same world, in the order they stand in the file. Ticking one no longer switches the others off.
+- bin64\cdmodkit\autoload.txt is now a list: one project name per line, without .cdproj. Lines starting with '#' are comments, blank lines and stray spaces are ignored, and a pasted file name ("mybuild.cdproj") works too. Existing single-line files keep working unchanged.
+- The Project tab shows which projects are set to autoload and warns when the list names a project whose file is gone.
+
+Note
+- Loading two projects that contain the same objects puts them into the world twice. "Remove duplicates" in the Scene tab cleans that up.

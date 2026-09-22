@@ -1,0 +1,102 @@
+[size=5][b]World Builder – In-Game Prefab Editor & Modding SDK[/b][/size]
+
+[b]Place any of the game's 48,000+ prefabs anywhere in the world, live, without leaving the game.[/b]
+
+Discord: [url=https://discord.gg/HfkShRJZU][b]Crimson Desert Modding[/b][/url] for help, builds, feature requests and everything else about modding this game.
+
+World Builder is an in-game editor for Crimson Desert. Open it with a hotkey, browse every prefab the game ships (walls, ruins, furniture, props, gimmicks, nature), put them in front of your character, walk around them, move, turn, tilt and scale them with the keyboard or a Blender-style mouse gizmo, drop them onto the ground, and save the result as a project that loads again on the next start. It also exposes a small C API so other mods can spawn and move objects through it.
+
+No game files are modified. Nothing is written into the game's own save data. Everything the mod places lives in its own project files.
+
+[size=4][b]Quick start[/b][/size]
+
+[list=1]
+[*]Press [b]Insert[/b] in the game world. The editor opens in edit mode: the mouse belongs to the menu, the world keeps running.
+[*]Type a word into the search box, pick a card or a row, press [b]PLACE[/b] (or double-click).
+[*]The object appears in front of your character. Move it with the placement keys (numpad by default) or press Numpad 5 and drag the gizmo. Place the next one, click another object or double-click into the open and it stays where it is ([b]Enter[/b] works too); [b]Backspace[/b] cancels while you hold it.
+[*]Prefer a small panel? Click [b]dock[/b]: a narrow side window with search, one to four columns of cards and PLACE. It stays open while you place.
+[*][b]Home[/b] switches between edit mode (menu takes the input) and play mode (game takes the input, window stays visible). Save your build in the Project tab.
+[/list]
+
+[size=4][b]Features[/b][/size]
+
+[list]
+[*][b]Prefab browser[/b]: category tree, full-text search (words in any order), tag filters, a "meshes only" filter, favorites and your own named collections
+[*][b]List or cards[/b]: the matches as a list or as tiles with the preview image; the dock shows one to four per row, sized to the window
+[*][b]Textured preview images[/b] for every prefab, rendered on your machine with the game's own textures. The mod asks the game's resource loader for the files: no archive code, no keys, nothing extracted, nothing redistributed
+[*][b]Placement mode[/b]: the object stays where it is while you walk around it. Move away / closer, left / right, up / down, rotate about its center, scale, bring it back in front of you
+[*][b]Mouse gizmo[/b]: Numpad 5 hands the mouse to World Builder. Arrows move along the object's axes, the center dot slides over the ground, the green ring turns, the red and blue rings tilt, the cubes scale
+[*][b]Full rotation[/b]: yaw, pitch and roll, with sliders in the Scene tab and a "level" key
+[*][b]Snapping[/b]: grid steps (0.1 to 2 m) and angle steps (5 to 90 degrees), one step per key press
+[*][b]Snap to ground[/b]: one key drops the carried object onto the surface below it, "To ground" in the Scene tab does the same for the selection. Uses the game's own physics probe, so it lands on terrain, floors and other objects alike
+[*][b]Click to select[/b]: in edit mode a click on a placed object selects it, a double-click grabs it. Selected objects are outlined
+[*][b]Scene tab[/b]: every placed object with position and distance; multi-select (Ctrl / Shift + click), groups (Ctrl+G) as collapsible rows, undo / redo (Ctrl+Z / Ctrl+Y), copy / paste with orientation (Ctrl+C / Ctrl+V), duplicate, delete, To ground, Grab, Remove duplicates
+[*][b]Line and circle tools[/b]: N copies in a row or on a ring in front of you, grouped, handed to the placement mode
+[*][b]Projects[/b]: save and load whole builds (absolute world coordinates, groups and tilt included), import .cdproj files shared by others, optional autoload when the game starts
+[*][b]Every key is yours[/b]: the editor hotkeys and all placement keys can be changed in the Settings tab or settings.txt. No numpad? Bind WASD, the arrows or anything else
+[*][b]Modding SDK[/b]: cdk_spawn, cdk_move, cdk_remove, cdk_player_pos and friends, callable from any other ASI mod
+[*][b]Experimental: interactive objects[/b]: Page Up spawns a gimmick through the game's own spawn path (a stand torch by default, or any of the 13,941 gimmick prefabs by path from the Log tab). Such a torch can be lit and put out like a real one. Needs a spawn template, which the game provides by itself a few steps after loading. Not saved in projects yet
+[*][b]Update-tolerant[/b]: game functions are located by signature and class name at startup. After a game patch the mod either works or disables itself cleanly and tells you why
+[/list]
+
+[size=4][b]Controls (defaults, all rebindable)[/b][/size]
+
+[list]
+[*][b]Insert[/b]: show / hide the editor
+[*][b]Home[/b]: edit mode (menu takes the input) / play mode (game takes the input)
+[*][b]Numpad 8 / 2[/b]: move the object away from you / closer     [b]Numpad 4 / 6[/b]: left / right     [b]Numpad 9 / 3[/b]: up / down
+[*][b]Numpad 7 / 1[/b]: rotate about the center     [b]Numpad + / -[/b]: scale     [b]Shift[/b]: fast
+[*][b]Numpad 0[/b]: bring it back in front of you     [b]Numpad .[/b]: snapping on / off     [b]Numpad 5[/b]: mouse gizmo on / off
+[*][b]Numpad *[/b]: level (remove the tilt)     [b]Numpad /[/b]: snap to ground
+[*][b]Enter[/b], placing or selecting something else, double-click into the open: done     [b]Backspace[/b]: cancel / put back
+[*][b]Scene tab[/b]: Ctrl+A select all, Ctrl+G group, Ctrl+Z / Ctrl+Y undo / redo, Ctrl+C / Ctrl+V copy / paste, Delete
+[/list]
+
+[size=4][b]Requirements[/b][/size]
+
+[list]
+[*]Crimson Desert (Steam), tested with builds 1.0.0.2850 and 1.0.0.2944
+[*][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url] installed as bin64\winmm.dll (DMM and Vortex users usually have it already)
+[/list]
+
+[size=4][b]Installation[/b][/size]
+
+[list=1]
+[*]Install Ultimate ASI Loader if you do not have it: download Ultimate-ASI-Loader_x64.zip, copy the included dinput8.dll into <game>\bin64\ and rename it to winmm.dll.
+[*]Copy cdmodkit.asi and the cdmodkit folder from this archive into <game>\bin64\. Mod managers (DMM, Vortex) work too: the prefab list is built into the plugin and written out if the folder is missing.
+[*]Start the game through Steam. The log is written to bin64\cdmodkit\cdmodkit.log (set console=1 in settings.txt if you want a console window).
+[/list]
+
+On the first start the mod renders preview images for all prefabs in the background (low priority, about 20 minutes). The prefab you select is always rendered first.
+
+[size=4][b]Known limitations[/b][/size]
+
+[list]
+[*]Placed objects are visual with collision. Gimmick behaviour (breakable, collectable, interactable) is not attached.
+[*]Objects exist for the running session only. Load a project (or use autoload) after restarting.
+[/list]
+
+[size=4][b]For mod authors[/b][/size]
+
+sdk\cdmodkit_api.h documents the exported functions. Get the module with GetModuleHandleA("cdmodkit.asi") and resolve the functions with GetProcAddress. Everything is queued to the game thread for you.
+
+[size=4][b]Questions, requests, problems[/b][/size]
+
+Join the [url=https://discord.gg/HfkShRJZU]Crimson Desert Modding[/url] Discord: questions, feature requests and bug reports are all welcome there, the comments here work too.
+
+When something goes wrong, everything is logged in bin64\cdmodkit\cdmodkit.log. Post the last 30 lines, especially lines containing "fault", "imgui assert" or "RESOLVE FAILED".
+
+[size=4][b]Support[/b][/size]
+
+If World Builder is useful to you and you want to say thanks, you can buy me a coffee: [url=https://ko-fi.com/daebak91]ko-fi.com/daebak91[/url]. Never expected, always appreciated.
+
+[size=4][b]Credits and thanks[/b][/size]
+
+[list]
+[*][b]dofo7777[/b] for extensive testing, ideas and videos. Many of the placement and input improvements exist because of that feedback.
+[*][b]Shin234[/b] for Master Looter, whose input layer this mod's virtual cursor is adapted from, and for showing the way into this engine.
+[*][b]LiangWood[/b] for tracking down the missing prefab list with DMM, [b]Alduin1991[/b] for the mounted-coordinates report, and the author of CrimsonRoute for the transform snapshot notes.
+[*]The whole Crimson Desert modding community: the pycrimson and CDMW projects for the archive and mesh format research, and everyone sharing findings in the open.
+[/list]
+
+Third-party code: MinHook (BSD-2), Dear ImGui (MIT), stb_image / stb_image_write (public domain), input layer adapted from Master Looter and Trinity (MIT). No game assets are included.

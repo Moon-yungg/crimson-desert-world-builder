@@ -1,0 +1,5 @@
+World Builder 0.76
+
+Changed
+- A double-click on a placed object (in the world or on a scene card) grabs that one object, not its whole group. Use the group header or Ctrl+A / Group to move a group as a whole.
+- Removed the temporary camera diagnostics from the log.

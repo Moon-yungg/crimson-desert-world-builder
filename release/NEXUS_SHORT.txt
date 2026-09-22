@@ -1,0 +1,1 @@
+In-game world editor for Crimson Desert: browse all 48,000+ prefabs with previews, spawn them live, walk around and place them with hotkeys, rotate, scale, save builds as projects. No game files modified. Includes a C API so other mods can spawn and move objects.
