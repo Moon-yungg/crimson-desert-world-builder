@@ -15,6 +15,7 @@
 #include "overlay.h"
 #include "thumbgen.h"
 #include "input.h"
+#include "http_api.h"
 
 namespace editor {
     static bool g_open = false;
@@ -1681,6 +1682,21 @@ namespace editor {
                 }
                 ImGui::Separator();
                 if (ImGui::Checkbox("console window (log output; applies on the next start)", &core::g_showConsole)) core::SaveSettings();
+                ImGui::Separator();
+                ImGui::TextDisabled("HTTP API (local programs only; changes apply on the next game start)");
+                ImGui::SetNextItemWidth(120);
+                if (ImGui::InputInt("port (0 = off)", &core::g_httpPort)) {
+                    if (core::g_httpPort < 0) core::g_httpPort = 0;
+                    if (core::g_httpPort > 65535) core::g_httpPort = 65535;
+                    core::SaveSettings();
+                }
+                if (httpapi::ActivePort() > 0) {
+                    char url[80]; snprintf(url, sizeof url, "http://127.0.0.1:%d/api/status", httpapi::ActivePort());
+                    ImGui::Text("Current: %s", url);
+                    ImGui::SameLine(); if (ImGui::SmallButton("copy URL")) ImGui::SetClipboardText(url);
+                    ImGui::TextDisabled("GET /api/prefabs and /api/objects; POST /api/objects to place a prefab");
+                    ImGui::TextDisabled("See HTTP_API.md for all requests and JSON fields.");
+                } else ImGui::TextDisabled("HTTP API is off for this game session.");
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem(ICON_LIST " Log")) {
