@@ -11,9 +11,12 @@ if len(sys.argv) < 2: print(__doc__); sys.exit(1)
 ver = sys.argv[1].lstrip("v"); build = "--no-build" not in sys.argv
 
 # 1) version strings
-for f, pat in [(ASI / "cdmodkit.cpp", r'cdmodkit\.asi v[0-9.]+ attached'), (ASI / "editor.cpp", r'World Builder  v[0-9.]+')]:
+for f, pat, replacement in [
+    (ASI / "cdmodkit.cpp", r'cdmodkit\.asi v[0-9.]+ attached', f'cdmodkit.asi v{ver} attached'),
+    (ASI / "editor.cpp", r'kEditorVersion = "[0-9.]+"', f'kEditorVersion = "{ver}"'),
+]:
     s = f.read_text(encoding="utf-8")
-    s2 = re.sub(pat, lambda m: re.sub(r'v[0-9.]+', 'v' + ver, m.group(0)), s)
+    s2 = re.sub(pat, replacement, s)
     if s2 != s: f.write_text(s2, encoding="utf-8"); print("version ->", f.name)
 
 # 2) build
@@ -39,7 +42,7 @@ if out.exists(): shutil.rmtree(out)
 (out / "bin64" / "cdmodkit").mkdir(parents=True)
 (out / "sdk").mkdir()
 shutil.copy(ASI / "build" / "cdmodkit.asi", out / "bin64")
-for name in ("prefabs.tsv", "settings.txt", "errnames.txt"):
+for name in ("prefabs.tsv", "settings.txt", "errnames.txt", "locales.tsv"):
     shutil.copy(ASI / "data" / name, out / "bin64" / "cdmodkit")
 # thumbnails and prefab_size.tsv are NOT shipped: the mod renders them locally from the player's own pack files
 shutil.copy(ASI / "cdmodkit_api.h", out / "sdk")

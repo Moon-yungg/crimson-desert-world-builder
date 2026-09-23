@@ -14,8 +14,10 @@ im Log steht `RESOLVE FAILED`, und nichts wird gehookt.
    die enthaltene `dinput8.dll` nach `bin64\winmm.dll` kopieren (umbenennen).
 2. Aus diesem Zip nach `<Spiel>\bin64\` kopieren:
    - `cdmodkit.asi`
-   - Ordner `cdmodkit\` (enthält `prefabs.tsv` und `settings.txt`; bei einem Update kannst du deine eigene `settings.txt` behalten)
+   - Ordner `cdmodkit\` (enthält `prefabs.tsv`, `locales.tsv` und `settings.txt`; bei einem Update kannst du deine eigene `settings.txt` behalten)
 3. Spiel normal über Steam starten. Das Log liegt in `bin64\cdmodkit\cdmodkit.log`; ein Konsolenfenster gibt es nur mit `console=1` in der `settings.txt`.
+
+Die Oberflächensprache lässt sich im Tab **Settings** unter **Language** ändern. Es gibt Englisch, vereinfachtes und traditionelles Chinesisch, Deutsch, Französisch, Koreanisch, Japanisch, Spanisch, brasilianisches Portugiesisch, Russisch und Türkisch sowie die automatische Erkennung der Systemsprache. Die Namen in der Auswahlliste werden in der jeweils gewählten Oberflächensprache angezeigt.
 
 ## Vorschaubilder
 

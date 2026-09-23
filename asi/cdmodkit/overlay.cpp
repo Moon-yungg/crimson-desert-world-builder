@@ -6,6 +6,7 @@
 #include "overlay.h"
 #include "thumbgen.h"
 #include "icons.h"
+#include "i18n.h"
 void* CdHeapAlloc(size_t n); void* CdHeapRealloc(void* p, size_t n); void CdHeapFree(void* p);   // heap.cpp
 #define STBI_MALLOC(sz)        CdHeapAlloc(sz)
 #define STBI_REALLOC(p, newsz) CdHeapRealloc(p, newsz)
@@ -209,15 +210,19 @@ namespace overlay {
         io.ConfigErrorRecoveryEnableTooltip = false; io.ConfigErrorRecoveryEnableAssert = false;
         float scale = g_height / 1080.0f; if (scale < 0.75f) scale = 0.75f;
         editor::ApplyStyle(scale);
+        i18n::Initialize(core::ModDir());
         const char* fonts[] = { "C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\calibri.ttf" };
         bool haveFont = false;
         ImFont* textFont = nullptr;
-        for (const char* fp : fonts) if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES) { textFont = io.Fonts->AddFontFromFileTTF(fp, 17.0f * scale); core::Log("[overlay] font %s", fp); haveFont = true; break; }
+        const ImWchar* ranges = (const ImWchar*)i18n::GlyphRanges();
+        for (const char* fp : fonts) if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES) { textFont = io.Fonts->AddFontFromFileTTF(fp, 17.0f * scale, nullptr, ranges); core::Log("[overlay] font %s", fp); haveFont = true; break; }
         if (!haveFont) textFont = io.Fonts->AddFontDefault();
+        i18n::MergeSystemFonts(io.Fonts, 17.0f * scale);
         // icons are drawn by the plugin into the atlas (icons.cpp); no icon font is needed
         icons::Register(io.Fonts, textFont, 17.0f * scale);
         io.Fonts->Build();
         icons::Paint(io.Fonts);
+        i18n::ReleaseMergedFontData(io.Fonts);
         ImGui_ImplWin32_Init(g_hwnd);
         ImGui_ImplDX12_Init(g_device, (int)g_bufferCount, g_format, g_srvHeap, g_srvHeap->GetCPUDescriptorHandleForHeapStart(), g_srvHeap->GetGPUDescriptorHandleForHeapStart());
         input::Init(g_hwnd);

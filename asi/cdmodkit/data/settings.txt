@@ -5,6 +5,7 @@ key_toggle=INSERT
 key_mode=HOME
 # console=1 opens a console window next to the game with the log (the log file is always written)
 console=0
+language=auto
 # HTTP API for programs on this PC (127.0.0.1 only, see HTTP_API.md): off by default, http_api=1 or the Settings tab checkbox turns it on
 http_api=0
 http_port=8765
