@@ -31,6 +31,7 @@ static HMODULE g_self = nullptr;
 static FILE*   g_log = nullptr;
 static bool    g_console = false;
 static std::string g_modDir;
+bool g_httpEnabled = false;   // settings.txt http_api=1; off by default, the Settings tab starts and stops the server at runtime
 int g_httpPort = 8765;
 
 void Log(const char* fmt, ...) {
@@ -1909,7 +1910,8 @@ static void LoadSettings() {
         size_t eq = line.find('='); if (eq == std::string::npos) continue;
         std::string k = line.substr(0, eq), v = line.substr(eq + 1);
         if (k == "console") { g_showConsole = v != "0" && v != "off" && v != "false"; continue; }
-        if (k == "http_port") { char* end = nullptr; long port = strtol(v.c_str(), &end, 10); if (end && !*end && port >= 0 && port <= 65535) g_httpPort = (int)port; continue; }
+        if (k == "http_api") { g_httpEnabled = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "http_port") { char* end = nullptr; long port = strtol(v.c_str(), &end, 10); if (end && !*end && port >= 1 && port <= 65535) g_httpPort = (int)port; continue; }
         if (k == "fov") { float f = (float)atof(v.c_str()); if (f >= 10 && f <= 150) g_fovDeg = f; continue; }
         if (k == "mirror") { g_camMirror = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "fovauto") { g_fovAuto = v != "0" && v != "off" && v != "false"; continue; }
@@ -1932,7 +1934,7 @@ void SaveSettings() {
     fprintf(f, "key_toggle=%s\nkey_mode=%s\n# console=0 hides the console window (log file only)\nconsole=%d\n# projection for the gizmo: vertical field of view in degrees and horizontal mirror (calibrate in the Settings tab)\nfov=%.1f\nmirror=%d\n# fovauto=1 reads the field of view from the game's camera object (fov= is the fallback)\nfovauto=%d\n# camlag: frames the overlay camera trails the game camera (0..4). Outlines run ahead while panning: raise it; they lag: lower it\ncamlag=%d\n", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? 1 : 0, g_fovDeg, g_camMirror ? 1 : 0, g_fovAuto ? 1 : 0, g_camLag);
     fprintf(f, "# placement keys (any key name from the list above, NUMPAD0..9, NUMPAD+ NUMPAD- NUMPAD. NUMPAD* NUMPAD/, ENTER, BACKSPACE, SPACE, UP/DOWN/LEFT/RIGHT, SHIFT/CTRL/ALT for 'fast')\n");
     for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
-    fprintf(f, "# HTTP API: loopback only; 0 disables it. Restart the game after changing the port.\nhttp_port=%d\n", g_httpPort);
+    fprintf(f, "# HTTP API for programs on this PC (127.0.0.1 only, see HTTP_API.md): http_api=1 runs it, http_port= its port. The Settings tab switches it at once\nhttp_api=%d\nhttp_port=%d\n", g_httpEnabled ? 1 : 0, g_httpPort);
     ApplyPlaceKeys(); fclose(f);
     Log("settings saved: toggle %s, mode %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off");
 }
@@ -2041,7 +2043,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     InstallIoTrace();
     overlay::Install();          // first: must be in place before the game creates its swapchain
     LoadPrefabs();
-    httpapi::Start(g_httpPort);
+    if (g_httpEnabled) httpapi::Start(g_httpPort);   // opt-in; before ResolveGame on purpose: /api/status reports a failed build, writes answer 503
     thumbgen::Start();           // background: renders prefab previews from the pack files into bin64\cdmodkit\thumbs
     g_buildOk = ResolveGame();
     if (!g_buildOk) { Log("signature resolution failed; game functions will NOT be hooked or called"); return 0; }

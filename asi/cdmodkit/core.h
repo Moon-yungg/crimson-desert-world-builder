@@ -91,7 +91,8 @@ namespace core {
     extern int  g_liveMode;                     // live-drag method, see DoLiveMove
     extern int  g_keyToggle, g_keyMode;         // configurable hotkeys (virtual key codes), settings.txt in the mod folder
     extern bool g_showConsole;                  // settings.txt console=0 hides the console window (takes effect on the next start)
-    extern int  g_httpPort;                     // settings.txt http_port=0 disables the loopback HTTP API; restart to apply
+    extern bool g_httpEnabled;                  // settings.txt http_api=1 runs the loopback HTTP API (off by default, switched live in the Settings tab)
+    extern int  g_httpPort;                     // settings.txt http_port= (1..65535)
     int KeyCount(); const char* KeyNameAt(int i); int KeyVkAt(int i); const char* KeyName(int vk); void SaveSettings();
     // placement keys (virtual key codes, settings.txt key_move_fwd= ...); every action can be bound to any key, numpad is only the default
     enum PlaceKey { PK_FWD, PK_BACK, PK_LEFT, PK_RIGHT, PK_UP, PK_DOWN, PK_ROT_L, PK_ROT_R, PK_SCALE_UP, PK_SCALE_DOWN, PK_FETCH, PK_SNAP, PK_MOUSE, PK_LEVEL, PK_GROUND, PK_DROP, PK_CANCEL, PK_FAST, PK_COUNT };

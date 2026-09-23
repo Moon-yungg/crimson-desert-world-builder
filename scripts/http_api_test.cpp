@@ -66,7 +66,11 @@ static int Count(const std::string& text, const std::string& token) {
 }
 int main() {
     WSADATA data{}; assert(WSAStartup(MAKEWORD(2, 2), &data) == 0);
-    httpapi::Start(18765); Sleep(150);
+    assert(httpapi::Start(18765) && httpapi::ActivePort() == 18765);
+    httpapi::Stop(); assert(httpapi::ActivePort() == 0);
+    { SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(18765);
+      assert(connect(s, (sockaddr*)&a, sizeof a) != 0); closesocket(s); }   // stopped = nothing listens any more
+    assert(httpapi::Start(18765));                                          // and the port can be taken again right away
     assert(Request("GET", "/api/status").find("\"ready\":true") != std::string::npos);
     assert(Request("GET", "/api/prefabs?q=lamp").find("test_lamp.prefab") != std::string::npos);
     assert(Request("GET", "/api/prefabs?q=missing").find("\"total\":0") != std::string::npos);

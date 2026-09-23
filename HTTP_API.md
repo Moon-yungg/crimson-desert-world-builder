@@ -1,6 +1,6 @@
 # Local HTTP API
 
-World Builder starts a local HTTP server when the game loads the ASI. The default address is `http://127.0.0.1:8765`. Set `http_port=0` in `bin64/cdmodkit/settings.txt` to disable it, or choose another port in the editor's **Settings** tab. Port changes take effect after restarting the game. The server listens only on IPv4 loopback.
+World Builder can run a local HTTP server. It is **off by default**: tick **HTTP API for programs on this PC** in the editor's **Settings** tab. The server starts at once, and the choice is remembered in `bin64/cdmodkit/settings.txt` (`http_api=1`) until the box is unticked again, which stops it at once. The default address is `http://127.0.0.1:8765`; the port can be changed next to the checkbox (or with `http_port=`) and a running server moves to the new port immediately. If the port is taken by another program, the Settings tab says so and offers a retry. The server listens only on IPv4 loopback.
 
 Requests and responses use UTF-8 JSON. Write requests take a flat JSON object with `Content-Type: application/json` and a `Content-Length` header. Responses have an `error` field on failure. The server handles one connection at a time and closes each connection after its response. Request bodies are limited to 64 KiB.
 

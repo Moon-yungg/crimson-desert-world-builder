@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <mutex>
 #include <string>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -85,7 +86,7 @@ static bool JsonObject(const std::string& s, Fields& out) {
         if (s[p] == '"') { if (!JsonString(s, p, val)) return false; }
         else {
             size_t a = p;
-            while (p < s.size() && s[p] != ',' && s[p] != '}' && s[p] != ' ' && s[p] != '\r' && s[p] != '\n') ++p;
+            while (p < s.size() && s[p] != ',' && s[p] != '}' && s[p] != ' ' && s[p] != '\t' && s[p] != '\r' && s[p] != '\n') ++p;
             val = s.substr(a, p - a);
             if (val != "true" && val != "false" && val != "null") {
                 char* end = nullptr; strtod(val.c_str(), &end);
@@ -333,33 +334,62 @@ static void Client(SOCKET s, int port) {
     if (!seenHost) { Reply(s, 400, Error("host required")); return; }
     if (method != "GET" && method != "DELETE" && !seenLength) { Reply(s, 400, Error("content length required")); return; }
     std::string body = request.substr(end + 4); if (body.size() > length) body.resize(length);
-    while (body.size() < length) { int n = recv(s, buf, (int)std::min(sizeof buf, length - body.size()), 0); if (n <= 0) return; body.append(buf, n); }
+    while (body.size() < length) { int n = recv(s, buf, (int)(std::min)(sizeof buf, length - body.size()), 0); if (n <= 0) return; body.append(buf, n); }
     size_t qm = target.find('?'); std::string path = target.substr(0, qm);
     if (path.empty() || path[0] != '/' || path.find('%') != std::string::npos) { Reply(s, 400, Error("invalid path")); return; }
     Fields fields = qm == std::string::npos ? Fields{} : Query(target.substr(qm + 1));
     if (length && !JsonObject(body, fields)) { Reply(s, 400, Error("expected flat JSON object")); return; }
     int status = 200; std::string result = Handle(method, path, fields, status); Reply(s, status, result);
 }
+// The listener is owned by Start/Stop, not by the server thread: Stop closes it, which makes the blocked accept() fail and
+// the thread exit after the request it is serving. The generation tells a stopped thread from a transient accept error.
+static std::mutex g_mx;                          // Start/Stop come from the init thread and the render thread (settings checkbox)
+static SOCKET g_listener = INVALID_SOCKET;
+static std::atomic<unsigned> g_gen{ 0 };
+static std::string g_error;
+struct ServerArg { SOCKET listener; int port; unsigned gen; };
 static DWORD WINAPI Server(void* param) {
-    int port = (int)(intptr_t)param;
-    WSADATA data{}; if (WSAStartup(MAKEWORD(2, 2), &data)) { core::Log("http: WSAStartup failed"); return 0; }
+    const ServerArg a = *(ServerArg*)param; delete (ServerArg*)param;
+    for (;;) {
+        SOCKET s = accept(a.listener, nullptr, nullptr);
+        if (g_gen.load() != a.gen) { if (s != INVALID_SOCKET) closesocket(s); break; }
+        if (s == INVALID_SOCKET) { Sleep(50); continue; }   // e.g. WSAECONNRESET from a client that gave up: keep serving
+        Client(s, a.port); closesocket(s);
+    }
+    core::Log("http: server on port %d stopped", a.port);
+    return 0;
+}
+static void StopLocked() {
+    if (g_listener == INVALID_SOCKET) return;
+    g_gen.fetch_add(1); activePort.store(0);
+    closesocket(g_listener); g_listener = INVALID_SOCKET;
+}
+}
+bool Start(int port) {
+    std::lock_guard<std::mutex> l(g_mx);
+    if (port <= 0 || port > 65535) { g_error = "invalid port"; return false; }
+    if (g_listener != INVALID_SOCKET && activePort.load() == port) return true;
+    StopLocked();
+    static bool s_wsa = false;
+    if (!s_wsa) { WSADATA data{}; if (WSAStartup(MAKEWORD(2, 2), &data)) { g_error = "WSAStartup failed"; core::Log("http: WSAStartup failed"); return false; } s_wsa = true; }
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listener == INVALID_SOCKET) { core::Log("http: socket failed"); WSACleanup(); return 0; }
+    if (listener == INVALID_SOCKET) { g_error = "socket failed (WSA " + Int(WSAGetLastError()) + ")"; core::Log("http: %s", g_error.c_str()); return false; }
+    BOOL excl = TRUE; setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&excl, sizeof excl);   // no other process can bind over us
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons((u_short)port);
     if (bind(listener, (sockaddr*)&addr, sizeof addr) == SOCKET_ERROR || listen(listener, 8) == SOCKET_ERROR) {
-        core::Log("http: cannot listen on 127.0.0.1:%d (WSA %d)", port, WSAGetLastError()); closesocket(listener); WSACleanup(); return 0;
+        const int e = WSAGetLastError(); closesocket(listener);
+        g_error = e == WSAEADDRINUSE || e == WSAEACCES ? "port " + Int(port) + " is used by another program" : "cannot listen on port " + Int(port) + " (WSA " + Int(e) + ")";
+        core::Log("http: %s", g_error.c_str()); return false;
     }
+    const unsigned gen = g_gen.fetch_add(1) + 1;
+    HANDLE h = CreateThread(nullptr, 0, Server, new ServerArg{ listener, port, gen }, 0, nullptr);
+    if (!h) { closesocket(listener); g_error = "thread creation failed"; core::Log("http: %s", g_error.c_str()); return false; }
+    CloseHandle(h);
+    g_listener = listener; activePort.store(port); g_error.clear();
     core::Log("http: listening on http://127.0.0.1:%d/api/status", port);
-    activePort.store(port);
-    for (;;) { SOCKET s = accept(listener, nullptr, nullptr); if (s == INVALID_SOCKET) break; Client(s, port); closesocket(s); }
-    activePort.store(0);
-    closesocket(listener); WSACleanup(); return 0;
+    return true;
 }
-}
-void Start(int port) {
-    if (port <= 0) return;
-    HANDLE h = CreateThread(nullptr, 0, Server, (void*)(intptr_t)port, 0, nullptr);
-    if (h) CloseHandle(h); else core::Log("http: thread creation failed");
-}
+void Stop() { std::lock_guard<std::mutex> l(g_mx); if (g_listener != INVALID_SOCKET) core::Log("http: stopping"); StopLocked(); }
 int ActivePort() { return activePort.load(); }
+std::string LastError() { std::lock_guard<std::mutex> l(g_mx); return g_error; }
 }
