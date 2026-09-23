@@ -785,7 +785,7 @@ namespace editor {
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o) continue; core::SetGroup(uid, gid); n++; }
         Note(T("%s %d objects"), T(group ? "grouped" : "ungrouped"), n);
     }
-    static void QuickGimmickSpawn() {   // Page Up: spawn the Log tab's override prefab (or a standtorch) through the game's own spawn path, newest capture as the template
+    static void QuickGimmickSpawn() {   // Log tab button: spawn the override prefab (or a standtorch) through the game's own spawn path, newest capture as the template
         if (!core::GimmickReplayPrefab()[0]) core::SetGimmickReplayPrefab("/object/cd_gimmick/00_common/lamp/gimmick_lamp_standtorch_03_on.prefab");
         core::GimmickCapInfo caps[4]; const int nc = core::GimmickCaptureList(caps, 4);
         if (!nc) { Note(T("no spawn template yet: walk a few meters first")); return; }
@@ -801,7 +801,6 @@ namespace editor {
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false)) GroupSel(true);
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) { g_sel.clear(); for (auto& o : core::Spawned()) if (!o.hidden) g_sel.insert(o.uid); }
         if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && !g_sel.empty()) DeleteSel();
-        if (ImGui::IsKeyPressed(ImGuiKey_PageUp, false)) QuickGimmickSpawn();   // research: the override prefab (default: a standtorch) 2 m in front, from the newest capture
     }
 
     // ---- line / circle tools ----
@@ -1745,7 +1744,8 @@ namespace editor {
                             for (int i = 0; i < ns; i++) { ImGui::PushID((int)(sp[i].so & 0x7FFFFFFF)); const char* fn = strrchr(sp[i].prefab, '/'); ImGui::Text(T("%lu s  %s  actor %p"), sp[i].ageMs / 1000, fn ? fn + 1 : sp[i].prefab, (void*)sp[i].actor); ImGui::SameLine(); if (sp[i].actor && ImGui::SmallButton(T("remove"))) core::RequestRemoveSpawned(sp[i].actor); ImGui::PopID(); } }
                     }
                     {   // the prefab the replay creates its server object from (the prepare's 4th argument is that path)
-                        static char prefabOverride[256] = {}; ImGui::SetNextItemWidth(-1);
+                        static char prefabOverride[256] = {};
+                        if (ImGui::SmallButton(T("spawn it in front of me"))) QuickGimmickSpawn(); if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("spawns the override prefab (a stand torch when the field is empty) 2 m in front of you through the game's spawn path, from the newest capture")); ImGui::SameLine(); ImGui::SetNextItemWidth(-1);
                         if (ImGui::InputTextWithHint("##replayprefab", T("replay prefab path override, e.g. /object/cd_gimmick/00_common/lamp/gimmick_lamp_stand_candle_0003_index01.prefab (empty = as captured)"), prefabOverride, sizeof prefabOverride)) core::SetGimmickReplayPrefab(prefabOverride);
                         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("\"here\" replays the capture, but the server object is built from this prefab instead of the captured one"));
                     }

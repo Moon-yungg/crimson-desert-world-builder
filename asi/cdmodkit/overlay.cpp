@@ -187,7 +187,8 @@ namespace overlay {
         if (g_fence->GetCompletedValue() < g_fenceValue) { g_fence->SetEventOnCompletion(g_fenceValue, g_fenceEvent); WaitForSingleObject(g_fenceEvent, 2000); }
     }
 
-    static bool Init(IDXGISwapChain3* sc) {
+    static bool Init(IDXGISwapChain3* sc) {   // each step is logged: a crash report then shows how far the first frame got
+        core::Log("[overlay] init: device");
         if (FAILED(sc->GetDevice(IID_PPV_ARGS(&g_device)))) { core::Log("[overlay] GetDevice failed"); return false; }
         DXGI_SWAP_CHAIN_DESC desc = {}; sc->GetDesc(&desc);
         g_hwnd = desc.OutputWindow;
@@ -195,31 +196,40 @@ namespace overlay {
         if (FAILED(g_device->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&g_rtvHeap)))) return false;
         D3D12_DESCRIPTOR_HEAP_DESC sh = {}; sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; sh.NumDescriptors = kSrvSlots; sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_device->CreateDescriptorHeap(&sh, IID_PPV_ARGS(&g_srvHeap)))) return false;
+        core::Log("[overlay] init: heaps + render targets");
         if (!CreateRenderTargets(sc)) { core::Log("[overlay] render targets failed"); return false; }
+        core::Log("[overlay] init: command list + fence");
         if (FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_frames[0].alloc, nullptr, IID_PPV_ARGS(&g_cmdList)))) return false;
         g_cmdList->Close();
         if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)))) return false;
         g_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
+        core::Log("[overlay] init: imgui context");
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         io.ConfigErrorRecoveryEnableTooltip = false; io.ConfigErrorRecoveryEnableAssert = false;
         float scale = g_height / 1080.0f; if (scale < 0.75f) scale = 0.75f;
+        core::Log("[overlay] init: style");
         editor::ApplyStyle(scale);
+        core::Log("[overlay] init: locales");
         i18n::Initialize(core::ModDir());
+        core::Log("[overlay] init: fonts (language %s)", i18n::Preference());
         const char* fonts[] = { "C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\calibri.ttf" };
         bool haveFont = false;
         ImFont* textFont = nullptr;
         const ImWchar* ranges = (const ImWchar*)i18n::GlyphRanges();
         for (const char* fp : fonts) if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES) { textFont = io.Fonts->AddFontFromFileTTF(fp, 17.0f * scale, nullptr, ranges); core::Log("[overlay] font %s", fp); haveFont = true; break; }
         if (!haveFont) textFont = io.Fonts->AddFontDefault();
+        core::Log("[overlay] init: system fonts");
         i18n::MergeSystemFonts(io.Fonts, 17.0f * scale);
         // icons are drawn by the plugin into the atlas (icons.cpp); no icon font is needed
         icons::Register(io.Fonts, textFont, 17.0f * scale);
+        core::Log("[overlay] init: atlas build");
         io.Fonts->Build();
         icons::Paint(io.Fonts);
         i18n::ReleaseMergedFontData(io.Fonts);
+        core::Log("[overlay] init: backends (atlas %dx%d)", io.Fonts->TexWidth, io.Fonts->TexHeight);
         ImGui_ImplWin32_Init(g_hwnd);
         ImGui_ImplDX12_Init(g_device, (int)g_bufferCount, g_format, g_srvHeap, g_srvHeap->GetCPUDescriptorHandleForHeapStart(), g_srvHeap->GetGPUDescriptorHandleForHeapStart());
         input::Init(g_hwnd);

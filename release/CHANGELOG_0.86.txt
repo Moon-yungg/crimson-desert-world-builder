@@ -1,0 +1,7 @@
+World Builder 0.86
+
+Fixed
+- A stand torch could appear out of nowhere while placing an object: Page Up was still bound to the research "quick spawn"
+  (the Log tab's override prefab, a stand torch by default) and fired whenever the key was pressed while the placement
+  mode or the editor was active, for example inside a house where the game itself uses the key. The hotkey is gone; the
+  quick spawn is a button next to the override field in the Log tab now.
