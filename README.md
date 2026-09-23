@@ -45,7 +45,7 @@ Then:
 asi\cdmodkit\build.bat
 ```
 
-Without Visual Studio, `asi\cdmodkituild-mingw.bat` builds the same sources with GCC / MinGW-w64 (g++, gcc and windres on
+Without Visual Studio, `asi/cdmodkit/build-mingw.bat` builds the same sources with GCC / MinGW-w64 (g++, gcc and windres on
 PATH; the fault guards use the plugin's exception handler there instead of MSVC's `__try`).
 
 The plugin lands in `asi/cdmodkit/build/cdmodkit.asi`. Copy it together with `asi/cdmodkit/data/prefabs.tsv`,
