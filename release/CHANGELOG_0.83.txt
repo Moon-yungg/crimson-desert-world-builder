@@ -1,0 +1,8 @@
+World Builder 0.83
+
+Changed
+- The plugin can be built with GCC / MinGW-w64 as well as with Visual Studio: asi\cdmodkit\build-mingw.bat (g++, gcc and
+  windres on PATH; verified with winlibs GCC 14.2 UCRT). The memory probes and crash guards that used MSVC's structured
+  exception handling now work with both compilers: under GCC the plugin's own exception handler returns control to the
+  guarded code. A self-built MinGW version no longer crashes on the Settings tab or wherever a probe read hits an invalid
+  address. The released zip is still the Visual Studio build.
