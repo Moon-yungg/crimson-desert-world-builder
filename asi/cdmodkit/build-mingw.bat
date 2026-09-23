@@ -17,7 +17,7 @@ set CXXFLAGS=-std=c++17 -O2 -w -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DMINGW_HAS_SE
 %GCC% -O2 -w -c -I%MH%\include -I%MH%\src %MH%\src\hook.c -o build\mh_hook.o || exit /b 1
 %GCC% -O2 -w -c -I%MH%\include -I%MH%\src %MH%\src\trampoline.c -o build\mh_trampoline.o || exit /b 1
 %GCC% -O2 -w -c -I%MH%\include -I%MH%\src %MH%\src\hde\hde64.c -o build\mh_hde64.o || exit /b 1
-%GXX% %CXXFLAGS% -shared -static -static-libgcc -static-libstdc++ -o build\cdmodkit.asi ^
+%GXX% %CXXFLAGS% -shared -static -static-libgcc -static-libstdc++ -s -o build\cdmodkit.asi ^
    cdmodkit.cpp http_api.cpp diag.cpp overlay.cpp input.cpp editor.cpp thumbgen.cpp heap.cpp icons.cpp i18n.cpp ^
    %IM%\imgui.cpp %IM%\imgui_draw.cpp %IM%\imgui_tables.cpp %IM%\imgui_widgets.cpp %IM%\backends\imgui_impl_dx12.cpp %IM%\backends\imgui_impl_win32.cpp ^
    build\mh_buffer.o build\mh_hook.o build\mh_trampoline.o build\mh_hde64.o build\cdmodkit_res.o ^
