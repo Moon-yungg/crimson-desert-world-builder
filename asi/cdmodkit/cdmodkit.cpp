@@ -2417,10 +2417,12 @@ static void ReadGameVersion() {
 // process-wide first-chance fault logger (so a crash anywhere leaves a trace, like master-looter's [fault] lines)
 static LONG CALLBACK VectoredHandler(EXCEPTION_POINTERS* ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
-    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
-        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != 0xC0000409 && code != EXCEPTION_BREAKPOINT) return EXCEPTION_CONTINUE_SEARCH;
+    // every error-class OS exception (severity bits 11, customer bit clear: access violation, illegal instruction, in-page
+    // error, alignment, ...) plus breakpoints; C++ throws (0xE06D7363 MSVC, 0x20474343 GCC) and debugger codes pass through
+    const bool osError = (code & 0xE0000000u) == 0xC0000000u;
+    if (!osError && code != EXCEPTION_BREAKPOINT) return EXCEPTION_CONTINUE_SEARCH;
 #ifndef _MSC_VER
-    if (code != EXCEPTION_STACK_OVERFLOW) cdk::GuardDispatch(ep);   // does not return when a guard is active on this thread
+    if (osError && code != EXCEPTION_STACK_OVERFLOW) cdk::GuardDispatch(ep);   // does not return when a guard is active on this thread (MSVC: __except catches the same set)
 #endif
     if (t_guardedRead) return EXCEPTION_CONTINUE_SEARCH;
     static volatile LONG s_count = 0;
@@ -2453,7 +2455,7 @@ static void Attach(HMODULE h) {
     CreateDirectoryA(g_modDir.c_str(), nullptr);
     g_log = fopen((g_modDir + "\\cdmodkit.log").c_str(), "a");
     ReadGameVersion();
-    Log("cdmodkit.asi v0.83 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
+    Log("cdmodkit.asi v0.84 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
     LoadSettings();
     ReserveHookGap();            // before the game fills the address space around its image (see ReserveHookGap)
     CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);

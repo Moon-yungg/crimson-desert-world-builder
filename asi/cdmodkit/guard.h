@@ -29,8 +29,11 @@ namespace cdk { inline int GuardFilter(EXCEPTION_POINTERS* ep) { t_fault.rec = *
 #define CDK_GUARD_END   }
 #else
 namespace cdk {
-    struct GuardFrame { intptr_t jb[5]; GuardFrame* prev; };
+    struct GuardFrame;
     extern thread_local GuardFrame* t_guardTop;   // innermost active guard of this thread (defined in cdmodkit.cpp)
+    // Registers itself on construction and leaves on destruction, so a `return` inside the guarded region (ReadBytes returns
+    // from within it) still unregisters the frame: a stale frame here would send the next fault into a dead stack frame.
+    struct GuardFrame { intptr_t jb[5]; GuardFrame* prev; GuardFrame() : prev(t_guardTop) { t_guardTop = this; } ~GuardFrame() { t_guardTop = prev; } };
     // Called by the vectored handler on the faulting thread. Returns only when no guard is active.
     inline void GuardDispatch(EXCEPTION_POINTERS* ep) {
         GuardFrame* f = t_guardTop; if (!f) return;
@@ -38,8 +41,8 @@ namespace cdk {
         __builtin_longjmp(f->jb, 1);
     }
 }
-#define CDK_GUARD_BEGIN { cdk::GuardFrame cdk_gf_; cdk_gf_.prev = cdk::t_guardTop; cdk::t_guardTop = &cdk_gf_; if (__builtin_setjmp(cdk_gf_.jb) == 0) {
-#define CDK_GUARD_FAIL  cdk::t_guardTop = cdk_gf_.prev; } else {
+#define CDK_GUARD_BEGIN { cdk::GuardFrame cdk_gf_; if (__builtin_setjmp(cdk_gf_.jb) == 0) {
+#define CDK_GUARD_FAIL  } else {
 #define CDK_GUARD_END   } }
 // MSVC intrinsics used by the plugin
 #ifndef _ReturnAddress

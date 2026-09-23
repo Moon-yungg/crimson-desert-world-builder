@@ -1,0 +1,10 @@
+World Builder 0.84
+
+Fixed
+- GCC / MinGW builds: the fault guard left a stale frame behind after every successful guarded read, so the first real
+  fault (a probe read of an invalid address, as the Settings tab makes) jumped into a dead stack frame and took the game
+  down without a log line. The guard frame now unregisters itself on every exit. Verified with a standalone test
+  (repeated faults, nested guards, worker threads) and a full build with winlibs GCC 14.2.
+- The plugin's exception handler catches every error-class OS exception for guarded code (not only access violations),
+  the same set MSVC's __except handled, and logs them with the call chain.
+The Visual Studio build is unchanged in behaviour.

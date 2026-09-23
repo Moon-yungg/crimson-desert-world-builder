@@ -69,14 +69,6 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 
 On the first start the mod renders preview images for all prefabs in the background (low priority, about 20 minutes). The prefab you select is always rendered first.
 
-[size=4][b]Known limitations[/b][/size]
-
-[list]
-[*]Gimmick prefabs (everything under /object/cd_gimmick/) are real, interactive game objects. All other prefabs are visual with collision only.
-[*]Interactive objects need a spawn template the game provides by itself: right after loading a save, walk a few meters before they appear (the Scene tab says so while they wait).
-[*]Objects exist for the running session only. Load a project (or use autoload) after restarting.
-[/list]
-
 [size=4][b]For mod authors[/b][/size]
 
 sdk\cdmodkit_api.h documents the exported functions. Get the module with GetModuleHandleA("cdmodkit.asi") and resolve the functions with GetProcAddress. Everything is queued to the game thread for you.
