@@ -1,0 +1,9 @@
+World Builder 0.85
+
+Fixed
+- Crash a few seconds after changing the DLSS mode (e.g. Quality to DLAA) or another setting that makes the game rebuild
+  its swapchain. The overlay held references to the swapchain's back buffers between frames; DXGI cannot destroy or
+  replace a swapchain while its buffers are referenced, the game went on with a null swapchain and crashed in its own
+  render code. The overlay now fetches the back buffer per frame and releases it right after drawing, so the game can
+  resize, destroy and recreate its swapchain at any time.
+- A failing ResizeBuffers or CreateSwapChainForHwnd of the game is now logged with its error code.
