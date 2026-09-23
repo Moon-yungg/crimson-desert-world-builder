@@ -18,6 +18,7 @@
 #include "core_internal.h"
 #include "thumbgen.h"
 #include "input.h"
+#include "http_api.h"
 
 namespace core {
 
@@ -30,6 +31,8 @@ static HMODULE g_self = nullptr;
 static FILE*   g_log = nullptr;
 static bool    g_console = false;
 static std::string g_modDir;
+bool g_httpEnabled = false;   // settings.txt http_api=1; off by default, the Settings tab starts and stops the server at runtime
+int g_httpPort = 8765;
 
 void Log(const char* fmt, ...) {
     SYSTEMTIME st; GetLocalTime(&st);
@@ -503,7 +506,13 @@ static void* DoSpawn(std::string prefab, Vec3 pos, Rot rot, float scale, int reg
     void* r = g_origCreate((void*)mgr, tag, arg3, arg4, rrp, xf, g_flags[0], g_flags[1], g_flags[2]);
     g_inOurSpawn = false;
     Log("spawn: \"%s\" at (%.2f %.2f %.2f) yaw %.0f tilt %.0f/%.0f scale %.2f -> %p (%s)", prefab.c_str(), pos.x, pos.y, pos.z, rot.yaw, rot.pitch, rot.roll, scale, r, r && RttiName((uintptr_t)r) ? RttiName((uintptr_t)r) : "?");
-    if (registerUid) { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(registerUid); if (i >= 0) { g_reg[i].obj = (uintptr_t)r; if (!r) g_reg[i].hidden = true; } }
+    if (registerUid) {
+        bool discarded = false;
+        { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(registerUid);
+          if (i >= 0 && !g_reg[i].hidden) { g_reg[i].obj = (uintptr_t)r; if (!r) g_reg[i].hidden = true; }
+          else discarded = true; }
+        if (discarded && r) DoRemove((uintptr_t)r);   // a queued spawn may finish after an HTTP client hides or forgets it
+    }
     return r;
 }
 
@@ -566,7 +575,10 @@ int SpawnAt(const std::string& prefab, Vec3 world, Rot rot, float scale, int gro
     if (!GameThreadReady()) { Log("spawn: game thread pump not active yet"); return 0; }
     int uid; { std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextUid++; g_reg.push_back({ 0, prefab, world, rot, scale, false, GetTickCount(), rot, scale, uid, group, proj }); if (!g_loading) MarkDirtyLocked(proj); }
     std::string p = prefab;
-    RunOnGameThread([p, world, rot, scale, uid]() { DoSpawn(p, world, rot, scale, uid); });
+    RunOnGameThread([p, world, rot, scale, uid]() {
+        { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(uid); if (i < 0 || g_reg[i].hidden) return; }
+        DoSpawn(p, world, rot, scale, uid);
+    });
     return uid;
 }
 
@@ -1898,6 +1910,8 @@ static void LoadSettings() {
         size_t eq = line.find('='); if (eq == std::string::npos) continue;
         std::string k = line.substr(0, eq), v = line.substr(eq + 1);
         if (k == "console") { g_showConsole = v != "0" && v != "off" && v != "false"; continue; }
+        if (k == "http_api") { g_httpEnabled = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "http_port") { char* end = nullptr; long port = strtol(v.c_str(), &end, 10); if (end && !*end && port >= 1 && port <= 65535) g_httpPort = (int)port; continue; }
         if (k == "fov") { float f = (float)atof(v.c_str()); if (f >= 10 && f <= 150) g_fovDeg = f; continue; }
         if (k == "mirror") { g_camMirror = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "fovauto") { g_fovAuto = v != "0" && v != "off" && v != "false"; continue; }
@@ -1920,6 +1934,7 @@ void SaveSettings() {
     fprintf(f, "key_toggle=%s\nkey_mode=%s\n# console=0 hides the console window (log file only)\nconsole=%d\n# projection for the gizmo: vertical field of view in degrees and horizontal mirror (calibrate in the Settings tab)\nfov=%.1f\nmirror=%d\n# fovauto=1 reads the field of view from the game's camera object (fov= is the fallback)\nfovauto=%d\n# camlag: frames the overlay camera trails the game camera (0..4). Outlines run ahead while panning: raise it; they lag: lower it\ncamlag=%d\n", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? 1 : 0, g_fovDeg, g_camMirror ? 1 : 0, g_fovAuto ? 1 : 0, g_camLag);
     fprintf(f, "# placement keys (any key name from the list above, NUMPAD0..9, NUMPAD+ NUMPAD- NUMPAD. NUMPAD* NUMPAD/, ENTER, BACKSPACE, SPACE, UP/DOWN/LEFT/RIGHT, SHIFT/CTRL/ALT for 'fast')\n");
     for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
+    fprintf(f, "# HTTP API for programs on this PC (127.0.0.1 only, see HTTP_API.md): http_api=1 runs it, http_port= its port. The Settings tab switches it at once\nhttp_api=%d\nhttp_port=%d\n", g_httpEnabled ? 1 : 0, g_httpPort);
     ApplyPlaceKeys(); fclose(f);
     Log("settings saved: toggle %s, mode %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off");
 }
@@ -2028,6 +2043,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     InstallIoTrace();
     overlay::Install();          // first: must be in place before the game creates its swapchain
     LoadPrefabs();
+    if (g_httpEnabled) httpapi::Start(g_httpPort);   // opt-in; before ResolveGame on purpose: /api/status reports a failed build, writes answer 503
     thumbgen::Start();           // background: renders prefab previews from the pack files into bin64\cdmodkit\thumbs
     g_buildOk = ResolveGame();
     if (!g_buildOk) { Log("signature resolution failed; game functions will NOT be hooked or called"); return 0; }
@@ -2099,7 +2115,12 @@ static uintptr_t FuncStartOf(uintptr_t rva) {
     RUNTIME_FUNCTION cur = rf[lo - 1];
     if (!(cur.BeginAddress <= rva && rva < cur.EndAddress)) return 0;
     for (int i = 0; i < 16; i++) {
+        // MinGW names the same RUNTIME_FUNCTION field UnwindData.
+#ifdef __MINGW32__
+        uint8_t* ui = (uint8_t*)(g_base + cur.UnwindData);
+#else
         uint8_t* ui = (uint8_t*)(g_base + cur.UnwindInfoAddress);
+#endif
         uint8_t flags = ui[0] >> 3, codes = ui[2];
         if (!(flags & UNW_FLAG_CHAININFO)) break;
         memcpy(&cur, ui + 4 + ((codes + 1) & ~1) * 2, sizeof cur);

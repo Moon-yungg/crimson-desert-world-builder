@@ -48,6 +48,7 @@ The plugin lands in `asi/cdmodkit/build/cdmodkit.asi`. Copy it together with `as
 | --- | --- |
 | `asi/cdmodkit/` | the plugin: `cdmodkit.cpp` (hooks, spawning, projects), `editor.cpp` (ImGui editor), `overlay.cpp` / `input.cpp` (D3D12 overlay, input), `thumbgen.cpp` (preview renderer), `diag.cpp` (reverse-engineering aids) |
 | `asi/cdmodkit/cdmodkit_api.h` | the C API other ASI mods can call (`cdk_spawn`, `cdk_move`, `cdk_remove`, `cdk_player_pos`, ...) |
+| `HTTP_API.md` | local HTTP API for prefab search, scene objects and project operations |
 | `asi/cdmodkit/data/` | `prefabs.tsv` (prefab paths and tags), default `settings.txt`, `errnames.txt` |
 | `scripts/` | build helpers and the offline reverse-engineering tools (`xref.py`, `disasm.py`, `rtti_static.py`, `parse_parc.py`, ...); the pack-reading scripts need pycrimson, bier and CDMW under `tools/` |
 | `notes/FORMATS.md` | how the game works from the plugin's point of view: signatures, struct offsets, the spawn recipe, file formats |

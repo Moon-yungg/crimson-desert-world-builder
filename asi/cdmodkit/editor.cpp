@@ -15,6 +15,7 @@
 #include "overlay.h"
 #include "thumbgen.h"
 #include "input.h"
+#include "http_api.h"
 
 namespace editor {
     static bool g_open = false;
@@ -1681,6 +1682,29 @@ namespace editor {
                 }
                 ImGui::Separator();
                 if (ImGui::Checkbox("console window (log output; applies on the next start)", &core::g_showConsole)) core::SaveSettings();
+                ImGui::Separator();
+                // opt-in: the checkbox starts / stops the server at once and is remembered in settings.txt (http_api=)
+                if (ImGui::Checkbox("HTTP API for programs on this PC", &core::g_httpEnabled)) {
+                    if (core::g_httpEnabled) httpapi::Start(core::g_httpPort); else httpapi::Stop();
+                    core::SaveSettings();
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("listens on 127.0.0.1 only. Local tools and scripts can search prefabs and spawn, move and delete World Builder objects (see HTTP_API.md)");
+                ImGui::SameLine(); ImGui::SetNextItemWidth(70);
+                ImGui::InputInt("port", &core::g_httpPort, 0, 0);   // no step buttons: applied once on Enter / leaving the field, not per keystroke
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    if (core::g_httpPort < 1 || core::g_httpPort > 65535) core::g_httpPort = 8765;
+                    core::SaveSettings();
+                    if (core::g_httpEnabled) httpapi::Start(core::g_httpPort);   // restarts on the new port
+                }
+                if (const int port = httpapi::ActivePort()) {
+                    char url[80]; snprintf(url, sizeof url, "http://127.0.0.1:%d/api/status", port);
+                    ImGui::TextDisabled("running: %s", url);
+                    ImGui::SameLine(); if (ImGui::SmallButton("copy URL")) ImGui::SetClipboardText(url);
+                } else if (core::g_httpEnabled) {
+                    const std::string err = httpapi::LastError();
+                    ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.2f, 1), "not running: %s", err.empty() ? "starting" : err.c_str());
+                    ImGui::SameLine(); if (ImGui::SmallButton("retry")) httpapi::Start(core::g_httpPort);
+                } else ImGui::TextDisabled("off");
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem(ICON_LIST " Log")) {
