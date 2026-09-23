@@ -1,0 +1,30 @@
+World Builder 0.82
+
+New
+- Interactive objects are part of the normal editor now. Every prefab under /object/cd_gimmick/ (16,591 of them, tag
+  "Gimmick": torches, lamps, doors, chests, campfires, levers ...) is placed through the game's own spawn path when you
+  spawn or place it, and behaves like the real thing: a stand torch can be lit and put out, a torch that is knocked over
+  falls, a chest opens. Rotation and scale are kept, selection, outline, gizmo, undo, copy, groups and projects work as
+  for every other object. While you drag one, a plain stand-in of the same prefab follows the mouse; on release the
+  interactive object is spawned again at the new spot. Deleting removes it the way the game removes a picked-up item.
+  Projects save and load them without a format change.
+- The spawn needs a template the game provides by itself: a spawn it makes while you walk (level streaming) or a housing
+  placement. Right after loading a save, the Scene tab says "N interactive objects waiting for a spawn template: walk a
+  few meters" until the first one happened. If the game refuses a prefab, it is placed as a plain object and the log
+  says so.
+- "gimmicks through the game" in the Log tab's developer row (settings.txt gimmick_spawn=0) switches the feature off;
+  gimmick prefabs are then plain objects as before.
+- Page Up spawns the Log tab's override prefab (a stand torch by default) two meters in front of you: a quick way to
+  try a prefab path from notes/gimmickinfo.tsv.
+- Local HTTP API for programs on this PC (off by default, Settings tab; see HTTP_API.md) and an interface in 11
+  languages (Settings, Language). Both contributed by dofo7777.
+
+Changed
+- Works on game build 1.0.0.2976. The callers of the game's spawn path are found by scanning the game at startup instead
+  of fixed addresses, and the two signatures that broke with the update tolerate moved code now.
+- The research tracers (hundreds of hooks on server classes) are only installed with settings.txt trace_hooks=1; the
+  memory scan for error names at startup is gone from normal runs.
+
+Fixed
+- A key held while switching between edit and play mode (Backspace in the search box, then Home) stayed pressed for
+  the menu, which made the search box eat text backwards.

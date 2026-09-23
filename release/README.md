@@ -73,21 +73,23 @@ Zum Neuaufbau einfach den Ordner `thumbs` und die Datei `prefab_size.tsv` lösch
   geladenen, ohne das erste vorher löschen zu müssen. "New" leert die Szene für einen echten Neuanfang.
 - Konsole: `help` listet die Befehle.
 
-## Experimentell: interaktive Objekte
+## Interaktive Objekte
 
-Platzierte Prefabs sind rein visuell. Zusätzlich kann World Builder Objekte über den Spawn-Weg des Spiels selbst erzeugen,
-so wie das Spiel seine Feld-Objekte anlegt. Die reagieren dann wie im Spiel: eine so erzeugte Standfackel lässt sich an- und
-ausmachen. **Bild auf** (Page Up) erzeugt zwei Meter vor dir eine Standfackel, oder das Prefab, dessen Pfad du im Log-Tab
-in das Feld "replay prefab path override" einträgst (das Spiel kennt 13.941 Gimmick-Prefabs: Fackeln, Lampen, Türen,
-Truhen, Lagerfeuer ...). "remove" in der Liste "spawned by replay" nimmt ein Objekt wieder weg.
-Dafür braucht die Mod eine Vorlage: sie kopiert die Parameter eines Spawns, den das Spiel gerade selbst gemacht hat, und
-tauscht Prefab, Position und Identität aus. Solche Spawns passieren beim Herumlaufen ständig, ein paar Schritte nach dem Laden
-reichen; vorher meldet Bild auf "walk a few meters first". Stand der Dinge: keine Rotation, kein Gizmo, nicht im Projekt
-gespeichert, und ein Spiel-Update kann die Funktion abschalten (das Log sagt dann, welcher Hook fehlt).
+Alle Prefabs unter `/object/cd_gimmick/` (Tag "Gimmick": Fackeln, Lampen, Türen, Truhen, Lagerfeuer, Hebel ...) erzeugt World
+Builder über den Spawn-Weg des Spiels selbst, so wie das Spiel seine Feld-Objekte anlegt. Sie verhalten sich dann wie im Spiel:
+eine Standfackel lässt sich an- und ausmachen und fällt um, eine Truhe geht auf. Auswahl, Rahmen, Gizmo, Undo, Gruppen und
+Projekte funktionieren wie bei jedem anderen Objekt. Beim Ziehen folgt ein statischer Platzhalter der Maus, beim Loslassen
+erscheint das interaktive Objekt an der neuen Stelle. Löschen entfernt es so, wie das Spiel ein aufgehobenes Item entfernt.
+
+Dafür braucht die Mod eine Vorlage, die das Spiel von selbst liefert: einen Spawn, den es beim Herumlaufen macht, oder eine
+Platzierung im Baumenü. Direkt nach dem Laden zeigt der Scene-Tab "N interactive objects waiting for a spawn template: walk a
+few meters", bis der erste passiert ist. Lehnt das Spiel ein Prefab ab, wird es als normales Objekt gesetzt, das Log sagt es.
+"gimmicks through the game" im Log-Tab (bzw. `gimmick_spawn=0` in der settings.txt) schaltet das ab. Ein Spiel-Update kann
+den Weg blockieren; das Log nennt dann den fehlenden Hook, alles andere läuft weiter.
 
 ## Bekannte Einschränkungen
 
-- Platzierte Objekte sind rein visuell mit Kollision. Gimmick-Verhalten gibt es nur über den experimentellen Spawn-Weg (siehe oben).
+- Prefabs außerhalb von `/object/cd_gimmick/` sind rein visuell mit Kollision.
 - Objekte existieren nur für die laufende Sitzung. Projekte müssen nach einem Neustart geladen werden (oder Autoload nutzen).
 - Mit DLSS Frame Generation ist das Overlay unter Umständen nicht sichtbar. Dann FG kurz abschalten.
 - Andere Overlays (CrimsonRoute, ReShade, Master Looter) sollten funktionieren, sind aber nicht getestet.

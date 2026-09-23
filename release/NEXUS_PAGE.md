@@ -33,7 +33,7 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 - **One scene, several projects**: every object knows which project it came from. The scene has a tab per loaded project plus "new" for what you just placed, a star marks unsaved changes, and each project is written back into its own file - so you can build inside a loaded project without having to clear it first
 - **Every key is yours**: the editor hotkeys and all placement keys can be changed in the Settings tab or settings.txt. No numpad? Bind WASD, the arrows or anything else
 - **Modding SDK**: `cdk_spawn`, `cdk_move`, `cdk_remove`, `cdk_player_pos` and friends, callable from any other ASI mod
-- **Experimental: interactive objects**: Page Up spawns a gimmick through the game's own spawn path (a stand torch by default, or any of the 13,941 gimmick prefabs by path from the Log tab). Such a torch can be lit and put out like a real one. Needs a spawn template, which the game provides by itself a few steps after loading. Not saved in projects yet
+- **Interactive objects**: every gimmick prefab (torches, lamps, doors, chests, campfires, levers - 16,591 of them) is spawned through the game's own spawn path and behaves like the real thing: light a torch, open a chest, knock a stand over. Select, drag, rotate, undo and save them like any other object. The game provides the spawn template by itself a few steps after loading
 - **Update-tolerant**: game functions are located by signature and class name at startup. After a game patch the mod either works or disables itself cleanly and tells you why
 
 ## Controls (defaults, all rebindable)

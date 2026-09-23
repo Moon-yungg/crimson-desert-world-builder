@@ -1194,13 +1194,14 @@ static bool MoveGimmick(size_t idx, Vec3 pos, Rot rot, float scale, bool final) 
       else { MarkDirtyLocked(e.proj); e.standin = false; e.actor = 0; e.obj = 0; } }
     if (!final) {
         if (!standin) {
+            { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); for (auto it = g_gimmickQueue.begin(); it != g_gimmickQueue.end(); ) it = it->uid == uid ? g_gimmickQueue.erase(it) : it + 1; }   // not yet spawned: it must not appear under the stand-in
             if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
             if (GameThreadReady()) RunOnGameThread([prefab, pos, rot, scale, uid]() { DoSpawn(prefab, pos, rot, scale, uid); });
         } else if (obj && GameThreadReady() && InterlockedCompareExchange(&g_queueCount, 0, 0) <= 2) { const DWORD now = GetTickCount(); RunOnGameThread([obj, pos, rot, scale, now]() { DoLiveMove(obj, pos, rot, scale, now); }); }
         return true;
     }
-    if (standin) { if (obj && GameThreadReady()) RunOnGameThread([obj]() { DoRemove(obj); }); }
-    else if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
+    if (standin && obj && GameThreadReady()) RunOnGameThread([obj]() { DoRemove(obj); });
+    if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); for (auto it = g_gimmickQueue.begin(); it != g_gimmickQueue.end(); ) it = it->uid == uid ? g_gimmickQueue.erase(it) : it + 1; }   // an older pending spawn of it is void
     EnqueueGimmick(uid, prefab, pos, rot, scale);
     return true;
@@ -1404,7 +1405,7 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     GimmickCapture t;
     if (!FindTemplateCapture(t)) { static DWORD lastLog = 0; if (GetTickCount() - lastLog > 15000) { lastLog = GetTickCount(); Log("[gimmick] %zu interactive object%s waiting for a spawn template (the game spawns one when you walk)", pending, pending == 1 ? "" : "s"); } return; }
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.pop_front(); }
-    { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return; }   // deleted meanwhile
+    { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].standin) return; }   // deleted or being dragged meanwhile
     char saved[256]; memcpy(saved, g_replayPrefab, sizeof saved); strncpy_s(g_replayPrefab, r.prefab.c_str(), _TRUNCATE);
     float xf[12]; MakeTransform(xf, r.pos, r.rot, r.scale, false); memcpy(g_replayQuat, xf + 3, 16); g_replayScale = r.scale; g_replayUseRot = true;
     g_gimmickReplayId = t.id; g_gimmickReplayAt = r.pos;
@@ -1413,7 +1414,7 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     const uintptr_t so = g_replayResultSo, actor = g_replayResultActor;
     if (so) {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid);
-        if (i < 0 || g_reg[(size_t)i].hidden) { if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); return; }   // deleted while spawning
+        if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].standin) { if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); return; }   // deleted or picked up while spawning
         g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale;
         Log("[gimmick] object %d spawned through the game: %s (scene object %p, actor %p)", r.uid, r.prefab.c_str(), (void*)so, (void*)actor);
     } else {
@@ -1810,7 +1811,7 @@ static void ResolveSpawnCallers() {
 static void ResolveGimmickSpawn() {
     int n = 0;
     { int m = 0; const uintptr_t h = FindPatternCount("48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 8D 9A CD 1D BA DE 48 8B FA 44 8B CB 44 8B DB F6 C1 03", &m);
-      if (h && m == 1) { g_gameHash = (GameHashFn)h; Log("resolved %-20s rva 0x%llx (via signature)", "string hash", (unsigned long long)(h - g_base)); Log("[gimmick] earlier replay codes: 0x20D51DB5 = %s, 0x615A8292 = %s", DecodeErr(0x20D51DB5).c_str(), DecodeErr(0x615A8292).c_str()); FindStringsForHash(0x20D51DB5); } else Log("[gimmick] string hash: %d matches", m); }
+      if (h && m == 1) { g_gameHash = (GameHashFn)h; Log("resolved %-20s rva 0x%llx (via signature)", "string hash", (unsigned long long)(h - g_base)); if (g_traceHooks) { Log("[gimmick] earlier replay codes: 0x20D51DB5 = %s, 0x615A8292 = %s", DecodeErr(0x20D51DB5).c_str(), DecodeErr(0x615A8292).c_str()); FindStringsForHash(0x20D51DB5); } } else Log("[gimmick] string hash: %d matches", m); }
     const uintptr_t f = FindPatternCount("48 8B C4 48 89 58 18 48 89 50 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 68 C1 48 81 EC B0 00 00 00 C5 F8 29 70 B8 C5 F8 29 78 A8 49 8B D9 49 8B F0 4C 8B FA 4C 8B F1 48 8B 49 18 48 83 C1 40", &n);
     if (!f || n != 1) { Log("[gimmick] spawn function: %d matches, not hooked (research feature only)", n); return; }
     kRva_GimmickSpawn = f - g_base; kRva_GimmickSpawn_ = kRva_GimmickSpawn;
@@ -2435,7 +2436,7 @@ static void Attach(HMODULE h) {
     CreateDirectoryA(g_modDir.c_str(), nullptr);
     g_log = fopen((g_modDir + "\\cdmodkit.log").c_str(), "a");
     ReadGameVersion();
-    Log("cdmodkit.asi v0.81 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
+    Log("cdmodkit.asi v0.82 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
     LoadSettings();
     ReserveHookGap();            // before the game fills the address space around its image (see ReserveHookGap)
     CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
