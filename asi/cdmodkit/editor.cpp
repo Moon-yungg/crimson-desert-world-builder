@@ -89,10 +89,10 @@ namespace editor {
     static Place g_place;
     bool IsOpen() { return g_open; }
     bool PlayMode() { return g_playMode; }
-    void TogglePlay() { if (g_open) g_playMode = !g_playMode; }
+    void TogglePlay() { if (g_open) { g_playMode = !g_playMode; ImGui::GetIO().ClearInputKeys(); } }   // a key held at the switch (Backspace in the search box) must not stay pressed for ImGui
     bool Placing() { return g_place.active; }
     bool MouseMode() { return g_place.active && (g_open ? !g_playMode : g_place.mouse); }
-    void Toggle() { g_open = !g_open; g_playMode = false; if (!g_open && g_previewShown) { core::PreviewClear(); g_previewShown = false; } }
+    void Toggle() { g_open = !g_open; g_playMode = false; ImGui::GetIO().ClearInputKeys(); if (!g_open && g_previewShown) { core::PreviewClear(); g_previewShown = false; } }
 
     void ApplyStyle(float scale) {
         ImGuiStyle& s = ImGui::GetStyle();
@@ -568,7 +568,7 @@ namespace editor {
         if (pressed(PK_SNAP)) g_snap = !g_snap;
         // two states only: the mouse belongs to World Builder (window + gizmo) or to the game (camera). With a window open that is the
         // edit / play switch; with the window closed (placed from the full editor) the gizmo has its own flag.
-        if (pressed(PK_MOUSE)) { if (g_open) g_playMode = !g_playMode; else P.mouse = !P.mouse; P.drag = 0; P.hover = 0; }
+        if (pressed(PK_MOUSE)) { if (g_open) { g_playMode = !g_playMode; ImGui::GetIO().ClearInputKeys(); } else P.mouse = !P.mouse; P.drag = 0; P.hover = 0; }
         const bool gizmoMouse = g_open ? !g_playMode : P.mouse;
         if (pressed(PK_GROUND)) StartGroundSnap(P);
         if (pressed(PK_LEVEL)) { if (P.m.size() == 1) { P.pitch = -P.m[0].rot0.pitch; P.roll = -P.m[0].rot0.roll; } else { P.pitch = P.roll = 0; } Note(T("levelled")); }   // Numpad *: remove the tilt
@@ -1654,7 +1654,7 @@ namespace editor {
         if (ImGui::BeginTabBar("tabs")) {
             bool inBrowser = false;
             if (ImGui::BeginTabItem(TStable(ICON_MAGNIFYING_GLASS " Browser"))) { inBrowser = true; DrawBrowser(p, havePos); ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem(TStable(ICON_CUBE " Scene"))) { DrawScene(p, havePos); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem(TStable(ICON_CUBE " Scene"))) { { const int gp = core::GimmickPending(); if (gp > 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), core::GimmickTemplateReady() ? T("%d interactive object(s) spawning...") : T("%d interactive object(s) waiting for a spawn template: walk a few meters"), gp); } DrawScene(p, havePos); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(TStable(ICON_FLOPPY_DISK " Project"))) { DrawProject(); ImGui::EndTabItem(); }
             static const bool s_showTravel = false;   // hidden until the game's own teleport path is found
             if (s_showTravel && ImGui::BeginTabItem(TStable(ICON_LOCATION_CROSSHAIRS " Travel"))) { DrawTravel(p, havePos); ImGui::EndTabItem(); }
@@ -1731,6 +1731,7 @@ namespace editor {
                 if (ImGui::CollapsingHeader(TStable("Developer: how moves are applied"))) {
                     ImGui::Checkbox(T("live drag in the details pane"), &g_live); ImGui::SameLine();
                     ImGui::Checkbox(T("re-create on move"), &core::g_recreateOnMove); ImGui::SameLine();
+                    ImGui::Checkbox(T("gimmicks through the game"), &core::g_gimmickSpawn); if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("prefabs under /object/cd_gimmick/ are spawned through the game's own spawn path and react like real objects (torches, doors, chests); off = plain objects")); ImGui::SameLine();
                     static const char* kLiveModes[] = { "disable/set/enable", "transform only", "transform re-insert", "transform + enable" };
                     ImGui::SetNextItemWidth(170 * ImGui::GetIO().FontGlobalScale); ComboT("##livemode", &core::g_liveMode, kLiveModes, 4);
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("how the object is updated while dragging (release always applies the final position)"));

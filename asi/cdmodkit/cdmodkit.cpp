@@ -235,6 +235,18 @@ static void* g_lastMgr = nullptr;
 
 static void NameGimmickCapture(const std::string& prefab, float x, float y, float z);
 extern uintptr_t kRva_GimmickSpawn_;
+// The prepare's callers, found at startup by scanning the image for calls to it (build 2949 had them at fixed addresses:
+// level streaming 0x2af537e, housing 0x2b65ea0, item drop 0x2b4d733; build 2976 moved everything by 0x70). Classified by the
+// bytes after the call (level, drop) or by the reason string the caller hashes right after it (housing and the others).
+static uintptr_t g_callerLevel = 0, g_callerHousing = 0, g_callerDrop = 0;
+static std::map<uintptr_t, std::string> g_callerReason;   // return address -> spawn reason string ("housing", "drop", "inspect", ...)
+// interactive objects (gimmick prefabs spawned through the game's server spawn path); see the gimmick section below
+bool g_gimmickSpawn = true; static bool g_traceHooks = false;
+static bool IsGimmickPrefab(const std::string& p) { return p.rfind("/object/cd_gimmick/", 0) == 0; }
+static void EnqueueGimmick(int uid, const std::string& prefab, Vec3 pos, Rot rot, float scale);
+static void RunOnServerTick(std::function<void()> f);
+static void RemoveSpawnedActor(uintptr_t actor);
+static bool MoveGimmick(size_t idx, Vec3 pos, Rot rot, float scale, bool final);
 static void* __fastcall HookCreate(void* mgr, void* tag, void* b, void* c, void* d, void* transform, uint8_t f1, uint8_t f2, uint8_t f3) {
     long n = InterlockedIncrement(&g_createCalls);
     bool log = g_createLogged < 20 || g_inOurSpawn || g_trace;
@@ -441,6 +453,7 @@ static void DoReplace(size_t idx, Vec3 pos, Rot rot, float scale) {
 // object was created, re-create it so the collision shape (built at creation) matches; otherwise move in place.
 static bool RotDiffers(const Rot& a, const Rot& b) { return fabsf(a.yaw - b.yaw) > 0.01f || fabsf(a.pitch - b.pitch) > 0.01f || fabsf(a.roll - b.roll) > 0.01f; }
 bool MoveSpawned(size_t idx, Vec3 pos, Rot rot, float scale, bool final) {
+    if (MoveGimmick(idx, pos, rot, scale, final)) return true;
     uintptr_t obj = 0; bool needRecreate = false;
     { std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size()) return false; obj = g_reg[idx].obj;
       g_reg[idx].pos = pos; g_reg[idx].rot = rot; g_reg[idx].scale = scale; if (final) MarkDirtyLocked(g_reg[idx].proj);
@@ -454,6 +467,7 @@ bool MoveSpawned(size_t idx, Vec3 pos, Rot rot, float scale, bool final) {
     return true;
 }
 static void ApplyMove(size_t idx, Vec3 pos, Rot rot, float scale, bool final) {   // game thread
+    if (MoveGimmick(idx, pos, rot, scale, final)) return;
     uintptr_t obj = 0; bool needRecreate = false;
     { std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size()) return; obj = g_reg[idx].obj;
       g_reg[idx].pos = pos; g_reg[idx].rot = rot; g_reg[idx].scale = scale; if (final) MarkDirtyLocked(g_reg[idx].proj);
@@ -471,6 +485,10 @@ bool MoveMany(const std::vector<MoveReq>& reqs, bool final) {
 }
 bool HideUid(int uid) { int i = IndexOfUid(uid); return i >= 0 && HideSpawned((size_t)i); }
 bool HideSpawned(size_t idx) {
+    {   // an interactive object: its actor is removed on the server tick, the way the game removes a picked-up item
+        std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size() || g_reg[idx].hidden) return false;
+        if (g_reg[idx].gimmick) { const uintptr_t actor = g_reg[idx].actor, so = g_reg[idx].standin ? g_reg[idx].obj : 0; g_reg[idx].hidden = true; g_reg[idx].obj = 0; g_reg[idx].actor = 0; g_reg[idx].standin = false; MarkDirtyLocked(g_reg[idx].proj); if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); if (so && GameThreadReady()) RunOnGameThread([so]() { DoRemove(so); }); return true; }
+    }
     uintptr_t obj = 0;
     { std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size() || g_reg[idx].hidden) return false; obj = g_reg[idx].obj; g_reg[idx].hidden = true; g_reg[idx].obj = 0; MarkDirtyLocked(g_reg[idx].proj); }
     if (!GameThreadReady()) return false;
@@ -510,9 +528,9 @@ static void* DoSpawn(std::string prefab, Vec3 pos, Rot rot, float scale, int reg
     if (registerUid) {
         bool discarded = false;
         { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(registerUid);
-          if (i >= 0 && !g_reg[i].hidden) { g_reg[i].obj = (uintptr_t)r; if (!r) g_reg[i].hidden = true; }
+          if (i >= 0 && !g_reg[i].hidden && !(g_reg[i].gimmick && !g_reg[i].standin)) { g_reg[i].obj = (uintptr_t)r; if (!r) g_reg[i].hidden = true; }
           else discarded = true; }
-        if (discarded && r) DoRemove((uintptr_t)r);   // a queued spawn may finish after an HTTP client hides or forgets it
+        if (discarded && r) DoRemove((uintptr_t)r);   // a queued spawn may finish after an HTTP client hides or forgets it, or a stand-in after the drag already ended
     }
     return r;
 }
@@ -574,7 +592,9 @@ static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uin
 
 int SpawnAt(const std::string& prefab, Vec3 world, Rot rot, float scale, int group, int proj) {
     if (!GameThreadReady()) { Log("spawn: game thread pump not active yet"); return 0; }
-    int uid; { std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextUid++; g_reg.push_back({ 0, prefab, world, rot, scale, false, GetTickCount(), rot, scale, uid, group, proj }); if (!g_loading) MarkDirtyLocked(proj); }
+    const bool gim = g_gimmickSpawn && kRva_GimmickSpawn_ && IsGimmickPrefab(prefab);
+    int uid; { std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextUid++; g_reg.push_back({ 0, prefab, world, rot, scale, false, GetTickCount(), rot, scale, uid, group, proj, gim, 0 }); if (!g_loading) MarkDirtyLocked(proj); }
+    if (gim) { EnqueueGimmick(uid, prefab, world, rot, scale); return uid; }   // spawned by the server tick once a template capture exists
     std::string p = prefab;
     RunOnGameThread([p, world, rot, scale, uid]() {
         { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(uid); if (i < 0 || g_reg[i].hidden) return; }
@@ -793,8 +813,9 @@ bool SaveProject(const std::string& rawName, int scope) {
 }
 void DeleteAllSpawned() {
     { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.clear(); }   // nothing left that could differ from a file
-    std::vector<uintptr_t> objs;
-    { std::lock_guard<std::mutex> l(g_regMutex); for (auto& o : g_reg) if (!o.hidden && o.obj) objs.push_back(o.obj); g_reg.clear(); }
+    std::vector<uintptr_t> objs, actors;
+    { std::lock_guard<std::mutex> l(g_regMutex); for (auto& o : g_reg) if (!o.hidden) { if (o.gimmick && !o.standin) { if (o.actor) actors.push_back(o.actor); } else if (o.obj) objs.push_back(o.obj); } g_reg.clear(); }
+    for (auto actor : actors) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
     if (!GameThreadReady()) return;
     for (auto obj : objs) RunOnGameThread([obj]() { DoRemove(obj); });
     Log("delete all: %zu objects", objs.size());
@@ -1021,10 +1042,12 @@ extern volatile uintptr_t g_replayActor;
 // method runs on the spawn thread during a replay is collected; after the create, the one that refers to the new scene object
 // (directly or one pointer deep) is the actor the replay made.
 static uintptr_t g_replayActors[8]; static int g_replayActorCount = 0; static uintptr_t g_replayCtorActor = 0;
+static uintptr_t g_ourActors[256]; static int g_ourActorsN = 0;   // every actor constructed during one of our replays (ring)
+static bool IsOurActor(uintptr_t a) { for (int i = 0; i < 256; i++) if (g_ourActors[i] == a) return true; return false; }
 static void NoteReplayActorRaw(uintptr_t a) {   // from the constructor hook: the vtable is not installed yet, so no RTTI check here
     if (g_replayActorCount >= 8) return;
     for (int i = 0; i < g_replayActorCount; i++) if (g_replayActors[i] == a) return;
-    g_replayActors[g_replayActorCount++] = a; if (!g_replayCtorActor) g_replayCtorActor = a; Log("[vt] replay actor candidate %d: %p (constructed during the replay)", g_replayActorCount, (void*)a);
+    g_replayActors[g_replayActorCount++] = a; if (!g_replayCtorActor) g_replayCtorActor = a; g_ourActors[g_ourActorsN++ % 256] = a; Log("[vt] replay actor candidate %d: %p (constructed during the replay)", g_replayActorCount, (void*)a);
 }
 static void NoteReplayActor(uintptr_t a, int slot) {
     if (g_replayActorCount >= 8) return;
@@ -1032,14 +1055,17 @@ static void NoteReplayActor(uintptr_t a, int slot) {
     const char* n = RttiName(a); if (!n || strcmp(n, ".?AVServerNormalInGameActor@pa@@") != 0) return;
     g_replayActors[g_replayActorCount++] = a; Log("[vt] replay actor candidate %d: %p first seen in slot %d", g_replayActorCount, (void*)a, slot);
 }
-static bool ActorRefersTo(uintptr_t actor, uintptr_t so, int* where) {
+static bool ActorRefersTo(uintptr_t actor, uintptr_t so, int* where) {   // the scene object pointer, up to three pointers deep (offsets moved between builds)
+    auto ptrAt = [](uintptr_t at, uintptr_t* v) { return ReadBytes(at, v, 8) && *v > 0x10000 && !(*v >> 47); };
     for (uintptr_t o = 0; o < 0x800; o += 8) { uintptr_t v = 0; if (ReadBytes(actor + o, &v, 8) && v == so) { *where = (int)o; return true; } }
-    for (uintptr_t o = 0; o < 0x800; o += 8) { uintptr_t v = 0; if (!ReadBytes(actor + o, &v, 8) || v < 0x10000 || (v >> 47)) continue; for (uintptr_t o2 = 0; o2 < 0x200; o2 += 8) { uintptr_t v2 = 0; if (ReadBytes(v + o2, &v2, 8) && v2 == so) { *where = (int)(o | (o2 << 16)); return true; } } }
+    for (uintptr_t o = 0; o < 0x800; o += 8) { uintptr_t v = 0; if (!ptrAt(actor + o, &v)) continue;
+        for (uintptr_t o2 = 0; o2 < 0x200; o2 += 8) { uintptr_t v2 = 0; if (!ptrAt(v + o2, &v2)) continue; if (v2 == so) { *where = (int)(o | (o2 << 12)); return true; }
+            for (uintptr_t o3 = 0; o3 < 0x100; o3 += 8) { uintptr_t v3 = 0; if (ReadBytes(v2 + o3, &v3, 8) && v3 == so) { *where = (int)(o | (o2 << 12) | (o3 << 20)); return true; } } } }
     return false;
 }
 static uintptr_t PickReplayActor(uintptr_t so) {
     for (int i = 0; i < g_replayActorCount; i++) { const char* n = RttiName(g_replayActors[i]); Log("[gimmick] actor candidate %p is a %s", (void*)g_replayActors[i], n ? n : "(no RTTI)"); }
-    for (int i = 0; i < g_replayActorCount; i++) { int w = 0; if (ActorRefersTo(g_replayActors[i], so, &w)) { Log("[gimmick] actor %p refers to the new scene object %p at actor+0x%x%s", (void*)g_replayActors[i], (void*)so, w & 0xFFFF, (w >> 16) ? " (one pointer deep)" : ""); return g_replayActors[i]; } }
+    for (int i = 0; i < g_replayActorCount; i++) { int w = 0; if (ActorRefersTo(g_replayActors[i], so, &w)) { Log("[gimmick] actor %p refers to the new scene object %p at actor+0x%x / +0x%x / +0x%x", (void*)g_replayActors[i], (void*)so, w & 0xFFF, (w >> 12) & 0xFF, (w >> 20) & 0xFF); return g_replayActors[i]; } }
     Log("[gimmick] none of %d actor candidates refers to the new scene object %p by pointer", g_replayActorCount, (void*)so);
     for (int i = 0; i < g_replayActorCount; i++) if (g_replayCtorActor == g_replayActors[i]) { Log("[gimmick] taking the actor constructed during the replay: %p", (void*)g_replayActors[i]); return g_replayActors[i]; }
     return 0;
@@ -1147,6 +1173,42 @@ static void LogSpawnTransforms(const char* what, uintptr_t save, uintptr_t s8, u
     Log("[gimmick] %s transforms: save+1CC pos (%.2f %.2f %.2f) scale %.2f | save+1F4 pos (%.2f %.2f %.2f) | s8 pos (%.2f %.2f %.2f) quat (%.2f %.2f %.2f %.2f) | s5+28 pos (%.2f %.2f %.2f)",
         what, t[7], t[8], t[9], t[0], o[7], o[8], o[9], a[7], a[8], a[9], a[3], a[4], a[5], a[6], b[7], b[8], b[9]);
 }
+// ---- interactive objects: the editor's gimmick prefabs spawned through the game's own spawn path -----------------------------
+// SpawnAt queues them here; the ServerField tick (slot 9, server thread) spawns one per tick from the newest usable capture
+// (a level streaming spawn, else a housing placement) with the prefab, position, rotation and scale swapped in. On failure the
+// object falls back to a plain client object. Moves remove + respawn (final only), deletes remove the actor.
+struct GimmickReq { int uid; std::string prefab; Vec3 pos; Rot rot; float scale; };
+static std::deque<GimmickReq> g_gimmickQueue; static std::mutex g_gimmickQueueMutex;
+static std::deque<std::function<void()>> g_serverJobs; static std::mutex g_serverJobsMutex;
+static void RunOnServerTick(std::function<void()> f) { std::lock_guard<std::mutex> l(g_serverJobsMutex); g_serverJobs.push_back(std::move(f)); }
+static void EnqueueGimmick(int uid, const std::string& prefab, Vec3 pos, Rot rot, float scale) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back({ uid, prefab, pos, rot, scale }); }
+int GimmickPending() { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); return (int)g_gimmickQueue.size(); }
+static bool MoveGimmick(size_t idx, Vec3 pos, Rot rot, float scale, bool final) {
+    // While an interactive object is dragged it cannot follow the mouse (a server object only moves by remove + respawn), so
+    // the first live move takes it away and puts a plain client object of the same prefab in its place; that one follows the
+    // drag like any other object, and the release removes it and spawns the interactive object at the final transform.
+    int uid = 0; uintptr_t actor = 0, obj = 0; std::string prefab; bool standin = false;
+    { std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size() || !g_reg[idx].gimmick) return false;
+      SpawnedObj& e = g_reg[idx]; e.pos = pos; e.rot = rot; e.scale = scale; uid = e.uid; actor = e.actor; obj = e.obj; prefab = e.prefab; standin = e.standin;
+      if (!final) { if (!standin) { e.standin = true; e.actor = 0; e.obj = 0; } }
+      else { MarkDirtyLocked(e.proj); e.standin = false; e.actor = 0; e.obj = 0; } }
+    if (!final) {
+        if (!standin) {
+            if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
+            if (GameThreadReady()) RunOnGameThread([prefab, pos, rot, scale, uid]() { DoSpawn(prefab, pos, rot, scale, uid); });
+        } else if (obj && GameThreadReady() && InterlockedCompareExchange(&g_queueCount, 0, 0) <= 2) { const DWORD now = GetTickCount(); RunOnGameThread([obj, pos, rot, scale, now]() { DoLiveMove(obj, pos, rot, scale, now); }); }
+        return true;
+    }
+    if (standin) { if (obj && GameThreadReady()) RunOnGameThread([obj]() { DoRemove(obj); }); }
+    else if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
+    { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); for (auto it = g_gimmickQueue.begin(); it != g_gimmickQueue.end(); ) it = it->uid == uid ? g_gimmickQueue.erase(it) : it + 1; }   // an older pending spawn of it is void
+    EnqueueGimmick(uid, prefab, pos, rot, scale);
+    return true;
+}
+static float g_replayQuat[4] = { 0, 0, 0, 1 }; static float g_replayScale = 1.0f; static bool g_replayUseRot = false;   // MakeCopy: also swap rotation and scale
+static uintptr_t g_replayResultSo = 0, g_replayResultActor = 0;   // what the last replay created
+extern uintptr_t g_replayInnerSo_;
+#define g_replayInnerSo g_replayInnerSo_
 static GimmickCopy MakeCopy(const GimmickCapture& c, uint8_t* mem, Vec3 at) {
     GimmickCopy g; g.frame = mem; g.save = mem + 0x2000;
     memset(mem, 0, 0x2400); memcpy(g.frame, c.frame, c.size); memcpy(g.save, c.bSave, kSaveSize);
@@ -1170,23 +1232,23 @@ static GimmickCopy MakeCopy(const GimmickCapture& c, uint8_t* mem, Vec3 at) {
     for (size_t o = 0; o + 12 <= c.size; o += 4) if (memcmp(g.frame + o, was, 12) == 0) { memcpy(g.frame + o, pos, 12); n++; }
     for (size_t o = 0; o + 12 <= kSaveSize; o += 4) if (memcmp(g.save + o, was, 12) == 0) { memcpy(g.save + o, pos, 12); n++; }
     Log("[gimmick] copy: target position written to s8+1C and %d further exact cop%s of the captured position", n, n == 1 ? "y" : "ies");
+    if (g_replayUseRot) {   // rotation (quaternion at s8+0x0C, copies replaced like the position) and scale (s8+0 only: 1,1,1 is too common to hunt for)
+        uint8_t wq[16]; memcpy(wq, g.s8 + 0x0C, 16); memcpy(g.s8 + 0x0C, g_replayQuat, 16); int nq = 0;
+        for (size_t o = 0; o + 16 <= c.size; o += 4) if (memcmp(g.frame + o, wq, 16) == 0) { memcpy(g.frame + o, g_replayQuat, 16); nq++; }
+        for (size_t o = 0; o + 16 <= kSaveSize; o += 4) if (memcmp(g.save + o, wq, 16) == 0) { memcpy(g.save + o, g_replayQuat, 16); nq++; }
+        const float sc[3] = { g_replayScale, g_replayScale, g_replayScale }; memcpy(g.s8, sc, 12);
+        Log("[gimmick] copy: rotation (%.2f %.2f %.2f %.2f) written, %d further cop%s, scale %.2f", g_replayQuat[0], g_replayQuat[1], g_replayQuat[2], g_replayQuat[3], nq, nq == 1 ? "y" : "ies", g_replayScale);
+    }
     return g;
 }
 // FieldGimmickSaveData (reflection offsets from the property setters): +0x28 key, +0x30 fieldSaveDataReason, +0x4C levelOriginSceneObjectUuid (16),
 // +0x1C0 gimmickInfoKey (u16), +0x1CC transform (scale3 quat4 pos3), +0x1F4 originSpawnTransform, +0x220 spawnReason hash
 static const char* SpawnReasonOf(uintptr_t caller) {
-    struct R { uintptr_t ret; const char* reason; };
-    static const R table[] = { { 0x2b65ea0, "housing" }, { 0x2ace459, "buff" }, { 0x2b8d6b8, "buff" }, { 0x2b92d29, "buff" }, { 0x2bf927c, "buff" }, { 0x27e14a9, "buff" }, { 0x27e65c3, "buff" },
-        { 0x290321a, "drop" }, { 0x2b40beb, "discardfrominventory" }, { 0x2b576c4, "inspect" }, { 0x2872814, "spawnbyprojectile" }, { 0x2bdf956, "spawnbyprojectile" },
-        { 0x279813a, "docking" }, { 0x2798a58, "docking" }, { 0x2798f85, "catchspawn" }, { 0x27ebfce, "AutoSpawnOwnerData" }, { 0x27ec43d, "AutoSpawnOwnerData" } };
-    for (const R& r : table) if (r.ret == caller) return r.reason;
-    return nullptr;
+    auto it = g_callerReason.find(caller); return it == g_callerReason.end() ? nullptr : it->second.c_str();
 }
 const char* GimmickCallerName(uintptr_t caller) {
-    if (caller == 0x2af537e) return "level";
-    if (caller == 0x2b4d733) return "item drop";
-    if (caller == 0x278d5d7) return "level (load)";
-    if (caller == 0x2afef5e) return "level (b)";
+    if (caller && caller == g_callerLevel) return "level";
+    if (caller && caller == g_callerDrop) return "item drop";
     if (const char* r = SpawnReasonOf(caller)) return r;
     return nullptr;
 }
@@ -1228,7 +1290,7 @@ static int RunSpawnSteps(const GimmickCapture& c, GimmickCopy& g, const char* wh
     Log("[gimmick] %s: prepare returned %p, out[0] = %d (%s); save: gimmickInfoKey %u, fieldSaveDataReason %d, uuid %08x..", what, r, code0, DecodeErr((uint32_t)code0).c_str(), key, reasonEnum, *(uint32_t*)(g.save + 0x4C));
     if (code0) return code0;
     FreshKey(g.param, what);
-    if (c.caller == 0x2aae2cb) {   // the summon of a spawner gimmick (flags): the reason hash sits in its summon data, [[param+0x5D8]+0x58]+0x50
+    if (false) {   // (build 2949, caller 0x2aae2cb) the summon of a spawner gimmick (flags): the reason hash sits in its summon data, [[param+0x5D8]+0x58]+0x50; not classified at runtime yet
         uintptr_t o = 0; memcpy(&o, g.param + 0x5D8, 8); uintptr_t o2 = 0; uint32_t h = 0;
         if (o && ReadPtr(o + 0x58, &o2) && o2 && ReadBytes(o2 + 0x50, &h, 4)) { memcpy(g.param + 0x3F8, &h, 4); memcpy(g.save + 0x220, &h, 4); Log("[gimmick] %s: summon reason hash 0x%08x from the summon data", what, h); }
     }
@@ -1249,13 +1311,13 @@ static int RunSpawnSteps(const GimmickCapture& c, GimmickCopy& g, const char* wh
     int* res = create(c.mgr, result, &list, nullptr);
     int code = -1; if (res) ReadBytes((uintptr_t)res, &code, 4);
     Log("[gimmick] %s: field create -> code %d (%s)", what, code, DecodeErr((uint32_t)code).c_str());
-    if (!code && g_soCreated_ != before) { float ps[3]; memcpy(ps, g.s8 + 0x1C, 12); NoteSpawned(g_lastSoCreated_, PickReplayActor(g_lastSoCreated_), g_replayPrefab[0] ? g_replayPrefab : c.ownerPath, ps); }
+    if (!code && (g_replayInnerSo || g_soCreated_ != before)) { float ps[3]; memcpy(ps, g.s8 + 0x1C, 12); const uintptr_t so = g_replayInnerSo ? g_replayInnerSo : g_lastSoCreated_; const uintptr_t act = PickReplayActor(so); g_replayResultSo = so; g_replayResultActor = act; NoteSpawned(so, act, g_replayPrefab[0] ? g_replayPrefab : c.ownerPath, ps); }
     return code;
 }
 static bool FindCapture(int id, GimmickCapture& out) { std::lock_guard<std::mutex> l(g_gringMutex); for (int k = 0; k < kGimmickRing; k++) if (g_gring[k].valid && g_gring[k].id == id) { out = g_gring[k]; return true; } return false; }
-static bool FindLatestHousingCapture(GimmickCapture& out) { std::lock_guard<std::mutex> l(g_gringMutex); int best = -1; for (int k = 0; k < kGimmickRing; k++) if (g_gring[k].valid && g_gring[k].caller == 0x2b65ea0 && g_gring[k].id > best) { best = g_gring[k].id; out = g_gring[k]; } return best >= 0; }
+static bool FindLatestHousingCapture(GimmickCapture& out) { std::lock_guard<std::mutex> l(g_gringMutex); int best = -1; for (int k = 0; k < kGimmickRing; k++) if (g_gring[k].valid && g_gring[k].caller == g_callerHousing && g_gring[k].id > best) { best = g_gring[k].id; out = g_gring[k]; } return best >= 0; }
 static void ReplayGimmickBody();
-static void ReplayGimmick() { g_lastActorCreated_ = 0; g_replayActor = 0; g_replayActorCount = 0; g_replayCtorActor = 0; g_inGimmickReplay = true; g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount(); const bool tr = g_trace; g_trace = true; ReplayGimmickBody(); g_trace = tr; g_inGimmickReplay = false; }   // the replay traces itself
+static void ReplayGimmick() { g_lastActorCreated_ = 0; g_replayActor = 0; g_replayActorCount = 0; g_replayCtorActor = 0; g_replayResultSo = 0; g_replayResultActor = 0; g_replayInnerSo = 0; g_inGimmickReplay = true; g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount(); const bool tr = g_trace; g_trace = tr || g_traceHooks; ReplayGimmickBody(); g_trace = tr; g_inGimmickReplay = false; }   // the replay traces itself
 // The item-drop caller (rva 0x2b4d733 in this build) does, after the prepare: register(&param+0x60, &param-0x198) - a function in
 // the protected code section that registers the server scene object the prepare created (SceneObjectServer slots 142..144 and
 // the sync manager's slots 15/5/4, as traced) - then the reason hash from param+0x558 into param+0x3F8 and save+0x220, two
@@ -1302,7 +1364,7 @@ static void ReplayDrop(const GimmickCapture& c, uint8_t* mem) {
     int* res = create(c.mgr, result, &list, nullptr);
     int code = -1; if (res) ReadBytes((uintptr_t)res, &code, 4);
     Log("[gimmick] drop replay: field create -> code %d (%s)", code, DecodeErr((uint32_t)code).c_str());
-    if (!code && g_soCreated_ != before) { float ps[3]; memcpy(ps, g.s8 + 0x1C, 12); NoteSpawned(g_lastSoCreated_, PickReplayActor(g_lastSoCreated_), g_replayPrefab[0] ? g_replayPrefab : c.ownerPath, ps); }
+    if (!code && (g_replayInnerSo || g_soCreated_ != before)) { float ps[3]; memcpy(ps, g.s8 + 0x1C, 12); const uintptr_t so = g_replayInnerSo ? g_replayInnerSo : g_lastSoCreated_; const uintptr_t act = PickReplayActor(so); g_replayResultSo = so; g_replayResultActor = act; NoteSpawned(so, act, g_replayPrefab[0] ? g_replayPrefab : c.ownerPath, ps); }
     LogSpawnTransforms("drop replay after create", (uintptr_t)g.save, (uintptr_t)g.s8, (uintptr_t)g.s5);
 }
 static void ReplayGimmickBody() {
@@ -1312,8 +1374,8 @@ static void ReplayGimmickBody() {
     if (!memB) memB = (uint8_t*)VirtualAlloc(nullptr, 0x2400, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!memA || !memB) return;
     Log("[gimmick] replay of capture %d (%s, caller rva 0x%llx) at (%.2f %.2f %.2f)", c.id, c.name[0] ? c.name : "unnamed", (unsigned long long)c.caller, g_gimmickReplayAt.x, g_gimmickReplayAt.y, g_gimmickReplayAt.z);
-    if (c.caller == 0x2b4d733) { ReplayDrop(c, memA); return; }   // an item drop: the full sequence of that caller
-    if (c.caller != 0x2af537e) { GimmickCopy g = MakeCopy(c, memA, g_gimmickReplayAt); RunSpawnSteps(c, g, "direct replay"); return; }   // housing, buff / summon, inspect, ...: prepare, reason, commit, create
+    if (c.caller == g_callerDrop) { ReplayDrop(c, memA); return; }   // an item drop: the full sequence of that caller
+    if (c.caller != g_callerLevel) { GimmickCopy g = MakeCopy(c, memA, g_gimmickReplayAt); RunSpawnSteps(c, g, "direct replay"); return; }   // housing, buff / summon, inspect, ...: prepare, reason, commit, create
     // A level capture as the template: the level's origin scene object UUID (stack arg 6, copied to save+0x4C by the prepare) is
     // cleared so the copy is not bound to the level's own object, the spawn UUID gets a fresh id (RunSpawnSteps), and the
     // reason stays the level's own (a "housing" reason made the create look the housing item up and crash at 0x389570 with the
@@ -1322,6 +1384,43 @@ static void ReplayGimmickBody() {
     GimmickCopy g = MakeCopy(c, memA, g_gimmickReplayAt);
     if (g.s6) { uint32_t u[4]; memcpy(u, g.s6, 16); Log("[gimmick] level replay: origin uuid at s6 %08x %08x %08x %08x cleared", u[0], u[1], u[2], u[3]); memset(g.s6, 0, 16); }
     RunSpawnSteps(c, g, "level replay");
+}
+static bool FindTemplateCapture(GimmickCapture& out) {   // newest level streaming spawn, else newest housing placement, else any other non-drop spawn with a path
+    std::lock_guard<std::mutex> l(g_gringMutex);
+    for (uintptr_t want : { g_callerLevel, g_callerHousing, (uintptr_t)0 }) {
+        int best = -1; DWORD bestWhen = 0;
+        for (int k = 0; k < kGimmickRing; k++) { const GimmickCapture& c = g_gring[k]; if (!c.valid || !c.ownerPath[0] || c.caller == g_callerDrop) continue; if (want && c.caller != want) continue; if (best < 0 || (DWORD)(c.when - bestWhen) < 0x80000000u) { best = k; bestWhen = c.when; } }
+        if (best >= 0) { out = g_gring[best]; return true; }
+    }
+    return false;
+}
+bool GimmickTemplateReady() { GimmickCapture c; return FindTemplateCapture(c); }
+static void ProcessServerJobs() {
+    for (;;) { std::function<void()> job; { std::lock_guard<std::mutex> l(g_serverJobsMutex); if (g_serverJobs.empty()) return; job = std::move(g_serverJobs.front()); g_serverJobs.pop_front(); } job(); }
+}
+static void ProcessGimmickQueue() {   // server thread, one object per tick
+    GimmickReq r; size_t pending = 0;
+    { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty()) return; r = g_gimmickQueue.front(); pending = g_gimmickQueue.size(); }
+    GimmickCapture t;
+    if (!FindTemplateCapture(t)) { static DWORD lastLog = 0; if (GetTickCount() - lastLog > 15000) { lastLog = GetTickCount(); Log("[gimmick] %zu interactive object%s waiting for a spawn template (the game spawns one when you walk)", pending, pending == 1 ? "" : "s"); } return; }
+    { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.pop_front(); }
+    { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return; }   // deleted meanwhile
+    char saved[256]; memcpy(saved, g_replayPrefab, sizeof saved); strncpy_s(g_replayPrefab, r.prefab.c_str(), _TRUNCATE);
+    float xf[12]; MakeTransform(xf, r.pos, r.rot, r.scale, false); memcpy(g_replayQuat, xf + 3, 16); g_replayScale = r.scale; g_replayUseRot = true;
+    g_gimmickReplayId = t.id; g_gimmickReplayAt = r.pos;
+    ReplayGimmick();
+    g_replayUseRot = false; memcpy(g_replayPrefab, saved, sizeof saved);
+    const uintptr_t so = g_replayResultSo, actor = g_replayResultActor;
+    if (so) {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid);
+        if (i < 0 || g_reg[(size_t)i].hidden) { if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); return; }   // deleted while spawning
+        g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale;
+        Log("[gimmick] object %d spawned through the game: %s (scene object %p, actor %p)", r.uid, r.prefab.c_str(), (void*)so, (void*)actor);
+    } else {
+        Log("[gimmick] object %d: the game's spawn path refused %s, placing it as a plain object instead", r.uid, r.prefab.c_str());
+        { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i >= 0) g_reg[(size_t)i].gimmick = false; }
+        if (GameThreadReady()) RunOnGameThread([r]() { DoSpawn(r.prefab, r.pos, r.rot, r.scale, r.uid); });
+    }
 }
 static void* __fastcall HookGimmickSpawn(void* param, void* out, void* mgr, void* owner, void* s5, void* s6, void* s7, void* s8, void* s9, void* s10, void* s11, void* s12) {
     g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount();
@@ -1423,8 +1522,10 @@ static void ResolveActorCore() {
 static uintptr_t kRva_ActorCreateInner = 0;
 using ActorInnerFn = void* (__fastcall*)(void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8, void* a9);
 static ActorInnerFn g_origActorInner = nullptr;
+uintptr_t g_replayInnerSo_ = 0;   // the first scene object the field create handed to the inner create during a replay
 static void* __fastcall HookActorInner(void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8, void* a9) {
-    const bool log = g_trace || g_inGimmickReplay;
+    const bool log = g_trace;
+    if (g_inGimmickReplay && !g_replayInnerSo && a6 && GetCurrentThreadId() == g_spawnWindowThread) { uintptr_t so = 0; if (ReadBytes((uintptr_t)a6, &so, 8) && so && RttiName(so) && strstr(RttiName(so), "SceneObjectServer")) g_replayInnerSo = so; }
     if (log) {
         uintptr_t payload = 0; if (a6) ReadBytes((uintptr_t)a6, &payload, 8);
         uint32_t uuid[4] = { 0, 0, 0, 0 }; if (payload) ReadBytes(payload + 0x1D8, uuid, 16);
@@ -1493,9 +1594,9 @@ static void RemoveSpawnedActor(uintptr_t actor) {
     {   // does this actor refer to the scene object our replay made? (a wrong actor must not be touched)
         uintptr_t so = 0; { std::lock_guard<std::mutex> l(g_spawnedMutex); for (const auto& g : g_spawned) if (g.actor == actor) so = g.so; }
         int found = -1; { int w = 0; if (ActorRefersTo(actor, so, &w)) found = w; }
-        Log("[remove] actor %p refers to scene object %p: %s", (void*)actor, (void*)so, found < 0 ? "NOT FOUND (wrong actor?)" : "yes");
-        if (found >= 0) Log("[remove]   at actor+0x%x%s", found & 0xFFFF, (found >> 16) ? " (one pointer deep)" : "");
-        if (found < 0) return;
+        Log("[remove] actor %p refers to scene object %p: %s", (void*)actor, (void*)so, found < 0 ? (IsOurActor(actor) ? "not by pointer, but it was constructed during our replay" : "NOT FOUND (wrong actor?)") : "yes");
+        if (found >= 0) Log("[remove]   at actor+0x%x%s%s", found & 0xFFF, (found >> 12) & 0xFF ? " -> +0x.." : "", (found >> 20) ? " -> +0x.. (two pointers deep)" : "");
+        if (found < 0 && !IsOurActor(actor)) return;
     }
     const bool tr = g_trace; g_trace = true; g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount(); WatchObject(actor);   // the removal traces itself
     struct Restore { bool tr; ~Restore() { g_trace = tr; } } restore{ tr };
@@ -1534,7 +1635,7 @@ static void* __fastcall HookActorCtor(void* self) {
 }
 static void ResolveActorCtor() {
     int n = 0;
-    const uintptr_t f = FindPatternCount("48 89 4C 24 08 53 48 83 EC 20 48 8B D9 E8 EE 59 77 FF 90 48 8D 05 B6 B6 ED 02 48 89 03 33 C0 48 89 83 A0 00 00 00 C6 83", &n);
+    const uintptr_t f = FindPatternCount("48 89 4C 24 08 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 90 48 8D 05 ?? ?? ?? ?? 48 89 03 33 C0 48 89 83 A0 00 00 00 C6 83 A8 00 00 00 FF", &n);
     if (!f || n != 1) { Log("[core] actor base constructor: %d matches, not hooked", n); return; }
     kRva_ActorCtor = f - g_base; Log("resolved %-20s rva 0x%llx (via signature)", "actor constructor", (unsigned long long)kRva_ActorCtor);
 }
@@ -1566,8 +1667,10 @@ static uintptr_t FindVtableByName(const char* mangled) {
     }
     return 0;
 }
-static const int kVtMax = 160; static const int kVtClasses = 4;
-static void* g_vtOrig[kVtClasses][kVtMax] = {}; static const char* g_vtClass[kVtClasses] = { "", "", "", "" };
+static const int kVtMax = 160; static const int kVtClasses = 5;
+static void* g_vtOrig[kVtClasses][kVtMax] = {}; static const char* g_vtClass[kVtClasses] = { "", "", "", "", "" };
+// class 4 (TrocTrSpawnCharacterCheatReq, a static handler object): slot 2 = execute(handler, &result, packet). Always logged with
+// the packet object, its sender and its buffer, to learn the request format from a mod that uses it (NPC spawn research).
 // class 3 (ServerNormalInGameActor): the first actor whose method runs during one of our replays is the actor the replay created
 volatile uintptr_t g_replayActor = 0;
 // class 2 (ServerField) is counted per slot (per-tick slots would flood the log); a slot is logged with arguments only for its first 20 calls of a trace
@@ -1588,9 +1691,16 @@ static std::string ArgText(void* a) {   // what an argument might be: an object 
 }
 template<int C, int N> static void* __fastcall VtThunk(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
     typedef void* (__fastcall* Fn)(void*, void*, void*, void*, void*, void*, void*, void*);
+    if (C == 4) {
+        Log("[troc] %s slot %d: handler=%p result=%p packet=%p thread %lu", g_vtClass[C], N, a, b, c, GetCurrentThreadId());
+        if (N == 2 && c) { DumpBlock("troc packet", (uintptr_t)c, 0x60); uintptr_t sess = 0, buf = 0; uint16_t len = 0; ReadBytes((uintptr_t)c, &sess, 8); ReadBytes((uintptr_t)c + 0x10, &len, 2); ReadBytes((uintptr_t)c + 0x18, &buf, 8);
+            Log("[troc]   sender %p (%s), total length %u, buffer %p", (void*)sess, sess && RttiName(sess) ? RttiName(sess) : "-", len, (void*)buf); if (sess) DumpDeep("troc sender", sess, 0x80, 6); if (buf) DumpBlock("troc buffer", buf, len ? (len < 0x80 ? len : 0x80) : 0x40); }
+        void* r = ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); int code = 0; if (N == 2 && b) ReadBytes((uintptr_t)b, &code, 4);
+        Log("[troc] %s slot %d returned %p, result %d (%s)", g_vtClass[C], N, r, code, DecodeErr((uint32_t)code).c_str()); return r; }
     if (C == 3) { if (g_inGimmickReplay && GetCurrentThreadId() == g_spawnWindowThread) NoteReplayActor((uintptr_t)a, N); if (!g_trace || !g_inGimmickReplay) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); }
     if (C == 2 && N == 9 && g_gimmickReplayArmed) { if (InterlockedCompareExchange(&g_gimmickReplayArmed, 0, 1) == 1) ReplayGimmick(); }
-    if (C == 2 && N == 9 && g_removeActorRequest) { const uintptr_t a = (uintptr_t)InterlockedExchangePointer((void* volatile*)&g_removeActorRequest, nullptr); if (a) RemoveSpawnedActor(a); }   // ServerField slot 9 runs ~18x per second on the server thread: armed replays run here, no game spawn needed
+    if (C == 2 && N == 9 && g_removeActorRequest) { const uintptr_t a = (uintptr_t)InterlockedExchangePointer((void* volatile*)&g_removeActorRequest, nullptr); if (a) RemoveSpawnedActor(a); }
+    if (C == 2 && N == 9) { ProcessServerJobs(); ProcessGimmickQueue(); }   // ServerField slot 9 runs ~18x per second on the server thread: armed replays run here, no game spawn needed
     if (C == 2) { if (!g_trace) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); const LONG k = InterlockedIncrement(&g_vtCount[N]); g_vtCountThread[N] = GetCurrentThreadId(); if (k > 20) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); }
     const bool log = g_trace && (C == 0 || C == 2 || Watched((uintptr_t)a) || (GetCurrentThreadId() == g_spawnWindowThread && GetTickCount() - g_spawnWindowTick < 500));
     if (!log) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h);
@@ -1612,7 +1722,7 @@ static bool SharedStub(uintptr_t f) {   // pure-virtual placeholders and tiny th
 }
 static void InstallVtableTracer(int cls, const char* mangled, const char* shortName, int slots) {
     const uintptr_t vt = FindVtableByName(mangled); if (!vt) { Log("[vt] %s: vtable not found", shortName); return; }
-    void* thunks[kVtMax]; if (cls == 0) VtThunkTable<0, kVtMax - 1>::fill(thunks); else if (cls == 1) VtThunkTable<1, kVtMax - 1>::fill(thunks); else if (cls == 2) VtThunkTable<2, kVtMax - 1>::fill(thunks); else VtThunkTable<3, kVtMax - 1>::fill(thunks);
+    void* thunks[kVtMax]; if (cls == 0) VtThunkTable<0, kVtMax - 1>::fill(thunks); else if (cls == 1) VtThunkTable<1, kVtMax - 1>::fill(thunks); else if (cls == 2) VtThunkTable<2, kVtMax - 1>::fill(thunks); else if (cls == 3) VtThunkTable<3, kVtMax - 1>::fill(thunks); else VtThunkTable<4, kVtMax - 1>::fill(thunks);
     g_vtClass[cls] = shortName; int ok = 0, skipped = 0;
     for (int i = 0; i < slots && i < kVtMax; i++) {
         uintptr_t f = 0; if (!ReadPtr(vt + (uintptr_t)i * 8, &f) || !InImage(f)) continue;
@@ -1669,6 +1779,33 @@ static void ResolveUuidLookup() {
     const uintptr_t f = FindPatternCount("48 89 5C 24 18 48 89 6C 24 20 48 89 54 24 10 56 57 41 56 48 83 EC 30 49 8B E8 48 8B FA 48 8B F1 45 33 C9 44 89 4C 24 20", &n);
     if (!f || n != 1) { Log("[uuid] lookup function: %d matches, not hooked", n); return; }
     kRva_UuidLookup = f - g_base; Log("resolved %-20s rva 0x%llx (via signature)", "uuid lookup", (unsigned long long)kRva_UuidLookup);
+}
+static void ResolveSpawnCallers() {
+    if (!kRva_GimmickSpawn_) return;
+    const uintptr_t target = g_base + kRva_GimmickSpawn_; int found = 0;
+    auto dos = (IMAGE_DOS_HEADER*)g_base; auto nt = (IMAGE_NT_HEADERS64*)(g_base + dos->e_lfanew); auto sec = IMAGE_FIRST_SECTION(nt);
+    auto matches = [](const uint8_t* at, const char* pat) { auto p = ParsePattern(pat); for (size_t i = 0; i < p.size(); i++) if (p[i] >= 0 && at[i] != p[i]) return false; return true; };
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        const uint8_t* b = (const uint8_t*)(g_base + sec[i].VirtualAddress); const size_t n = sec[i].Misc.VirtualSize;
+        for (size_t k = 0; k + 5 <= n; k++) {
+            if (b[k] != 0xE8) continue;
+            int32_t rel; memcpy(&rel, b + k + 1, 4); const uintptr_t ret = (uintptr_t)(b + k + 5);
+            if (ret + (intptr_t)rel != target) continue;
+            found++; const uint8_t* at = (const uint8_t*)ret;
+            if (matches(at, "8B 00 85 C0 74 ?? 41 89 06 48 8D 4D C0 E8")) g_callerLevel = ret - g_base;          // mov eax,[rax]; test; je; mov [r14],eax; lea rcx,[rbp-0x40]; call
+            else if (matches(at, "48 8D 55 10 48 8D 8D 08 02 00 00 E8")) g_callerDrop = ret - g_base;           // lea rdx,[rbp+0x10]; lea rcx,[rbp+0x208]; call register
+            for (size_t j = 0; j < 0x90 && at + j + 7 <= b + n; j++) {   // a reason string: lea rcx,[rip+disp] to a short identifier, hashed right after the call
+                if (at[j] != 0x48 || at[j + 1] != 0x8D || at[j + 2] != 0x0D) continue;
+                int32_t d; memcpy(&d, at + j + 3, 4); const uintptr_t str = (uintptr_t)(at + j + 7) + (intptr_t)d;
+                if (!InImage(str)) continue;
+                char buf[24] = {}; size_t m = 0; while (m < 22 && ReadBytes(str + m, buf + m, 1) && buf[m] && ((buf[m] >= 'a' && buf[m] <= 'z') || (buf[m] >= 'A' && buf[m] <= 'Z') || buf[m] == '_')) m++;
+                if (m >= 3 && m < 22 && buf[m] == 0) { g_callerReason[ret - g_base] = buf; if (strcmp(buf, "housing") == 0) g_callerHousing = ret - g_base; break; }
+            }
+        }
+    }
+    Log("[gimmick] %d callers of the spawn prepare: level 0x%llx, housing 0x%llx, item drop 0x%llx, %zu with a reason string", found, (unsigned long long)g_callerLevel, (unsigned long long)g_callerHousing, (unsigned long long)g_callerDrop, g_callerReason.size());
+    if (!g_callerLevel || !g_callerHousing) Log("[gimmick] a caller was not recognized in this build: the level / housing templates are limited to what is recognized");
 }
 static void ResolveGimmickSpawn() {
     int n = 0;
@@ -1917,6 +2054,8 @@ static void LoadSettings() {
         if (k == "fov") { float f = (float)atof(v.c_str()); if (f >= 10 && f <= 150) g_fovDeg = f; continue; }
         if (k == "mirror") { g_camMirror = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "fovauto") { g_fovAuto = v != "0" && v != "off" && v != "false"; continue; }
+        if (k == "gimmick_spawn") { g_gimmickSpawn = v != "0" && v != "off" && v != "false"; continue; }
+        if (k == "trace_hooks") { g_traceHooks = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "camlag") { const int c = atoi(v.c_str()); g_camLag = c < 0 ? 0 : c > 4 ? 4 : c; continue; }
         // manual fallback for snap to ground if the collector vtable cannot be resolved after a game patch; deliberately
         // never written back by SaveSettings, otherwise a stale value would outrank the signature on the next build
@@ -1934,6 +2073,7 @@ void SaveSettings() {
     FILE* f = fopen(SettingsPath().c_str(), "w"); if (!f) return;
     fprintf(f, "# World Builder hotkeys. Names: INSERT HOME END DELETE PAGEUP PAGEDOWN F1..F12 SCROLLLOCK PAUSE BACKQUOTE MINUS EQUALS BACKSLASH NUMPAD* NUMPAD/ NUMLOCK CAPSLOCK TAB or a single letter/digit\n");
     fprintf(f, "key_toggle=%s\nkey_mode=%s\n# console=0 hides the console window (log file only)\nconsole=%d\n# projection for the gizmo: vertical field of view in degrees and horizontal mirror (calibrate in the Settings tab)\nfov=%.1f\nmirror=%d\n# fovauto=1 reads the field of view from the game's camera object (fov= is the fallback)\nfovauto=%d\n# camlag: frames the overlay camera trails the game camera (0..4). Outlines run ahead while panning: raise it; they lag: lower it\ncamlag=%d\n", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? 1 : 0, g_fovDeg, g_camMirror ? 1 : 0, g_fovAuto ? 1 : 0, g_camLag);
+    fprintf(f, "# gimmick_spawn=0: place gimmick prefabs (/object/cd_gimmick/...) as plain objects instead of through the game spawn path\ngimmick_spawn=%d\n", g_gimmickSpawn ? 1 : 0);
     fprintf(f, "# placement keys (any key name from the list above, NUMPAD0..9, NUMPAD+ NUMPAD- NUMPAD. NUMPAD* NUMPAD/, ENTER, BACKSPACE, SPACE, UP/DOWN/LEFT/RIGHT, SHIFT/CTRL/ALT for 'fast')\n");
     for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
     fprintf(f, "# Interface language: auto, en, zh-CN, zh-TW, de, fr, ko, ja, es, pt-BR, ru, tr\nlanguage=%s\n", i18n::Preference());
@@ -2066,11 +2206,14 @@ static DWORD WINAPI InitThread(LPVOID) {
         if (kRva_CastRay) { void* t3 = (void*)(g_base + kRva_CastRay); HookFn(t3, (void*)HookCastRay, (void**)&g_origCastRay, "castRay (trace)"); }
         if (kRva_CastShape) { void* t5 = (void*)(g_base + kRva_CastShape); HookFn(t5, (void*)HookCastShape, (void**)&g_origCastShape, "castShape (trace)"); }
         if (kRva_WorldCastShape) { void* t6 = (void*)(g_base + kRva_WorldCastShape); HookFn(t6, (void*)HookWorldCastShape, (void**)&g_origWorldCastShape, "worldCastShape (trace)"); }
-        if (kRva_GimmickSpawn) { InstallVtableTracer(0, ".?AVServerSyncSceneObjectManager@pa@@", "ServerSyncSceneObjectManager", 19); InstallVtableTracer(1, ".?AVSceneObjectServer@pa@@", "SceneObjectServer", 156); InstallVtableTracer(2, ".?AVServerField@pa@@", "ServerField", 39); InstallVtableTracer(3, ".?AVServerNormalInGameActor@pa@@", "ServerNormalInGameActor", 145); }   // ServerField: which slots run per tick (a place to run our own spawns) and which run on a pickup (removal)   // research: how the server makes and fills its scene objects
-        if (kRva_UuidLookup) { void* t10 = (void*)(g_base + kRva_UuidLookup); HookFn(t10, (void*)HookUuidLookup, (void**)&g_origUuidLookup, "uuid lookup (trace)"); }
+        if (kRva_GimmickSpawn) {   // ServerField slot 9 is the server tick our spawns and removals run from; the other tracers are research (settings.txt trace_hooks=1)
+            InstallVtableTracer(2, ".?AVServerField@pa@@", "ServerField", g_traceHooks ? 39 : 10);
+            if (g_traceHooks) { InstallVtableTracer(0, ".?AVServerSyncSceneObjectManager@pa@@", "ServerSyncSceneObjectManager", 19); InstallVtableTracer(1, ".?AVSceneObjectServer@pa@@", "SceneObjectServer", 156); InstallVtableTracer(3, ".?AVServerNormalInGameActor@pa@@", "ServerNormalInGameActor", 145); InstallVtableTracer(4, ".?AVTrocTrSpawnCharacterCheatReq@pa@@", "TrocTrSpawnCharacterCheatReq", 3); }
+        }   // ServerField: which slots run per tick (a place to run our own spawns) and which run on a pickup (removal)   // research: how the server makes and fills its scene objects
+        if (g_traceHooks && kRva_UuidLookup) { void* t10 = (void*)(g_base + kRva_UuidLookup); HookFn(t10, (void*)HookUuidLookup, (void**)&g_origUuidLookup, "uuid lookup (trace)"); }
         if (kRva_SoServerCreate) { void* t9 = (void*)(g_base + kRva_SoServerCreate); HookFn(t9, (void*)HookSoServerCreate, (void**)&g_origSoServerCreate, "SceneObjectServer new (trace)"); }
         if (kRva_ActorCtor) { void* t13 = (void*)(g_base + kRva_ActorCtor); HookFn(t13, (void*)HookActorCtor, (void**)&g_origActorCtor, "actor constructor (trace)"); }
-        if (kRva_RemovalLoop) { void* t12 = (void*)(g_base + kRva_RemovalLoop); HookFn(t12, (void*)HookRemovalLoop, (void**)&g_origRemovalLoop, "actor removal loop (trace)"); }
+        if (g_traceHooks && kRva_RemovalLoop) { void* t12 = (void*)(g_base + kRva_RemovalLoop); HookFn(t12, (void*)HookRemovalLoop, (void**)&g_origRemovalLoop, "actor removal loop (trace)"); }
         if (kRva_ActorCreateInner) { void* t11 = (void*)(g_base + kRva_ActorCreateInner); HookFn(t11, (void*)HookActorInner, (void**)&g_origActorInner, "actor create inner (trace)"); }
         if (kRva_ActorCreateCore) { void* t8 = (void*)(g_base + kRva_ActorCreateCore); HookFn(t8, (void*)HookActorCore, (void**)&g_origActorCore, "actor create core (trace)"); }
         if (kRva_GimmickSpawn) { void* t7 = (void*)(g_base + kRva_GimmickSpawn); HookFn(t7, (void*)HookGimmickSpawn, (void**)&g_origGimmickSpawn, "gimmick spawn (trace)"); }
@@ -2225,7 +2368,7 @@ static bool ResolveGame() {
     uint8_t head[4] = {0}; ReadBytes(g_base + kRva_CreateSceneObjectFrom, head, 4);
     if (ok && !(head[0] == 0x4C && head[1] == 0x89 && head[2] == 0x4C && head[3] == 0x24)) { ok = false; g_buildMsg = "createSceneObjectFrom prologue unexpected"; Log("RESOLVE FAILED: create prologue %02x %02x %02x %02x", head[0], head[1], head[2], head[3]); }
     ResolveProbeCollectorVtable();   // optional: only snap to ground depends on it
-    ResolveGimmickSpawn();           // research: traced only, nothing depends on it
+    ResolveGimmickSpawn(); ResolveSpawnCallers();           // research: traced only, nothing depends on it
     ResolveActorCore();              // research: traced only
     ResolveActorInner();             // research: traced only
     ResolveRemovalLoop();            // research: traced only

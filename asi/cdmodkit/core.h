@@ -11,7 +11,7 @@ struct Vec3 { float x, y, z; };
 struct Rot { float yaw = 0, pitch = 0, roll = 0; };   // degrees; rotation = Ry(yaw) * Rx(pitch) * Rz(roll) (yaw about the up axis, then tilt, then roll)
 struct PosInfo { Vec3 tiled, world; int tileX, tileZ; };
 struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float scale; bool hidden; DWORD tick; Rot colRot; float colScale;
-                    int uid; int group; int proj; };   // uid: stable id for the editor (indices shift when entries are forgotten); group 0 = none;
+                    int uid; int group; int proj; bool gimmick = false; uintptr_t actor = 0; bool standin = false; };   // gimmick: spawned through the game's server path (obj = its server scene object, actor = its actor)   // uid: stable id for the editor (indices shift when entries are forgotten); group 0 = none;
                                                        // proj: which project the object belongs to (0 = placed by hand, not part of a saved project yet)
 
 namespace core {
@@ -51,6 +51,9 @@ namespace core {
     struct SpawnedInfo { uintptr_t so, actor; char prefab[200]; Vec3 pos; unsigned long ageMs; };
     int  SpawnedList(SpawnedInfo* out, int max);            // objects our replays created, newest first
     void RequestRemoveSpawned(uintptr_t actor);              // experiment: repeat the game's removal loop body for that actor on the server tick
+    extern bool g_gimmickSpawn;                              // gimmick prefabs are spawned through the game (interactive) instead of as plain objects
+    int  GimmickPending();                                   // objects waiting for a spawn template
+    bool GimmickTemplateReady();
     void SetGimmickReplayPrefab(const char* path);   // the replay creates the server object from this prefab path instead of the captured one (empty = as captured)
     const char* GimmickReplayPrefab();
     bool GimmickReplayArmed();
