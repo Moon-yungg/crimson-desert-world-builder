@@ -16,8 +16,11 @@
 #include "thumbgen.h"
 #include "input.h"
 #include "http_api.h"
+#include "i18n.h"
+#include "ui_localized_imgui.h"
 
 namespace editor {
+    static constexpr const char* kEditorVersion = "0.81";
     static bool g_open = false;
     // browser state
     static char  g_filter[128] = "";
@@ -120,7 +123,7 @@ namespace editor {
     }
 
     static void Note(const char* fmt, ...) {
-        char b[512]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
+        char b[512]; va_list a; va_start(a, fmt); i18n::FormatV(b, sizeof b, fmt, a); va_end(a);
         g_log.push_back(b); if (g_log.size() > 40) g_log.erase(g_log.begin());
         core::Log("[editor] %s", b);
     }
@@ -410,8 +413,8 @@ namespace editor {
         if (!g_calib || !havePos) return;
         CamFrame c = CurrentCam(); if (!c.ok) return;
         ImDrawList* dl = ImGui::GetForegroundDrawList(); ImVec2 s;
-        if (WorldToScreen(c, p.world, &s)) { dl->AddCircle(s, 14, IM_COL32(255, 220, 40, 255), 24, 3); dl->AddText(ImVec2(s.x + 18, s.y - 8), IM_COL32(255, 220, 40, 255), "feet"); }
-        ImVec2 h; if (WorldToScreen(c, { p.world.x, p.world.y + 1.8f, p.world.z }, &h)) { dl->AddCircle(h, 10, IM_COL32(255, 220, 40, 255), 24, 2); dl->AddText(ImVec2(h.x + 14, h.y - 8), IM_COL32(255, 220, 40, 255), "head (1.8 m)"); }
+        if (WorldToScreen(c, p.world, &s)) { dl->AddCircle(s, 14, IM_COL32(255, 220, 40, 255), 24, 3); dl->AddText(ImVec2(s.x + 18, s.y - 8), IM_COL32(255, 220, 40, 255), i18n::Translate("feet")); }
+        ImVec2 h; if (WorldToScreen(c, { p.world.x, p.world.y + 1.8f, p.world.z }, &h)) { dl->AddCircle(h, 10, IM_COL32(255, 220, 40, 255), 24, 2); dl->AddText(ImVec2(h.x + 14, h.y - 8), IM_COL32(255, 220, 40, 255), i18n::Translate("head (1.8 m)")); }
         DrawGizmo(p.world, 0, 0, 1.0f);
     }
     static void DrawPlaceHud() {
@@ -419,14 +422,14 @@ namespace editor {
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 28.0f), ImGuiCond_Always, ImVec2(0.5f, 0));
         ImGui::SetNextWindowBgAlpha(0.75f);
         if (ImGui::Begin("##placehud", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
-            ImGui::Text(ICON_CUBE "  %s  %s%s", P.isNew ? "Place" : "Grab", P.name.c_str(), P.m.size() > 1 ? "  (group)" : "");
+            ImGui::Text(ICON_CUBE "  %s  %s%s", i18n::Translate(P.isNew ? "Place" : "Grab"), P.name.c_str(), P.m.size() > 1 ? i18n::Translate("  (group)") : "");
             ImGui::TextDisabled("center %.1f  %.1f  %.1f    rotation %+.0f    tilt %+.0f / %+.0f    scale x%.2f    snap %s", P.center.x, P.center.y, P.center.z, P.yaw, P.pitch, P.roll, P.scale,
-                g_snap ? (std::string(kSnapPosNames[g_snapPosIdx]) + " / " + kSnapYawNames[g_snapYawIdx]).c_str() : "off");
+                g_snap ? (std::string(i18n::Translate(kSnapPosNames[g_snapPosIdx])) + " / " + i18n::Translate(kSnapYawNames[g_snapYawIdx])).c_str() : i18n::Translate("off"));
             auto kn = [](int pk) { return core::KeyName(core::g_placeKeys[pk]); };
             ImGui::TextDisabled("Move: %s %s %s %s%s     Rotate: %s %s     Height: %s %s     Size: %s %s", kn(core::PK_FWD), kn(core::PK_BACK), kn(core::PK_LEFT), kn(core::PK_RIGHT),
-                g_snap ? " (one grid step per press)" : (std::string(" (") + kn(core::PK_FAST) + " = fast)").c_str(), kn(core::PK_ROT_L), kn(core::PK_ROT_R), kn(core::PK_UP), kn(core::PK_DOWN), kn(core::PK_SCALE_UP), kn(core::PK_SCALE_DOWN));
-            ImGui::TextDisabled("%s = bring it in front of me     %s = snap %s     %s = mouse to %s     %s = level     %s = to ground     %s or placing / selecting something else = done     %s = %s", kn(core::PK_FETCH), kn(core::PK_SNAP), g_snap ? "off" : "on",
-                kn(core::PK_MOUSE), (g_open ? !g_playMode : P.mouse) ? "the game (camera)" : "World Builder (gizmo)", kn(core::PK_LEVEL), kn(core::PK_GROUND), kn(core::PK_DROP), kn(core::PK_CANCEL), P.isNew ? "cancel" : "put back");
+                g_snap ? i18n::Translate(" (one grid step per press)") : (std::string(" (") + kn(core::PK_FAST) + " = " + i18n::Translate("fast") + ")").c_str(), kn(core::PK_ROT_L), kn(core::PK_ROT_R), kn(core::PK_UP), kn(core::PK_DOWN), kn(core::PK_SCALE_UP), kn(core::PK_SCALE_DOWN));
+            ImGui::TextDisabled("%s = bring it in front of me     %s = snap %s     %s = mouse to %s     %s = level     %s = to ground     %s or placing / selecting something else = done     %s = %s", kn(core::PK_FETCH), kn(core::PK_SNAP), i18n::Translate(g_snap ? "off" : "on"),
+                kn(core::PK_MOUSE), i18n::Translate((g_open ? !g_playMode : P.mouse) ? "the game (camera)" : "World Builder (gizmo)"), kn(core::PK_LEVEL), kn(core::PK_GROUND), kn(core::PK_DROP), kn(core::PK_CANCEL), i18n::Translate(P.isNew ? "cancel" : "put back"));
         }
         ImGui::End();
     }
@@ -451,7 +454,7 @@ namespace editor {
         else { P.reopen = g_open; g_open = false; }
         g_playMode = false; core::g_placing = true; input::ClearKeys();
         g_place = P;
-        Note("%s %s (%d object%s): place or select something else or %s = done, %s %s", isNew ? "placing" : "grabbed", name.c_str(), (int)P.m.size(), P.m.size() == 1 ? "" : "s", core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL]), isNew ? "cancels" : "puts back");
+        Note("%s: %s | %d objects | %s = done, %s %s", i18n::Translate(isNew ? "placing" : "grabbed"), name.c_str(), (int)P.m.size(), core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL]), i18n::Translate(isNew ? "cancels" : "puts back"));
     }
     static void StartPlaceNew(const PosInfo& p, bool havePos) {
         if (g_selPrefab < 0 || !havePos || !core::GameThreadReady()) return;
@@ -543,7 +546,7 @@ namespace editor {
             acts.push_back(a);
         }
         Push(acts);
-        Note("%s %s", P.isNew ? "placed" : "dropped", P.name.c_str()); FinishPlace();
+        Note(P.isNew ? "placed %s" : "dropped %s", P.name.c_str()); FinishPlace();
     }
     static void PlaceTick(const PosInfo& p, bool havePos) {
         if (!g_place.active) return;
@@ -681,7 +684,7 @@ namespace editor {
             const float startY = top + 0.5f;
             int t = core::GroundProbe({ o->pos.x, startY, o->pos.z }, 400.0f); if (t) { g_snapJobs.push_back({ uid, t, 0, bottom, top, startY }); n++; }
         }
-        if (n) Note("snapping %d object%s to the ground", n, n == 1 ? "" : "s");
+        if (n) Note("snapping %d objects to the ground", n);
     }
     static void PumpSnapJobs() {
         if (g_snapJobs.empty()) return;
@@ -700,12 +703,12 @@ namespace editor {
             }
             g_snapJobs.erase(g_snapJobs.begin() + i);
         }
-        if (!moves.empty()) { core::MoveMany(moves, true); Push(acts); Note("%d object%s snapped to the ground", (int)moves.size(), moves.size() == 1 ? "" : "s"); }
+        if (!moves.empty()) { core::MoveMany(moves, true); Push(acts); Note("%d objects snapped to the ground", (int)moves.size()); }
     }
     static void DeleteSel() {
         auto list = core::Spawned(); std::vector<Act> acts;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; Act a; a.kind = Act::Delete; a.uid = uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale; a.group = o->group; a.proj = o->proj; acts.push_back(a); core::HideUid(uid); }
-        if (!acts.empty()) { Note("deleted %d object%s", (int)acts.size(), acts.size() == 1 ? "" : "s"); Push(acts); }
+        if (!acts.empty()) { Note("deleted %d objects", (int)acts.size()); Push(acts); }
         g_sel.clear(); g_primary = 0;
     }
     // objects that sit exactly on an earlier identical one (same prefab, position, rotation and scale), as after a project
@@ -757,7 +760,7 @@ namespace editor {
         if (!n) return; c.x /= n; c.y /= n; c.z /= n; g_clipRadius = 1;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; g_clip.push_back({ o->prefab, { o->pos.x - c.x, o->pos.y - c.y, o->pos.z - c.z }, o->rot, o->scale });
             float dx = o->pos.x - c.x, dz = o->pos.z - c.z; g_clipRadius = std::max(g_clipRadius, sqrtf(dx * dx + dz * dz) + 1.0f); }
-        Note("copied %d object%s", (int)g_clip.size(), g_clip.size() == 1 ? "" : "s");
+        Note("copied %d objects", (int)g_clip.size());
     }
     // spawns a set of objects around a center, groups them (when more than one) and hands them to the placement mode
     static void SpawnSet(const std::vector<ClipItem>& items, Vec3 center, float radius, const char* what) {
@@ -765,7 +768,7 @@ namespace editor {
         int group = items.size() > 1 ? core::NewGroupId() : 0; std::vector<int> uids;
         for (auto& it : items) { int uid = core::SpawnAt(it.prefab, { center.x + it.rel.x, center.y + it.rel.y, center.z + it.rel.z }, it.rot, it.scale, group); if (uid) uids.push_back(uid); }
         if (uids.empty()) return;
-        std::string name = items.size() == 1 ? ShortName(items[0].prefab) : std::string(what) + " (" + std::to_string(items.size()) + ")";
+        std::string name = items.size() == 1 ? ShortName(items[0].prefab) : std::string(i18n::Translate(what)) + " (" + std::to_string(items.size()) + ")";
         StartGrab(uids, true, name);
         g_place.radius = std::max(g_place.radius, radius);
     }
@@ -773,7 +776,7 @@ namespace editor {
     static void GroupSel(bool group) {
         auto list = core::Spawned(); int gid = group ? core::NewGroupId() : 0; int n = 0;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o) continue; core::SetGroup(uid, gid); n++; }
-        Note("%s %d object%s", group ? "grouped" : "ungrouped", n, n == 1 ? "" : "s");
+        Note("%s %d objects", i18n::Translate(group ? "grouped" : "ungrouped"), n);
     }
     static void QuickGimmickSpawn() {   // Page Up: spawn the Log tab's override prefab (or a standtorch) through the game's own spawn path, newest capture as the template
         if (!core::GimmickReplayPrefab()[0]) core::SetGimmickReplayPrefab("/object/cd_gimmick/00_common/lamp/gimmick_lamp_standtorch_03_on.prefab");
@@ -822,7 +825,7 @@ namespace editor {
         g_selPrefab = i;
         if (ImGui::MenuItem(core::IsFavorite(i) ? "remove favorite" : "add favorite")) core::ToggleFavorite(i);
         ImGui::Separator();
-        for (int ci = 0; ci < (int)g_colls.size(); ci++) { bool in = InColl(g_colls[ci], pi.path); if (ImGui::MenuItem((std::string(in ? "remove from " : "add to ") + g_colls[ci].name).c_str())) { auto& v = g_colls[ci].paths; if (in) v.erase(std::remove(v.begin(), v.end(), pi.path), v.end()); else v.push_back(pi.path); SaveColls(); g_lastKey.clear(); } }
+        for (int ci = 0; ci < (int)g_colls.size(); ci++) { bool in = InColl(g_colls[ci], pi.path); if (ImGui::MenuItem((std::string(i18n::Translate(in ? "remove from " : "add to ")) + g_colls[ci].name).c_str())) { auto& v = g_colls[ci].paths; if (in) v.erase(std::remove(v.begin(), v.end(), pi.path), v.end()); else v.push_back(pi.path); SaveColls(); g_lastKey.clear(); } }
         if (g_colls.empty()) ImGui::TextDisabled("no collections yet (left pane)");
         ImGui::EndPopup();
     }
@@ -874,7 +877,7 @@ namespace editor {
                 dl->PushClipRect({ p0.x + pad, t1.y }, { p1.x - pad, p1.y }, true);
                 dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), { p0.x + pad, t1.y + 2 }, ImGui::GetColorU32(ImGuiCol_Text), pi.name.c_str(), nullptr, tile);
                 dl->PopClipRect();
-                if (hov && !ImGui::IsPopupOpen("cardctx")) ImGui::SetTooltip("%s\n%s\n%s%s", pi.name.c_str(), core::Categories()[pi.cat].name.c_str(), pi.tags.c_str(), onStar ? "\n(click: favorite)" : "");
+                if (hov && !ImGui::IsPopupOpen("cardctx")) ImGui::SetTooltip("%s\n%s\n%s%s", pi.name.c_str(), core::Categories()[pi.cat].name.c_str(), pi.tags.c_str(), onStar ? (std::string("\n") + i18n::Translate("(click: favorite)")).c_str() : "");
                 ImGui::PopID();
             }
         }
@@ -931,7 +934,7 @@ namespace editor {
         }
         ImGui::NewLine();
         RefreshMatches();
-        ImGui::TextDisabled("%d results%s", (int)g_matches.size(), g_matches.size() >= 5000 ? " (first 5000)" : "");
+        ImGui::TextDisabled("%d results%s", (int)g_matches.size(), g_matches.size() >= 5000 ? i18n::Translate(" (first 5000)") : "");
         if (idx.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 120, 100, 255));
             ImGui::TextWrapped("No prefab list loaded: %s\\prefabs.tsv is missing. Mod managers such as DMM install only the .asi: copy the 'cdmodkit' folder from the zip into bin64 by hand (next to cdmodkit.asi) and restart the game.", core::ModDir().c_str());
@@ -999,7 +1002,7 @@ namespace editor {
             if (ImGui::SmallButton(core::IsFavorite(g_selPrefab) ? ICON_STAR " unfavorite" : ICON_STAR " favorite")) core::ToggleFavorite(g_selPrefab);
             ImGui::SameLine(); ImGui::SetNextItemWidth(160);
             if (ImGui::BeginCombo("##addcoll", "add to collection", ImGuiComboFlags_NoArrowButton)) {
-                for (int ci = 0; ci < (int)g_colls.size(); ci++) { bool in = InColl(g_colls[ci], pi.path); if (ImGui::Selectable((std::string(in ? "remove from " : "add to ") + g_colls[ci].name).c_str())) { auto& v = g_colls[ci].paths; if (in) v.erase(std::remove(v.begin(), v.end(), pi.path), v.end()); else v.push_back(pi.path); SaveColls(); g_lastKey.clear(); } }
+                for (int ci = 0; ci < (int)g_colls.size(); ci++) { bool in = InColl(g_colls[ci], pi.path); if (ImGui::Selectable((std::string(i18n::Translate(in ? "remove from " : "add to ")) + g_colls[ci].name).c_str())) { auto& v = g_colls[ci].paths; if (in) v.erase(std::remove(v.begin(), v.end(), pi.path), v.end()); else v.push_back(pi.path); SaveColls(); g_lastKey.clear(); } }
                 if (g_colls.empty()) ImGui::TextDisabled("create a collection in the left pane first");
                 ImGui::EndCombo();
             }
@@ -1117,7 +1120,7 @@ namespace editor {
             dl->PushClipRect({ p0.x + pad, t1.y }, { p1.x - pad, p1.y }, true);
             dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), { p0.x + pad, t1.y + 2 }, ImGui::GetColorU32(o.hidden ? ImGuiCol_TextDisabled : ImGuiCol_Text), pi >= 0 ? idx[pi].name.c_str() : ShortName(o.prefab).c_str(), nullptr, tile);
             dl->PopClipRect();
-            if (hov && !ImGui::IsPopupOpen("scardctx")) ImGui::SetTooltip("%s\n%.1f  %.1f  %.1f   yaw %.0f   scale %.2f%s", o.prefab.c_str(), o.pos.x, o.pos.y, o.pos.z, o.rot.yaw, o.scale, o.group > 0 ? "\n(in a group)" : "");
+            if (hov && !ImGui::IsPopupOpen("scardctx")) ImGui::SetTooltip("%s\n%.1f  %.1f  %.1f   yaw %.0f   scale %.2f%s", o.prefab.c_str(), o.pos.x, o.pos.y, o.pos.z, o.rot.yaw, o.scale, o.group > 0 ? (std::string("\n") + i18n::Translate("(in a group)")).c_str() : "");
             ImGui::PopID();
         };
         auto grid = [&](const std::vector<int>& order) { for (size_t k = 0; k < order.size(); k++) { if (k % cols) ImGui::SameLine(); card(order[k], (int)order.size(), order); } };
@@ -1130,7 +1133,7 @@ namespace editor {
             ImGui::PushID(gid);
             if (ImGui::SmallButton(closed ? ">" : "v")) { if (closed) g_closedGroups.erase(gid); else g_closedGroups.insert(gid); }
             ImGui::SameLine();
-            char glbl[64]; snprintf(glbl, sizeof glbl, "Group %d  (%d objects)", gid, (int)mem.size());
+            char glbl[64]; snprintf(glbl, sizeof glbl, i18n::Translate("Group %d  (%d objects)"), gid, (int)mem.size());
             ImGui::PushStyleColor(ImGuiCol_Text, GroupColor(gid, 255));
             if (ImGui::Selectable(glbl, allSel)) { ImGuiIO& io = ImGui::GetIO(); if (!io.KeyCtrl) g_sel.clear(); for (int m : mem) { if (allSel && io.KeyCtrl) g_sel.erase(list[m].uid); else g_sel.insert(list[m].uid); } g_primary = list[mem[0]].uid; g_editUid = 0; }
             ImGui::PopStyleColor();
@@ -1161,10 +1164,10 @@ namespace editor {
         if (g_projTab == 0 && !newCount) g_projTab = -1;
         if (!ImGui::BeginTabBar("projtabs")) return;   // no AutoSelectNewTabs: loading a project must not drag the view away
         char lbl[96];
-        snprintf(lbl, sizeof lbl, "all (%d)###ptall", visible);
+        snprintf(lbl, sizeof lbl, i18n::Translate("all (%d)###ptall"), visible);
         if (ImGui::BeginTabItem(lbl)) { g_projTab = -1; ImGui::EndTabItem(); }
         if (newCount) {
-            snprintf(lbl, sizeof lbl, ICON_STAR " new (%d)###ptnew", newCount);
+            snprintf(lbl, sizeof lbl, i18n::Translate(ICON_STAR " new (%d)###ptnew"), newCount);
             if (ImGui::BeginTabItem(lbl)) {
                 g_projTab = 0; ImGui::EndTabItem();
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("placed by hand and not part of a saved project yet - the Project tab saves exactly these under a new name");
@@ -1242,7 +1245,7 @@ namespace editor {
                     char lbl[48]; snprintf(lbl, sizeof lbl, "%s##g%d", s_closed.count(gid) ? ">" : "v", gid);
                     if (ImGui::SmallButton(lbl)) { if (s_closed.count(gid)) s_closed.erase(gid); else s_closed.insert(gid); }
                     ImGui::TableSetColumnIndex(1);
-                    char glbl[64]; snprintf(glbl, sizeof glbl, "Group %d  (%d objects)##gs%d", gid, (int)mem.size(), gid);
+                    char glbl[64]; snprintf(glbl, sizeof glbl, i18n::Translate("Group %d  (%d objects)##gs%d"), gid, (int)mem.size(), gid);
                     if (ImGui::Selectable(glbl, allSel, ImGuiSelectableFlags_SpanAllColumns)) { ImGuiIO& io = ImGui::GetIO(); if (!io.KeyCtrl) g_sel.clear(); for (int m : mem) { if (allSel && io.KeyCtrl) g_sel.erase(list[m].uid); else g_sel.insert(list[m].uid); } g_primary = list[mem[0]].uid; g_lastClicked = g_primary; g_editUid = 0; }
                     ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%d", gid);
                     continue;
@@ -1338,7 +1341,7 @@ namespace editor {
         }
         ImGui::EndDisabled();
         ImGui::SameLine(); ImGui::SetNextItemWidth(220);
-        char scopeNew[64]; snprintf(scopeNew, sizeof scopeNew, "only the new objects (%d)", newCount);
+        char scopeNew[64]; snprintf(scopeNew, sizeof scopeNew, i18n::Translate("only the new objects (%d)"), newCount);
         const char* scopes[2] = { "everything in the scene", scopeNew };
         ImGui::Combo("##savescope", &s_scope, scopes, 2);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("everything: the whole world including loaded projects - they all become part of this one project.\nonly the new objects: what you placed by hand since the last save, so a loaded project stays a project of its own.\nEither way the saved objects belong to this project afterwards, and the scene tab shows them under its name.");
@@ -1515,12 +1518,12 @@ namespace editor {
         ImGui::SetNextWindowSize(ImVec2(300.0f * ui, io.DisplaySize.y - 80.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 320.0f * ui, 40.0f), ImGuiCond_FirstUseEver);
         if (g_playMode) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.45f);
-        char title[160]; snprintf(title, sizeof title, "World Builder  [%s]###cdmodkit_dock", g_playMode ? "PLAY" : "EDIT");
+        char title[160]; snprintf(title, sizeof title, i18n::Translate("World Builder [%s]###cdmodkit_dock"), i18n::Translate(g_playMode ? "PLAY" : "EDIT"));
         const bool began = ImGui::Begin(title, &g_open, g_playMode ? ImGuiWindowFlags_NoInputs : 0);
         if (!began) { ImGui::End(); if (g_playMode) ImGui::PopStyleVar(); return; }
         HandleHotkeys(havePos);
         if (ImGui::SmallButton(ICON_LIST " full editor")) g_compact = false;
-        ImGui::SameLine(); ImGui::TextDisabled("%s = %s   %s = hide", core::KeyName(core::g_keyMode), g_playMode ? "edit" : "play", core::KeyName(core::g_keyToggle));
+        ImGui::SameLine(); ImGui::TextDisabled("%s = %s   %s = hide", core::KeyName(core::g_keyMode), i18n::Translate(g_playMode ? "edit" : "play"), core::KeyName(core::g_keyToggle));
         ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##dockfilter", "search  (words in any order)", g_filter, sizeof g_filter);
         ImGui::Checkbox(ICON_STAR "##dfav", &g_favOnly); if (ImGui::IsItemHovered()) ImGui::SetTooltip("favorites only");
         ImGui::SameLine(); ImGui::Checkbox("meshes", &g_meshOnly); if (ImGui::IsItemHovered()) ImGui::SetTooltip("hide prefabs without a visible mesh");
@@ -1546,7 +1549,7 @@ namespace editor {
             if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
             if (ImGui::SmallButton(lbl)) g_dockCols = c;
             if (on) ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%d card%s per row", c, c == 1 ? "" : "s");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%d cards per row", c);
         }
         ImGui::SameLine(); ImGui::TextDisabled("double-click places");
         const float footer = (ImGui::GetFrameHeightWithSpacing() * 2 + 8) ;
@@ -1612,7 +1615,7 @@ namespace editor {
             ImGui::SetNextWindowPos(ImVec2(30, 30), ImGuiCond_FirstUseEver);
         }
         if (g_playMode) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.45f);
-        char title[200]; snprintf(title, sizeof title, "World Builder  v0.81   [%s]   %s = %s, %s = hide###cdmodkit", g_playMode ? "PLAY MODE" : "EDIT MODE", core::KeyName(core::g_keyMode), g_playMode ? "back to editing" : "play mode", core::KeyName(core::g_keyToggle));
+        char title[240]; snprintf(title, sizeof title, i18n::Translate("World Builder v%s [%s] %s = %s, %s = hide###cdmodkit"), kEditorVersion, i18n::Translate(g_playMode ? "PLAY MODE" : "EDIT MODE"), core::KeyName(core::g_keyMode), i18n::Translate(g_playMode ? "back to editing" : "play mode"), core::KeyName(core::g_keyToggle));
         const bool began = ImGui::Begin(title, &g_open, g_playMode ? ImGuiWindowFlags_NoInputs : 0);
         if (!began) { ImGui::End(); if (g_playMode) ImGui::PopStyleVar(); return; }
         HandleHotkeys(havePos);
@@ -1638,7 +1641,7 @@ namespace editor {
             static long s_lastTicks = 0; static DWORD s_lastChange = 0; const long ticks = core::PumpTicks(); const DWORD now = GetTickCount();
             if (ticks != s_lastTicks) { s_lastTicks = ticks; s_lastChange = now; }
             const char* state = !core::HooksReady() ? "hooks MISSING" : ticks == 0 ? "game thread: waiting" : now - s_lastChange < 500 ? "game thread: running" : "game thread: paused";
-            ImGui::TextDisabled("objects %d  |  %s", (int)core::Spawned().size(), state);
+            ImGui::TextDisabled("objects %d  |  %s", (int)core::Spawned().size(), i18n::Translate(state));
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Spawning and moving happen on the game's simulation tick (%ld ticks so far).\nPaused = loading screen, menu or pause; queued actions run once it continues.", ticks);
         }
         if (ImGui::BeginTabBar("tabs")) {
@@ -1649,6 +1652,14 @@ namespace editor {
             static const bool s_showTravel = false;   // hidden until the game's own teleport path is found
             if (s_showTravel && ImGui::BeginTabItem(ICON_LOCATION_CROSSHAIRS " Travel")) { DrawTravel(p, havePos); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(ICON_LIST " Settings")) {
+                int languageCount = 0; const auto* languageOptions = i18n::Languages(&languageCount); int languageIndex = 0;
+                for (int i = 0; i < languageCount; ++i) if (_stricmp(languageOptions[i].id, i18n::Preference()) == 0) { languageIndex = i; break; }
+                if (ImGui::BeginCombo("Language", languageOptions[languageIndex].name)) {
+                    for (int i = 0; i < languageCount; ++i) {
+                        if (ImGui::Selectable(languageOptions[i].name, i == languageIndex) && i18n::SetPreference(languageOptions[i].id)) core::SaveSettings();
+                    }
+                    ImGui::EndCombo();
+                }
                 ImGui::TextDisabled("Hotkeys (saved to settings.txt in the cdmodkit folder, active immediately)");
                 auto keyCombo = [](const char* label, int* vk) {
                     int cur = -1; for (int i = 0; i < core::KeyCount(); i++) if (core::KeyVkAt(i) == *vk) cur = i;
@@ -1717,7 +1728,7 @@ namespace editor {
                 }
                 {   // gimmick spawn research: the game's own server spawns, newest first; "here" issues that one again in front of you
                     core::GimmickCapInfo caps[16]; const int nc = core::GimmickCaptureList(caps, 16);
-                    ImGui::TextDisabled("gimmick spawn research: %d capture%s%s", nc, nc == 1 ? "" : "s", core::GimmickReplayArmed() ? "  (replay armed: walk a bit or drop an item)" : "");
+                    ImGui::TextDisabled("gimmick spawn research: captures %d%s", nc, core::GimmickReplayArmed() ? "  (replay armed: walk a bit or drop an item)" : "");
                     {   // objects our replays created; "remove" repeats the game's own removal steps for that actor (experiment)
                         core::SpawnedInfo sp[16]; const int ns = core::SpawnedList(sp, 16);
                         if (ns) { ImGui::TextDisabled("spawned by replay: %d", ns);

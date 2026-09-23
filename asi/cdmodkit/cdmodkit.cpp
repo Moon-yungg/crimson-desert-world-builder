@@ -2,6 +2,7 @@
 // Loaded by Ultimate ASI Loader (winmm.dll) from bin64\. Log: bin64\cdmodkit\cdmodkit.log
 // Offsets are for CrimsonDesert.exe 1.0.0.2850. See notes/FORMATS.md for provenance.
 #include "core.h"
+#include "i18n.h"
 #include <cstdio>
 #include <cmath>
 #include <deque>
@@ -1909,6 +1910,7 @@ static void LoadSettings() {
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
         size_t eq = line.find('='); if (eq == std::string::npos) continue;
         std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+        if (k == "language") { i18n::SetPreference(v.c_str()); continue; }
         if (k == "console") { g_showConsole = v != "0" && v != "off" && v != "false"; continue; }
         if (k == "http_api") { g_httpEnabled = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "http_port") { char* end = nullptr; long port = strtol(v.c_str(), &end, 10); if (end && !*end && port >= 1 && port <= 65535) g_httpPort = (int)port; continue; }
@@ -1934,6 +1936,7 @@ void SaveSettings() {
     fprintf(f, "key_toggle=%s\nkey_mode=%s\n# console=0 hides the console window (log file only)\nconsole=%d\n# projection for the gizmo: vertical field of view in degrees and horizontal mirror (calibrate in the Settings tab)\nfov=%.1f\nmirror=%d\n# fovauto=1 reads the field of view from the game's camera object (fov= is the fallback)\nfovauto=%d\n# camlag: frames the overlay camera trails the game camera (0..4). Outlines run ahead while panning: raise it; they lag: lower it\ncamlag=%d\n", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? 1 : 0, g_fovDeg, g_camMirror ? 1 : 0, g_fovAuto ? 1 : 0, g_camLag);
     fprintf(f, "# placement keys (any key name from the list above, NUMPAD0..9, NUMPAD+ NUMPAD- NUMPAD. NUMPAD* NUMPAD/, ENTER, BACKSPACE, SPACE, UP/DOWN/LEFT/RIGHT, SHIFT/CTRL/ALT for 'fast')\n");
     for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
+    fprintf(f, "# Interface language: auto, en, zh-CN, zh-TW, de, fr, ko, ja, es, pt-BR, ru, tr\nlanguage=%s\n", i18n::Preference());
     fprintf(f, "# HTTP API for programs on this PC (127.0.0.1 only, see HTTP_API.md): http_api=1 runs it, http_port= its port. The Settings tab switches it at once\nhttp_api=%d\nhttp_port=%d\n", g_httpEnabled ? 1 : 0, g_httpPort);
     ApplyPlaceKeys(); fclose(f);
     Log("settings saved: toggle %s, mode %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off");

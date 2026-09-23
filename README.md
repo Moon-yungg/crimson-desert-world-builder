@@ -21,6 +21,13 @@ interactive (a torch placed that way can be lit and put out); see `notes/GIMMICK
 3. Start the game through Steam. Press **Insert** in the world to open the editor, **Home** to switch between edit and
    play mode. The log is `bin64\cdmodkit\cdmodkit.log`.
 
+## Interface language
+
+Choose **Settings → Language** in the editor. The interface supports English, Simplified Chinese, Traditional Chinese,
+German, French, Korean, Japanese, Spanish, Brazilian Portuguese, Russian, and Turkish, plus automatic system-language
+detection. The language names in the selector follow the currently selected interface language. Keep `locales.tsv` in
+`bin64\cdmodkit`; untranslated text falls back to English.
+
 ## Build from source
 
 Requirements: Visual Studio 2026 Build Tools (MSVC, x64; `asi/cdmodkit/build.bat` calls `vcvars64.bat`, adjust the path
@@ -39,7 +46,7 @@ asi\cdmodkit\build.bat
 ```
 
 The plugin lands in `asi/cdmodkit/build/cdmodkit.asi`. Copy it together with `asi/cdmodkit/data/prefabs.tsv`,
-`settings.txt` and `errnames.txt` (into `bin64\cdmodkit\`) while the game is not running.
+`settings.txt`, `errnames.txt`, and `locales.tsv` (into `bin64\cdmodkit\`) while the game is not running.
 `python scripts/make_release.py <version>` bumps the version strings, builds, and assembles the release zip.
 
 ## Repository layout
@@ -49,7 +56,7 @@ The plugin lands in `asi/cdmodkit/build/cdmodkit.asi`. Copy it together with `as
 | `asi/cdmodkit/` | the plugin: `cdmodkit.cpp` (hooks, spawning, projects), `editor.cpp` (ImGui editor), `overlay.cpp` / `input.cpp` (D3D12 overlay, input), `thumbgen.cpp` (preview renderer), `diag.cpp` (reverse-engineering aids) |
 | `asi/cdmodkit/cdmodkit_api.h` | the C API other ASI mods can call (`cdk_spawn`, `cdk_move`, `cdk_remove`, `cdk_player_pos`, ...) |
 | `HTTP_API.md` | local HTTP API for prefab search, scene objects and project operations |
-| `asi/cdmodkit/data/` | `prefabs.tsv` (prefab paths and tags), default `settings.txt`, `errnames.txt` |
+| `asi/cdmodkit/data/` | `prefabs.tsv` (prefab paths and tags), default `settings.txt`, `errnames.txt`, `locales.tsv` (UI translations) |
 | `scripts/` | build helpers and the offline reverse-engineering tools (`xref.py`, `disasm.py`, `rtti_static.py`, `parse_parc.py`, ...); the pack-reading scripts need pycrimson, bier and CDMW under `tools/` |
 | `notes/FORMATS.md` | how the game works from the plugin's point of view: signatures, struct offsets, the spawn recipe, file formats |
 | `notes/GIMMICK_SPAWN.md` | the server spawn path research (interactive objects) |
