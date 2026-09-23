@@ -60,7 +60,10 @@ namespace overlay {
     static ID3D12Fence* g_fence = nullptr;
     static HANDLE g_fenceEvent = nullptr;
     static UINT64 g_fenceValue = 0;
-    struct Frame { ID3D12CommandAllocator* alloc = nullptr; ID3D12Resource* rt = nullptr; D3D12_CPU_DESCRIPTOR_HANDLE rtv = {}; UINT64 fence = 0; };
+    // No reference to a back buffer is kept between frames: DXGI cannot destroy or resize a swapchain while someone holds one,
+    // and the game does destroy and recreate its swapchain (DLSS / DLAA switch, display mode). The buffer is fetched, drawn
+    // to and released again inside DrawFrame; the RTV descriptor is rewritten each frame (cheap).
+    struct Frame { ID3D12CommandAllocator* alloc = nullptr; D3D12_CPU_DESCRIPTOR_HANDLE rtv = {}; UINT64 fence = 0; };
     static std::vector<Frame> g_frames;
     static bool g_ready = false, g_failed = false, g_disabled = false;
     static std::atomic<long> g_presents{0};
@@ -164,9 +167,7 @@ namespace overlay {
         return (ImTextureID)GpuHandle(t.slot).ptr;
     }
 
-    static void ReleaseRenderTargets() {
-        for (auto& f : g_frames) { if (f.rt) { f.rt->Release(); f.rt = nullptr; } }
-    }
+    static void ReleaseRenderTargets() {}   // nothing is held between frames (see Frame)
     static bool CreateRenderTargets(IDXGISwapChain3* sc) {
         DXGI_SWAP_CHAIN_DESC desc = {}; sc->GetDesc(&desc);
         g_bufferCount = desc.BufferCount; g_width = desc.BufferDesc.Width; g_height = desc.BufferDesc.Height; g_format = desc.BufferDesc.Format;
@@ -177,12 +178,7 @@ namespace overlay {
         }
         const UINT inc = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         D3D12_CPU_DESCRIPTOR_HANDLE h = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        for (UINT i = 0; i < g_bufferCount; i++) {
-            if (FAILED(sc->GetBuffer(i, IID_PPV_ARGS(&g_frames[i].rt)))) return false;
-            D3D12_RENDER_TARGET_VIEW_DESC rd = {}; rd.Format = g_format; rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-            g_device->CreateRenderTargetView(g_frames[i].rt, &rd, h);
-            g_frames[i].rtv = h; h.ptr += inc;
-        }
+        for (UINT i = 0; i < g_bufferCount; i++) { g_frames[i].rtv = h; h.ptr += inc; }   // the views are written per frame
         return true;
     }
     static void WaitIdle() {
@@ -272,13 +268,16 @@ namespace overlay {
           core::g_uiWantsMouse = edit || gizmo; core::g_uiWantsKeyboard = edit; }
 
         const UINT idx = sc->GetCurrentBackBufferIndex();
-        if (idx >= g_frames.size() || !g_frames[idx].rt) return;
+        if (idx >= g_frames.size()) return;
         Frame& f = g_frames[idx];
+        ID3D12Resource* rt = nullptr;
+        if (FAILED(sc->GetBuffer(idx, IID_PPV_ARGS(&rt))) || !rt) { Stage("no back buffer"); return; }
+        { D3D12_RENDER_TARGET_VIEW_DESC rd = {}; rd.Format = g_format; rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D; g_device->CreateRenderTargetView(rt, &rd, f.rtv); }
         if (f.fence && g_fence->GetCompletedValue() < f.fence) { g_fence->SetEventOnCompletion(f.fence, g_fenceEvent); WaitForSingleObject(g_fenceEvent, 1000); }
         f.alloc->Reset();
         g_cmdList->Reset(f.alloc, nullptr);
         RecordUploads();
-        D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = f.rt;
+        D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = rt;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT; b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         g_cmdList->ResourceBarrier(1, &b);
         g_cmdList->OMSetRenderTargets(1, &f.rtv, FALSE, nullptr);
@@ -286,12 +285,13 @@ namespace overlay {
         ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_cmdList);
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
         g_cmdList->ResourceBarrier(1, &b);
-        if (FAILED(g_cmdList->Close())) { Stage("close failed"); return; }
+        if (FAILED(g_cmdList->Close())) { Stage("close failed"); rt->Release(); return; }
         Stage("execute");
         ID3D12CommandList* lists[] = { g_cmdList };
         g_queue->ExecuteCommandLists(1, lists);
         g_queue->Signal(g_fence, ++g_fenceValue);
         f.fence = g_fenceValue;
+        rt->Release();   // the swapchain keeps the buffer alive while the queue works; our reference must not outlive the frame
         Stage("done");
         g_drawCount++;
     }
@@ -325,10 +325,11 @@ namespace overlay {
     static HRESULT WINAPI hkPresent(IDXGISwapChain3* sc, UINT sync, UINT flags) { OnPresent(sc); return oPresent(sc, sync, flags); }
     static HRESULT WINAPI hkPresent1(IDXGISwapChain3* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp) { OnPresent(sc); return oPresent1(sc, sync, flags, pp); }
     static HRESULT WINAPI hkResizeBuffers(IDXGISwapChain3* sc, UINT n, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
-        if (g_ready && sc == g_swapChain) { WaitIdle(); ReleaseRenderTargets(); }
+        if (g_ready && sc == g_swapChain) WaitIdle();   // our last frame must be off the GPU; no buffer reference is held
         HRESULT hr = oResizeBuffers(sc, n, w, h, fmt, flags);
         if (g_ready && sc == g_swapChain) {
-            if (!CreateRenderTargets(sc)) { g_disabled = true; core::Log("[overlay] rebuild after resize failed; overlay disabled"); }
+            if (FAILED(hr)) core::Log("[overlay] the game's ResizeBuffers failed: 0x%08x", (unsigned)hr);
+            else if (!CreateRenderTargets(sc)) { g_disabled = true; core::Log("[overlay] rebuild after resize failed; overlay disabled"); }
             else core::Log("[overlay] resized to %ux%u", g_width, g_height);
         }
         return hr;
@@ -360,7 +361,7 @@ namespace overlay {
         if (SUCCEEDED(hr) && pp && *pp && desc && desc->Width > 64 && desc->Height > 64) {
             core::Log("[overlay] game created swapchain %ux%u fmt %d buffers %u hwnd %p", desc->Width, desc->Height, (int)desc->Format, desc->BufferCount, (void*)hwnd);
             HookFrom(*pp, device);
-        }
+        } else if (FAILED(hr)) core::Log("[overlay] the game's CreateSwapChainForHwnd failed: 0x%08x (a swapchain that is still referenced cannot be replaced)", (unsigned)hr);
         return hr;
     }
 
