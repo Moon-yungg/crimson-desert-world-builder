@@ -17,6 +17,12 @@
 #include "MinHook.h"
 #pragma comment(lib, "version.lib")
 #include "core_internal.h"
+#include "guard.h"
+namespace cdk { thread_local FaultInfo t_fault;
+#ifndef _MSC_VER
+thread_local GuardFrame* t_guardTop = nullptr;
+#endif
+}
 #include "thumbgen.h"
 #include "input.h"
 #include "http_api.h"
@@ -60,13 +66,17 @@ static thread_local bool t_guardedRead = false;   // probing reads fault on purp
 bool ReadBytes(uintptr_t a, void* out, size_t n) {
     if (a < 0x10000 || (a >> 47) != 0) return false;
     t_guardedRead = true;
-    __try { memcpy(out, (const void*)a, n); t_guardedRead = false; return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { t_guardedRead = false; return false; }
+    CDK_GUARD_BEGIN memcpy(out, (const void*)a, n); t_guardedRead = false; return true;
+    CDK_GUARD_FAIL t_guardedRead = false; return false;
+    CDK_GUARD_END
+    return false;
 }
 bool WriteBytes(uintptr_t a, const void* src, size_t n) {
     if (a < 0x10000 || (a >> 47) != 0) return false;
-    __try { memcpy((void*)a, src, n); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    CDK_GUARD_BEGIN memcpy((void*)a, src, n); return true;
+    CDK_GUARD_FAIL return false;
+    CDK_GUARD_END
+    return false;
 }
 static bool ReadPtr(uintptr_t a, uintptr_t* out) {
     uintptr_t v = 0; if (!ReadBytes(a, &v, 8)) return false;
@@ -348,7 +358,7 @@ static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* 
     // (low nibble compression: 0 none, 1 partial, 2 LZ4; high nibble crypto). The worker's slot 5 reads, decrypts and
     // decompresses the entry into a caller buffer: read(worker, handler, u8* buf, u32 capacity, u32 offset, u32 length).
     void* res = nullptr;
-    __try {
+    CDK_GUARD_BEGIN
         g_origResLoad(g_resLoader, &res, pathObj, 0);
         if (!res) return false;
         const uintptr_t h = (uintptr_t)res, worker = *(uintptr_t*)(h + 0x20);
@@ -364,7 +374,9 @@ static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* 
         }
         (*(void(__fastcall**)(void*, int))(*(uintptr_t*)res))(res, 1);   // handler release, as the game's load() does
         return ok;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    CDK_GUARD_FAIL return false;
+    CDK_GUARD_END
+    return false;
 }
 bool GameReadAvailable() { return g_resLoader && g_origResLoad && kRva_StringDataAlloc && kRva_PathNormalizeCtor; }
 bool GameReadFile(const std::string& path, std::vector<uint8_t>& out) {
@@ -573,7 +585,7 @@ static int LogFault(EXCEPTION_POINTERS* ep) {
     Log("   rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx rsi=%016llx rdi=%016llx r14=%016llx r15=%016llx", c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->R14, c->R15);
     return EXCEPTION_EXECUTE_HANDLER;
 }
-static void RunJobGuarded(std::function<void()>* job) { __try { (*job)(); } __except (LogFault(GetExceptionInformation())) { } }
+static void RunJobGuarded(std::function<void()>* job) { CDK_GUARD_BEGIN (*job)(); CDK_GUARD_FAIL EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); CDK_GUARD_END }
 static void AutoloadTick();
 static void PumpJobs() {
     g_pumpTicks++; g_gameThread = GetCurrentThreadId();
@@ -1837,8 +1849,10 @@ static bool g_probeZeroVel = false;   // dev variant: second vector zeroed (prov
 // count, +0x10 the hit fraction as a double (0..1 of the displacement), +0x80 the normal. Sphere center at the hit =
 // start - fraction * len (y); the surface is one sphere radius further down.
 static bool CallCastGuarded(void* world, void* q, void* xf, void* col, void** r) {   // plain function: SEH must not share a frame with C++ objects
-    __try { *r = g_origWorldCastShape(world, q, xf, col, col, nullptr, nullptr, nullptr); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    CDK_GUARD_BEGIN *r = g_origWorldCastShape(world, q, xf, col, col, nullptr, nullptr, nullptr); return true;
+    CDK_GUARD_FAIL return false;
+    CDK_GUARD_END
+    return false;
 }
 static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int tileZ, GroundHit* out, bool verbose) {
     if (!g_tpl.have || !g_origWorldCastShape) { if (verbose) Log("[probe] no template yet (the character has to be in the world for a moment)"); return false; }
@@ -2405,6 +2419,9 @@ static LONG CALLBACK VectoredHandler(EXCEPTION_POINTERS* ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
         code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != 0xC0000409 && code != EXCEPTION_BREAKPOINT) return EXCEPTION_CONTINUE_SEARCH;
+#ifndef _MSC_VER
+    if (code != EXCEPTION_STACK_OVERFLOW) cdk::GuardDispatch(ep);   // does not return when a guard is active on this thread
+#endif
     if (t_guardedRead) return EXCEPTION_CONTINUE_SEARCH;
     static volatile LONG s_count = 0;
     if (InterlockedIncrement(&s_count) > 40) return EXCEPTION_CONTINUE_SEARCH;

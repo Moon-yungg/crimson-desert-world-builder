@@ -4,6 +4,7 @@
 #include "core.h"
 #include "input.h"
 #include "overlay.h"
+#include "guard.h"
 #include "thumbgen.h"
 #include "icons.h"
 #include "i18n.h"
@@ -296,8 +297,9 @@ namespace overlay {
     }
 
     static void RenderGuarded(IDXGISwapChain3* sc) {
-        __try { DrawFrame(sc); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { g_disabled = true; core::Log("[overlay] exception 0x%08x while drawing; overlay disabled", GetExceptionCode()); }
+        CDK_GUARD_BEGIN DrawFrame(sc);
+        CDK_GUARD_FAIL g_disabled = true; core::Log("[overlay] exception 0x%08x while drawing; overlay disabled", cdk::GuardCode());
+        CDK_GUARD_END
     }
 
     static void OnPresent(IDXGISwapChain3* sc) {

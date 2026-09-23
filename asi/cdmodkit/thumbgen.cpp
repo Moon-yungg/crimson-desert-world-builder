@@ -4,6 +4,7 @@
 //   -> bin64\cdmodkit\thumbs\<fnv64(prefab path)>.png (+ bounding box in prefab_size.tsv)
 // Format knowledge ported from pycrimson (reflection) and CDMW mesh_parser (pam layouts).
 #define NOMINMAX
+#include "guard.h"
 #include "core.h"
 #include "thumbgen.h"
 #include <cstdio>
@@ -650,8 +651,10 @@ static bool Generate(const std::string& logical, float dims[6], std::string& why
     return true;
 }
 static bool GenerateGuarded(const std::string& logical, float dims[6], std::string& why) {
-    __try { return Generate(logical, dims, why); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { why = "crash"; return false; }
+    CDK_GUARD_BEGIN return Generate(logical, dims, why);
+    CDK_GUARD_FAIL why = "crash"; return false;
+    CDK_GUARD_END
+    return false;
 }
 
 static DWORD WINAPI Worker(LPVOID) {
