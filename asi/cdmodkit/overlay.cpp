@@ -222,6 +222,7 @@ namespace overlay {
         icons::Register(io.Fonts, textFont, 17.0f * scale);
         io.Fonts->Build();
         icons::Paint(io.Fonts);
+        i18n::ReleaseMergedFontData(io.Fonts);
         ImGui_ImplWin32_Init(g_hwnd);
         ImGui_ImplDX12_Init(g_device, (int)g_bufferCount, g_format, g_srvHeap, g_srvHeap->GetCPUDescriptorHandleForHeapStart(), g_srvHeap->GetGPUDescriptorHandleForHeapStart());
         input::Init(g_hwnd);
