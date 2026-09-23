@@ -5,3 +5,6 @@ Fixed
   (the Log tab's override prefab, a stand torch by default) and fired whenever the key was pressed while the placement
   mode or the editor was active, for example inside a house where the game itself uses the key. The hotkey is gone; the
   quick spawn is a button next to the override field in the Log tab now.
+
+Changed
+- The overlay logs every step of its first-frame setup, so a crash report shows how far it got.
