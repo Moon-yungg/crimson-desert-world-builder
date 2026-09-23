@@ -1,6 +1,6 @@
 # World Builder – In-Game Prefab Editor & Modding SDK
 
-**Place any of the game's 48,000+ prefabs anywhere in the world, live, without leaving the game.**
+**Place any of the game's 48,000+ prefabs anywhere in the world, live, without leaving the game. Torches, doors, chests and every other gimmick come alive: they are spawned through the game's own spawn path.**
 
 Discord: [Crimson Desert Modding](https://discord.gg/HfkShRJZU) for help, builds, feature requests and everything else about modding this game.
 
@@ -71,7 +71,8 @@ On the first start the mod renders preview images for all prefabs in the backgro
 
 ## Known limitations
 
-- Placed objects are visual with collision. Gimmick behaviour (breakable, collectable, interactable) is not attached.
+- Gimmick prefabs (everything under /object/cd_gimmick/) are real, interactive game objects. All other prefabs are visual with collision only.
+- Interactive objects need a spawn template the game provides by itself: right after loading a save, walk a few meters before they appear (the Scene tab says so while they wait).
 - Objects exist for the running session only. Load a project (or use autoload) after restarting.
 
 ## For mod authors
