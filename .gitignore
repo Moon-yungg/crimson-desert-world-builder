@@ -20,3 +20,6 @@ notes/*_disasm.txt
 notes/rtti_runtime.txt
 notes/rtti_hierarchy.txt
 notes/rtti_dump.txt
+
+# game data table dumps (scripts/staticinfo_dump.py): derived from the game files, not published
+notes/staticinfo/
