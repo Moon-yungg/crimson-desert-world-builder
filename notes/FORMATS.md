@@ -132,7 +132,28 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   the preview expands it in place. prefabs.tsv tags it "SubPrefab" and does not count its meshes.
 - Characters are assembled at runtime from character/appearance/.../*.app_xml (<Nude>, <Head>, <Hair>, <Armor> list prefab names).
 - Game data tables: gamedata/binarystaticinfo__/bin/<name>.staticinfoheader + .staticinfobody (characterinfo, faction,
-  factionrelationgroup, allygroupinfo, aiactionattributeinfo, dropsetinfo, ...), 134 files; format per table not decoded yet.
+  factionrelationgroup, allygroupinfo, aiactionattributeinfo, dropsetinfo, ...), 134 files. Header = row directory: count
+  (1, 2 or 4 bytes) + per row key (1/2/4/8/12 bytes) + u32 body offset; widths resolved against the body, where every row
+  repeats its key first (CDMW structured_binary_editor). Rows are packed structs without a type table; field names exist in
+  the exe as (class, field) string pairs ("FactionInfo" / "_factionRelationGroupInfo"), types and order not decoded.
+  scripts/staticinfo_dump.py writes all tables as TSV (gitignored notes/staticinfo/).
+- String tables (v0.93): gamedata/stringtable/binary__/<lang>/<table>.paloc (eng ger fre spa-es por-br rus tur kor jpn
+  zho-cn zho-tw ara ita pol spa-mx; 39 files each). "paloc" header, u32 stored size @9, u32 declared size @13, LZ4 from 17.
+  The stream starts with offset-0 matches (invalid LZ4; the reference decoder copies its zeroed buffer: a run of zeros of
+  decoded - declared bytes), then CDMW's records: u32 category, u32 reserved, u32 key length + key, u32 text length + text,
+  u32 count at the end. Keys are global u64 in text form: (row key << 32) | field tag. Only the key a table row stores itself
+  (or row key << 32 for gimmicks/characters) is reliable; guessing tags returns other tables' texts.
+- In-game names in the browser: gimmickinfo row strings (prefab path + name key) + <lang>/gimmick.paloc, read at runtime
+  through the game's loader. 11,114 of 13,941 gimmicks share a name; the tokens after the group's common ones are appended.
+- Appearances (v0.93): prefabs.tsv rows "/character/appearance/.../x.app_xml" (scripts/build_appearance_index.py);
+  the preview is the union of the prefabs listed under <Nude>/<Head>/<Hair>/<Armor> (flight cloak left out).
+- Decals: DecalComponent _offsetTransform (box: scale, quat, pos; missing = 1 m box) + DecalInfo _textureFilename
+  (DXT5 _dec.dds); previewed as a textured quad in the box's XZ plane, camera from above.
+- Partial textures (v0.93): ~13 % of DDS entries are stored "partial": the first up to four mips are LZ4 blocks of their own,
+  stored sizes in the DDS header's reserved1[0..3] (one block {stored, full} in reserved1[0..1] when mips <= 5 or an array).
+  The game's loader hands them over as stored. The renderer plans the stored offset of its mip (PlanDds) and reads only the
+  header plus that tail (core::GameReadFileRange, read() with offset/length), enabled by a start-up byte-compare self test.
+  Offline: 1093 -> 219 MB read for 220 prefabs, identical images.
 
 ## TiledTransform und setWorldTransform (v0.45, Build 2944)
 - SceneObject::setWorldTransform(this, TiledTransform*, u8 a, u8 b) erwartet 44 Bytes: scale3, quat4, pos3 (relativ zur Kachel), int16 tileX, int16 tileZ.

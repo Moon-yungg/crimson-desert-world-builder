@@ -42,6 +42,11 @@ Zum Neuaufbau einfach den Ordner `thumbs` und die Datei `prefab_size.tsv` lösch
   "fold variants" fasst Geschwister wie wall_01 / wall_02 / wall_01_broken zu einer aufklappbaren Zeile zusammen, "meshes only"
   blendet Prefabs ohne sichtbares Mesh aus (Standard). Rechtsklick auf einen Eintrag: Favorit, Sammlung hinzufügen.
   Unter den Kategorien stehen deine **Sammlungen**: Name eingeben, "add". SPAWN setzt das Objekt vor dir ab, Abstand nach Objektgröße.
+  Interaktive Objekte (Gimmicks) stehen unter ihrem Namen aus dem Spiel, in der Sprache der Oberfläche (z.B. "Privates Lager");
+  gleichnamige bekommen den unterscheidenden Teil des Dateinamens angehängt. Die Suche findet sie auch über diesen Namen,
+  die Listenansicht zeigt den Dateinamen in der Spalte "prefab".
+- **Figuren:** Unter character › appearance stehen alle Figuren des Spiels (Spielfiguren, NPCs, Monster, Tiere, Reittiere)
+  mit einer Vorschau der kompletten Figur aus Körper, Kopf, Haaren und Rüstung. Vorerst nur als Vorschau, Spawnen folgt später.
 - **Kachelansicht:** Knopf "cards" links neben der Suche zeigt die Treffer als Kacheln mit Vorschaubild (Größe per Regler),
   gleiche Filter wie die Liste. Die Vorschauen werden mit den echten Texturen des Spiels gerendert; beim ersten Start mit
   dieser Version werden vorhandene Bilder im Hintergrund einmal neu erzeugt, sichtbare Kacheln zuerst.
