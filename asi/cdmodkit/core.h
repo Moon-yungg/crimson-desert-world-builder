@@ -38,8 +38,8 @@ namespace core {
     bool SetPlayerPos(Vec3 world);             // writes the transform component (experimental: the game may correct it)
     bool CameraPose(Vec3* fwd, Vec3* pos);     // horizontal view direction (local +Z of the camera object) and world position of the active camera
     bool CameraBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd);   // full camera frame from the camera object's quaternion (fwd = local +Z, sign applied by the editor)
-    void CameraControlStart();                 // capture the live camera and start overriding its transform
-    void CameraControlStop();                  // restore the captured camera transform
+    void CameraControlStart();                 // capture the live pose and switch CameraManager's active stack entry to its native FreeCamCamera
+    void CameraControlStop();                  // restore the camera stack entry captured at activation
     bool CameraControlActive();
     void CameraControlStep(float forward, float right, float up, float zoom, float dt, bool fast);
     void CameraControlLook(float dx, float dy);
