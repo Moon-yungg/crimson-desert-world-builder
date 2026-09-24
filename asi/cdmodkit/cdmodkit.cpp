@@ -615,9 +615,11 @@ static void PumpJobs() {
     g_pumpTicks++; g_gameThread = GetCurrentThreadId();
     if (g_trace) TraceTick();
     if ((g_pumpTicks & 15) == 0) AutoloadTick();
-    if (InterlockedCompareExchange(&g_queueCount, 0, 0) == 0) return;
     std::function<void()> job;
-    { std::lock_guard<std::mutex> l(g_qMutex); if (!g_queue.empty()) { job = std::move(g_queue.front()); g_queue.pop_front(); InterlockedDecrement(&g_queueCount); } }
+    if (InterlockedCompareExchange(&g_queueCount, 0, 0) != 0) {
+        std::lock_guard<std::mutex> l(g_qMutex);
+        if (!g_queue.empty()) { job = std::move(g_queue.front()); g_queue.pop_front(); InterlockedDecrement(&g_queueCount); }
+    }
     if (job) RunJobGuarded(&job);
 }
 static void InstallCrashFilter(const char* when);
@@ -1877,7 +1879,11 @@ static void FcStep() {
     if (g_fcPitch > 89.0f) g_fcPitch = 89.0f; if (g_fcPitch < -89.0f) g_fcPitch = -89.0f;
     if (g_fcYaw > 180.0f) g_fcYaw -= 360.0f; if (g_fcYaw < -180.0f) g_fcYaw += 360.0f;
     float r[3], u[3], f[3]; FcBasis(r, u, f);
-    if (!g_uiTextInput) {   // W/S along the view, A/D sideways, E/Space up, Q/Ctrl down; Shift x4
+    // editor shortcuts (Ctrl+Z, Ctrl+D ...) must not fly the camera: no movement while Ctrl is held with a shortcut letter
+    const bool ctrl = input::ScanDown(0x1D, false) || input::ScanDown(0x1D, true);
+    const bool ctrlCommand = ctrl && (input::ScanDown(0x2C, false) || input::ScanDown(0x15, false) || input::ScanDown(0x2E, false) || input::ScanDown(0x2D, false) ||
+                                      input::ScanDown(0x2F, false) || input::ScanDown(0x20, false) || input::ScanDown(0x22, false) || input::ScanDown(0x1E, false));
+    if (!g_uiTextInput && !g_fcHoldMove && !ctrlCommand) {   // W/S along the view, A/D sideways, E/Space up, Q/Ctrl down; Shift x4
         float v = g_fcSpeed * dt * (input::ScanDown(0x2A, false) ? 4.0f : 1.0f);
         const float fw = (input::ScanDown(0x11, false) ? 1.0f : 0.0f) - (input::ScanDown(0x1F, false) ? 1.0f : 0.0f);
         const float sd = (input::ScanDown(0x20, false) ? 1.0f : 0.0f) - (input::ScanDown(0x1E, false) ? 1.0f : 0.0f);
@@ -1901,6 +1907,7 @@ static bool FreeCamSceneXf(const float* in, float* out) {
     return true;
 }
 float g_fcSpeed = 10.0f, g_fcSens = 0.12f;   // m/s, degrees per mouse count
+volatile bool g_fcHoldMove = false;   // set by the editor: a context menu is open or a field is being edited
 static void V3Cross(const float* a, const float* b, float* o) { o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0]; }
 static void V3Norm(float* v) { const float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); if (l > 1e-6f) { v[0] /= l; v[1] /= l; v[2] /= l; } }
 static void FcBasis(float* r, float* u, float* f) {   // from yaw/pitch, with the game's handedness learned at the start
@@ -1961,6 +1968,16 @@ void SetFreeCam(bool on) {
     if (on == g_fcOn) return;
     g_fcInit = false; g_fcRel = false; g_fcSoSeen = false; if (!on) g_fcSceneObj = 0; input::SetFreeCam(on); g_fcOn = on;
     Log("[freecam] %s", on ? "requested" : "off");
+}
+bool FreeCamBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd) {
+    if (!g_fcOn || !g_fcInit) return false;
+    float r[3], u[3], f[3]; FcBasis(r, u, f);
+    if (pos) *pos = { g_fcPos[0], g_fcPos[1], g_fcPos[2] }; if (right) *right = { r[0], r[1], r[2] }; if (up) *up = { u[0], u[1], u[2] }; if (fwd) *fwd = { f[0], f[1], f[2] };
+    return true;
+}
+void FreeCamDolly(float meters) {   // mouse wheel: along the view
+    if (!g_fcOn || !g_fcInit || !std::isfinite(meters)) return;
+    float r[3], u[3], f[3]; FcBasis(r, u, f); for (int i = 0; i < 3; i++) g_fcPos[i] += f[i] * meters;
 }
 void FreeCamTurn(float dyaw, float dpitch) { g_fcYaw += dyaw; g_fcPitch += dpitch; }   // tests without a mouse
 bool FreeCamPose(Vec3* pos, Vec3* fwd) {
@@ -2298,13 +2315,26 @@ static void FindCameraObjects(std::vector<std::pair<std::string, uintptr_t>>& ou
     }
 }
 // The CameraManager (reachable from the world root) keeps the active camera's SceneObject at +0x40; its world transform
-// sits at +0x1A4 like every SceneObject (scale3, quat4 at +0x1B0, pos3). camtrace showed the quaternion turning with the view.
-static uintptr_t g_camMgr = 0; static DWORD g_camSearchAt = 0;
+// sits at +0x1A4 like every SceneObject (scale3, quat4 at +0x1B0, pos3). Guarded by a mutex: the free camera asks for it on
+// the game thread every frame, the editor on the render thread.
+static uintptr_t g_camMgr = 0; static DWORD g_camSearchAt = 0; static std::mutex g_camMgrMutex;
 static uintptr_t CameraManagerPtr() {
-    if (g_camMgr) { const char* n = RttiName(g_camMgr); if (n && strstr(n, "CameraManager@")) return g_camMgr; g_camMgr = 0; }
-    const DWORD now = GetTickCount(); if (now - g_camSearchAt < 2000) return 0; g_camSearchAt = now;
-    std::vector<std::pair<std::string, uintptr_t>> found; FindCameraObjects(found);
-    for (auto& f : found) if (f.first.find("CameraManager@") != std::string::npos) { g_camMgr = f.second; Log("camera manager %p", (void*)g_camMgr); break; }
+    std::lock_guard<std::mutex> lock(g_camMgrMutex);
+    if (g_camMgr) {
+        const char* n = RttiName(g_camMgr);
+        if (n && strstr(n, "CameraManager@")) return g_camMgr;
+        g_camMgr = 0;
+    }
+    const DWORD now = GetTickCount();
+    if (now - g_camSearchAt < 2000) return 0;
+    g_camSearchAt = now;
+    std::vector<std::pair<std::string, uintptr_t>> found;
+    FindCameraObjects(found);
+    for (auto& f : found) if (f.first.find("CameraManager@") != std::string::npos) {
+        g_camMgr = f.second;
+        Log("camera manager %p", (void*)g_camMgr);
+        break;
+    }
     return g_camMgr;
 }
 uintptr_t CameraSceneObject() {
@@ -2313,9 +2343,7 @@ uintptr_t CameraSceneObject() {
     return n && strstr(n, "SceneObject") ? so : 0;
 }
 bool CameraBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd) {
-    uintptr_t mgr = CameraManagerPtr(); if (!mgr) return false;
-    uintptr_t so = Deref(mgr, 0x40); if (!so) return false;
-    const char* n = RttiName(so); if (!n || !strstr(n, "SceneObject")) return false;
+    uintptr_t so = CameraSceneObject(); if (!so) return false;
     float xf[10]; int16_t tile[2];
     if (!ReadBytes(so + 0x1A4, xf, 40) || !ReadBytes(so + 0x1CC, tile, 4)) return false;
     const float x = xf[3], y = xf[4], z = xf[5], w = xf[6];
@@ -2339,9 +2367,11 @@ bool CameraFov(float* deg) {
     return false;
 }
 bool CameraPose(Vec3* fwd, Vec3* pos) {
-    uintptr_t mgr = CameraManagerPtr(); if (!mgr) return false;
-    uintptr_t so = Deref(mgr, 0x40); if (!so) return false;
-    const char* n = RttiName(so); if (!n || !strstr(n, "SceneObject")) return false;
+    {   // flying: the free camera is the camera
+        Vec3 fp, ff;
+        if (FreeCamPose(&fp, &ff)) { const float l = sqrtf(ff.x * ff.x + ff.z * ff.z); if (l >= 0.05f) { if (pos) *pos = fp; if (fwd) *fwd = { ff.x / l, 0, ff.z / l }; return true; } }
+    }
+    uintptr_t so = CameraSceneObject(); if (!so) return false;
     float xf[10]; int16_t tile[2];
     if (!ReadBytes(so + 0x1A4, xf, 40) || !ReadBytes(so + 0x1CC, tile, 4)) return false;   // world TiledTransform: scale3, quat4, pos3, tile
     const float x = xf[3], y = xf[4], z = xf[5], w = xf[6];
@@ -2356,7 +2386,7 @@ bool CameraPose(Vec3* fwd, Vec3* pos) {
 
 
 // ---- configurable hotkeys (bin64\cdmodkit\settings.txt: key_toggle=INSERT, key_mode=HOME, key_pos=F9) ----
-int g_keyToggle = VK_INSERT, g_keyMode = VK_HOME, g_keyFreeCam = VK_F6; bool g_showConsole = false;
+int g_keyToggle = VK_INSERT, g_keyMode = VK_HOME; bool g_showConsole = false;
 float g_fovDeg = 55.0f; bool g_camMirror = false; bool g_fovAuto = true; int g_camLag = 0;
 struct KeyEntry { const char* name; int vk; };
 static const KeyEntry kKeyNames[] = {
@@ -2408,7 +2438,7 @@ static void LoadSettings() {
         if (k == "groundsnap") continue;   // 0.74: snap to ground is always on, the old switch is ignored
         int vk = KeyFromName(v);
         if (!vk) continue;
-        if (k == "key_toggle") g_keyToggle = vk; else if (k == "key_mode") g_keyMode = vk; else if (k == "key_freecam") g_keyFreeCam = vk;
+        if (k == "key_toggle") g_keyToggle = vk; else if (k == "key_mode") g_keyMode = vk;
         else if (k.rfind("key_", 0) == 0) { for (int i = 0; i < PK_COUNT; i++) if (k == std::string("key_") + kPlaceKeyIds[i]) g_placeKeys[i] = vk; }
     }
     ApplyPlaceKeys();
@@ -2422,7 +2452,7 @@ void SaveSettings() {
     fprintf(f, "# gimmick_spawn=0: place gimmick prefabs (/object/cd_gimmick/...) as plain objects instead of through the game spawn path\ngimmick_spawn=%d\n", g_gimmickSpawn ? 1 : 0);
     fprintf(f, "# placement keys (any key name from the list above, NUMPAD0..9, NUMPAD+ NUMPAD- NUMPAD. NUMPAD* NUMPAD/, ENTER, BACKSPACE, SPACE, UP/DOWN/LEFT/RIGHT, SHIFT/CTRL/ALT for 'fast')\n");
     for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
-    fprintf(f, "# free camera: key_freecam switches it (WASD, E/Space up, Q/Ctrl down, Shift faster, mouse turns; with the editor open hold the right mouse button), speed in m/s, mouse sensitivity in degrees per count\nkey_freecam=%s\nfreecam_speed=%.1f\nfreecam_sens=%.3f\n", KeyName(g_keyFreeCam), g_fcSpeed, g_fcSens);
+    fprintf(f, "# free camera (camera mode, key_mode in the editor): speed in m/s, mouse sensitivity in degrees per count\nfreecam_speed=%.1f\nfreecam_sens=%.3f\n", g_fcSpeed, g_fcSens);
     fprintf(f, "# Interface language: auto, en, zh-CN, zh-TW, de, fr, ko, ja, es, pt-BR, ru, tr\nlanguage=%s\n", i18n::Preference());
     fprintf(f, "# HTTP API for programs on this PC (127.0.0.1 only, see HTTP_API.md): http_api=1 runs it, http_port= its port. The Settings tab switches it at once\nhttp_api=%d\nhttp_port=%d\n", g_httpEnabled ? 1 : 0, g_httpPort);
     ApplyPlaceKeys(); fclose(f);

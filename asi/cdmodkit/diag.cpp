@@ -186,7 +186,8 @@ bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float
     if (NativeRenderCamera(pos, right, up, fwd, m00, m11)) { g_rcNative = true; return true; }   // the frame being rendered: nothing to rank
     g_rcNative = false;
     std::vector<RcBlock> blocks; { std::lock_guard<std::mutex> l(g_rcMutex); blocks = g_rcBlocks; }
-    Vec3 np, nr, nu, nf; const bool haveNode = CameraBasis(&np, &nr, &nu, &nf);
+    Vec3 np, nr, nu, nf;
+    const bool haveNode = FreeCamBasis(&np, &nr, &nu, &nf) || CameraBasis(&np, &nr, &nu, &nf);
     struct Cand { Vec3 pos, r, u, f; float m00, m11, sim; }; std::vector<Cand> c;
     for (const RcBlock& b : blocks) {
         float m[16], p[16]; if (!ReadBytes(b.view, m, sizeof m) || !ReadBytes(b.proj, p, sizeof p)) continue;

@@ -1,5 +1,8 @@
 // cdmodkit core API shared by the console, the overlay and the editor UI.
 #pragma once
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdint>
@@ -97,13 +100,16 @@ namespace core {
     extern bool g_recreateOnMove;               // false: disable/setTransform/enable in place; true: remove + re-create
     extern int  g_liveMode;                     // live-drag method, see DoLiveMove
     extern bool g_uiTextInput, g_uiMouseOverUi;  // a text field is active / the cursor is over a World Builder window (finer than g_uiWants*: edit mode claims all input)
-    extern int  g_keyToggle, g_keyMode, g_keyFreeCam;
+    extern int  g_keyToggle, g_keyMode;         // configurable hotkeys (virtual key codes), settings.txt in the mod folder
     extern float g_fcSpeed, g_fcSens;           // free camera: m/s and degrees per mouse count
     bool FreeCamAvailable();                    // the camera pose function and the renderer camera were found
     bool FreeCamActive();
-    void SetFreeCam(bool on);
-    bool FreeCamPose(Vec3* pos, Vec3* fwd);
-    void FreeCamTurn(float dyaw, float dpitch);  // degrees, as the mouse would     // current free camera position and view direction (false while off)         // configurable hotkeys (virtual key codes), settings.txt in the mod folder
+    void SetFreeCam(bool on);                   // the editor's camera mode (key_mode) switches it; also POST /api/freecam
+    bool FreeCamPose(Vec3* pos, Vec3* fwd);     // current free camera position and view direction (false while off)
+    bool FreeCamBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd);   // full frame of the free camera (false while off)
+    void FreeCamDolly(float meters);            // move along the view (mouse wheel)
+    void FreeCamTurn(float dyaw, float dpitch);  // degrees, as the mouse would (tests without a mouse)
+    extern volatile bool g_fcHoldMove;          // editor: no key movement now (context menu open, a field being edited)
     extern bool g_showConsole;                  // settings.txt console=0 hides the console window (takes effect on the next start)
     extern bool g_httpEnabled;                  // settings.txt http_api=1 runs the loopback HTTP API (off by default, switched live in the Settings tab)
     extern int  g_httpPort;                     // settings.txt http_port= (1..65535)

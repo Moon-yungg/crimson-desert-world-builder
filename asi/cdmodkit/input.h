@@ -8,6 +8,7 @@ namespace input {
     void MenuOpened();          // centres the virtual cursor
     void MenuClosed();
     void FeedMouse(ImGuiIO& io);   // render thread, once per frame while the menu is open
+    void TakeMouseDelta(float* dx, float* dy); // consumes raw relative motion accumulated since the previous frame
     // key state by scan code, tracked from the window messages (GetAsyncKeyState can stick after Shift+Numpad); ext = extended key flag
     bool ScanDown(int scan, bool ext);
     bool ScanDownAny(int scan);    // either variant (numpad key with NumLock off arrives as the extended arrow/page key)
