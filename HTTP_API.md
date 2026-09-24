@@ -10,6 +10,7 @@ Requests and responses use UTF-8 JSON. Write requests take a flat JSON object wi
 | --- | --- |
 | `GET /api/status` | API version, game readiness/build status, queued game-thread jobs |
 | `GET /api/player` | Player world coordinates `{x,y,z}`; 503 if unavailable |
+| `GET /api/camera` | Camera position `{x,y,z}`, its raw `axis` (sign ambiguous) and `view` `{x,z}`: horizontal unit direction from the camera to the player, i.e. where the screen looks. 503 if unavailable |
 | `GET /api/prefabs?q=lamp&offset=0&limit=100` | Search prefab path, display name and tags; paged results. Omit `q` for the whole catalog. |
 | `GET /api/objects?offset=0&limit=100` | Paged World Builder scene objects with stable `uid`, prefab, position, rotation, scale, hidden state, group and project |
 | `GET /api/objects/{uid}` | One scene object |

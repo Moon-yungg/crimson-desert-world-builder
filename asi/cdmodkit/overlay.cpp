@@ -148,6 +148,10 @@ namespace overlay {
     }
     static void EvictIfNeeded() {
         if (g_texs.size() <= kMaxThumbs) return;
+        // entries for images that did not exist (yet) hold no slot and were never evicted: after scrolling past ~600 tiles
+        // without a preview the loop below could not get under the limit and dropped every real texture in every frame
+        for (auto it = g_texs.begin(); it != g_texs.end();) { if (it->second.failed && !it->second.res) it = g_texs.erase(it); else ++it; }
+        if (g_texs.size() <= kMaxThumbs) return;
         std::vector<std::pair<DWORD, std::string>> byAge; for (auto& kv : g_texs) if (kv.second.uploaded) byAge.push_back({ kv.second.lastUse, kv.first });
         std::sort(byAge.begin(), byAge.end());
         for (size_t i = 0; i < byAge.size() && g_texs.size() > kMaxThumbs - 100; i++) {

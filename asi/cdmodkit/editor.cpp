@@ -27,7 +27,7 @@ namespace editor {
         for (int i = 0; i < count; i++) shown[i] = T(items[i]);   // stays valid: T keeps its last 16 decorated results
         return ImGui::Combo(label, cur, shown, count);
     }
-    static constexpr const char* kEditorVersion = "0.91";
+    static constexpr const char* kEditorVersion = "0.92";
     static bool g_open = false;
     // browser state
     static char  g_filter[128] = "";
@@ -197,7 +197,9 @@ namespace editor {
         for (int i = 0; i < (int)idx.size(); i++) {
             const auto& pi = idx[i];
             if (g_favOnly && !core::IsFavorite(i)) continue;
-            if (g_meshOnly && pi.meshes == 0 && pi.children == 0) continue;   // skinned-only / empty prefabs never show a visible spawn
+            // skinned-only / empty prefabs never show a visible spawn (tested in game: NPC and armour prefabs create an invisible
+            // scene object); sets made of other prefabs do, their meshes are just not counted in the index
+            if (g_meshOnly && pi.meshes == 0 && pi.children == 0 && pi.tags.find("SubPrefab") == std::string::npos) continue;
             if (g_selColl >= 0 && !collSet.count(pi.path)) continue;
             if (g_selCat > 0 && !InCat(pi.cat, g_selCat)) continue;
             bool ok = true;

@@ -37,8 +37,11 @@ def walk(o, acc):
         for v in o: walk(v, acc)
 t0 = time.time(); out = open("asi/cdmodkit/data/prefabs.tsv", "w", encoding="utf-8"); errs = 0
 out.write("#path\ttags\tmeshes\tchildren\tmesh\n")
+seen = set()   # 32 prefabs exist with and without bin__: one row per logical path, the first (bin__) wins
 for i, p in enumerate(paths):
     logical = p.replace("/bin__/", "/", 1)
+    if logical in seen: continue
+    seen.add(logical)
     acc = {"tags": collections.Counter(), "meshes": 0, "children": 0, "mesh": ""}
     try:
         data = ctx.get_file(p.lstrip("/"))

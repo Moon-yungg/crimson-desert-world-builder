@@ -1039,7 +1039,11 @@ static DWORD WINAPI Worker(LPVOID) {
         g_failed = (int)failedSet.size(); g_done = (int)g_processed.size() - g_failed;
     }
     g_sizes = fopen(sizesPath.c_str(), "a");
-    const auto& idx = core::PrefabIndex(); g_total = (int)idx.size();
+    const auto& idx = core::PrefabIndex();
+    {   // unique paths: the packs hold 32 prefabs twice (with and without bin__), older prefabs.tsv list them twice, and the
+        // progress then stopped 32 short of the total forever
+        std::unordered_set<std::string> u; for (const auto& pi : idx) u.insert(pi.path); g_total = (int)u.size();
+    }
     int noMesh = 0;   // index rows without any mesh (never a preview), for the log lines
     {   // prefabs.tsv counts the .pam/.pami _path entries: 0 without a SkinnedMesh or SubPrefab tag (the .pac and the meshes of
         // referenced prefabs are not counted there) means

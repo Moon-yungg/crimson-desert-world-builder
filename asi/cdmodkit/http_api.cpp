@@ -172,6 +172,15 @@ static std::string Handle(const std::string& method, const std::string& path, co
         Vec3 p{}; if (!core::PlayerWorldPos(&p)) { status = 503; return Error("player is not in the world"); }
         return "{\"x\":" + Num(p.x) + ",\"y\":" + Num(p.y) + ",\"z\":" + Num(p.z) + "}";
     }
+    if (method == "GET" && path == "/api/camera") {
+        // pos + axis of the camera object; the axis sign is ambiguous, so "view" is the horizontal direction from the camera
+        // towards the player (the third-person camera always looks over the character), which is what callers want
+        Vec3 fwd{}, cam{}, pl{}; if (!core::CameraPose(&fwd, &cam)) { status = 503; return Error("camera not found"); }
+        std::string view = "null";
+        if (core::PlayerWorldPos(&pl)) { const float vx = pl.x - cam.x, vz = pl.z - cam.z, l = sqrtf(vx * vx + vz * vz);
+            if (l > 0.3f) view = "{\"x\":" + Num(vx / l) + ",\"z\":" + Num(vz / l) + "}"; }
+        return "{\"x\":" + Num(cam.x) + ",\"y\":" + Num(cam.y) + ",\"z\":" + Num(cam.z) + ",\"axis\":{\"x\":" + Num(fwd.x) + ",\"y\":" + Num(fwd.y) + ",\"z\":" + Num(fwd.z) + "},\"view\":" + view + "}";
+    }
     if (method == "GET" && path == "/api/prefabs") {
         int offset = 0, limit = 100;
         if (!Page(arg, offset, limit)) { status = 400; return Error("invalid offset or limit (page size 1..500)"); }

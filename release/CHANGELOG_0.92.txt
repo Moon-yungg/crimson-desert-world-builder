@@ -1,0 +1,13 @@
+World Builder 0.92
+
+Fixed
+- All previews in the browser could vanish at once: the preview texture cache counted tiles whose image did not exist yet
+  but never dropped them, so after scrolling past a few hundred such tiles it threw away every real image in every frame.
+  Tiles without an image are dropped first now. (Restarting the game was the workaround.)
+- The preview progress stopped 32 short of the total ("48694 / 48726") and never finished: 32 prefabs are stored twice in the
+  game's packs. They are counted once, and the prefab list no longer shows them twice.
+- The browser filter "meshes only" hid prefabs that are made of other prefabs (sets, presets). They spawn fine and are
+  listed now. Character, monster and armour prefabs stay hidden with the filter on: they spawn nothing visible.
+
+Added
+- HTTP API: GET /api/camera returns the camera position and the direction the screen looks (see HTTP_API.md).

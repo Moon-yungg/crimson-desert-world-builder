@@ -15840,8 +15840,6 @@
 /character/sequenceprefab/05_natural/cd_ani_cd_t0000_crowhair_0001.prefab	Mesh	1	0	cd_gimmick_item_crowhair_01
 /character/sequenceprefab/05_natural/cd_ani_ex_dpf_woodlog_set_03_03.prefab	Mesh	1	0	cd_ex_dpf_woodlog_set_03_03
 /character/sequenceprefab/05_natural/cd_ani_gimmick_rock_06_minigame.prefab	Mesh	1	0	cd_gimmick_her_rock_b_river_0003
-/character/sequenceprefab/01_tool/cd_ani_cd_tool_hammer_02.prefab	Socket:2,Mesh	1	0	cd_tool_hammer_02
-/character/sequenceprefab/01_tool/cd_ani_cd_tool_hammer_04.prefab	Socket:2,Mesh,SkinnedMesh	1	0	cd_gimmick_tool_hammer_04
 /object/000_water_00001.prefab	Houdini:21,Spline:8,Mesh	1	0	hda_b6553aec5ed81024deeedbd30
 /object/007_02.prefab	Mesh:234,SubPrefab:6	234	234	cd_akapen_dungeon_beams_01_break
 /object/00_common/ancient/cd_ancient_altarmarble_01_pail.prefab	Mesh	1	0	cd_ancient_altarmarble_01_pai
@@ -48694,34 +48692,4 @@
 /object/road_mask_01.prefab	Spline:10	0	0	
 /object/trigger.prefab	Spline:11,Trigger:2,Other	0	0	
 /object/trigger_camera.prefab	Other:17,Camera:8,Trigger:4	0	1	
-/object/cd_gimmick/00_common/puzzle/gimmick_puzzle_mansion_ceillingfan_03_index02.prefab	Mesh,Gimmick	1	0	cd_gimmick_marni_airship_01_propeller_02
 /object/cd_gimmick/00_common/puzzle/gimmick_puzzle_throwstone_spawner_01.prefab	Mesh,Gimmick	1	0	cd_gimmick_moudule_stone_sphere_01
-/object/invalid.prefab	Mesh	1	0	invalid_prefab
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_compoundpolyhedron_000_0001.prefab	Mesh	1	0	mo_00_prp_compoundpolyhedron_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_cone_000_0001.prefab	Mesh	1	0	mo_00_prp_cone_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_crossblock_000_0001.prefab	Mesh	1	0	mo_00_prp_crossblock_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_cube_000_0001.prefab	Mesh	1	0	mo_00_prp_cube_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_cuboid_000_0001.prefab	Mesh	1	0	mo_00_prp_cuboid_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_curvedpipe_000_0001.prefab	Mesh	1	0	mo_00_prp_curvedpipe_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_curvedslope_000_0001.prefab	Mesh	1	0	mo_00_prp_curvedslope_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_cylinder_000_0001.prefab	Mesh	1	0	mo_00_prp_cylinder_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_hemisphere_000_0001.prefab	Mesh	1	0	mo_00_prp_hemisphere_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_hollowcylinder_000_0001.prefab	Mesh	1	0	mo_00_prp_hollowcylinder_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_hyperbolicparaboloid_000_0001.prefab	Mesh	1	0	mo_00_prp_hyperbolicparaboloid_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_lbeam_000_0001.prefab	Mesh	1	0	mo_00_prp_lbeam_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_octahedron_000_0001.prefab	Mesh	1	0	mo_00_prp_octahedron_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_propeller_000_0001.prefab	Mesh	1	0	mo_00_prp_propeller_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_puzzleblocka_000_0001.prefab	Mesh	1	0	mo_00_prp_puzzleblocka_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_puzzleblockb_000_0001.prefab	Mesh	1	0	mo_00_prp_puzzleblockb_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_roundedgecube_000_0001.prefab	Mesh	1	0	mo_00_prp_roundedgecube_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_semicone_000_0001.prefab	Mesh	1	0	mo_00_prp_semicone_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_semicylindertunnel_000_0001.prefab	Mesh	1	0	mo_00_prp_semicylindertunnel_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_sphere_000_0001.prefab	Mesh	1	0	mo_00_prp_sphere_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_sphere_000_0001_index0001.prefab	Mesh	1	0	mo_00_prp_sphere_000_0001_index0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_spiralramp_000_0001.prefab	Mesh	1	0	mo_00_prp_spiralramp_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_stairblock_000_0001.prefab	Mesh	1	0	mo_00_prp_stairblock_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_tetrahedron_000_0001.prefab	Mesh	1	0	mo_00_prp_tetrahedron_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_thincube_000_0001.prefab	Mesh	1	0	mo_00_prp_thincube_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_torus_000_0001.prefab	Mesh	1	0	mo_00_prp_torus_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_triangularpyramid_000_0001.prefab	Mesh	1	0	mo_00_prp_triangularpyramid_000_0001
-/object/prefab/01_aft_artifact/04_prp_prop/mo_00_prp_wireframecube_000_0001.prefab	Mesh	1	0	mo_00_prp_wireframecube_000_0001
