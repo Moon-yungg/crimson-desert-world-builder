@@ -751,26 +751,67 @@ static void DecodeBc45(const uint8_t* src, size_t n, int w, int h, bool bc5, Tex
         DecodeBc4Block(src + bo, bx, by, 0, out); if (bc5) DecodeBc4Block(src + bo + 8, bx, by, 1, out);
     }
 }
+// Where the mip we decode (long side <= 256) lies in the file as it is STORED in the pack. Most textures are stored raw, but
+// ~13 % are "partial": the first up to four mips are each an LZ4 block of their own, their stored sizes in the DDS header's
+// reserved1[0..3] (one block with reserved1 = {stored, full} when the texture has <= 5 mips or is an array). The game's loader
+// hands such entries over as stored, so reading the mip at its unpacked offset decoded garbage (offline tools unpack first).
+struct DdsPlan {
+    int fmt = 0, bs = 8, w = 0, h = 0;      // fmt 1 BC1, 3 BC3, 4 BC4, 5 BC5; chosen mip size
+    size_t hdr = 128, off = 0, len = 0;      // stored offset and stored length of the chosen mip
+    size_t full = 0; bool lz4 = false;       // unpacked length; lz4 = the chosen mip is itself a compressed block
+    bool single = false;                     // one compressed block over the start of the payload: unpack it all
+    uint32_t singleStored = 0, singleFull = 0;
+};
+static bool PlanDds(const uint8_t* d, size_t n, size_t storedTotal, DdsPlan& p) {
+    if (n < 128 || memcmp(d, "DDS ", 4) != 0) return false;
+    int h = (int)rd32(d + 12), w = (int)rd32(d + 16); const int depth = (int)rd32(d + 24), mips = std::max(1, (int)rd32(d + 28)), caps2 = (int)rd32(d + 112);
+    const uint32_t fourcc = rd32(d + 84); bool dx10 = false; int arraySize = 1;
+    if (fourcc == 0x30315844) {   // "DX10": dxgi format follows
+        if (n < 148) return false; dx10 = true; p.hdr = 148; const uint32_t dxgi = rd32(d + 128); arraySize = (int)rd32(d + 140);
+        p.fmt = (dxgi == 71 || dxgi == 72) ? 1 : (dxgi == 77 || dxgi == 78) ? 3 : (dxgi == 80 || dxgi == 81) ? 4 : (dxgi == 83 || dxgi == 84) ? 5 : 0;
+    } else p.fmt = fourcc == 0x31545844 ? 1 : fourcc == 0x35545844 ? 3 : (fourcc == 0x55344342 || fourcc == 0x31495441) ? 4 : (fourcc == 0x55354342 || fourcc == 0x32495441) ? 5 : 0;   // DXT1 DXT5 BC4U/ATI1 BC5U/ATI2
+    if (!p.fmt || w <= 0 || h <= 0 || w > 16384 || h > 16384) return false;
+    p.bs = (p.fmt == 1 || p.fmt == 4) ? 8 : 16;
+    auto mipSize = [&](int mw, int mh) { return (size_t)((mw + 3) / 4) * ((mh + 3) / 4) * p.bs; };
+    size_t fullTotal = p.hdr; { int mw = w, mh = h; for (int i = 0; i < mips; i++) { fullTotal += mipSize(mw, mh); mw = std::max(1, mw / 2); mh = std::max(1, mh / 2); } }
+    const bool partial = storedTotal + 16 < fullTotal;   // stored smaller than unpacked: compressed blocks inside
+    const uint32_t r1[4] = { rd32(d + 32), rd32(d + 36), rd32(d + 40), rd32(d + 44) };
+    const bool multi = mips > 5 && caps2 == 0 && depth < 2 && (!dx10 || arraySize < 2);
+    if (partial && !multi) { p.single = true; p.singleStored = r1[0]; p.singleFull = r1[1]; }
+    int chosen = 0, mw = w, mh = h; size_t off = p.hdr;
+    while ((mw > 256 || mh > 256) && chosen + 1 < mips) {
+        const size_t full = mipSize(mw, mh);
+        off += (partial && multi && chosen < 4) ? r1[chosen] : full;
+        mw = std::max(1, mw / 2); mh = std::max(1, mh / 2); chosen++;
+    }
+    p.w = mw; p.h = mh; p.full = mipSize(mw, mh); p.off = off;
+    p.lz4 = partial && multi && chosen < 4 && r1[chosen] != p.full; p.len = p.lz4 ? r1[chosen] : p.full;
+    if (p.lz4 && (p.len == 0 || p.len > p.full + 64)) return false;
+    return true;
+}
 // DDS: the mip level with at most 256 px on the long side is decoded (BC1, BC3, BC4, BC5; anything else falls back to the material colour)
 static std::shared_ptr<TexImg> LoadTexture(const std::string& path) {
     auto it = g_texs.find(path); if (it != g_texs.end()) return it->second;
     if (g_texBytes > (192u << 20)) { g_texs.clear(); g_texBytes = 0; }
     std::shared_ptr<TexImg> t; std::vector<uint8_t> d; const char* kind = "?";
-    if (GetFile(path, d) && d.size() >= 128 && memcmp(d.data(), "DDS ", 4) == 0) {
-        int h = (int)rd32(d.data() + 12), w = (int)rd32(d.data() + 16), mips = std::max(1, (int)rd32(d.data() + 28));
-        const uint32_t fourcc = rd32(d.data() + 84); size_t off = 128; int fmt = 0;   // 1 BC1, 3 BC3, 4 BC4, 5 BC5
-        if (fourcc == 0x30315844) {   // "DX10": dxgi format follows
-            const uint32_t dxgi = rd32(d.data() + 128); off = 148;
-            fmt = (dxgi == 71 || dxgi == 72) ? 1 : (dxgi == 77 || dxgi == 78) ? 3 : (dxgi == 80 || dxgi == 81) ? 4 : (dxgi == 83 || dxgi == 84) ? 5 : 0;
-        } else fmt = fourcc == 0x31545844 ? 1 : fourcc == 0x35545844 ? 3 : (fourcc == 0x55344342 || fourcc == 0x31495441) ? 4 : (fourcc == 0x55354342 || fourcc == 0x32495441) ? 5 : 0;   // DXT1 DXT5 BC4U/ATI1 BC5U/ATI2
-        if (fmt && w > 0 && h > 0 && w <= 16384 && h <= 16384) {
-            const int bs = (fmt == 1 || fmt == 4) ? 8 : 16;
-            while ((w > 256 || h > 256) && mips > 1) { off += (size_t)((w + 3) / 4) * ((h + 3) / 4) * bs; w = std::max(1, w / 2); h = std::max(1, h / 2); mips--; }
-            if (off < d.size()) {
-                t = std::make_shared<TexImg>();
-                if (fmt <= 3) DecodeBc(d.data() + off, d.size() - off, w, h, fmt == 3, *t); else DecodeBc45(d.data() + off, d.size() - off, w, h, fmt == 5, *t);
-                g_texBytes += t->rgba.size(); kind = fmt == 1 ? "bc1" : fmt == 3 ? "bc3" : fmt == 4 ? "bc4" : "bc5";
-            }
+    DdsPlan p;
+    if (GetFile(path, d) && PlanDds(d.data(), d.size(), d.size(), p)) {
+        if (p.single) {   // one compressed block over the start of the payload: unpack it, then plan on the unpacked file
+            std::vector<uint8_t> blk, un;
+            if (p.hdr + p.singleStored <= d.size() && p.singleFull < (64u << 20) && Lz4Block(d.data() + p.hdr, p.singleStored, blk, p.singleFull)) {
+                un.assign(d.begin(), d.begin() + p.hdr); un.insert(un.end(), blk.begin(), blk.end()); un.insert(un.end(), d.begin() + p.hdr + p.singleStored, d.end());
+                d.swap(un); if (!PlanDds(d.data(), d.size(), d.size(), p) || p.single) p.fmt = 0;
+            } else p.fmt = 0;
+        }
+        std::vector<uint8_t> mip; const uint8_t* src = nullptr; size_t srcLen = 0;
+        if (p.fmt && p.off + p.len <= d.size()) {
+            if (p.lz4) { if (Lz4Block(d.data() + p.off, p.len, mip, p.full)) { src = mip.data(); srcLen = mip.size(); } }
+            else { src = d.data() + p.off; srcLen = d.size() - p.off; }
+        }
+        if (src) {
+            t = std::make_shared<TexImg>();
+            if (p.fmt <= 3) DecodeBc(src, srcLen, p.w, p.h, p.fmt == 3, *t); else DecodeBc45(src, srcLen, p.w, p.h, p.fmt == 5, *t);
+            g_texBytes += t->rgba.size(); kind = p.fmt == 1 ? "bc1" : p.fmt == 3 ? "bc3" : p.fmt == 4 ? "bc4" : "bc5";
         }
     }
     if (d.empty() && g_readError) return t;   // read error: not cached
