@@ -185,3 +185,11 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Projekt v2: prefab|x|y|z|yaw|scale|group, Gruppen-IDs werden beim Laden neu vergeben.
 - Query_TerrainForHousing ist nur der Name eines Collision-Query-Enums (Registrierung bei rva 0x267bac7 / 0x267e936, Wert 0x5d/0x5e), keine Raycast-Funktion.
 - PlayerCameraComponent vtable 0x560bca0 (145 Slots); Blickrichtung noch unbekannt -> Konsole "camtrace" loggt Kandidaten.
+
+## NPC / creature spawn (v0.94, build 1.0.0.2976)
+- Path: the game's cheat request handler `TrocTrSpawnCharacterCheatReq` (RTTI; one static instance in .data, found by scanning for its vtable). `execute(handler, int* result, packet)` = vtable slot 2 (rva 0x29be8c0 in 2976). Must run on the server tick (`RunOnServerTick`).
+- Packet: +0 sender = the player's server actor (`ServerChildOnlyInGameActor`), +0x10 u16 total length, +0x18 u8* buffer. Buffer: 5 header bytes (u16 payload length at +3, must equal total - 5) + payload {u32 characterKey, u32 unused, float3 world position, u8 spawn type}. Every payload byte must be read or the handler rejects it. Handler byte +0x21 set = answers ok and does nothing.
+- characterKey = row key of characterinfo.staticinfo (e.g. 30191 Animal_Domestic_Bear_Domestic_30191). Row: first string (offset <= 12) = internal name, name key string ((key << 32) | tag) -> character.paloc.
+- Spawn type = reason byte of the `ICreateServerActorDesc` the worker (0x2c3ed50) builds (ctor 0x278ea70, type at desc+0xa; type 0x28 is mapped to 0x21). 0 faults deep in the actor creation (null at 0x3d6250 via 0x1851010 / 0x2b04ae0); 1, 12, 13, 39, 40 spawn. Game values seen at desc ctor call sites: 1, 0xa, 0xc (NPCSchedule), 0xd, 0x10, 0x16, 0x1e, 0x25, 0x27 (DailyRoutine).
+- The actor appears 5-7 s after the call (async), at the given position.
+- Sender: taken from MoveActorReq / EchoMoveSessionIDReq (slot 2 hooks, packet+0) when it changes; checked before use by its vtable (a loaded save replaces it). HeartbeatReq is useless: it runs as a server timer, its third argument is no packet and its "sender" a static object (faults at vtable+0x160).

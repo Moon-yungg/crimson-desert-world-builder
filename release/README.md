@@ -96,6 +96,21 @@ few meters", bis der erste passiert ist. Lehnt das Spiel ein Prefab ab, wird es 
 "gimmicks through the game" im Log-Tab (bzw. `gimmick_spawn=0` in der settings.txt) schaltet das ab. Ein Spiel-Update kann
 den Weg blockieren; das Log nennt dann den fehlenden Hook, alles andere läuft weiter.
 
+## NPCs und Kreaturen
+
+Der Tab **NPCs** listet alle rund 7.250 Figuren des Spiels (Menschen, Goblins, Tiere, Reittiere, Monster, Bosse) mit ihrem
+Spielnamen in deiner Sprache, dem internen Namen und dem Schlüssel. Suche und Kategorie grenzen die Liste ein, **SPAWN** (oder
+ein Doppelklick) setzt die Figur mit dem eingestellten Abstand vor dich, mit "count" auch mehrere nebeneinander. Die Liste
+liest die Mod zur Laufzeit aus deinem installierten Spiel, es wird nichts davon mitgeliefert.
+
+Die Figuren entstehen über die Spawn-Anfrage des Spiels selbst und sind danach ganz normale Bewohner der Welt: Sie laufen,
+kämpfen, fliehen und verschwinden nach den Regeln des Spiels. Feindliche Figuren greifen an. Deshalb stehen sie nicht in der
+Szenenliste, lassen sich nicht verschieben oder rückgängig machen und werden nicht in Projekten gespeichert.
+
+Nach dem Laden eines Spielstands zeigt der Tab "walk a few steps first", bis du dich kurz bewegt hast: Die Anfrage braucht
+die Server-Figur deines Charakters, und die liefert das Spiel beim Laufen. Ein Spiel-Update kann den Weg blockieren; dann sagt
+der Tab das, alles andere läuft weiter.
+
 ## Bekannte Einschränkungen
 
 - Prefabs außerhalb von `/object/cd_gimmick/` sind rein visuell mit Kollision.

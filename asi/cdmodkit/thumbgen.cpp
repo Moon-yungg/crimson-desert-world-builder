@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <fstream>
+#include <functional>
 void* CdHeapAlloc(size_t n); void* CdHeapRealloc(void* p, size_t n); void CdHeapFree(void* p);   // heap.cpp
 #define STBIW_MALLOC(sz)        CdHeapAlloc(sz)
 #define STBIW_REALLOC(p, newsz) CdHeapRealloc(p, newsz)
@@ -1146,6 +1147,57 @@ static bool LoadGameNames(const std::string& lang) {
     return true;
 }
 
+// characters (NPC spawn list): characterinfo.staticinfo rows hold the internal name as their first string ("Animal_Bear_Wild_30048")
+// and the name key like gimmickinfo; the texts are in character.paloc. The row key is what the spawn request takes.
+static std::shared_ptr<const std::vector<thumbgen::CharInfo>> g_chars;   // atomic_load/store
+static bool ReadPaloc(const std::string& file, const std::function<void(const std::string& key, std::string text)>& each) {
+    std::vector<uint8_t> pal;
+    if (!GetFile(file, pal) || pal.size() < 17 || memcmp(pal.data(), "paloc", 5) != 0) { Log("[names] %s: not readable", file.c_str()); return false; }
+    const uint32_t size = rd32(pal.data() + 13); std::vector<uint8_t> u;
+    if (!Lz4Block(pal.data() + 17, pal.size() - 17, u, (size_t)size + 65536, false) || u.size() < (size_t)size + 4) { Log("[names] %s: unpack failed", file.c_str()); return false; }
+    for (size_t pos = u.size() - size, end = u.size() - 4; pos + 16 <= end;) {
+        const uint32_t kl = rd32(u.data() + pos + 8); if (pos + 16 + kl > end) break;
+        const uint32_t tl = rd32(u.data() + pos + 12 + kl); if (pos + 16 + kl + tl > end) break;
+        if (tl) { std::string t((const char*)u.data() + pos + 16 + kl, tl); while (!t.empty() && (unsigned char)t.back() <= ' ') t.pop_back(); if (!t.empty()) each(std::string((const char*)u.data() + pos + 12, kl), std::move(t)); }
+        pos += 16 + kl + tl;
+    }
+    return true;
+}
+static bool LoadCharacters(const std::string& lang) {
+    std::vector<uint8_t> hd, bd;
+    if (!GetFile("gamedata/binarystaticinfo__/bin/characterinfo.staticinfoheader", hd) || !GetFile("gamedata/binarystaticinfo__/bin/characterinfo.staticinfobody", bd)) return false;
+    std::vector<std::pair<uint32_t, uint32_t>> rows; if (!RowDirectory(hd, bd, rows)) { Log("[names] characterinfo: row directory not recognised"); return false; }
+    auto list = std::make_shared<std::vector<thumbgen::CharInfo>>(); std::unordered_map<std::string, size_t> byKey;
+    for (size_t r = 0; r < rows.size(); r++) {
+        const size_t off = rows[r].second, end = r + 1 < rows.size() ? rows[r + 1].second : bd.size();
+        thumbgen::CharInfo c; c.key = rows[r].first; std::string nameKey;
+        for (size_t i = off; i + 4 <= end;) {
+            const uint32_t n = rd32(bd.data() + i);
+            if (n >= 1 && n <= 400 && i + 4 + n <= end) {
+                const char* q = (const char*)bd.data() + i + 4; bool text = true; for (uint32_t k = 0; k < n; k++) if ((unsigned char)q[k] < 32) { text = false; break; }
+                if (text) {
+                    std::string v(q, n);
+                    if (c.internal.empty() && i - off <= 12) c.internal = v;
+                    else if (nameKey.empty() && n >= 10 && v.find_first_not_of("0123456789") == std::string::npos && (strtoull(v.c_str(), nullptr, 10) >> 32) == c.key) nameKey = v;
+                    i += 4 + n; continue;
+                }
+            }
+            i++;
+        }
+        if (c.internal.empty()) continue;
+        if (!nameKey.empty()) byKey.emplace(nameKey, list->size());
+        list->push_back(std::move(c));
+    }
+    ReadPaloc(std::string("gamedata/stringtable/binary__/") + PalocFolder(lang) + "/character.paloc",
+              [&](const std::string& k, std::string t) { auto it = byKey.find(k); if (it != byKey.end()) (*list)[it->second].name = std::move(t); });
+    size_t named = 0; std::string all;
+    for (auto& c : *list) if (!c.name.empty()) { named++; all += c.name; all += ' '; }
+    i18n::AddGlyphText(all);
+    Log("[names] %zu characters (%zu named, %s)", list->size(), named, PalocFolder(lang));
+    std::atomic_store(&g_chars, std::shared_ptr<const std::vector<thumbgen::CharInfo>>(list));
+    return true;
+}
+
 // ---------------------------------------------------------------- worker
 static std::mutex g_mu;
 static std::deque<std::string> g_requests;
@@ -1337,7 +1389,7 @@ static DWORD WINAPI Worker(LPVOID) {
     for (;;) {
         {   // in-game names for the browser: (re)loaded when the UI language differs from the loaded one
             std::string want; { std::lock_guard<std::mutex> l(g_mu); want = g_namesWanted; }
-            if (!want.empty() && want != g_namesLoaded) { g_namesLoaded = want; const bool e = g_readError; LoadGameNames(want); g_readError = e; }
+            if (!want.empty() && want != g_namesLoaded) { g_namesLoaded = want; const bool e = g_readError; LoadGameNames(want); LoadCharacters(want); g_readError = e; }
         }
         std::string path; bool prio = false; bool measure = false, check = false;
         {
@@ -1443,6 +1495,7 @@ std::vector<std::string> TakeRefreshed() { std::lock_guard<std::mutex> l(g_mu); 
 int Done() { return g_done; }
 void WantNamesLanguage(const std::string& id) { std::lock_guard<std::mutex> l(g_mu); g_namesWanted = id; }
 std::shared_ptr<const std::unordered_map<std::string, std::string>> GameNames() { return std::atomic_load(&g_names); }
+std::shared_ptr<const std::vector<CharInfo>> Characters() { return std::atomic_load(&g_chars); }
 bool PassProgress(int* done, int* total) { std::lock_guard<std::mutex> l(g_mu); if (done) *done = (int)g_passDone.size(); if (total) *total = g_passTotal; return g_passActive; }
 int Failed() { return g_failed; }
 int Total() { return g_total; }

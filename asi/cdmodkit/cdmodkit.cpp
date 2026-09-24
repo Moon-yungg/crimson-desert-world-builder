@@ -1766,6 +1766,104 @@ static void InstallVtableTracer(int cls, const char* mangled, const char* shortN
     Log("[vt] %s: vtable at rva 0x%llx, %d of %d slots traced (%d shared stubs skipped)", shortName, (unsigned long long)(vt - g_base), ok, slots, skipped);
 }
 
+// ---- NPC and creature spawn: the game's own "spawn character" cheat request, executed on the server thread ----
+// TrocTrSpawnCharacterCheatReq::execute(handler, int* result, packet) (vtable slot 2): packet {+0 sender = the player's server
+// actor (ServerChildOnlyInGameActor), +0x10 u16 total length, +0x18 u8* buffer}; buffer = 5 header bytes (u16 payload length
+// at +3) + payload {u32 characterKey (characterinfo row), u32 (read, not passed on), float3 position, u8 spawn type}; all
+// payload bytes must be consumed. The type becomes the actor desc's reason byte: 0 faults deep in the actor creation, 1, 12,
+// 13, 39, 40 all spawn. The worker asks the sender for the player actor, so the sender is taken from the requests the client
+// really sends while walking (MoveActorReq, EchoMoveSessionIDReq) and re-taken whenever it changes (save loaded, respawn).
+// If the handler's byte +0x21 is set it answers ok and does nothing.
+static uintptr_t g_npcHandler = 0; static void* g_npcExecute = nullptr;
+static SRWLOCK g_npcLock = SRWLOCK_INIT;
+static uintptr_t g_serverSession = 0, g_sessionVt = 0; static uint8_t g_pktTemplate[0x40];   // under g_npcLock
+static volatile uintptr_t g_lastSender = 0;   // fast path of the capture: same sender as last time, nothing to do
+static void* g_capOrig[2] = {}; static const char* g_capName[2] = { "", "" };
+template<int K> static void* __fastcall CapThunk(void* h, void* res, void* pkt, void* d, void* e, void* f, void* g, void* i) {
+    uintptr_t s = 0;
+    if (pkt && ReadPtr((uintptr_t)pkt, &s) && s && s != g_lastSender) {
+        // a real client packet: u16 total at +0x10, buffer at +0x18 whose u16 at +3 is total - 5, sender with RTTI
+        uintptr_t buf = 0, vt = 0; uint16_t total = 0, plen = 0; const char* sn = nullptr;
+        if (ReadBytes((uintptr_t)pkt + 0x10, &total, 2) && ReadPtr((uintptr_t)pkt + 0x18, &buf) && buf && ReadBytes(buf + 3, &plen, 2) &&
+            total >= 5 && plen == total - 5 && ReadPtr(s, &vt) && (sn = RttiName(s)) != nullptr) {
+            AcquireSRWLockExclusive(&g_npcLock);
+            ReadBytes((uintptr_t)pkt, g_pktTemplate, sizeof g_pktTemplate); g_serverSession = s; g_sessionVt = vt;
+            ReleaseSRWLockExclusive(&g_npcLock);
+            g_lastSender = s;
+            Log("[npc] player actor %p (%s) from %s", (void*)s, sn, g_capName[K]);
+        }
+    }
+    return ((void* (__fastcall*)(void*, void*, void*, void*, void*, void*, void*, void*))g_capOrig[K])(h, res, pkt, d, e, f, g, i);
+}
+static uintptr_t FindObjectWithVtable(uintptr_t vt, int* count) {   // static handler objects live in the image's writable data
+    auto dos = (PIMAGE_DOS_HEADER)g_base; auto nt = (PIMAGE_NT_HEADERS)(g_base + dos->e_lfanew); auto sec = IMAGE_FIRST_SECTION(nt);
+    uintptr_t first = 0; *count = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE) || (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        const uint8_t* p = (const uint8_t*)(g_base + sec[i].VirtualAddress); const size_t n = sec[i].Misc.VirtualSize;
+        for (size_t k = 0; k + 8 <= n; k += 8) { uintptr_t v; memcpy(&v, p + k, 8); if (v == vt) { if (!first) first = (uintptr_t)(p + k); (*count)++; } }
+    }
+    return first;
+}
+static void InstallNpcSpawn() {
+    const uintptr_t vt = FindVtableByName(".?AVTrocTrSpawnCharacterCheatReq@pa@@"); if (!vt) { Log("[npc] spawn cheat handler vtable not found: NPC spawning off"); return; }
+    uintptr_t exec = 0; ReadPtr(vt + 2 * 8, &exec); int n = 0; const uintptr_t handler = FindObjectWithVtable(vt, &n);
+    if (!InImage(exec) || !handler) { Log("[npc] handler object not found (%d instances, execute %p): NPC spawning off", n, (void*)exec); return; }
+    static void* thunks[2] = { (void*)&CapThunk<0>, (void*)&CapThunk<1> };
+    static const char* reqs[2][2] = { { ".?AVTrocTrMoveActorReq@pa@@", "MoveActorReq" }, { ".?AVTrocTrEchoMoveSessionIDReq@pa@@", "EchoMoveSessionIDReq" } };
+    int hooked = 0;
+    for (int k = 0; k < 2; k++) {
+        const uintptr_t v = FindVtableByName(reqs[k][0]); uintptr_t f = 0; if (!v || !ReadPtr(v + 2 * 8, &f) || !InImage(f)) { Log("[npc] %s not found", reqs[k][1]); continue; }
+        g_capName[k] = reqs[k][1]; ReleaseHookPiece();
+        if (MH_CreateHook((void*)f, thunks[k], &g_capOrig[k]) == MH_OK && MH_EnableHook((void*)f) == MH_OK) hooked++;
+    }
+    if (!hooked) { Log("[npc] no request to take the player actor from: NPC spawning off"); return; }
+    g_npcHandler = handler; g_npcExecute = (void*)exec;
+    Log("[npc] spawn handler at rva 0x%llx (%d instance(s)), execute rva 0x%llx, %d request hook(s)", (unsigned long long)(handler - g_base), n, (unsigned long long)(exec - g_base), hooked);
+}
+static void NpcUnwind(const CONTEXT* fault) {   // call chain of a fault via the unwind tables, for bug reports
+    CONTEXT c = *fault; char line[700]; int k = 0;
+    for (int i = 0; i < 16 && c.Rip && k < (int)sizeof line - 24; i++) {
+        k += snprintf(line + k, sizeof line - k, InImage(c.Rip) ? " %llx" : " ?%llx", InImage(c.Rip) ? (unsigned long long)(c.Rip - g_base) : (unsigned long long)c.Rip);
+        DWORD64 imageBase = 0; PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+        if (!rf) { uintptr_t ret = 0; if (!ReadPtr(c.Rsp, &ret)) break; c.Rip = ret; c.Rsp += 8; continue; }
+        void* hd = nullptr; DWORD64 ef = 0; RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, rf, &c, &hd, &ef, nullptr);
+    }
+    Log("[npc] fault chain:%s", line);
+}
+static bool CallNpcExecute(void* pkt, int* res) {   // guarded: a wrong packet must not take the game down
+    typedef void* (__fastcall* Exec)(void*, int*, void*);
+    CDK_GUARD_BEGIN ((Exec)g_npcExecute)((void*)g_npcHandler, res, pkt); return true;
+    CDK_GUARD_FAIL { EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); NpcUnwind(ep.ContextRecord); } return false;
+    CDK_GUARD_END
+    return false;
+}
+int NpcState() {
+    if (!g_npcExecute) return 0;
+    AcquireSRWLockShared(&g_npcLock); const bool have = g_serverSession != 0; ReleaseSRWLockShared(&g_npcLock);
+    return have ? 2 : 1;
+}
+bool SpawnNpc(uint32_t key, Vec3 pos, int type, uint32_t extra) {
+    if (!g_npcExecute) { Log("[npc] not available (handler not resolved)"); return false; }
+    if (NpcState() < 2) { Log("[npc] player actor not known yet: walk a few steps"); return false; }
+    if (type < 1 || type > 255) type = 1;   // 0 is no valid reason and faults inside the game
+    RunOnServerTick([key, pos, type, extra]() {
+        alignas(16) uint8_t pkt[0x40]; uintptr_t s = 0, vt = 0, cur = 0;
+        AcquireSRWLockShared(&g_npcLock); memcpy(pkt, g_pktTemplate, sizeof pkt); s = g_serverSession; vt = g_sessionVt; ReleaseSRWLockShared(&g_npcLock);
+        if (!ReadPtr(s, &cur) || cur != vt) {   // the actor was replaced (save loaded) and no move has been seen since
+            Log("[npc] player actor %p is gone: walk a few steps, then spawn again", (void*)s); g_lastSender = 0;
+            AcquireSRWLockExclusive(&g_npcLock); if (g_serverSession == s) g_serverSession = 0; ReleaseSRWLockExclusive(&g_npcLock);
+            return;
+        }
+        uint8_t buf[5 + 21] = {}; const uint16_t plen = 21; memcpy(buf + 3, &plen, 2);
+        memcpy(buf + 5, &key, 4); memcpy(buf + 9, &extra, 4); memcpy(buf + 13, &pos, 12); buf[25] = (uint8_t)type;
+        const uint16_t total = sizeof buf; memcpy(pkt + 0x10, &total, 2); uint8_t* bp = buf; memcpy(pkt + 0x18, &bp, 8);
+        int res = -1; const bool ok = CallNpcExecute(pkt, &res);
+        Log("[npc] spawn character %u at (%.2f %.2f %.2f) type %d: %s, result %d (%s)", key, pos.x, pos.y, pos.z, type, ok ? "executed" : "FAULTED", res, DecodeErr((uint32_t)res).c_str());
+    });
+    return true;
+}
+
 // SceneObjectServer objects are born in the reflection factory's create() (the entry of the class meta table that follows the
 // "... for Server" strings); hooked to log who creates one (caller rva) and to put it on the watch list at birth
 static uintptr_t kRva_SoServerCreate = 0; volatile LONG g_soCreated_ = 0; volatile uintptr_t g_lastSoCreated_ = 0; volatile uintptr_t g_lastActorCreated_ = 0;
@@ -2167,6 +2265,10 @@ static DWORD WINAPI ConsoleThread(LPVOID) {
         else if (cmd == "raytrace") RayTrace(12);
         else if (cmd == "probe") ProbeGround(3.0f, 10.0f);
         else if (cmd == "traceio on" || cmd == "traceio off") SetIoTrace(cmd == "traceio on");
+        else if (cmd.rfind("npc ", 0) == 0) {   // npc <characterKey> [type]: spawn 4 m east of the player
+            unsigned key = 0; int type = 1; Vec3 p{};
+            if (sscanf(cmd.c_str() + 4, "%u %d", &key, &type) >= 1 && PlayerWorldPos(&p)) { p.x += 4.0f; SpawnNpc(key, p, type); } else Log("usage: npc <characterKey> [type]");
+        }
         else if (cmd == "thumbs on" || cmd == "thumbs off") { thumbgen::SetBackground(cmd == "thumbs on"); Log("background preview generation %s", thumbgen::Background() ? "on" : "off"); }
         else if (cmd.rfind("save ", 0) == 0) SaveProject(cmd.substr(5));
         else if (cmd.rfind("load ", 0) == 0) LoadProject(cmd.substr(5), false);
@@ -2247,6 +2349,7 @@ static DWORD WINAPI InitThread(LPVOID) {
             InstallVtableTracer(2, ".?AVServerField@pa@@", "ServerField", g_traceHooks ? 39 : 10);
             if (g_traceHooks) { InstallVtableTracer(0, ".?AVServerSyncSceneObjectManager@pa@@", "ServerSyncSceneObjectManager", 19); InstallVtableTracer(1, ".?AVSceneObjectServer@pa@@", "SceneObjectServer", 156); InstallVtableTracer(3, ".?AVServerNormalInGameActor@pa@@", "ServerNormalInGameActor", 145); InstallVtableTracer(4, ".?AVTrocTrSpawnCharacterCheatReq@pa@@", "TrocTrSpawnCharacterCheatReq", 3); }
         }   // ServerField: which slots run per tick (a place to run our own spawns) and which run on a pickup (removal)   // research: how the server makes and fills its scene objects
+        InstallNpcSpawn();   // NPC spawn research: the game's spawn-character cheat request
         if (g_traceHooks && kRva_UuidLookup) { void* t10 = (void*)(g_base + kRva_UuidLookup); HookFn(t10, (void*)HookUuidLookup, (void**)&g_origUuidLookup, "uuid lookup (trace)"); }
         if (kRva_SoServerCreate) { void* t9 = (void*)(g_base + kRva_SoServerCreate); HookFn(t9, (void*)HookSoServerCreate, (void**)&g_origSoServerCreate, "SceneObjectServer new (trace)"); }
         if (kRva_ActorCtor) { void* t13 = (void*)(g_base + kRva_ActorCtor); HookFn(t13, (void*)HookActorCtor, (void**)&g_origActorCtor, "actor constructor (trace)"); }
