@@ -1456,8 +1456,8 @@ namespace editor {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("rotation step for Rotate - / Rotate +"));
         ImGui::BeginDisabled(g_undo.empty()); if (ImGui::SmallButton(T("Undo"))) Undo(); ImGui::EndDisabled(); SameLineOrWrap(compact, 45);
         ImGui::BeginDisabled(g_redo.empty()); if (ImGui::SmallButton(T("Redo"))) Redo(); ImGui::EndDisabled();
-        if (compact) ImGui::TextWrapped(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select"));
-        else { ImGui::SameLine(); ImGui::TextDisabled(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select")); }
+        if (compact) ImGui::TextWrapped(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+D duplicate   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select"));
+        else { ImGui::SameLine(); ImGui::TextDisabled(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+D duplicate   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select")); }
         const float ui = ImGui::GetFontSize() / 17.0f;
         const float availY = ImGui::GetContentRegionAvail().y;
         const bool hasSelection = !g_sel.empty() && Find(list, g_primary);
@@ -1596,7 +1596,7 @@ namespace editor {
         // Save always writes the whole scene, so a fresh project starts from an empty world
         if (ImGui::Button(T(ICON_CUBE " New"))) ImGui::OpenPopup("newproj");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("empty scene for a new project: removes everything World Builder has placed.\nSaved .cdproj files on disk are not touched."));
-        if (ImGui::BeginPopupModal(TStable("newproj"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (ImGui::BeginPopupModal(TStable("New project###newproj"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::TextWrapped(T("Remove all %d placed objects and start an empty project?"), (int)core::Spawned().size());
             ImGui::TextDisabled(T("Saved projects stay on disk. Undo cannot bring the objects back."));
             ImGui::Separator();
