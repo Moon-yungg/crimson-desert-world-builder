@@ -235,6 +235,27 @@ static bool LoadPrefabRoots(const std::string& logical, std::vector<Node>& roots
     }
     return true;
 }
+// Character appearance (.app_xml): the game assembles the character at runtime from the prefabs listed under <Nude>, <Head>,
+// <Hair> and <Armor> (names without path, mixed case). All of them are loaded as roots of one preview. The flight cloak is
+// left out: its spread glider covers the whole figure.
+static bool LoadAppearanceRoots(const std::string& logical, std::vector<Node>& roots, std::string* why) {
+    static std::unordered_map<std::string, std::string> byName;   // lower-case prefab base name -> logical path (worker thread only)
+    if (byName.empty()) for (const auto& pi : core::PrefabIndex()) if (EndsWith(pi.path, ".prefab")) {
+        std::string n = pi.path.substr(pi.path.rfind('/') + 1); n.resize(n.size() - 7); for (char& c : n) c = (char)tolower((unsigned char)c); byName.emplace(n, pi.path); }
+    std::vector<uint8_t> x; std::string phys = logical[0] == '/' ? logical.substr(1) : logical;
+    if (!GetFile(phys, x)) { if (why) *why = g_readError ? "read error" : "prefab missing"; return false; }
+    const std::string s((const char*)x.data(), x.size()); static const char kTag[] = "<Prefab Name=\"";
+    int parts = 0;
+    for (size_t p = s.find(kTag); p != std::string::npos; p = s.find(kTag, p + 1)) {
+        const size_t b = p + sizeof(kTag) - 1, e = s.find('"', b); if (e == std::string::npos) break;
+        std::string n = s.substr(b, e - b); for (char& c : n) c = (char)tolower((unsigned char)c);
+        if (n.find("cloak_flight") != std::string::npos) continue;
+        auto it = byName.find(n); if (it == byName.end()) continue;
+        std::vector<Node> r; if (LoadPrefabRoots(it->second, r, nullptr)) { for (auto& nd : r) roots.push_back(std::move(nd)); parts++; }
+    }
+    if (!parts && why) *why = "no meshes";
+    return parts > 0;
+}
 // Sub-prefab instances (a child whose type is another prefab's path) are expanded in place with their transform, so the
 // preview shows what spawning the parent shows. chain guards against a prefab that contains itself.
 struct CollectCtx { std::vector<std::string> chain; int subs = 0; };
@@ -971,7 +992,7 @@ static std::vector<std::string> g_refreshed;               // images overwritten
 static bool g_passActive = false; static std::unordered_set<std::string> g_passDone;   // re-render pass: browser requests jump the queue
 static bool Generate(const std::string& logical, float dims[6], std::string& why) {
     g_readError = false;
-    std::vector<Node> roots; if (!LoadPrefabRoots(logical, roots, &why)) return false;
+    std::vector<Node> roots; if (!(EndsWith(logical, ".app_xml") ? LoadAppearanceRoots(logical, roots, &why) : LoadPrefabRoots(logical, roots, &why))) return false;
     std::vector<Inst> inst; const float I[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }, Z[3] = { 0, 0, 0 };
     CollectCtx cx; cx.chain.push_back(logical);
     for (const auto& r : roots) Collect(r, I, Z, inst, cx);
@@ -1080,7 +1101,7 @@ static DWORD WINAPI Worker(LPVOID) {
         // "no meshes" without reading the file. ~1.6k of them (decals, effects, logic objects) would otherwise be read one by
         // one. A parse-error row is read anyway.
         std::lock_guard<std::mutex> l(g_mu); int skipped = 0;
-        for (const auto& pi : idx) if (pi.meshes == 0 && pi.tags.find("SkinnedMesh") == std::string::npos && pi.tags.find("SubPrefab") == std::string::npos && pi.tags.find("Decal") == std::string::npos && pi.tags.find("parse-error") == std::string::npos) { noMesh++; if (g_processed.insert(pi.path).second) skipped++; }
+        for (const auto& pi : idx) if (pi.meshes == 0 && pi.tags.find("SkinnedMesh") == std::string::npos && pi.tags.find("SubPrefab") == std::string::npos && pi.tags.find("Decal") == std::string::npos && pi.tags.find("Appearance") == std::string::npos && pi.tags.find("parse-error") == std::string::npos) { noMesh++; if (g_processed.insert(pi.path).second) skipped++; }
         g_failed += skipped;
         Log("[thumbs] %d prefabs have no mesh in the index (decals, effects, logic objects): no preview, not read", noMesh);
     }

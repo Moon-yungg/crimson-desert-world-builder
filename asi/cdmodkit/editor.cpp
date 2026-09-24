@@ -199,7 +199,7 @@ namespace editor {
             if (g_favOnly && !core::IsFavorite(i)) continue;
             // skinned-only / empty prefabs never show a visible spawn (tested in game: NPC and armour prefabs create an invisible
             // scene object); sets made of other prefabs do, their meshes are just not counted in the index
-            if (g_meshOnly && pi.meshes == 0 && pi.children == 0 && pi.tags.find("SubPrefab") == std::string::npos) continue;
+            if (g_meshOnly && pi.meshes == 0 && pi.children == 0 && pi.tags.find("SubPrefab") == std::string::npos) continue;   // appearances list their parts as children
             if (g_selColl >= 0 && !collSet.count(pi.path)) continue;
             if (g_selCat > 0 && !InCat(pi.cat, g_selCat)) continue;
             bool ok = true;
@@ -292,9 +292,11 @@ namespace editor {
         if (pi.hasCenter) { const float t = yaw * 3.14159265f / 180.0f, cs = cosf(t), sn = sinf(t); at.x -= scale * (cs * pi.cx + sn * pi.cz); at.z -= scale * (-sn * pi.cx + cs * pi.cz); }
         return at;
     }
+    static bool IsAppearance(const core::PrefabInfo& pi) { return pi.tags.rfind("Appearance", 0) == 0; }   // .app_xml rows: preview only
     static void SpawnSelected(const PosInfo& p) {
         if (g_selPrefab < 0) return;
         const auto& pi = core::PrefabIndex()[g_selPrefab];
+        if (IsAppearance(pi)) { Note(T("characters can only be previewed for now, spawning them comes later")); return; }
         Vec3 at = SpawnSpot(pi, g_spawnYaw, g_spawnScale);
         if (g_previewShown && core::PreviewCommit()) { g_previewShown = false; g_previewSuppressed = true; Note(T("placed %s"), pi.name.c_str()); }
         else { int uid = core::SpawnAt(pi.path, at, Rot{ g_spawnYaw }, g_spawnScale); std::vector<Act> acts; RecordSpawn(acts, uid, pi.path, at, Rot{ g_spawnYaw }, g_spawnScale, 0); Push(acts); Note(T("spawn %s"), pi.name.c_str()); }
@@ -468,6 +470,7 @@ namespace editor {
     static void StartPlaceNew(const PosInfo& p, bool havePos) {
         if (g_selPrefab < 0 || !havePos || !core::GameThreadReady()) return;
         const auto& pi = core::PrefabIndex()[g_selPrefab];
+        if (IsAppearance(pi)) { Note(T("characters can only be previewed for now, spawning them comes later")); return; }
         if (g_place.active) {   // PLACE / double-click while something is already carried
             const Place& P = g_place;
             if (P.isNew && !P.touched && P.m.size() == 1 && P.m[0].prefab == pi.path) { Note(T("%s is already in your hands: %s drops it, %s cancels"), pi.name.c_str(), core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL])); return; }   // a repeated double-click, not a second copy

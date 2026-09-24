@@ -612,7 +612,9 @@ static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uin
 
 int SpawnAt(const std::string& prefab, Vec3 world, Rot rot, float scale, int group, int proj) {
     if (!GameThreadReady()) { Log("spawn: game thread pump not active yet"); return 0; }
-    const bool gim = g_gimmickSpawn && kRva_GimmickSpawn_ && IsGimmickPrefab(prefab);
+    // a character appearance is assembled by the game's actor system; as a scene object it would spawn nothing visible
+    if (prefab.size() > 8 && prefab.compare(prefab.size() - 8, 8, ".app_xml") == 0) { Log("spawn: %s is a character appearance, characters cannot be spawned yet", prefab.c_str()); return 0; }
+    const bool gim =g_gimmickSpawn && kRva_GimmickSpawn_ && IsGimmickPrefab(prefab);
     int uid; { std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextUid++; g_reg.push_back({ 0, prefab, world, rot, scale, false, GetTickCount(), rot, scale, uid, group, proj, gim, 0 }); if (!g_loading) MarkDirtyLocked(proj); }
     if (gim) { EnqueueGimmick(uid, prefab, world, rot, scale); return uid; }   // spawned by the server tick once a template capture exists
     std::string p = prefab;
