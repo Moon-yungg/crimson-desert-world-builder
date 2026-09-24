@@ -848,6 +848,8 @@ namespace editor {
         if (thumbgen::Ready()) {
             const int done = thumbgen::Done(), failed = thumbgen::Failed(), total = thumbgen::Total();
             if (done + failed < total && !thumbgen::Idle()) { ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 200, 90, 255)); ImGui::TextWrapped(T("Previews are still being rendered: %d of %d done (%d without visible geometry). Empty tiles fill in as they finish, the visible ones are rendered first."), done + failed, total, failed); ImGui::PopStyleColor(); }
+            int pd = 0, pt = 0;   // re-render pass after a renderer fix: existing images are replaced, the counts above do not move
+            if (thumbgen::PassProgress(&pd, &pt) && pt > 0) { ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(150, 200, 255, 255)); ImGui::TextWrapped(T("Updating existing previews with the improved renderer: %d of %d. Tiles on screen are updated first."), pd, pt); ImGui::PopStyleColor(); }
         } else if (thumbgen::Error()[0]) { ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 120, 100, 255)); ImGui::TextWrapped(T("Previews are off: %s"), thumbgen::Error()); ImGui::PopStyleColor(); }
         else ImGui::TextDisabled(T("preview generator is starting..."));
         const float pad = 4.0f * ui, tile = tilePx > 0 ? tilePx : g_cardSize * ui, textH = ImGui::GetTextLineHeight() * 2 + 3;
@@ -1031,7 +1033,8 @@ namespace editor {
             ImGui::EndDisabled();
             ImGui::EndGroup();
         } else ImGui::TextDisabled(T("select a prefab, then PLACE. Double-click on a row or card places it right away."));
-        if (thumbgen::Ready()) { ImGui::SameLine(); ImGui::TextDisabled(T("   previews %d / %d"), thumbgen::Done(), thumbgen::Total()); }
+        if (thumbgen::Ready()) { ImGui::SameLine(); ImGui::TextDisabled(T("   previews %d / %d"), thumbgen::Done(), thumbgen::Total());
+            int pd = 0, pt = 0; if (thumbgen::PassProgress(&pd, &pt) && pt > 0) { ImGui::SameLine(); ImGui::TextDisabled(T("   updating %d / %d"), pd, pt); } }
         else if (thumbgen::Error()[0]) { ImGui::SameLine(); ImGui::TextDisabled(T("   previews off: %s"), thumbgen::Error()); }
         g_showSpawnOpts = ImGui::CollapsingHeader(TStable("Spawn options: offset, yaw, scale, direction"));
         if (g_showSpawnOpts) {

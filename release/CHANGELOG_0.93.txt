@@ -9,7 +9,8 @@ Added
 Fixed
 - About 13 % of the game's textures were decoded wrongly in previews (flat or blotchy colours, missing patterns): they are
   stored with compressed blocks and were read at the wrong place. All existing previews are rendered again once in the
-  background, the tiles on screen first.
+  background, the tiles on screen first. The browser shows the progress of that update ("updating x / y"); new entries
+  without any preview (characters, decals) are rendered before it.
 
 Changed
 - Previews read only the part of each texture they use: about 80 % less data read and roughly a third faster per

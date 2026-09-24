@@ -1062,6 +1062,7 @@ static int g_statInst = 0, g_statSurf = 0, g_statMat = 0, g_statTex = 0;   // la
 static bool g_recheckOnly = false, g_recheckForce = false, g_lastSkipped = false;   // re-render pass: force = every prefab (textured previews), else only LZ4 meshes
 static std::vector<std::string> g_refreshed;               // images overwritten by the re-render pass (the overlay drops its cached textures)
 static bool g_passActive = false; static std::unordered_set<std::string> g_passDone;   // re-render pass: browser requests jump the queue
+static int g_passTotal = 0;   // prefabs the re-render pass covers (for the progress line in the browser)
 static bool Generate(const std::string& logical, float dims[6], std::string& why) {
     g_readError = false;
     std::vector<Node> roots; if (!(EndsWith(logical, ".app_xml") ? LoadAppearanceRoots(logical, roots, &why) : LoadPrefabRoots(logical, roots, &why))) return false;
@@ -1220,7 +1221,7 @@ static DWORD WINAPI Worker(LPVOID) {
             if (first) { first = false; passCurrent = s == "#" + std::to_string(kCacheVersion); if (!passCurrent) break; continue; }
             if (!s.empty()) g_passDone.insert(s); } fclose(pf); } }
         for (auto& pi : idx) if (g_processed.count(pi.path) && pi.sx > 0 && !g_passDone.count(pi.path)) recheck.push_back(pi.path);
-        g_recheckForce = cacheVer < kCacheVersion; g_passActive = !recheck.empty();
+        g_recheckForce = cacheVer < kCacheVersion; g_passActive = !recheck.empty(); g_passTotal = (int)(recheck.size() + g_passDone.size());
         if (!g_passDone.empty()) Log("[thumbs] re-render pass continues: %zu done in earlier sessions, %zu to go", g_passDone.size(), recheck.size());
         if (!recheck.empty()) { passOut = fopen(passPath.c_str(), passCurrent ? "a" : "w"); if (passOut && !passCurrent) fprintf(passOut, "#%d\n", kCacheVersion); }
         if (!recheck.empty()) Log("[thumbs] cache version %d -> %d: %zu rendered prefabs are %s in the background", cacheVer, kCacheVersion, recheck.size(), g_recheckForce ? "rendered again with textures" : "checked for LZ4 meshes"); }
@@ -1248,9 +1249,12 @@ static DWORD WINAPI Worker(LPVOID) {
             }
             if (!path.empty()) {}
             else if (!remeasure.empty()) { path = remeasure.front(); remeasure.pop_front(); measure = true; }
-            else if (!recheck.empty()) { path = recheck.front(); recheck.pop_front(); check = true; }
-            else if (g_background) { while (cursor < idx.size() && g_processed.count(idx[cursor].path)) cursor++; if (cursor < idx.size()) path = idx[cursor++].path;
-                                     else if (!retry.empty()) { path = retry.front(); retry.pop_front(); } }
+            else {   // prefabs without any image first (new index entries: characters, decals), then re-renders of existing ones
+                if (g_background) while (cursor < idx.size() && g_processed.count(idx[cursor].path)) cursor++;
+                if (g_background && cursor < idx.size()) path = idx[cursor++].path;
+                else if (!recheck.empty()) { path = recheck.front(); recheck.pop_front(); check = true; }
+                else if (g_background && !retry.empty()) { path = retry.front(); retry.pop_front(); }
+            }
             if (check && g_passDone.count(path)) continue;   // rendered earlier in this pass on request
             if (!measure && !check && !path.empty() && g_processed.count(path)) {
                 if (prio && g_passActive && !g_passDone.count(path)) check = true;   // visible in the browser: render it now instead of later in the pass
@@ -1331,6 +1335,7 @@ bool Ready() { return g_ready; }
 bool Idle() { return g_idle; }
 std::vector<std::string> TakeRefreshed() { std::lock_guard<std::mutex> l(g_mu); std::vector<std::string> r; r.swap(g_refreshed); return r; }
 int Done() { return g_done; }
+bool PassProgress(int* done, int* total) { std::lock_guard<std::mutex> l(g_mu); if (done) *done = (int)g_passDone.size(); if (total) *total = g_passTotal; return g_passActive; }
 int Failed() { return g_failed; }
 int Total() { return g_total; }
 int Generation() { return g_gen; }

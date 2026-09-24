@@ -16,6 +16,7 @@ namespace thumbgen {
     int  Quality();
     bool Background();
     int  Done();                                    // prefabs with a rendered image
+    bool PassProgress(int* done, int* total);       // re-render pass of existing images (after a renderer fix): active, how far
     int  Failed();                                  // prefabs without usable geometry
     int  Total();
     int  Generation();                              // increments whenever a new png is written (texture cache retries on change)
