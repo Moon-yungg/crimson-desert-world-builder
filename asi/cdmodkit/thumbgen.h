@@ -3,6 +3,8 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <memory>
+#include <unordered_map>
 namespace thumbgen {
     void Start();                                   // called once after the prefab index is loaded
     void Request(const std::string& prefabPath);    // render this prefab next (no-op when done or already queued)
@@ -16,6 +18,8 @@ namespace thumbgen {
     int  Quality();
     bool Background();
     int  Done();                                    // prefabs with a rendered image
+    void WantNamesLanguage(const std::string& id);   // UI language id; the worker loads the in-game names for it
+    std::shared_ptr<const std::unordered_map<std::string, std::string>> GameNames();   // prefab path -> in-game name (gimmicks), null until loaded
     bool PassProgress(int* done, int* total);       // re-render pass of existing images (after a renderer fix): active, how far
     int  Failed();                                  // prefabs without usable geometry
     int  Total();

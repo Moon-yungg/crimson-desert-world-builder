@@ -16,6 +16,7 @@ namespace i18n {
     const char* T(const char* english);
     const char* TStable(const char* english);    // "translated###english"
     const char* Preference();
+    std::string ActiveLanguage();   // resolved id ("auto" becomes the system language), e.g. "de"
     const LanguageOption* Languages(int* count);  // names: native spelling first, then the name in the current UI language
     bool SetPreference(const char* id);
     const unsigned short* GlyphRanges();

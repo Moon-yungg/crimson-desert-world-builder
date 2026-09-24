@@ -429,7 +429,7 @@ static void ParseScanFallback(PamCtx& c, const std::vector<RawEntry>& entries, M
 }
 // LZ4 block decoder (written from the public block format description: token = literal length | match length, little-endian
 // 2-byte match offset, 4-byte minimum match). Returns false on malformed input.
-static bool Lz4Block(const uint8_t* src, size_t n, std::vector<uint8_t>& out, size_t expect) {
+static bool Lz4Block(const uint8_t* src, size_t n, std::vector<uint8_t>& out, size_t expect, bool exact = true) {   // exact=false: expect is only a cap
     out.clear(); out.reserve(expect); size_t i = 0;
     while (i < n) {
         const uint8_t tok = src[i++];
@@ -443,12 +443,15 @@ static bool Lz4Block(const uint8_t* src, size_t n, std::vector<uint8_t>& out, si
         size_t ml = tok & 15;
         if (ml == 15) { uint8_t b; do { if (i >= n) return false; b = src[i++]; ml += b; } while (b == 255); }
         ml += 4;
+        // offset 0 is invalid LZ4, but the reference decoder copies the (zeroed) output buffer onto itself: the string tables
+        // (.paloc) start with such a run of zeros. Only the lenient mode accepts it; meshes and textures stay strict.
+        if (off == 0 && !exact) { out.insert(out.end(), ml, 0); if (out.size() > expect + 64) return false; continue; }
         if (off == 0 || off > out.size()) return false;
         const size_t start = out.size() - off;
         for (size_t k = 0; k < ml; k++) out.push_back(out[start + k]);   // byte-wise: overlapping matches are the normal case
         if (out.size() > expect + 64) return false;
     }
-    return out.size() == expect;
+    return !exact || out.size() == expect;
 }
 bool Lz4Decode(const uint8_t* src, size_t n, std::vector<uint8_t>& out, size_t expect) { return Lz4Block(src, n, out, expect); }
 static bool ParsePam(const std::vector<uint8_t>& dataIn, Mesh& out) {
@@ -1044,6 +1047,78 @@ static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const s
     return stbi_write_png(file.c_str(), S, S, 4, out.data(), S * 4) != 0;
 }
 
+// ---------------------------------------------------------------- in-game names (browser)
+// Gimmicks are shown under the name the game gives them, in the UI language, read at runtime through the game's loader
+// (nothing of the game's text ships with the mod): gimmickinfo.staticinfo rows hold the prefab path and the name key as
+// strings (the key is (row key << 32) | field tag, a global u64 in text form), gamedata/stringtable/binary__/<lang>/gimmick.paloc
+// maps keys to text. .paloc: u32 declared size @13, LZ4 from 17, the decoded stream starts with (decoded - declared) zero
+// bytes, then records {u32 category, u32 reserved, u32 key length, key, u32 text length, text}, u32 count at the end.
+static std::shared_ptr<const std::unordered_map<std::string, std::string>> g_names;   // prefab path -> in-game name (atomic_load/store)
+static std::string g_namesWanted, g_namesLoaded;                                        // UI language ids, under g_mu / worker only
+static const char* PalocFolder(const std::string& id) {
+    static const char* map[][2] = { { "en", "eng" }, { "de", "ger" }, { "fr", "fre" }, { "es", "spa-es" }, { "pt-BR", "por-br" }, { "ru", "rus" },
+                                    { "tr", "tur" }, { "ko", "kor" }, { "ja", "jpn" }, { "zh-CN", "zho-cn" }, { "zh-TW", "zho-tw" } };
+    for (auto& m : map) if (id == m[0]) return m[1];
+    return "eng";
+}
+// staticinfo header: count (1, 2 or 4 bytes), then per row key + u32 offset into the body; the widths are resolved against
+// the body, where every row repeats its key first (same search as CDMW's structured_binary_editor)
+static bool RowDirectory(const std::vector<uint8_t>& h, const std::vector<uint8_t>& b, std::vector<std::pair<uint32_t, uint32_t>>& rows) {
+    for (int cw : { 1, 2, 4 }) {
+        if (h.size() < (size_t)cw) continue;
+        uint32_t count = 0; memcpy(&count, h.data(), cw); if (!count) continue;
+        const size_t rem = h.size() - cw; if (rem % count) continue;
+        const size_t rs = rem / count, kw = rs - 4; if (kw != 1 && kw != 2 && kw != 4 && kw != 8 && kw != 12) continue;
+        rows.clear(); bool ok = true; int64_t prev = -1;
+        for (uint32_t i = 0; i < count && ok; i++) {
+            const uint8_t* e = h.data() + cw + i * rs; const uint32_t off = rd32(e + kw);
+            if ((int64_t)off <= prev || off + kw > b.size() || memcmp(b.data() + off, e, kw) != 0) ok = false;
+            uint32_t key = 0; memcpy(&key, e, std::min<size_t>(kw, 4)); rows.push_back({ key, off }); prev = off;
+        }
+        if (ok && !rows.empty() && rows[0].second == 0) return true;
+    }
+    return false;
+}
+static bool LoadGameNames(const std::string& lang) {
+    std::vector<uint8_t> hd, bd, pal;
+    if (!GetFile("gamedata/binarystaticinfo__/bin/gimmickinfo.staticinfoheader", hd) || !GetFile("gamedata/binarystaticinfo__/bin/gimmickinfo.staticinfobody", bd)) return false;
+    std::vector<std::pair<uint32_t, uint32_t>> rows; if (!RowDirectory(hd, bd, rows)) { Log("[names] gimmickinfo: row directory not recognised"); return false; }
+    std::unordered_map<std::string, std::string> keyOf;   // name key -> prefab path
+    for (size_t r = 0; r < rows.size(); r++) {
+        const size_t off = rows[r].second, end = r + 1 < rows.size() ? rows[r + 1].second : bd.size(); std::string path, nameKey;
+        for (size_t i = off; i + 4 <= end;) {   // length-prefixed strings in the row
+            const uint32_t n = rd32(bd.data() + i);
+            if (n >= 1 && n <= 400 && i + 4 + n <= end) {
+                const char* s = (const char*)bd.data() + i + 4; bool text = true; for (uint32_t k = 0; k < n; k++) if ((unsigned char)s[k] < 32) { text = false; break; }
+                if (text) {
+                    std::string v(s, n);
+                    if (path.empty() && v[0] == '/' && EndsWith(v, ".prefab")) path = v;
+                    else if (nameKey.empty() && n >= 10 && v.find_first_not_of("0123456789") == std::string::npos && (strtoull(v.c_str(), nullptr, 10) >> 32) == rows[r].first) nameKey = v;
+                    i += 4 + n; continue;
+                }
+            }
+            i++;
+        }
+        if (nameKey.empty()) nameKey = std::to_string((uint64_t)rows[r].first << 32);
+        if (!path.empty()) keyOf.emplace(nameKey, path);
+    }
+    const std::string palPath = std::string("gamedata/stringtable/binary__/") + PalocFolder(lang) + "/gimmick.paloc";
+    if (!GetFile(palPath, pal) || pal.size() < 17 || memcmp(pal.data(), "paloc", 5) != 0) { Log("[names] %s: not readable", palPath.c_str()); return false; }
+    const uint32_t size = rd32(pal.data() + 13); std::vector<uint8_t> u;
+    if (!Lz4Block(pal.data() + 17, pal.size() - 17, u, (size_t)size + 65536, false) || u.size() < (size_t)size + 4) { Log("[names] %s: unpack failed", palPath.c_str()); return false; }
+    auto names = std::make_shared<std::unordered_map<std::string, std::string>>();
+    for (size_t pos = u.size() - size, end = u.size() - 4; pos + 16 <= end;) {
+        const uint32_t kl = rd32(u.data() + pos + 8); if (pos + 16 + kl > end) break;
+        const uint32_t tl = rd32(u.data() + pos + 12 + kl); if (pos + 16 + kl + tl > end) break;
+        auto it = keyOf.find(std::string((const char*)u.data() + pos + 12, kl));
+        if (it != keyOf.end() && tl) { std::string t((const char*)u.data() + pos + 16 + kl, tl); while (!t.empty() && (unsigned char)t.back() <= ' ') t.pop_back(); if (!t.empty()) (*names)[it->second] = t; }
+        pos += 16 + kl + tl;
+    }
+    Log("[names] %zu gimmick names (%s) from %zu table rows", names->size(), PalocFolder(lang), rows.size());
+    std::atomic_store(&g_names, std::shared_ptr<const std::unordered_map<std::string, std::string>>(names));
+    return true;
+}
+
 // ---------------------------------------------------------------- worker
 static std::mutex g_mu;
 static std::deque<std::string> g_requests;
@@ -1233,6 +1308,10 @@ static DWORD WINAPI Worker(LPVOID) {
     std::deque<std::string> retry;   // background prefabs that hit a read error, tried again once the pass reaches the end
     std::unordered_map<std::string, int> retries; int errStreak = 0, streaksLogged = 0;
     for (;;) {
+        {   // in-game names for the browser: (re)loaded when the UI language differs from the loaded one
+            std::string want; { std::lock_guard<std::mutex> l(g_mu); want = g_namesWanted; }
+            if (!want.empty() && want != g_namesLoaded) { g_namesLoaded = want; const bool e = g_readError; LoadGameNames(want); g_readError = e; }
+        }
         std::string path; bool prio = false; bool measure = false, check = false;
         {
             std::lock_guard<std::mutex> l(g_mu);
@@ -1335,6 +1414,8 @@ bool Ready() { return g_ready; }
 bool Idle() { return g_idle; }
 std::vector<std::string> TakeRefreshed() { std::lock_guard<std::mutex> l(g_mu); std::vector<std::string> r; r.swap(g_refreshed); return r; }
 int Done() { return g_done; }
+void WantNamesLanguage(const std::string& id) { std::lock_guard<std::mutex> l(g_mu); g_namesWanted = id; }
+std::shared_ptr<const std::unordered_map<std::string, std::string>> GameNames() { return std::atomic_load(&g_names); }
 bool PassProgress(int* done, int* total) { std::lock_guard<std::mutex> l(g_mu); if (done) *done = (int)g_passDone.size(); if (total) *total = g_passTotal; return g_passActive; }
 int Failed() { return g_failed; }
 int Total() { return g_total; }

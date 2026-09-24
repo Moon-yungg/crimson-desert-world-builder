@@ -176,6 +176,7 @@ namespace i18n {
         thread_local std::string ring[8]; thread_local unsigned next = 0;
         std::string& s = ring[next++ & 7]; s = t; s += "###"; s += english; return s.c_str();
     }
+    std::string ActiveLanguage() { return ActiveId(); }
     const char* Preference() { return g_preference.c_str(); }
     const LanguageOption* Languages(int* count) {
         // "Deutsch (German)" in an English UI, "日本語 (Japanisch)" in a German one, just "Deutsch" where both agree;

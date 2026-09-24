@@ -184,8 +184,14 @@ namespace editor {
     static float SnapV(float v, float step) { return step > 0 ? roundf(v / step) * step : v; }
     static float WrapYaw(float y) { while (y > 180) y -= 360; while (y < -180) y += 360; return y; }
 
+    // in-game names (gimmicks, in the UI language) replace the file-derived name wherever the user reads it; snapshot per frame
+    static std::shared_ptr<const std::unordered_map<std::string, std::string>> g_gameNames;
+    static const std::string& ShownName(const core::PrefabInfo& pi) {
+        if (g_gameNames) { auto it = g_gameNames->find(pi.path); if (it != g_gameNames->end()) return it->second; }
+        return pi.name;
+    }
     static void RefreshMatches() {
-        std::string key = std::string(g_filter) + "|" + std::to_string(g_selCat) + "|" + (g_favOnly ? "f" : "") + (g_meshOnly ? "m" : "") + "|" + std::to_string(g_selColl) + "|" + (g_groupVariants ? "v" : "") + "|";
+        std::string key = std::string(g_filter) + "|" + std::to_string(g_selCat) + "|" + (g_favOnly ? "f" : "") + (g_meshOnly ? "m" : "") + "|" + std::to_string(g_selColl) + "|" + (g_groupVariants ? "v" : "") + "|" + std::to_string((uintptr_t)g_gameNames.get()) + "|";   // names arrive later: search again
         for (auto& t : g_tagFilter) key += t + ",";
         if (key == g_lastKey && !g_rowsDirty) return;
         const bool sameMatches = key == g_lastKey;
@@ -203,7 +209,8 @@ namespace editor {
             if (g_selColl >= 0 && !collSet.count(pi.path)) continue;
             if (g_selCat > 0 && !InCat(pi.cat, g_selCat)) continue;
             bool ok = true;
-            for (auto& w : words) if (!ContainsCI(pi.path, w) && !ContainsCI(pi.tags, w)) { ok = false; break; }
+            const std::string& gn = ShownName(pi);
+            for (auto& w : words) if (!ContainsCI(pi.path, w) && !ContainsCI(pi.tags, w) && !ContainsCI(gn, w)) { ok = false; break; }
             if (!ok) continue;
             for (auto& t : g_tagFilter) if (!HasTag(pi.tags, t)) { ok = false; break; }
             if (!ok) continue;
@@ -298,8 +305,8 @@ namespace editor {
         const auto& pi = core::PrefabIndex()[g_selPrefab];
         if (IsAppearance(pi)) { Note(T("characters can only be previewed for now, spawning them comes later")); return; }
         Vec3 at = SpawnSpot(pi, g_spawnYaw, g_spawnScale);
-        if (g_previewShown && core::PreviewCommit()) { g_previewShown = false; g_previewSuppressed = true; Note(T("placed %s"), pi.name.c_str()); }
-        else { int uid = core::SpawnAt(pi.path, at, Rot{ g_spawnYaw }, g_spawnScale); std::vector<Act> acts; RecordSpawn(acts, uid, pi.path, at, Rot{ g_spawnYaw }, g_spawnScale, 0); Push(acts); Note(T("spawn %s"), pi.name.c_str()); }
+        if (g_previewShown && core::PreviewCommit()) { g_previewShown = false; g_previewSuppressed = true; Note(T("placed %s"), ShownName(pi).c_str()); }
+        else { int uid = core::SpawnAt(pi.path, at, Rot{ g_spawnYaw }, g_spawnScale); std::vector<Act> acts; RecordSpawn(acts, uid, pi.path, at, Rot{ g_spawnYaw }, g_spawnScale, 0); Push(acts); Note(T("spawn %s"), ShownName(pi).c_str()); }
         g_recent.erase(std::remove(g_recent.begin(), g_recent.end(), g_selPrefab), g_recent.end());
         g_recent.insert(g_recent.begin(), g_selPrefab); if (g_recent.size() > 12) g_recent.pop_back();
     }
@@ -473,12 +480,12 @@ namespace editor {
         if (IsAppearance(pi)) { Note(T("characters can only be previewed for now, spawning them comes later")); return; }
         if (g_place.active) {   // PLACE / double-click while something is already carried
             const Place& P = g_place;
-            if (P.isNew && !P.touched && P.m.size() == 1 && P.m[0].prefab == pi.path) { Note(T("%s is already in your hands: %s drops it, %s cancels"), pi.name.c_str(), core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL])); return; }   // a repeated double-click, not a second copy
+            if (P.isNew && !P.touched && P.m.size() == 1 && P.m[0].prefab == pi.path) { Note(T("%s is already in your hands: %s drops it, %s cancels"), ShownName(pi).c_str(), core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL])); return; }   // a repeated double-click, not a second copy
         }
         if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
         Vec3 at = SpawnSpot(pi, g_spawnYaw, g_spawnScale);
         int uid = core::SpawnAt(pi.path, at, Rot{ g_spawnYaw }, g_spawnScale);
-        if (uid) StartGrab({ uid }, true, pi.name);
+        if (uid) StartGrab({ uid }, true, ShownName(pi));
     }
     static void FinishPlace() {
         g_place.active = false; core::g_placing = false; input::ClearKeys();
@@ -889,9 +896,9 @@ namespace editor {
                 const bool fav = core::IsFavorite(i);
                 if (fav || hov) { dl->AddRectFilled(star0, star1, IM_COL32(0, 0, 0, 110), 3.0f); dl->AddText({ star0.x + 4 * ui, star0.y + 2 * ui }, fav ? IM_COL32(255, 199, 64, 255) : IM_COL32(200, 200, 200, 160), ICON_STAR); }
                 dl->PushClipRect({ p0.x + pad, t1.y }, { p1.x - pad, p1.y }, true);
-                dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), { p0.x + pad, t1.y + 2 }, ImGui::GetColorU32(ImGuiCol_Text), pi.name.c_str(), nullptr, tile);
+                dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), { p0.x + pad, t1.y + 2 }, ImGui::GetColorU32(ImGuiCol_Text), ShownName(pi).c_str(), nullptr, tile);
                 dl->PopClipRect();
-                if (hov && !ImGui::IsPopupOpen("cardctx")) ImGui::SetTooltip("%s\n%s\n%s%s", pi.name.c_str(), core::Categories()[pi.cat].name.c_str(), pi.tags.c_str(), onStar ? (std::string("\n") + T("(click: favorite)")).c_str() : "");
+                if (hov && !ImGui::IsPopupOpen("cardctx")) ImGui::SetTooltip("%s\n%s\n%s\n%s%s", ShownName(pi).c_str(), pi.path.c_str(), core::Categories()[pi.cat].name.c_str(), pi.tags.c_str(), onStar ? (std::string("\n") + T("(click: favorite)")).c_str() : "");
                 ImGui::PopID();
             }
         }
@@ -986,7 +993,7 @@ namespace editor {
                 ImGui::PopStyleColor();
                 ImGui::TableSetColumnIndex(1);
                 if (row.head == 2) ImGui::Indent(18.0f);
-                if (ImGui::Selectable(pi.name.c_str(), g_selPrefab == i, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                if (ImGui::Selectable(ShownName(pi).c_str(), g_selPrefab == i, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
                     g_selPrefab = i;
                     if (ImGui::IsMouseDoubleClicked(0) && havePos) StartPlaceNew(p, havePos);
                 }
@@ -1012,7 +1019,7 @@ namespace editor {
                 }
             }
             ImGui::BeginGroup();
-            ImGui::Text("%s", pi.name.c_str()); ImGui::SameLine();
+            ImGui::Text("%s", ShownName(pi).c_str()); ImGui::SameLine();
             if (ImGui::SmallButton(T(core::IsFavorite(g_selPrefab) ? ICON_STAR " unfavorite" : ICON_STAR " favorite"))) core::ToggleFavorite(g_selPrefab);
             ImGui::SameLine(); ImGui::SetNextItemWidth(160);
             if (ImGui::BeginCombo("##addcoll", T("add to collection"), ImGuiComboFlags_NoArrowButton)) {
@@ -1577,7 +1584,7 @@ namespace editor {
         }
         if (g_selPrefab >= 0 && g_selPrefab < (int)core::PrefabIndex().size()) {
             const auto& pi = core::PrefabIndex()[g_selPrefab];
-            ImGui::TextDisabled("%s", pi.name.c_str());
+            ImGui::TextDisabled("%s", ShownName(pi).c_str());
             ImGui::BeginDisabled(!havePos || !core::GameThreadReady());
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
             if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS "   PLACE   "), ImVec2(-1, 0))) StartPlaceNew(p, havePos);
@@ -1606,6 +1613,11 @@ namespace editor {
         (void)io;
     }
     void Draw() {
+        {   // in-game names follow the UI language
+            static std::string lastLang; std::string lang = i18n::ActiveLanguage();
+            if (lang != lastLang) { lastLang = lang; thumbgen::WantNamesLanguage(lang); }
+            g_gameNames = thumbgen::GameNames();
+        }
         SampleCamera();
         PosInfo p{}; bool havePos = core::PlayerPosInfo(&p);
         DrawFocusHud();
