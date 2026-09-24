@@ -1766,6 +1766,62 @@ static void InstallVtableTracer(int cls, const char* mangled, const char* shortN
     Log("[vt] %s: vtable at rva 0x%llx, %d of %d slots traced (%d shared stubs skipped)", shortName, (unsigned long long)(vt - g_base), ok, slots, skipped);
 }
 
+// ---- native render camera: the renderer's own camera object instead of guessing among constant-buffer copies ----
+// Path found by CrimsonDesertTelemetry (github.com/fabianviol/CrimsonDesertTelemetry, MIT): a global holds the renderer camera
+// (read by "mov rax,[rip+X]; vmovsd xmm6,[rax+0xC8]; mov ebx,[rax+0xD0]"), camera+0x428 points to the scene constants of the
+// frame being rendered: +0x20 frame number, +0x30/+0x34 screen size (+0x38/+0x3C reciprocals), +0x80 eye, view matrix at +0x3E0
+// (columns = right / up / forward, row 3 = -R*eye), projection at +0x4E0 (m00 +0x4E0, m11 +0x4F4, +0x50C = 1), +0xAC0 = 6360000
+// (earth radius, a layout signature). The camera class has no RTTI, so it is recognised by two vtable slot fingerprints
+// (slot 2 unchanged since 1.0.0.2658, slot 1 with two register-allocation bytes wildcarded).
+static uintptr_t g_natCamGlobal = 0, g_natCamVt = 0;
+static uintptr_t FindVtableBySlots(uintptr_t f1, uintptr_t f2) {   // read-only image data holding {slot1, slot2} = {f1, f2}; must be unique
+    auto dos = (PIMAGE_DOS_HEADER)g_base; auto nt = (PIMAGE_NT_HEADERS)(g_base + dos->e_lfanew); auto sec = IMAGE_FIRST_SECTION(nt);
+    uintptr_t found = 0; int n = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        const DWORD ch = sec[i].Characteristics;
+        if ((ch & IMAGE_SCN_MEM_EXECUTE) || (ch & IMAGE_SCN_MEM_WRITE) || !(ch & IMAGE_SCN_MEM_READ)) continue;
+        const uint8_t* p = (const uint8_t*)(g_base + sec[i].VirtualAddress); const size_t sz = sec[i].Misc.VirtualSize;
+        for (size_t k = 8; k + 16 <= sz; k += 8) {
+            uintptr_t a, b; memcpy(&a, p + k, 8); if (a != f1) continue; memcpy(&b, p + k + 8, 8); if (b != f2) continue;
+            found = (uintptr_t)(p + k - 8); n++;
+        }
+    }
+    return n == 1 ? found : 0;
+}
+static void ResolveNativeCamera() {
+    int n = 0; const uintptr_t ref = FindPatternCount("48 8B 05 ?? ?? ?? ?? C5 FB 10 B0 C8 00 00 00 8B 98 D0 00 00 00", &n);
+    if (!ref || n != 1) { Log("[rendercam] native camera: global load %d matches, using the copy scan", n); return; }
+    int32_t disp = 0; memcpy(&disp, (const void*)(ref + 3), 4); const uintptr_t global = ref + 7 + disp;
+    int n1 = 0, n2 = 0;
+    const uintptr_t f1 = FindPatternCount("48 8B C4 48 89 58 10 48 89 70 18 41 54 41 56 41 57 48 81 EC 10 01 00 00 8B B1 A8 02 00 00 4D 8B ?? 4D 8B ?? 4C 8B F2 48 8B D9 85 F6", &n1);
+    const uintptr_t f2 = FindPatternCount("40 53 48 83 EC 20 48 8B 01 48 8B DA FF 50 68 4C 8B C8 48 63 48 08 85 C9 75 08 32 C0 48 83 C4 20 5B C3 48 89 7C 24 30 41 B0 01 33 FF 4C 8B D1 C5 F8 57 C0 48 83 F9 04", &n2);
+    if (!f1 || !f2 || n1 != 1 || n2 != 1) { Log("[rendercam] native camera: slot fingerprints %d / %d matches, using the copy scan", n1, n2); return; }
+    const uintptr_t vt = FindVtableBySlots(f1, f2);
+    if (!vt) { Log("[rendercam] native camera: no unique vtable with both slots, using the copy scan"); return; }
+    g_natCamGlobal = global; g_natCamVt = vt;
+    Log("resolved %-20s rva 0x%llx (global rva 0x%llx, vtable rva 0x%llx)", "native render camera", (unsigned long long)(ref - g_base), (unsigned long long)(global - g_base), (unsigned long long)(vt - g_base));
+}
+bool NativeRenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11) {
+    if (!g_natCamGlobal) return false;
+    uintptr_t cam = 0, vt = 0, src = 0;
+    if (!ReadPtr(g_natCamGlobal, &cam) || !cam || !ReadPtr(cam, &vt) || vt != g_natCamVt || !ReadPtr(cam + 0x428, &src) || !src) return false;
+    // two reads of the same frame number around the fields: the renderer may be writing the next frame into this block
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint32_t f0 = 0, f1 = 0; float sig = 0, v[16], p[16], eye[3];
+        if (!ReadBytes(src + 0x20, &f0, 4) || !ReadBytes(src + 0xAC0, &sig, 4) || sig != 6360000.0f) return false;
+        if (!ReadBytes(src + 0x80, eye, 12) || !ReadBytes(src + 0x3E0, v, sizeof v) || !ReadBytes(src + 0x4E0, p, sizeof p) || !ReadBytes(src + 0x20, &f1, 4)) return false;
+        if (f0 != f1) continue;
+        const Vec3 r = { v[0], v[4], v[8] }, u = { v[1], v[5], v[9] }, f = { v[2], v[6], v[10] };
+        auto dot = [](const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
+        if (fabsf(dot(r, r) - 1) > 0.01f || fabsf(dot(u, u) - 1) > 0.01f || fabsf(dot(f, f) - 1) > 0.01f || fabsf(dot(r, u)) > 0.01f || fabsf(dot(r, f)) > 0.01f || fabsf(dot(u, f)) > 0.01f) return false;
+        if (!(p[0] > 0.1f && p[0] < 20.0f && p[5] > 0.3f && p[5] < 20.0f && fabsf(p[11] - 1.0f) < 1e-4f && std::isfinite(eye[0]) && fabsf(eye[0]) < 1e6f)) return false;
+        if (pos) *pos = { eye[0], eye[1], eye[2] }; if (right) *right = r; if (up) *up = u; if (fwd) *fwd = f;
+        if (m00) *m00 = p[0]; if (m11) *m11 = p[5];
+        return true;
+    }
+    return false;
+}
+
 // ---- NPC and creature spawn: the game's own "spawn character" cheat request, executed on the server thread ----
 // TrocTrSpawnCharacterCheatReq::execute(handler, int* result, packet) (vtable slot 2): packet {+0 sender = the player's server
 // actor (ServerChildOnlyInGameActor), +0x10 u16 total length, +0x18 u8* buffer}; buffer = 5 header bytes (u16 payload length
@@ -2349,6 +2405,7 @@ static DWORD WINAPI InitThread(LPVOID) {
             InstallVtableTracer(2, ".?AVServerField@pa@@", "ServerField", g_traceHooks ? 39 : 10);
             if (g_traceHooks) { InstallVtableTracer(0, ".?AVServerSyncSceneObjectManager@pa@@", "ServerSyncSceneObjectManager", 19); InstallVtableTracer(1, ".?AVSceneObjectServer@pa@@", "SceneObjectServer", 156); InstallVtableTracer(3, ".?AVServerNormalInGameActor@pa@@", "ServerNormalInGameActor", 145); InstallVtableTracer(4, ".?AVTrocTrSpawnCharacterCheatReq@pa@@", "TrocTrSpawnCharacterCheatReq", 3); }
         }   // ServerField: which slots run per tick (a place to run our own spawns) and which run on a pickup (removal)   // research: how the server makes and fills its scene objects
+        ResolveNativeCamera();   // gizmo projection: the renderer's own camera, else the copy scan in diag.cpp
         InstallNpcSpawn();   // NPC spawn research: the game's spawn-character cheat request
         if (g_traceHooks && kRva_UuidLookup) { void* t10 = (void*)(g_base + kRva_UuidLookup); HookFn(t10, (void*)HookUuidLookup, (void**)&g_origUuidLookup, "uuid lookup (trace)"); }
         if (kRva_SoServerCreate) { void* t9 = (void*)(g_base + kRva_SoServerCreate); HookFn(t9, (void*)HookSoServerCreate, (void**)&g_origSoServerCreate, "SceneObjectServer new (trace)"); }

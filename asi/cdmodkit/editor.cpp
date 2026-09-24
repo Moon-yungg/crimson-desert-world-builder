@@ -918,6 +918,53 @@ namespace editor {
         if (t.size() >= 3 && t.size() <= 4 && t[0] == 'N' && (t.back() == 'M' || t.back() == 'W')) return 1;
         return 5;
     }
+    static bool g_npcCards = false;
+    static void SpawnNpcInFront(const thumbgen::CharInfo& c) {
+        Vec3 at = { g_lastPlayer.x + g_fx * g_npcDist, g_lastPlayer.y, g_lastPlayer.z + g_fz * g_npcDist };
+        core::SpawnNpc(c.key, at); Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str());
+    }
+    // tiles like the prefab browser's cards: the appearance preview, the in-game name below, a double-click spawns
+    static void DrawNpcCards(const std::vector<thumbgen::CharInfo>& chars, float listH, float ui, bool canSpawn) {
+        const float pad = 4.0f * ui, tile = g_cardSize * ui, textH = ImGui::GetTextLineHeight() * 2 + 3;
+        const float cw = tile + 2 * pad, ch = tile + 2 * pad + textH;
+        ImGui::BeginChild("npccards", ImVec2(0, listH), ImGuiChildFlags_Borders);
+        const float sp = ImGui::GetStyle().ItemSpacing.x, spy = ImGui::GetStyle().ItemSpacing.y;
+        const int cols = std::max(1, (int)((ImGui::GetContentRegionAvail().x + sp) / (cw + sp)));
+        const int n = (int)g_npcRows.size(), rows = (n + cols - 1) / cols;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImGuiListClipper clip; clip.Begin(rows, ch + spy);
+        while (clip.Step()) for (int r = clip.DisplayStart; r < clip.DisplayEnd; r++) {
+            for (int col = 0; col < cols; col++) {
+                const int k = r * cols + col; if (k >= n) break;
+                const int i = g_npcRows[k]; const auto& c = chars[i];
+                if (col) ImGui::SameLine();
+                ImGui::PushID(i);
+                const ImVec2 p0 = ImGui::GetCursorScreenPos(), p1 = { p0.x + cw, p0.y + ch };
+                const ImVec2 t0 = { p0.x + pad, p0.y + pad }, t1 = { t0.x + tile, t0.y + tile };
+                ImGui::InvisibleButton("npccard", ImVec2(cw, ch));
+                const bool hov = ImGui::IsItemHovered(), sel = g_npcSel == i;
+                if (ImGui::IsItemClicked(0)) g_npcSel = i;
+                if (hov && ImGui::IsMouseDoubleClicked(0) && canSpawn) { g_npcSel = i; SpawnNpcInFront(c); }
+                dl->AddRectFilled(p0, p1, sel ? ImGui::GetColorU32(ImGuiCol_Header) : hov ? ImGui::GetColorU32(ImGuiCol_FrameBgHovered) : ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
+                if (sel) dl->AddRect(p0, p1, ImGui::GetColorU32(ImGuiCol_HeaderActive), 4.0f, 0, 2.0f);
+                ImTextureID tex = c.app.empty() ? ImTextureID{} : overlay::Thumb(core::ThumbFile(c.app));
+                if (tex) dl->AddImage(tex, t0, t1);
+                else {
+                    dl->AddRectFilled(t0, t1, IM_COL32(0, 0, 0, 70), 3.0f);
+                    const char* st = "no preview";
+                    if (!c.app.empty() && thumbgen::Ready() && !thumbgen::Processed(c.app)) { thumbgen::Request(c.app); st = thumbgen::Pending(c.app) ? "rendering..." : "queued"; }
+                    const char* shown = T(st); const ImVec2 ts = ImGui::CalcTextSize(shown);
+                    dl->AddText({ t0.x + (tile - ts.x) * 0.5f, t0.y + (tile - ts.y) * 0.5f }, ImGui::GetColorU32(ImGuiCol_TextDisabled), shown);
+                }
+                dl->PushClipRect({ p0.x + pad, t1.y }, { p1.x - pad, p1.y }, true);
+                dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), { p0.x + pad, t1.y + 2 }, ImGui::GetColorU32(ImGuiCol_Text), c.name.empty() ? c.internal.c_str() : c.name.c_str(), nullptr, tile);
+                dl->PopClipRect();
+                if (hov) ImGui::SetTooltip("%s\n%s   key %u", c.name.empty() ? "-" : c.name.c_str(), c.internal.c_str(), c.key);
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndChild();
+    }
     static void DrawNpcs(const PosInfo& p, bool havePos) {
         const auto chars = thumbgen::Characters();
         const float ui = ImGui::GetFontSize() / 17.0f;
@@ -926,6 +973,13 @@ namespace editor {
         else if (st == 1) { ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), T("walk a few steps first: the game's spawn request needs your character's server actor")); }
         else ImGui::TextDisabled(T("Spawned characters are part of the game world: they fight, walk and despawn by the game's rules, and are not in the scene list or in projects."));
         if (!chars) { ImGui::TextDisabled(T("reading the character list from the game files...")); return; }
+        {   // view switch: list or tiles (tile size shared with the browser)
+            const ImVec4 on = ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive), off = ImGui::GetStyleColorVec4(ImGuiCol_Button);
+            ImGui::PushStyleColor(ImGuiCol_Button, g_npcCards ? off : on); if (ImGui::Button(T(ICON_LIST " list"))) g_npcCards = false; ImGui::PopStyleColor();
+            ImGui::SameLine(0, 2); ImGui::PushStyleColor(ImGuiCol_Button, g_npcCards ? on : off); if (ImGui::Button(T(ICON_COPY " cards"))) g_npcCards = true; ImGui::PopStyleColor();
+            if (g_npcCards) { ImGui::SameLine(); ImGui::SetNextItemWidth(100 * ui); ImGui::SliderFloat("##npccardsize", &g_cardSize, 64.0f, 200.0f, "%.0f px"); if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("tile size")); }
+            ImGui::SameLine();
+        }
         ImGui::SetNextItemWidth(std::max(120.0f * ui, ImGui::GetContentRegionAvail().x - 260.0f * ui));
         ImGui::InputTextWithHint("##npcfilter", T("search  (name, internal name or key)"), g_npcFilter, sizeof g_npcFilter);
         ImGui::SameLine(); ImGui::SetNextItemWidth(180 * ui); ComboT("##npccat", &g_npcCat, kNpcCats, 6);
@@ -943,9 +997,10 @@ namespace editor {
             std::stable_sort(g_npcRows.begin(), g_npcRows.end(), [&](int a, int b) { const auto& x = (*chars)[a]; const auto& y = (*chars)[b]; if (x.name.empty() != y.name.empty()) return !x.name.empty(); return (x.name.empty() ? x.internal : x.name) < (y.name.empty() ? y.internal : y.name); });
         }
         ImGui::TextDisabled(T("%d characters"), (int)g_npcRows.size());
-        const float detailsH = 96.0f * ui;
+        const float detailsH = 118.0f * ui;
         float listH = ImGui::GetContentRegionAvail().y - detailsH - ImGui::GetStyle().ItemSpacing.y; if (listH < 80 * ui) listH = 80 * ui;
-        if (ImGui::BeginTable("npcs", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable, ImVec2(0, listH))) {
+        if (g_npcCards) DrawNpcCards(*chars, listH, ui, havePos && st == 2);
+        else if (ImGui::BeginTable("npcs", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable, ImVec2(0, listH))) {
             ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch, 3);
             ImGui::TableSetupColumn(T("internal name"), ImGuiTableColumnFlags_WidthStretch, 4);
             ImGui::TableSetupColumn(T("key"), ImGuiTableColumnFlags_WidthFixed, 70 * ui);
@@ -956,7 +1011,7 @@ namespace editor {
                 ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::PushID(i);
                 if (ImGui::Selectable(c.name.empty() ? "-" : c.name.c_str(), g_npcSel == i, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
                     g_npcSel = i;
-                    if (ImGui::IsMouseDoubleClicked(0) && havePos && st == 2) { Vec3 at = { g_lastPlayer.x + g_fx * g_npcDist, g_lastPlayer.y, g_lastPlayer.z + g_fz * g_npcDist }; core::SpawnNpc(c.key, at); Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str()); }
+                    if (ImGui::IsMouseDoubleClicked(0) && havePos && st == 2) SpawnNpcInFront(c);
                 }
                 ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", c.internal.c_str());
                 ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%u", c.key);
@@ -967,6 +1022,19 @@ namespace editor {
         ImGui::BeginChild("npcdetails", ImVec2(0, detailsH), ImGuiChildFlags_Borders);
         if (g_npcSel >= 0 && g_npcSel < (int)chars->size()) {
             const auto& c = (*chars)[g_npcSel];
+            {   // the preview of its appearance (same renderer and cache as the character browser)
+                const float th = 96.0f * ui;
+                if (c.app.empty()) { ImGui::BeginChild("npcph", ImVec2(th, th), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar); ImGui::TextDisabled(T("no preview")); ImGui::EndChild(); }
+                else if (ImTextureID tex = overlay::Thumb(core::ThumbFile(c.app))) ImGui::Image(tex, ImVec2(th, th));
+                else {
+                    if (thumbgen::Ready()) thumbgen::Request(c.app);
+                    ImGui::BeginChild("npcph", ImVec2(th, th), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+                    ImGui::TextDisabled(T(!thumbgen::Ready() ? "no preview" : thumbgen::Pending(c.app) ? "rendering..." : thumbgen::Processed(c.app) ? "no preview" : "queued"));
+                    ImGui::EndChild();
+                }
+                ImGui::SameLine();
+            }
+            ImGui::BeginGroup();
             ImGui::Text("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str()); ImGui::SameLine(); ImGui::TextDisabled("  %s   key %u", c.internal.c_str(), c.key);
             ImGui::SetNextItemWidth(140 * ui); ImGui::SliderFloat(T("distance"), &g_npcDist, 1.0f, 30.0f, "%.0f m"); ImGui::SameLine();
             ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, 20);
@@ -982,7 +1050,9 @@ namespace editor {
             }
             ImGui::PopStyleColor(2); ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(T("spawns the character <distance> in front of you; it appears after a few seconds. Hostile ones attack, wild animals may flee."));
-        } else ImGui::TextDisabled(T("select a character, then SPAWN. Double-click on a row spawns it right away."));
+            if (!c.app.empty()) ImGui::TextDisabled("%s", c.app.c_str());
+            ImGui::EndGroup();
+        } else ImGui::TextDisabled(T("select a character, then SPAWN. Double-click on a row or card spawns it right away."));
         ImGui::EndChild();
     }
 
@@ -1793,11 +1863,18 @@ namespace editor {
                 ImGui::Checkbox(T("show calibration marker"), &g_calib); ImGui::SameLine(); ImGui::Checkbox(T("axis gizmo while placing"), &g_gizmo);
                 { float live = 0; bool haveLive = core::CameraFov(&live);
                   if (ImGui::Checkbox(T("read the field of view from the game"), &core::g_fovAuto)) core::SaveSettings();
-                  ImGui::SameLine(); if (haveLive) ImGui::TextDisabled(T("(game says %.1f deg)"), live); else ImGui::TextDisabled(T("(not available, using the manual value)")); }
+                  // the renderer's projection is the first source (LiveCam); the camera object's own field is only the fallback
+                  float rm00 = 0, rm11 = 0; Vec3 rp; const bool rc = core::RenderCamera(&rp, nullptr, nullptr, nullptr, &rm00, &rm11, core::g_camLag);
+                  ImGui::SameLine();
+                  if (rc) ImGui::TextDisabled(T("(game says %.1f deg)"), 2.0f * atanf(1.0f / rm11) * 57.2958f);
+                  else if (haveLive) ImGui::TextDisabled(T("(game says %.1f deg)"), live);
+                  else ImGui::TextDisabled(T("(not available, using the manual value)")); }
                 ImGui::SetNextItemWidth(220); ImGui::SliderFloat(T("manual field of view"), &core::g_fovDeg, 20.0f, 120.0f, "%.1f deg"); if (ImGui::IsItemDeactivatedAfterEdit()) core::SaveSettings();
                 ImGui::SameLine(); if (ImGui::Checkbox(T("mirror horizontally"), &core::g_camMirror)) core::SaveSettings();
                 { const int nb = core::RenderCameraBlocks(); float m00 = 0, m11 = 0; Vec3 d0;
-                  if (nb && core::RenderCamera(&d0, nullptr, nullptr, nullptr, &m00, &m11, core::g_camLag)) ImGui::TextDisabled(T("render camera: %d copies tracked, live field of view %.1f deg, aspect %.3f"), nb, 2.0f * atanf(1.0f / m11) * 57.2958f, m11 / m00);
+                  const bool haveRc = core::RenderCamera(&d0, nullptr, nullptr, nullptr, &m00, &m11, core::g_camLag);
+                  if (haveRc && core::RenderCameraNative()) ImGui::TextDisabled(T("render camera: the renderer's own camera, live field of view %.1f deg, aspect %.3f (the copy setting below is not needed)"), 2.0f * atanf(1.0f / m11) * 57.2958f, m11 / m00);
+                  else if (haveRc && nb) ImGui::TextDisabled(T("render camera: %d copies tracked, live field of view %.1f deg, aspect %.3f"), nb, 2.0f * atanf(1.0f / m11) * 57.2958f, m11 / m00);
                   else { ImGui::TextDisabled(T("render camera: not found yet (camera object + field of view setting in use)")); ImGui::SameLine(); if (ImGui::SmallButton(T("search now"))) core::FindRenderCamera(); } }
                 ImGui::SetNextItemWidth(220); if (ImGui::SliderInt(T("camera copy in flight (0 = newest)"), &core::g_camLag, 0, 4)) core::SaveSettings();
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("several frames are in flight between the game and the screen. Pan the camera with an object selected: if the outline runs ahead of the object, raise this; if it lags behind, lower it"));

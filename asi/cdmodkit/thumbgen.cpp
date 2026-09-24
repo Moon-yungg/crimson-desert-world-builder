@@ -1163,6 +1163,41 @@ static bool ReadPaloc(const std::string& file, const std::function<void(const st
     }
     return true;
 }
+// the game's path checksum (Jenkins lookup3 hashlittle, other seed; same as pycrimson's calculate_checksum)
+static uint32_t PathChecksum(const std::string& s) {
+    auto rot = [](uint32_t x, int k) { return (x << k) | (x >> (32 - k)); };
+    const uint8_t* d = (const uint8_t*)s.data(); size_t n = s.size();
+    uint32_t a, b, c; a = b = c = (uint32_t)n + 0xDEBA1DCDu;
+    if (n == 0) return c;
+    while (n > 12) {
+        a += rd32(d); b += rd32(d + 4); c += rd32(d + 8);
+        a -= c; a ^= rot(c, 4); c += b; b -= a; b ^= rot(a, 6); a += c; c -= b; c ^= rot(b, 8); b += a;
+        a -= c; a ^= rot(c, 16); c += b; b -= a; b ^= rot(a, 19); a += c; c -= b; c ^= rot(b, 4); b += a;
+        d += 12; n -= 12;
+    }
+    uint8_t t[12] = {}; memcpy(t, d, n); a += rd32(t); b += rd32(t + 4); c += rd32(t + 8);
+    c ^= b; c -= rot(b, 14); a ^= c; a -= rot(c, 11); b ^= a; b -= rot(a, 25); c ^= b; c -= rot(b, 16);
+    a ^= c; a -= rot(c, 4); b ^= a; b -= rot(a, 14); c ^= b; c -= rot(b, 24);
+    return c;
+}
+// characterappearanceindexinfo: 29-byte rows {u32 characterKey, u32 variant (0xFFFFFFFE = default), u32, u8, u32, u32 checksum of
+// the .app_xml path without the leading slash, float scale, u32 characterKey}; the default row wins, else the first one
+static void AttachAppearances(std::vector<thumbgen::CharInfo>& list) {
+    std::vector<uint8_t> hd, bd;
+    if (!GetFile("gamedata/binarystaticinfo__/bin/characterappearanceindexinfo.staticinfoheader", hd) || !GetFile("gamedata/binarystaticinfo__/bin/characterappearanceindexinfo.staticinfobody", bd)) return;
+    std::vector<std::pair<uint32_t, uint32_t>> rows; if (!RowDirectory(hd, bd, rows)) { Log("[names] characterappearanceindexinfo: row directory not recognised"); return; }
+    std::unordered_map<uint32_t, const std::string*> byHash;
+    for (const auto& pi : core::PrefabIndex()) if (EndsWith(pi.path, ".app_xml") && pi.path.size() > 1) byHash.emplace(PathChecksum(pi.path.substr(1)), &pi.path);
+    std::unordered_map<uint32_t, std::pair<const std::string*, bool>> app;   // character key -> path, from the default row
+    for (const auto& r : rows) {
+        if (r.second + 29 > bd.size()) continue;
+        const uint32_t key = rd32(bd.data() + r.second), variant = rd32(bd.data() + r.second + 4), h = rd32(bd.data() + r.second + 17);
+        auto it = byHash.find(h); if (it == byHash.end()) continue;
+        auto& slot = app[key]; if (!slot.first || (variant == 0xFFFFFFFEu && !slot.second)) slot = { it->second, variant == 0xFFFFFFFEu };
+    }
+    size_t n = 0; for (auto& c : list) { auto it = app.find(c.key); if (it != app.end()) { c.app = *it->second.first; n++; } }
+    Log("[names] %zu of %zu characters have an appearance with a preview", n, list.size());
+}
 static bool LoadCharacters(const std::string& lang) {
     std::vector<uint8_t> hd, bd;
     if (!GetFile("gamedata/binarystaticinfo__/bin/characterinfo.staticinfoheader", hd) || !GetFile("gamedata/binarystaticinfo__/bin/characterinfo.staticinfobody", bd)) return false;
@@ -1190,6 +1225,7 @@ static bool LoadCharacters(const std::string& lang) {
     }
     ReadPaloc(std::string("gamedata/stringtable/binary__/") + PalocFolder(lang) + "/character.paloc",
               [&](const std::string& k, std::string t) { auto it = byKey.find(k); if (it != byKey.end()) (*list)[it->second].name = std::move(t); });
+    AttachAppearances(*list);
     size_t named = 0; std::string all;
     for (auto& c : *list) if (!c.name.empty()) { named++; all += c.name; all += ' '; }
     i18n::AddGlyphText(all);

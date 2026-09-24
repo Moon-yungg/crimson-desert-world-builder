@@ -41,6 +41,7 @@ namespace core {
     void ViewScan();                          // logs every copy of the camera basis in memory (view matrices) and nearby projection blocks
     // the view + projection the renderer really uses (found by a memory scan, read every frame); rank 0 = newest copy in flight
     bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11, int rank);
+    bool RenderCameraNative();                // the last RenderCamera() answer came from the renderer's camera object (no copy guessing, rank ignored)
     void FindRenderCamera();                  // (re)starts the background scan; RenderCamera() does this itself when it has nothing
     int  RenderCameraBlocks();                // how many copies are currently tracked (0 = falling back to the camera object + fov setting)
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)

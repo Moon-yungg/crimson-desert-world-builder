@@ -9,3 +9,8 @@ Added
   flee and despawn like any other. Hostile ones attack. They are therefore not scene objects (no moving, undo or saving in
   projects). After loading a save, walk a few steps before the first spawn.
 - HTTP API: POST /api/npc {"key", "x", "y", "z", "type"} spawns a character (see HTTP_API.md).
+
+Changed
+- Gizmo, selection outlines and the line/circle preview use the renderer's own camera (path from
+  CrimsonDesertTelemetry, thanks): no search for camera copies, no "camera copy in flight" setting to tune, and it
+  works right after loading a save. The old search stays as a fallback if a game update moves the camera.

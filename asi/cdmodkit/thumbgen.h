@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <cstdint>
 namespace thumbgen {
-    struct CharInfo { uint32_t key = 0; std::string internal, name; };   // characterinfo row: spawn key, internal name, in-game name (may be empty)
+    struct CharInfo { uint32_t key = 0; std::string internal, name, app; };   // characterinfo row: spawn key, internal name, in-game name, .app_xml of its look (either may be empty)
     void Start();                                   // called once after the prefab index is loaded
     void Request(const std::string& prefabPath);    // render this prefab next (no-op when done or already queued)
     void Refresh(const std::string& prefabPath);    // render again even if it was done before

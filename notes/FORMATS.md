@@ -193,3 +193,10 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Spawn type = reason byte of the `ICreateServerActorDesc` the worker (0x2c3ed50) builds (ctor 0x278ea70, type at desc+0xa; type 0x28 is mapped to 0x21). 0 faults deep in the actor creation (null at 0x3d6250 via 0x1851010 / 0x2b04ae0); 1, 12, 13, 39, 40 spawn. Game values seen at desc ctor call sites: 1, 0xa, 0xc (NPCSchedule), 0xd, 0x10, 0x16, 0x1e, 0x25, 0x27 (DailyRoutine).
 - The actor appears 5-7 s after the call (async), at the given position.
 - Sender: taken from MoveActorReq / EchoMoveSessionIDReq (slot 2 hooks, packet+0) when it changes; checked before use by its vtable (a loaded save replaces it). HeartbeatReq is useless: it runs as a server timer, its third argument is no packet and its "sender" a static object (faults at vtable+0x160).
+
+## Native render camera (v0.94, build 1.0.0.2976)
+- Source: CrimsonDesertTelemetry (github.com/fabianviol/CrimsonDesertTelemetry, MIT), docs/ENGINE_CAMERA_RESEARCH.md + SceneConstantsDecoder.cs.
+- Global: unique `48 8B 05 ?? ?? ?? ?? C5 FB 10 B0 C8 00 00 00 8B 98 D0 00 00 00` (rva 0x2D14367 -> global rva 0x6C8CF30) holds the renderer camera.
+- The camera class has NO MSVC RTTI (qword before its vtable rva 0x5D20718 is a function pointer). Recognised by slot 1 + slot 2 fingerprints (see ResolveNativeCamera); slot 2 unchanged since 1.0.0.2658.
+- camera+0x2C8 frame counter, camera+0x428 -> scene constants (0xB00 bytes): +0x20 frame number, +0x30/+0x34 screen w/h (+0x38/+0x3C reciprocals), +0x80 eye, +0x90 forward, +0x3E0 view matrix (columns right/up/forward, row 3 = -R*eye), +0x420 view-relative (same rotation, no translation), +0x4E0 projection (m00 +0x4E0, m11 +0x4F4, +0x50C = 1), +0x860 near, +0xAC0 = 6360000 (earth radius; layout signature).
+- This is the block the old heap scan (diag.cpp RenderCamScanThread) found as one of several copies; through camera+0x428 it is the frame being rendered, so no ranking / camlag is needed. The scan stays as fallback.
