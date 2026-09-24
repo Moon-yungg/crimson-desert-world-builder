@@ -121,6 +121,7 @@ namespace editor {
     static bool  g_playMode = false;      // menu visible but every input goes to the game (Home toggles)
     static bool  g_cameraMode = false;    // free camera keeps the upstream editor/input UI; no full-screen input window
     static DWORD g_cameraStartAt = 0; static bool g_cameraEverActive = false;
+    static bool  g_cameraShortcutDown[256] = {};
     static float g_fx = 1, g_fz = 0; static Vec3 g_lastPlayer{}; static bool g_havePlayer = false;   // "in front": camera view (default) or last movement direction
     static bool  g_useCamera = true; static float g_camSign = 0;   // camSign: +1/-1 once the camera axis was compared with a walking direction
     static float g_mx = 1, g_mz = 0;                                // last movement direction
@@ -148,7 +149,7 @@ namespace editor {
     static Place g_place;
     static void StopCameraMode() {
         if (!g_cameraMode) return;
-        g_cameraMode = false; g_cameraStartAt = 0; g_cameraEverActive = false;
+        g_cameraMode = false; g_cameraStartAt = 0; g_cameraEverActive = false; memset(g_cameraShortcutDown, 0, sizeof g_cameraShortcutDown);
         g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0;
         core::CameraControlStop(); input::ClearKeys(); ImGui::GetIO().ClearInputKeys();
     }
@@ -162,7 +163,7 @@ namespace editor {
     void ToggleCameraMode() {
         if (!g_open) return;
         if (g_cameraMode) { StopCameraMode(); return; }
-        g_playMode = false; g_cameraMode = true; g_cameraStartAt = GetTickCount(); g_cameraEverActive = false;
+        g_playMode = false; g_cameraMode = true; g_cameraStartAt = GetTickCount(); g_cameraEverActive = false; memset(g_cameraShortcutDown, 0, sizeof g_cameraShortcutDown);
         input::TakeMouseDelta(nullptr, nullptr);
         input::ClearKeys(); ImGui::GetIO().ClearInputKeys(); core::CameraControlStart();
     }
@@ -539,6 +540,7 @@ namespace editor {
     static void StartGrab(const std::vector<int>& uids, bool isNew, const std::string& name) {
         if (uids.empty() || !core::GameThreadReady()) return;
         if (g_place.active) DropCarried();   // whatever is in the hands is left where it is (undo step included)
+        const bool keepCamera = g_cameraMode;
         auto list = core::Spawned();
         Place P; P.active = true; P.isNew = isNew; P.name = name;
         Vec3 c{ 0, 0, 0 }; int n = 0;
@@ -550,9 +552,11 @@ namespace editor {
         for (auto& m : P.m) m.rel = { m.origPos.x - c.x, m.origPos.y - c.y, m.origPos.z - c.z };
         P.center = c; P.lastCenter = c; P.lastYaw = 0; P.lastScale = 1; P.dirty = isNew;
         if (fabsf(g_fx) >= fabsf(g_fz)) { P.snapAx = g_fx > 0 ? 1.0f : -1.0f; P.snapAz = 0; } else { P.snapAx = 0; P.snapAz = g_fz > 0 ? 1.0f : -1.0f; }
-        if (g_compact && g_open) { P.reopen = false; }                    // the dock stays where it is
+        if (keepCamera) { P.reopen = false; }                             // camera mode stays live while the gizmo is shown
+        else if (g_compact && g_open) { P.reopen = false; }               // the dock stays where it is
         else { P.reopen = g_open; g_open = false; }
-        StopCameraMode(); g_playMode = false; core::g_placing = true; input::ClearKeys();
+        if (!keepCamera) StopCameraMode();
+        g_playMode = false; core::g_placing = true; input::ClearKeys();
         g_place = P;
         Note(T("%s: %s | %d objects | %s = done, %s %s"), T(isNew ? "placing" : "grabbed"), name.c_str(), (int)P.m.size(), core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL]), T(isNew ? "cancels" : "puts back"));
     }
@@ -971,11 +975,36 @@ namespace editor {
         const char* fn = strrchr(core::GimmickReplayPrefab(), '/'); Note(T("spawning %s"), fn ? fn + 1 : core::GimmickReplayPrefab());
     }
     static void HandleHotkeys(bool havePos) {
-        ImGuiIO& io = ImGui::GetIO(); if (io.WantTextInput || g_playMode) return;
+        ImGuiIO& io = ImGui::GetIO();
+        if (g_cameraMode) {
+            // Camera movement uses async key state because the game may not forward legacy keyboard messages.
+            // Editing shortcuts must use the same reliable source while camera mode owns the workflow.
+            auto pressed = [&](int vk) {
+                const bool now = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                const bool fire = now && !g_cameraShortcutDown[vk & 0xFF];
+                g_cameraShortcutDown[vk & 0xFF] = now;
+                return fire;
+            };
+            const bool pZ = pressed('Z'), pY = pressed('Y'), pC = pressed('C'), pV = pressed('V');
+            const bool pD = pressed('D'), pG = pressed('G'), pA = pressed('A'), pDelete = pressed(VK_DELETE);
+            const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            if (io.WantTextInput || g_playMode) return;
+            if (ctrl && pZ) Undo();
+            if (ctrl && pY) Redo();
+            if (ctrl && pC) CopySel();
+            if (ctrl && pV) Paste(havePos);
+            if (ctrl && pD && !g_sel.empty()) { CopySel(); Paste(havePos); }
+            if (ctrl && pG) GroupSel(true);
+            if (ctrl && pA) { g_sel.clear(); for (auto& o : core::Spawned()) if (!o.hidden) g_sel.insert(o.uid); }
+            if (!ctrl && pDelete && !g_sel.empty()) DeleteSel();
+            return;
+        }
+        if (io.WantTextInput || g_playMode) return;
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) Undo();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) Redo();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) CopySel();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false)) Paste(havePos);
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false) && !g_sel.empty()) { CopySel(); Paste(havePos); }
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false)) GroupSel(true);
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) { g_sel.clear(); for (auto& o : core::Spawned()) if (!o.hidden) g_sel.insert(o.uid); }
         if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && !g_sel.empty()) DeleteSel();
@@ -1729,6 +1758,8 @@ namespace editor {
         g_hoverUid = 0;
         ImGuiIO& io = ImGui::GetIO();
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
+        const bool addSelect = g_cameraMode ? ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) : io.KeyCtrl;
+        const bool addBox = g_cameraMode ? (((GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT)) & 0x8000) != 0) : (io.KeyCtrl || io.KeyShift);
         if (g_playMode) return;
         auto list = core::Spawned();
         if (g_rightGesture) {
@@ -1777,7 +1808,7 @@ namespace editor {
         if (!best) {
             if (placing) { if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) DropCarried(); return; }
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                g_boxSelecting = true; g_boxMoved = false; g_boxAdd = io.KeyCtrl || io.KeyShift;
+                g_boxSelecting = true; g_boxMoved = false; g_boxAdd = addBox;
                 g_boxStart = g_boxCurrent = io.MousePos; g_boxBase = g_boxAdd ? g_sel : std::set<int>{};
             }
             return;
@@ -1786,7 +1817,7 @@ namespace editor {
             g_sel.clear(); g_sel.insert(best); g_primary = g_lastClicked = best; g_editUid = 0;
             StartGrab({ best }, false, ShortName(Find(list, best)->prefab)); return;
         }
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { SelectUid(best, io.KeyCtrl, list); g_editUid = 0; }
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { SelectUid(best, addSelect, list); g_editUid = 0; }
     }
     static void DrawWorldContextPopup(bool havePos) {
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
