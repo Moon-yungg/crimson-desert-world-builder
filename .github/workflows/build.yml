@@ -55,7 +55,7 @@ jobs:
           git clone --depth 1 --branch v1.3.3 https://github.com/TsudaKageyu/minhook tools/minhook
           git clone --depth 1 --branch v1.91.5 https://github.com/ocornut/imgui tools/imgui
           curl -sL -o winlibs.zip https://github.com/brechtsanders/winlibs_mingw/releases/download/14.2.0posix-19.1.1-12.0.0-ucrt-r2/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2.zip
-          mkdir -p tools && tar -xf winlibs.zip -C tools
+          mkdir -p tools && 7z x -y -otools winlibs.zip > /dev/null   # Git Bash's tar does not read zip files
           echo "$GITHUB_WORKSPACE/tools/mingw64/bin" >> "$GITHUB_PATH"
       - name: Build
         shell: cmd
