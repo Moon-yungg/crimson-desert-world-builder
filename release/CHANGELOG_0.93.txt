@@ -1,0 +1,16 @@
+World Builder 0.93
+
+Added
+- Character browser: all 5,667 character appearances of the game (player characters, NPCs, monsters, animals, mounts) are
+  listed under character > appearance, each with a preview of the complete figure assembled from its parts (body, head,
+  hair, armour). They can be previewed only for now; spawning characters comes later.
+- Previews for decals (blood, dirt, moss, paint ...): the decal texture on a flat tile, seen from above.
+
+Fixed
+- About 13 % of the game's textures were decoded wrongly in previews (flat or blotchy colours, missing patterns): they are
+  stored with compressed blocks and were read at the wrong place. All existing previews are rendered again once in the
+  background, the tiles on screen first.
+
+Changed
+- Previews read only the part of each texture they use: about 80 % less data read and roughly a third faster per
+  preview. The mod checks at start that this works with the installed game version and reads whole files otherwise.
