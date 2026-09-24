@@ -119,6 +119,8 @@ static uintptr_t kRva_StringDataAlloc = 0;        // StringData* alloc(int len)
 static uintptr_t kRva_PathNormalizeCtor = 0;      // NormalizedPath(this8, const StringObj* src)
 static uintptr_t kRva_SetWorldTransform = 0;      // SceneObject::setWorldTransform(this, const Transform*, u8 a=0, u8 b=1)
 static uintptr_t kRva_SetEnable = 0;              // SceneObject::setEnable(this, u8)
+static uintptr_t kRva_CameraTransformGetter = 0;  // returns the 44-byte camera TiledTransform used by the final camera-state writer
+static uintptr_t kRva_CameraWriterReturn = 0;     // return address of that one getter call inside the final writer
 static uintptr_t kRva_ProbeCollector = 0;         // vtable of the collector class the ground probe uses, see ResolveProbeCollectorVtable()
 static uintptr_t g_probeVtableOverride = 0;       // settings.txt probe_vtable=<rva>: manual fallback, read only, never written back
 // struct offsets: defaults from 2850, the player chain is re-discovered through RTTI names at runtime
@@ -415,20 +417,32 @@ bool GameReadFileRange(const std::string& path, std::vector<uint8_t>& out, uint3
 static SetWorldTransformFn g_origSetXf = nullptr; static SetEnableFn g_origSetEnable = nullptr;
 struct CameraControlState {
     bool active = false;
-    uintptr_t manager = 0;
-    uintptr_t object = 0;
-    uintptr_t stackEntry = 0;
-    uintptr_t originalCamera = 0;
-    uintptr_t freeCamera = 0;
-    float original[11] = {};
     Vec3 pos{};
     float yaw = 0, pitch = 0, roll = 0;
 };
 static std::mutex g_cameraControlMutex;
 static CameraControlState g_cameraControl;
 static std::atomic<uint64_t> g_cameraControlRequest{ 0 };
+static std::atomic<uint64_t> g_cameraWriterLoggedRequest{ 0 };
 static uintptr_t CameraSceneObject(uintptr_t* managerOut = nullptr);
-static void ApplyCameraControl();
+using CameraTransformGetterFn = void* (__fastcall*)(void*, float*);
+static CameraTransformGetterFn g_origCameraTransformGetter = nullptr;
+static bool g_cameraWriterHookReady = false;
+static void* __fastcall HookCameraTransformGetter(void* camera, float* out) {
+    const uintptr_t caller = (uintptr_t)_ReturnAddress();
+    void* result = g_origCameraTransformGetter ? g_origCameraTransformGetter(camera, out) : out;
+    if (!out || !kRva_CameraWriterReturn || caller != g_base + kRva_CameraWriterReturn) return result;
+    CameraControlState state;
+    { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (!g_cameraControl.active) return result; state = g_cameraControl; }
+    alignas(16) float xf[12] = {};
+    MakeTransform(xf, state.pos, { state.yaw, state.pitch, state.roll }, 1.0f, true);
+    if (!WriteBytes((uintptr_t)out, xf, 44)) return result;
+    const uint64_t request = g_cameraControlRequest.load(std::memory_order_relaxed);
+    if (g_cameraWriterLoggedRequest.exchange(request, std::memory_order_relaxed) != request)
+        Log("camera control: final camera writer override active at (%.1f %.1f %.1f) yaw %.1f pitch %.1f",
+            state.pos.x, state.pos.y, state.pos.z, state.yaw, state.pitch);
+    return result;
+}
 static std::map<uintptr_t, long> g_traceCallers; static long g_traceLines = 0; static DWORD g_traceSec = 0;
 static bool TraceBudget() { DWORD s = GetTickCount() / 1000; if (s != g_traceSec) { g_traceSec = s; g_traceLines = 0; } return g_traceLines++ < 80; }
 static void __fastcall HookSetXf(void* obj, const float* xf, uint8_t a, uint8_t b) {
@@ -630,15 +644,9 @@ static void PumpJobs() {
         if (!g_queue.empty()) { job = std::move(g_queue.front()); g_queue.pop_front(); InterlockedDecrement(&g_queueCount); }
     }
     if (job) RunJobGuarded(&job);
-    ApplyCameraControl();   // post-game-tick camera write wins over the controller's follow update
-    CameraControlRenderOverride();   // renderer keeps separate per-frame view copies; keep those on the same pose
 }
 static void InstallCrashFilter(const char* when);
 static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
-    // Feed the desired pose into the native FreeCam before CameraManager runs this tick. PumpJobs applies it once more
-    // afterwards so a just-queued activation is initialized immediately; the next tick then goes through the game's full
-    // FreeCam -> CameraManager -> renderer path.
-    ApplyCameraControl();
     const uint64_t r = g_origPump(a1, a2, a3, a4, a5, a6, a7, a8);
     static bool s_filter = false; if (!s_filter) { s_filter = true; InstallCrashFilter("on the first game tick"); }
     PumpJobs();
@@ -2118,10 +2126,9 @@ static void FindCameraObjects(std::vector<std::pair<std::string, uintptr_t>>& ou
         }
     }
 }
-// The CameraManager (reachable from the world root) keeps the rendered camera's SceneObject at +0x40.  More importantly,
-// it owns the game's native FreeCamCamera at +0x18 and a stack of camera bases at +0x20/+0x28.  Its update calls virtual
-// slot 91 on every stack camera and the last stack entry becomes the active camera.  Driving that native camera keeps the
-// whole CameraManager -> renderer path coherent; writing the SceneObject alone only changes a downstream mirror.
+// CameraManager's SceneObject is still the most reliable place to capture the pose that is visible when camera mode starts.
+// Actual control is applied later: the final camera-state writer asks a common camera helper for a 44-byte TiledTransform,
+// then builds view/projection data from it. HookCameraTransformGetter substitutes only that one return value while active.
 static uintptr_t g_camMgr = 0; static DWORD g_camSearchAt = 0; static std::mutex g_camMgrMutex;
 static uintptr_t CameraManagerPtr() {
     std::lock_guard<std::mutex> lock(g_camMgrMutex);
@@ -2154,63 +2161,7 @@ static uintptr_t CameraSceneObject(uintptr_t* managerOut) {
     if (managerOut) *managerOut = manager;
     return CameraSceneObjectFromManager(manager);
 }
-static bool CameraStackTop(uintptr_t manager, uintptr_t* entryOut, uintptr_t* cameraOut) {
-    uintptr_t list = 0; uint32_t count = 0;
-    if (!manager || !ReadPtr(manager + 0x20, &list) || !Read32(manager + 0x28, &count) || !count || count > 64) return false;
-    uintptr_t entry = 0, camera = 0, vt = 0;
-    if (!ReadPtr(list + (uintptr_t)(count - 1) * 8, &entry) || !ReadPtr(entry + 8, &camera) || !ReadPtr(camera, &vt) || !InImage(vt)) return false;
-    if (entryOut) *entryOut = entry;
-    if (cameraOut) *cameraOut = camera;
-    return true;
-}
-static bool NativeCameraSetPose(uintptr_t camera, Vec3 pos, float yaw, float pitch, float roll) {
-    uintptr_t vt = 0, setPos = 0, setRot = 0;
-    if (!camera || !ReadPtr(camera, &vt) || !InImage(vt) || !ReadPtr(vt + 95 * 8, &setPos) || !InImage(setPos) ||
-        !ReadPtr(vt + 96 * 8, &setRot) || !InImage(setRot)) return false;
-    alignas(16) float xf[12] = {};
-    MakeTransform(xf, pos, { yaw, pitch, roll }, 1.0f, true);
-    using SetPosFn = void(__fastcall*)(void*, const Vec3*);
-    using SetRotFn = void(__fastcall*)(void*, const float*);
-    bool ok = false;
-    CDK_GUARD_BEGIN
-        ((SetPosFn)setPos)((void*)camera, &pos);
-        ((SetRotFn)setRot)((void*)camera, xf + 3);
-        ok = true;
-    CDK_GUARD_FAIL return false;
-    CDK_GUARD_END
-    return ok;
-}
 static void QueueCameraControlCapture(uint64_t request, int retryCount);
-static void ApplyCameraControl() {
-    CameraControlState state;
-    { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (!g_cameraControl.active) return; state = g_cameraControl; }
-    // The manager or its camera stack can be rebuilt during loading/cutscenes. Never overwrite a new stack entry.
-    uintptr_t topEntry = 0, topCamera = 0;
-    if (!CameraStackTop(state.manager, &topEntry, &topCamera) || topEntry != state.stackEntry || topCamera != state.freeCamera) {
-        std::lock_guard<std::mutex> l(g_cameraControlMutex);
-        if (g_cameraControl.stackEntry == state.stackEntry) g_cameraControl = {};
-        Log("camera control: disabled because the camera stack changed (entry %p/%p camera %p/%p)",
-            (void*)state.stackEntry, (void*)topEntry, (void*)state.freeCamera, (void*)topCamera);
-        return;
-    }
-    // FreeCam's own update stores horizontal/vertical look in radians at +0x118/+0x11c. Feed those together with the
-    // common camera position/quaternion setters so its next native update starts from exactly our requested pose.
-    const float yawRad = state.yaw * (3.14159265f / 180.0f);
-    const float pitchRad = state.pitch * (3.14159265f / 180.0f);
-    if (!WriteBytes(state.freeCamera + 0x118, &yawRad, 4) || !WriteBytes(state.freeCamera + 0x11C, &pitchRad, 4) ||
-        !NativeCameraSetPose(state.freeCamera, state.pos, state.yaw, state.pitch, state.roll)) {
-        std::lock_guard<std::mutex> l(g_cameraControlMutex);
-        if (g_cameraControl.freeCamera == state.freeCamera) g_cameraControl = {};
-        Log("camera control: disabled after the native FreeCam pose update failed");
-        return;
-    }
-    static DWORD s_lastApplyLog = 0;
-    const DWORD now = GetTickCount();
-    if (now - s_lastApplyLog >= 1000) {
-        s_lastApplyLog = now;
-        Log("camera control: native FreeCam pose (%.1f %.1f %.1f) yaw %.1f pitch %.1f", state.pos.x, state.pos.y, state.pos.z, state.yaw, state.pitch);
-    }
-}
 static void QueueCameraControlCapture(uint64_t request, int retryCount) {
     RunOnGameThread([request, retryCount]() {
         if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) return;
@@ -2222,8 +2173,7 @@ static void QueueCameraControlCapture(uint64_t request, int retryCount) {
             }
             return false;
         };
-        uintptr_t manager = 0;
-        const uintptr_t so = CameraSceneObject(&manager);
+        const uintptr_t so = CameraSceneObject();
         if (!so) {
             if (!retry()) Log("camera control: active camera transform is unavailable");
             return;
@@ -2244,8 +2194,7 @@ static void QueueCameraControlCapture(uint64_t request, int retryCount) {
         }
         int16_t tile[2]; memcpy(tile, original + 10, sizeof tile);
         CameraControlState state;
-        state.active = true; state.manager = manager; state.object = so;
-        memcpy(state.original, original, sizeof original);
+        state.active = true;
         state.pos = { original[7] + tile[0] * kTileSize, original[8], original[9] + tile[1] * kTileSize };
         // MakeTransform builds Ry(yaw) * Rx(pitch) * Rz(roll). Extract yaw from the rotated +Z
         // axis (R02/R22); the common ZYX denominator is wrong here when the camera is pitched.
@@ -2254,46 +2203,16 @@ static void QueueCameraControlCapture(uint64_t request, int retryCount) {
         state.pitch = std::max(-85.0f, std::min(85.0f, state.pitch));
         state.roll = atan2f(2.0f * (qx * qy + qz * qw), 1.0f - 2.0f * (qx * qx + qz * qz)) * (180.0f / 3.14159265f);
 
-        uintptr_t stackEntry = 0, originalCamera = 0;
-        if (!CameraStackTop(manager, &stackEntry, &originalCamera)) {
-            if (!retry()) Log("camera control: CameraManager has no usable active camera stack");
-            return;
-        }
-        const uintptr_t freeCamera = Deref(manager, 0x18);
-        const char* freeName = freeCamera ? RttiName(freeCamera) : nullptr;
-        if (!freeName || !strstr(freeName, "FreeCamCamera@")) {
-            if (!retry()) Log("camera control: native FreeCamCamera is unavailable");
-            return;
-        }
-        const float yawRad = state.yaw * (3.14159265f / 180.0f);
-        const float pitchRad = state.pitch * (3.14159265f / 180.0f);
-        if (!WriteBytes(freeCamera + 0x118, &yawRad, 4) || !WriteBytes(freeCamera + 0x11C, &pitchRad, 4) ||
-            !NativeCameraSetPose(freeCamera, state.pos, state.yaw, state.pitch, state.roll)) {
-            if (!retry()) Log("camera control: could not initialize native FreeCamCamera");
-            return;
-        }
-        if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) return;
-        if (!WriteBytes(stackEntry + 8, &freeCamera, sizeof freeCamera)) {
-            if (!retry()) Log("camera control: could not switch the active camera stack to FreeCamCamera");
-            return;
-        }
-        if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) {
-            WriteBytes(stackEntry + 8, &originalCamera, sizeof originalCamera);
-            return;
-        }
-        state.stackEntry = stackEntry; state.originalCamera = originalCamera; state.freeCamera = freeCamera;
         { std::lock_guard<std::mutex> l(g_cameraControlMutex);
-          if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) {
-              WriteBytes(stackEntry + 8, &originalCamera, sizeof originalCamera);
-              return;
-          }
+          if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) return;
           g_cameraControl = state; }
-        Log("camera control: native FreeCam active (stack %p: %p -> %p), captured scene camera %p at (%.1f %.1f %.1f)",
-            (void*)stackEntry, (void*)originalCamera, (void*)freeCamera, (void*)so, state.pos.x, state.pos.y, state.pos.z);
+        Log("camera control: captured scene camera %p at (%.1f %.1f %.1f); final-writer override armed",
+            (void*)so, state.pos.x, state.pos.y, state.pos.z);
     });
 }
 void CameraControlStart() {
     if (!HooksReady()) { Log("camera control: game hooks are not ready"); return; }
+    if (!g_cameraWriterHookReady || !g_origCameraTransformGetter) { Log("camera control: final camera writer hook is not ready"); return; }
     const uint64_t request = g_cameraControlRequest.fetch_add(1, std::memory_order_relaxed) + 1;
     // Do not inherit a recent failed/probing lookup from CameraPose(). Free-camera activation
     // needs one immediate authoritative manager search on the next game tick.
@@ -2302,23 +2221,13 @@ void CameraControlStart() {
     QueueCameraControlCapture(request, 0);
 }
 void CameraControlStop() {
-    const uint64_t request = g_cameraControlRequest.fetch_add(1, std::memory_order_relaxed) + 1;
-    CameraControlState state;
+    g_cameraControlRequest.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> l(g_cameraControlMutex);
         if (!g_cameraControl.active) return;
-        state = g_cameraControl;
-        g_cameraControl = {};   // stop overriding immediately; a quick restart must be able to capture again
+        g_cameraControl = {};
     }
-    if (!HooksReady()) return;
-    RunOnGameThread([request, state]() {
-        if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) return;
-        uintptr_t topEntry = 0, topCamera = 0;
-        const bool sameStack = CameraStackTop(state.manager, &topEntry, &topCamera) && topEntry == state.stackEntry && topCamera == state.freeCamera;
-        const bool restored = sameStack && WriteBytes(state.stackEntry + 8, &state.originalCamera, sizeof state.originalCamera);
-        Log("camera control: %s native camera stack %p%s", restored ? "restored" : "could not restore", (void*)state.stackEntry,
-            !sameStack ? " (camera stack changed; skipped stale entry)" : "");
-    });
+    Log("camera control: final camera writer override stopped");
 }
 bool CameraControlActive() { std::lock_guard<std::mutex> l(g_cameraControlMutex); return g_cameraControl.active; }
 bool CameraControlBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd) {
@@ -2592,6 +2501,14 @@ static DWORD WINAPI InitThread(LPVOID) {
     g_buildOk = ResolveGame();
     if (!g_buildOk) { Log("signature resolution failed; game functions will NOT be hooked or called"); return 0; }
     ReleaseHookGap();
+    if (kRva_CameraTransformGetter && kRva_CameraWriterReturn) {
+        void* t = (void*)(g_base + kRva_CameraTransformGetter);
+        if (HookFn(t, (void*)HookCameraTransformGetter, (void**)&g_origCameraTransformGetter, "final camera transform getter")) {
+            g_cameraWriterHookReady = true;
+            Log("camera control: final writer hook ready (getter rva 0x%llx, call return rva 0x%llx)",
+                (unsigned long long)kRva_CameraTransformGetter, (unsigned long long)kRva_CameraWriterReturn);
+        } else Log("camera control: final writer hook failed; camera mode unavailable");
+    } else Log("camera control: final writer path unresolved; camera mode unavailable");
     uintptr_t target = g_base + kRva_CreateSceneObjectFrom;
     {
         if (HookFn((void*)target, (void*)HookCreate, (void**)&g_origCreate, "createSceneObjectFrom")) Log("hooked createSceneObjectFrom at %p", (void*)target);
@@ -2752,6 +2669,25 @@ static bool ResolveGame() {
     ok &= ResolveSig("PrefabPathCtor", "48 89 5C 24 10 48 89 4C 24 08 55 56 57 48 83 EC 20 48 8B F9 E8 ?? ?? ?? ?? 90 48 8D 05 ?? ?? ?? ?? 48 89 01 33 ED 48 89 69 30 48 8D 41 38", &kRva_PrefabPathCtor);
     ResolveSig("ResourceLoader.load", "48 89 5C 24 18 48 89 54 24 10 55 56 57 41 56 41 57 48 81 EC 90 00 00 00 41 8B E9 4D 8B F0 48 8B F2 48 8B F9 45 33 FF", &kRva_ResLoad);   // optional: previews via the game's loader
     ok &= ResolveSig("PathNormalizeCtor", "4C 8B DC 49 89 5B 10 49 89 4B 08 55 56 57 41 54 41 55 41 56 41 57 48 81 EC 40 01 00 00 48 8B DA 48 8B F9 4C 8D 2D ?? ?? ?? ??", &kRva_PathNormalizeCtor);
+    {   // final camera-state writer -> common TiledTransform getter. This is optional: only free-camera mode depends on it.
+        int n = 0;
+        const uintptr_t call = FindPatternCount(
+            "48 8B 07 48 8D 54 24 68 48 85 C0 48 8D 48 D8 B8 00 00 00 00 48 0F 44 C8 E8 ?? ?? ?? ??", &n);
+        if (call && n == 1) {
+            int32_t disp = 0;
+            if (ReadBytes(call + 25, &disp, 4)) {
+                const uintptr_t target = call + 29 + disp;
+                static const uint8_t expected[] = { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x81,0xEC,0x80,0x00,0x00,0x00 };
+                uint8_t head[sizeof expected] = {};
+                if (InImage(target) && ReadBytes(target, head, sizeof head) && memcmp(head, expected, sizeof expected) == 0) {
+                    kRva_CameraTransformGetter = target - g_base;
+                    kRva_CameraWriterReturn = call + 29 - g_base;
+                    Log("resolved %-20s rva 0x%llx (writer return 0x%llx)", "camera final pose",
+                        (unsigned long long)kRva_CameraTransformGetter, (unsigned long long)kRva_CameraWriterReturn);
+                } else Log("[camera] final writer call resolved but transform getter prologue is unexpected");
+            }
+        } else Log("[camera] final writer transform call: %d matches; camera mode will stay off", n);
+    }
     // world global: `mov rax,[rip+d]; mov rcx,[rax+0x30]; mov rax,[rbx+0xa0]; cmp [rcx+0x58],rax` (take-or-steal check, 15 copies)
     uintptr_t ref = 0;
     if (ResolveSig("WorldGlobalRef", "48 8B 05 ?? ?? ?? ?? 48 8B 48 30 48 8B 83 A0 00 00 00 48 39 41 58", &ref, false)) {

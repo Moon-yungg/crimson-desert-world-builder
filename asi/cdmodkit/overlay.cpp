@@ -284,7 +284,6 @@ namespace overlay {
         Stage("imgui newframe");
         ImGui::NewFrame();
         editor::Draw();
-        core::CameraControlRenderOverride();   // editor input may have moved the camera since the last simulation tick
         Stage("imgui render");
         ImGui::Render();
         // edit mode: every input belongs to the menu (the game keeps running but does not react); play mode / placement: everything to the game

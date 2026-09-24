@@ -179,40 +179,6 @@ static DWORD WINAPI RenderCamScanThread(LPVOID) {
 }
 void FindRenderCamera() { if (InterlockedCompareExchange(&g_rcScanning, 1, 0) != 0) return; CreateThread(nullptr, 0, RenderCamScanThread, nullptr, 0, nullptr); }
 int RenderCameraBlocks() { std::lock_guard<std::mutex> l(g_rcMutex); return (int)g_rcBlocks.size(); }
-static bool WriteRenderView(uintptr_t at, const float* m) {
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery((LPCVOID)at, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return false;
-    const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    if (!(mbi.Protect & writable)) return false;
-    SIZE_T wrote = 0;
-    return WriteProcessMemory(GetCurrentProcess(), (LPVOID)at, m, sizeof(float) * 16, &wrote) && wrote == sizeof(float) * 16;
-}
-bool CameraControlRenderOverride() {
-    static volatile LONG s_logged = 0;
-    Vec3 pos{}, r{}, u{}, f{};
-    if (!CameraControlBasis(&pos, &r, &u, &f)) { InterlockedExchange(&s_logged, 0); return false; }
-    std::vector<RcBlock> blocks; { std::lock_guard<std::mutex> l(g_rcMutex); blocks = g_rcBlocks; }
-    if (blocks.empty()) {
-        if (GetTickCount() - g_rcScanAt > 1000 && !g_rcScanning) FindRenderCamera();
-        return false;
-    }
-    auto dot = [](const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; };
-    float m[16] = {
-        r.x, u.x, f.x, 0.0f,
-        r.y, u.y, f.y, 0.0f,
-        r.z, u.z, f.z, 0.0f,
-        -dot(pos, r), -dot(pos, u), -dot(pos, f), 1.0f
-    };
-    int wrote = 0;
-    for (const RcBlock& b : blocks) {
-        float old[16], p[16];
-        if (!ReadBytes(b.view, old, sizeof old) || !ReadBytes(b.proj, p, sizeof p) || !PerspOk(p)) continue;
-        if (WriteRenderView(b.view, m)) wrote++;
-    }
-    if (wrote && InterlockedCompareExchange(&s_logged, 1, 0) == 0)
-        Log("[rendercam] camera control overriding %d tracked view block(s)", wrote);
-    return wrote != 0;
-}
 bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11, int rank) {
     std::vector<RcBlock> blocks; { std::lock_guard<std::mutex> l(g_rcMutex); blocks = g_rcBlocks; }
     Vec3 np, nr, nu, nf;
