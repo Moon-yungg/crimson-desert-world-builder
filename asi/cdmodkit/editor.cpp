@@ -1429,12 +1429,15 @@ namespace editor {
         if (compact) ImGui::TextWrapped(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select"));
         else { ImGui::SameLine(); ImGui::TextDisabled(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select")); }
         const float ui = ImGui::GetFontSize() / 17.0f;
-        const float footer = (compact ? 330.0f : 150.0f) * ui;
-        if (g_sceneCards) DrawSceneCards(list, p, havePos, std::max(100.0f, ImGui::GetContentRegionAvail().y - footer), ui);
+        const float availY = ImGui::GetContentRegionAvail().y;
+        const bool hasSelection = !g_sel.empty() && Find(list, g_primary);
+        const float footer = compact ? (hasSelection ? (g_sel.size() == 1 ? 210.0f : 85.0f) : 28.0f) * ui : 150.0f * ui;
+        const float listH = compact ? std::max(180.0f * ui, std::max(availY * 0.48f, availY - footer)) : std::max(100.0f, availY - footer);
+        if (g_sceneCards) DrawSceneCards(list, p, havePos, listH, ui);
         else {
             ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH;
             if (compact) tableFlags |= ImGuiTableFlags_ScrollX;
-            if (ImGui::BeginTable("objs", 6, tableFlags, ImVec2(-1, std::max(100.0f, ImGui::GetContentRegionAvail().y - footer)))) {
+            if (ImGui::BeginTable("objs", 6, tableFlags, ImVec2(-1, listH))) {
             ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 40); ImGui::TableSetupColumn(T("object")); ImGui::TableSetupColumn(T("grp"), ImGuiTableColumnFlags_WidthFixed, 40);
             ImGui::TableSetupColumn(T("position"), ImGuiTableColumnFlags_WidthFixed, 230); ImGui::TableSetupColumn(T("yaw"), ImGuiTableColumnFlags_WidthFixed, 50); ImGui::TableSetupColumn(T("dist"), ImGuiTableColumnFlags_WidthFixed, 60);
             ImGui::TableSetupScrollFreeze(0, 1); ImGui::TableHeadersRow();
