@@ -1,0 +1,8 @@
+World Builder 0.89
+
+Fixed
+- Previews seemed not to render at all after a fresh start or after deleting the thumbs folder: the index starts with
+  about 17,800 prefabs that have no static mesh (characters with skinned meshes, decals, effects), and the preview worker
+  read every one of them before reaching the first object - more than five minutes without a single image. They are
+  now recognised from the prefab index and skipped without being read; the first object previews appear right away.
+- The one-time retry of earlier failures in 0.87 therefore no longer spends minutes on those prefabs either.

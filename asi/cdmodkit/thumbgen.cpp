@@ -709,6 +709,14 @@ static DWORD WINAPI Worker(LPVOID) {
     }
     g_sizes = fopen(sizesPath.c_str(), "a");
     const auto& idx = core::PrefabIndex(); g_total = (int)idx.size();
+    {   // prefabs.tsv counts the same .pam/.pami _path entries Collect() looks for: 0 means "no meshes" without reading the file.
+        // ~17.8k of them (characters with skinned meshes, decals, effects) head the index; reading them first took over
+        // five minutes before the first image, which looked like nothing was rendered at all. A parse-error row is read anyway.
+        std::lock_guard<std::mutex> l(g_mu); int skipped = 0;
+        for (const auto& pi : idx) if (pi.meshes == 0 && pi.tags.find("parse-error") == std::string::npos && g_processed.insert(pi.path).second) skipped++;
+        g_failed += skipped;
+        if (skipped) Log("[thumbs] %d prefabs have no static mesh in the index (skinned characters, decals, effects): no preview, not read", skipped);
+    }
     Log("[thumbs] worker ready: %d done, %d failed, %d prefabs", g_done.load(), g_failed.load(), g_total.load());
     g_ready = true;
     {   // self test: one prefab and one mesh through the game's loader (logged once per start)
