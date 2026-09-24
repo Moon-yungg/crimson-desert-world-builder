@@ -113,11 +113,12 @@ der Tab das, alles andere läuft weiter.
 
 ## Freie Kamera
 
-**F6** (oder der Button „free camera“ oben im Editor) schaltet eine frei fliegende Kamera ein: W/A/S/D bewegen, E oder
-Leertaste hoch, Q oder Strg runter, Shift schneller. Die Maus steuert den Blick; bei offenem Editor hältst du dafür die
-rechte Maustaste über der Welt gedrückt, damit die Maus sonst für den Editor frei bleibt. Deine Figur bleibt stehen, neue
-Objekte erscheinen vor der Kamera, Gizmo und Rahmen folgen ihr. Tempo, Mausempfindlichkeit und Taste stehen im Tab
-Settings. Die Welt lädt Details weiterhin rund um deine Figur, bei sehr weiten Flügen wird es daher gröber.
+**Home** (oder der Button „free camera“ oben im Editor) schaltet den Kameramodus ein: eine frei fliegende Kamera, während
+der Editor offen bleibt. W/A/S/D bewegen, E oder Leertaste hoch, Q oder Strg runter, Shift schneller, das Mausrad fährt
+vorwärts. Mit gedrückter rechter Maustaste über der Welt ziehen dreht den Blick; ein Rechtsklick ohne Bewegung öffnet das
+Kontextmenü. Editor-Kürzel wie Strg+Z bleiben aktiv. Deine Figur bleibt stehen, neue Objekte erscheinen vor der Kamera,
+Gizmo und Rahmen folgen ihr. Home noch einmal (oder den Editor schließen) beendet den Kameramodus. Tempo und
+Mausempfindlichkeit stehen im Tab Settings. Die Welt lädt Details weiterhin rund um deine Figur, bei sehr weiten Flügen wird es daher gröber.
 
 ## Bekannte Einschränkungen
 

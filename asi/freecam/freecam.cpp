@@ -272,7 +272,7 @@ static void SetOn(bool on) {
 }
 static DWORD WINAPI MainThread(LPVOID) {
     Sleep(1500);   // all .asi plugins are loaded by then
-    if (GetModuleHandleA("cdmodkit.asi")) { Log("World Builder (cdmodkit.asi) is installed and has the same free camera on its own key (F6): Fly Mode stays inactive so the two do not hook the same functions"); return 0; }
+    if (GetModuleHandleA("cdmodkit.asi")) { Log("World Builder (cdmodkit.asi) is installed and has the same free camera in its camera mode (Home): Fly Mode stays inactive so the two do not hook the same functions"); return 0; }
     // the game unpacks parts of its code after start: retry the signatures for a while
     bool ok = false;
     for (int i = 0; i < 120 && !ok; i++) { ok = Resolve(i < 119); if (!ok) Sleep(1000); }

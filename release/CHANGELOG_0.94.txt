@@ -11,10 +11,15 @@ Added
 - HTTP API: POST /api/npc {"key", "x", "y", "z", "type"} spawns a character (see HTTP_API.md).
 
 Changed
+- Editor tools from dofo7777: box selection (drag a rectangle over the world), a context menu on right click in the
+  world, rotate the selection in steps and align it to an axis, groups act as one unit, exact number entry next to
+  sliders (the small ">"), the Scene tools in the docked window. Menu open / close clears stuck mouse buttons and keys.
 - Gizmo, selection outlines and the line/circle preview use the renderer's own camera (path from
   CrimsonDesertTelemetry, thanks): no search for camera copies, no "camera copy in flight" setting to tune, and it
   works right after loading a save. The old search stays as a fallback if a game update moves the camera.
-- Free camera (F6 or the button in the editor's header): fly freely with W/A/S/D, E/Space up, Q/Ctrl down, Shift faster;
-  the mouse looks around (with the editor open: hold the right mouse button over the world). Your character stays where it
-  is, new objects appear in front of the camera, and gizmo and outlines follow it. Speed, mouse sensitivity and the key are in
-  Settings. The world keeps loading around your character, so very distant flights show coarser detail.
+- Camera mode (Home, or the button in the editor's header): a free-flying camera while the editor stays open. W/A/S/D,
+  E/Space up, Q/Ctrl down, Shift faster, mouse wheel forward; a right-button drag looks around, a right click opens the
+  context menu, editor shortcuts keep working. Your character stays where it is, new objects appear in front of the camera,
+  and gizmo and outlines follow it. The game treats it as its real camera, so the world stays visible while you turn. Speed
+  and mouse sensitivity are in Settings. The world keeps loading around your character, so very distant flights show
+  coarser detail.

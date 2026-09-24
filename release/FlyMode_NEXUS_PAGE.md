@@ -32,7 +32,7 @@ To uninstall, delete `FlyMode.asi` (and `FlyMode.ini` / `FlyMode.log` if you lik
 ## Good to know
 
 - The world loads its details around your **character**, not the camera. Fly far away and distant areas get coarser; fly back and they sharpen again.
-- **World Builder users:** World Builder already has the same camera on F6 (with its own settings in the Settings tab). If World Builder is installed, Fly Mode stays inactive on purpose, so the two never get in each other's way.
+- **World Builder users:** World Builder already has the same camera in its camera mode (Home, with its own settings in the Settings tab). If World Builder is installed, Fly Mode stays inactive on purpose, so the two never get in each other's way.
 - After a game update Fly Mode checks that it still finds everything it needs. If something moved, it stays switched off and says why in `FlyMode.log`, instead of guessing.
 
 ## Credits
