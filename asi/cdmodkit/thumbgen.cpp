@@ -43,13 +43,29 @@ static bool EndsWith(const std::string& s, const char* suf) { size_t n = strlen(
 
 // Pack files are read through the game's own resource loader (core::GameReadFile): the mod contains no archive
 // format code and no key; the game decrypts and decompresses its files exactly as it does for itself.
-static std::atomic<int> g_reads{ 0 };
+// While the game streams heavily (startup, loading screens, fast travel) the loader can report success with an unfilled
+// buffer: zeros parse as an empty prefab ("no meshes") and got recorded as permanent failures. A read that failed without
+// the entry being missing sets g_readError, so the render is retried later instead of being recorded or cached.
+static std::atomic<int> g_reads{ 0 }, g_badReads{ 0 };
+static bool g_readError = false;   // worker thread only: a read in the current Generate() failed for a reason other than a missing entry
+static bool LooksUnfilled(const std::vector<uint8_t>& d) {   // no pack file starts with 64 zero bytes (prefab, pam, pami, dds headers)
+    const size_t n = std::min<size_t>(d.size(), 64); if (!n) return true;
+    for (size_t i = 0; i < n; i++) if (d[i]) return false;
+    return true;
+}
 static bool GetFile(std::string path, std::vector<uint8_t>& out) {
     if (!path.empty() && path[0] == '/') path.erase(0, 1);
+    bool notFound = false;
     for (int attempt = 0; attempt < 3; attempt++) {
-        if (core::GameReadFile(path, out)) { g_reads++; return true; }
-        Sleep(15);
+        if (core::GameReadFile(path, out, &notFound)) {
+            if (!LooksUnfilled(out)) { g_reads++; return true; }
+            if (g_badReads++ < 5) Log("[thumbs] empty buffer from the game loader for %s (%zu bytes), attempt %d", path.c_str(), out.size(), attempt + 1);
+            out.clear(); notFound = false;
+        }
+        if (notFound) return false;   // not in the packs: retrying cannot help, and it is not a transient error
+        Sleep(15 + attempt * 100);
     }
+    g_readError = true;
     return false;
 }
 
@@ -416,6 +432,7 @@ static const std::unordered_map<std::string, MatInfo>* LoadMaterials(const std::
         }
     }
     if (g_pamiMats.size() > 4000) g_pamiMats.clear();
+    if (x.empty() && g_readError) { static std::unordered_map<std::string, MatInfo> s_none; return &s_none; }   // read error: not cached, the retry reads it again
     return &(g_pamiMats[pamiPath] = mats);
 }
 struct TexImg { int w = 0, h = 0; bool alpha = false; std::vector<uint8_t> rgba; };
@@ -463,6 +480,7 @@ static std::shared_ptr<TexImg> LoadTexture(const std::string& path) {
             if (off < d.size()) { t = std::make_shared<TexImg>(); DecodeBc(d.data() + off, d.size() - off, w, h, bc3, *t); g_texBytes += t->rgba.size(); }
         }
     }
+    if (d.empty() && g_readError) return t;   // read error: not cached
     static int s_logged = 0; if (s_logged < 6) { s_logged++; Log("[thumbs] texture %s: %s%s", path.c_str(), t ? "ok" : "FAILED", t ? (std::string(" ") + std::to_string(t->w) + "x" + std::to_string(t->h) + (t->alpha ? " bc3" : " bc1")).c_str() : (d.empty() ? " (read failed)" : " (format)")); }
     g_texs[path] = t;
     return t;
@@ -485,6 +503,7 @@ static std::string ResolvePam(const std::string& path) {
         size_t p = s.find(kTag);
         if (p != std::string::npos) { p += sizeof(kTag) - 1; size_t q = s.find('"', p); if (q != std::string::npos) { std::string v = s.substr(p, q - p); if (EndsWith(v, ".pam")) res = v; } }
     }
+    if (x.empty() && g_readError) return res;   // read error: guessed name only, not cached
     g_pami[path] = res;
     return res;
 }
@@ -495,6 +514,7 @@ static std::shared_ptr<Mesh> LoadMesh(const std::string& path) {
     std::shared_ptr<Mesh> m;
     std::vector<uint8_t> data;
     if (GetFile(pam, data)) { auto mm = std::make_shared<Mesh>(); if (ParsePam(data, *mm)) { m = mm; g_meshBytes += mm->v.size() * 4 + mm->f.size() * 4; } }
+    else if (g_readError) return m;   // read error: not cached, a later render reads it again
     g_meshes[pam] = m;
     return m;
 }
@@ -609,13 +629,17 @@ static bool Generate(const std::string& logical, float dims[6], std::string& why
     std::string phys = logical; if (!phys.empty() && phys[0] == '/') phys.erase(0, 1);
     size_t sl = phys.find('/');
     std::string physBin = sl == std::string::npos ? phys : phys.substr(0, sl) + "/bin__/" + phys.substr(sl + 1);
-    std::vector<uint8_t> data;
-    if (!GetFile(physBin, data) && !GetFile(phys, data)) { why = "prefab missing"; return false; }
+    std::vector<uint8_t> data; g_readError = false;
+    if (!GetFile(physBin, data) && !GetFile(phys, data)) { why = g_readError ? "read error" : "prefab missing"; return false; }
     std::vector<Node> roots;
     try { ParsePrefab(data, roots); } catch (const std::exception& e) { why = std::string("prefab: ") + e.what(); return false; }
     std::vector<Inst> inst; const float I[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }, Z[3] = { 0, 0, 0 };
     for (const auto& r : roots) Collect(r, I, Z, inst);
-    if (inst.empty()) { why = "no meshes"; return false; }
+    if (inst.empty()) {
+        static int s_logged = 0;   // an empty object list from a non-empty file is suspicious: the first bytes tell a bad read from a real prefab without meshes
+        if (roots.empty() && s_logged < 5) { s_logged++; char hex[64] = { 0 }; for (size_t i = 0; i < 16 && i < data.size(); i++) snprintf(hex + i * 3, 4, "%02X ", data[i]);
+            Log("[thumbs] %s: no objects in %zu bytes (%s)", logical.c_str(), data.size(), hex); }
+        why = "no meshes"; return false; }
     Mesh all; bool anyCompressed = false; std::vector<uint16_t> fs; std::vector<Surface> surf; g_statInst = (int)inst.size(); g_statSurf = g_statMat = g_statTex = 0;
     for (size_t k = 0; k < inst.size() && k < 400; k++) {
         auto m = LoadMesh(inst[k].path); if (!m) continue; if (m->compressed) anyCompressed = true;
@@ -641,6 +665,7 @@ static bool Generate(const std::string& logical, float dims[6], std::string& why
         for (size_t t = 0; t < m->f.size() / 3; t++) { const uint16_t si = surfaceFor(mFm ? m->fm[t] : 0); if (si < surf.size() && surf[si].skip) continue;
             all.f.push_back(m->f[t * 3] + base); all.f.push_back(m->f[t * 3 + 1] + base); all.f.push_back(m->f[t * 3 + 2] + base); fs.push_back(si); }
     }
+    if (g_readError) { why = "read error"; return false; }   // a mesh, material or texture could not be read: no incomplete image
     if (all.v.empty() || all.f.empty()) { why = "no geometry"; return false; }
     float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
     for (size_t i = 0; i < all.v.size(); i += 3) for (int k = 0; k < 3; k++) { mn[k] = std::min(mn[k], all.v[i + k]); mx[k] = std::max(mx[k], all.v[i + k]); }
@@ -671,6 +696,15 @@ static DWORD WINAPI Worker(LPVOID) {
             std::string path = line.substr(0, t); g_processed.insert(path);
             if (line.compare(t + 1, 4, "0.00") == 0 && line.find("0.00\t0.00\t0.00") != std::string::npos) failedSet.insert(path); else failedSet.erase(path);
         }
+        // up to v0.86 an unfilled read from the game loader was recorded as "no meshes" for good (thousands of prefabs when the
+        // pass ran during a loading screen): every recorded failure is tried once more, the real ones are recorded again
+        const std::string retryPath = core::ModDir() + "\\thumbs_retry.txt";
+        if (!failedSet.empty() && GetFileAttributesA(retryPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            for (const auto& p : failedSet) g_processed.erase(p);
+            Log("[thumbs] %zu prefabs without a preview are tried again (earlier failures may have been read errors)", failedSet.size());
+            failedSet.clear();
+        }
+        if (FILE* rf = fopen(retryPath.c_str(), "w")) { fprintf(rf, "1\n"); fclose(rf); }
         g_failed = (int)failedSet.size(); g_done = (int)g_processed.size() - g_failed;
     }
     g_sizes = fopen(sizesPath.c_str(), "a");
@@ -705,6 +739,8 @@ static DWORD WINAPI Worker(LPVOID) {
     std::deque<std::string> remeasure;   // rendered before the center columns existed: measure again without rendering
     for (auto& pi : idx) if (pi.sx > 0 && !pi.hasCenter) remeasure.push_back(pi.path);
     if (!remeasure.empty()) Log("[thumbs] %zu cached entries lack the bounding box center, measuring them again (no rendering)", remeasure.size());
+    std::deque<std::string> retry;   // background prefabs that hit a read error, tried again once the pass reaches the end
+    std::unordered_map<std::string, int> retries; int errStreak = 0, streaksLogged = 0;
     for (;;) {
         std::string path; bool prio = false; bool measure = false, check = false;
         {
@@ -712,7 +748,8 @@ static DWORD WINAPI Worker(LPVOID) {
             if (!g_requests.empty()) { path = g_requests.front(); g_requests.pop_front(); prio = true; }
             else if (!remeasure.empty()) { path = remeasure.front(); remeasure.pop_front(); measure = true; }
             else if (!recheck.empty()) { path = recheck.front(); recheck.pop_front(); check = true; }
-            else if (g_background) { while (cursor < idx.size() && g_processed.count(idx[cursor].path)) cursor++; if (cursor < idx.size()) path = idx[cursor++].path; }
+            else if (g_background) { while (cursor < idx.size() && g_processed.count(idx[cursor].path)) cursor++; if (cursor < idx.size()) path = idx[cursor++].path;
+                                     else if (!retry.empty()) { path = retry.front(); retry.pop_front(); } }
             if (check && g_passDone.count(path)) continue;   // rendered earlier in this pass on request
             if (!measure && !check && !path.empty() && g_processed.count(path)) {
                 if (prio && g_passActive && !g_passDone.count(path)) check = true;   // visible in the browser: render it now instead of later in the pass
@@ -725,6 +762,15 @@ static DWORD WINAPI Worker(LPVOID) {
         g_measureOnly = measure; g_recheckOnly = check; g_lastSkipped = false;   // g_recheckForce stays as set at start
         bool ok = GenerateGuarded(path, dims, why);
         g_measureOnly = false; g_recheckOnly = false;
+        if (!ok && why == "read error") {   // the loader is busy (loading screen, fast travel): nothing is recorded, the prefab comes back after a pause
+            reasons[why]++; const DWORD pause = std::min<DWORD>(10000, 500u << std::min(errStreak, 5));
+            if (errStreak == 0 && streaksLogged < 20) { streaksLogged++; Log("[thumbs] %s: read error from the game loader, pausing the preview worker", path.c_str()); }
+            errStreak++;
+            { std::lock_guard<std::mutex> l(g_mu); g_pending.erase(path); const bool again = ++retries[path] <= 3;   // an entry that never reads is left for the next session
+              if (!again) {} else if (measure) remeasure.push_back(path); else if (check) recheck.push_back(path); else if (!prio) retry.push_back(path); }
+            Sleep(pause); continue;   // a browser request comes back on its own, the tile asks again every frame
+        }
+        if (errStreak) { if (streaksLogged <= 20) Log("[thumbs] game loader reads work again after %d failed renders", errStreak); errStreak = 0; }
         if (check) {
             rechecked++;
             { std::lock_guard<std::mutex> l(g_mu); g_passDone.insert(path); g_pending.erase(path); }
@@ -744,7 +790,7 @@ static DWORD WINAPI Worker(LPVOID) {
         const bool record = ok || why != "prefab missing";
         if (record && g_sizes) { fprintf(g_sizes, "%s\t%.2f\t%.2f\t%.2f\t%.3f\t%.3f\t%.3f\n", path.c_str(), dims[0], dims[1], dims[2], dims[3], dims[4], dims[5]); fflush(g_sizes); }
         if (ok) core::SetPrefabSize(path, dims);
-        { std::lock_guard<std::mutex> l(g_mu); g_processed.insert(path); g_pending.erase(path); }
+        { std::lock_guard<std::mutex> l(g_mu); g_processed.insert(path); g_pending.erase(path); if (ok) g_refreshed.push_back(core::ThumbFile(path)); }   // Refresh() of a shown image: the overlay drops its copy
         if (ok) { g_done++; g_gen++; sessionDone++; } else g_failed++;
         if (prio) Log("[thumbs] %s: %s (instances %d, surfaces %d, with material %d, with texture %d)", path.c_str(), ok ? "rendered" : why.c_str(), g_statInst, g_statSurf, g_statMat, g_statTex);
         if (GetTickCount() - lastLog > 60000) {

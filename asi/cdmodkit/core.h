@@ -104,7 +104,7 @@ namespace core {
     void ApplyPlaceKeys();                      // hands the bound keys to the input layer (swallowed while placing)
     void SetTrace(bool on); bool Trace();       // log the game's own setWorldTransform/setEnable calls (reverse engineering aid)
     bool GameReadAvailable();                   // the game's resource loader can be used (instance captured, functions resolved)
-    bool GameReadFile(const std::string& packPath, std::vector<uint8_t>& out);   // read a pack file through the game's loader
+    bool GameReadFile(const std::string& packPath, std::vector<uint8_t>& out, bool* notFound = nullptr);   // read a pack file through the game's loader; notFound: no entry (false = the read itself failed)
 
     // Prefab index (bin64\cdmodkit\prefabs.tsv, fallback prefabs.txt): logical path, display name, category tree, tags
     struct PrefabInfo { std::string path, name, tags, mesh; int cat = 0; int meshes = 0, children = 0;

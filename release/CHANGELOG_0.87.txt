@@ -1,0 +1,15 @@
+World Builder 0.87
+
+Fixed
+- Missing previews: while the game was streaming heavily (startup, loading screens, fast travel) its file loader could
+  report a read as successful and leave the buffer empty. The preview worker took that for a prefab without meshes and
+  recorded it as a permanent failure, so thousands of tiles stayed empty for good. Empty reads are recognised now, the
+  worker pauses and tries those prefabs again later instead of recording them.
+- Broken previews: a mesh, material or texture that failed to read was remembered as "does not exist" for the rest of
+  the session, so every prefab using it was rendered incomplete or without texture and saved like that. Failed reads are
+  no longer cached and a render with a read error writes no image.
+- Every preview recorded as failed by an earlier version is tried once more on the first start of this version.
+
+Added
+- "render preview again" in the right-click menu of the prefab browser, to redo a single broken preview.
+- The log shows the loader's handler and flags for the first empty reads, and the first bytes of prefabs that contain no objects.

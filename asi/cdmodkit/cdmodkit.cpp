@@ -353,14 +353,14 @@ static void* __fastcall HookResLoad(void* self, void** out, void* path, uint32_t
     if (!g_resLoader && self) { g_resLoader = self; Log("resource loader captured %p (%s)", self, RttiName((uintptr_t)self) ? RttiName((uintptr_t)self) : "?"); }
     return g_origResLoad(self, out, path, flags);
 }
-static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* rtti, size_t rttiLen) {
+static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* rtti, size_t rttiLen, bool* notFound) {
     // load() returns a ResourceHandler_Paz: +0x20 worker (ResourceLoadWorker_Package), +0x34 / +0x38 sizes, +0x3c flags
     // (low nibble compression: 0 none, 1 partial, 2 LZ4; high nibble crypto). The worker's slot 5 reads, decrypts and
     // decompresses the entry into a caller buffer: read(worker, handler, u8* buf, u32 capacity, u32 offset, u32 length).
     void* res = nullptr;
     CDK_GUARD_BEGIN
         g_origResLoad(g_resLoader, &res, pathObj, 0);
-        if (!res) return false;
+        if (!res) { *notFound = true; return false; }
         const uintptr_t h = (uintptr_t)res, worker = *(uintptr_t*)(h + 0x20);
         const uint8_t fl = *(uint8_t*)(h + 0x3c); const uint32_t s34 = *(uint32_t*)(h + 0x34), s38 = *(uint32_t*)(h + 0x38);
         const uint32_t need = ((fl & 0xF) == 1) ? s34 : s38, cap = s34 > s38 ? s34 : s38;
@@ -371,6 +371,10 @@ static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* 
             auto read5 = *(uint8_t(__fastcall**)(void*, void*, void*, uint32_t, uint32_t, uint32_t))(*(uintptr_t*)worker + 0x28);
             ok = read5((void*)worker, res, out->data(), cap, 0, 0) != 0;
             if (ok) out->resize(need); else out->clear();
+            static int s_zeroLogged = 0;   // success with an untouched buffer (seen while the game streams): which handler and flags, for the next bug report
+            if (ok && s_zeroLogged < 3) { bool zero = true; for (size_t i = 0; i < out->size() && i < 64; i++) if ((*out)[i]) { zero = false; break; }
+                if (zero) { s_zeroLogged++; Log("game loader: read reported success but left the buffer empty (%s / worker %s, flags 0x%02x, sizes %u/%u)",
+                    RttiName(h) ? RttiName(h) : "?", worker && RttiName(worker) ? RttiName(worker) : "?", fl, s34, s38); } }
         }
         (*(void(__fastcall**)(void*, int))(*(uintptr_t*)res))(res, 1);   // handler release, as the game's load() does
         return ok;
@@ -379,7 +383,8 @@ static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* 
     return false;
 }
 bool GameReadAvailable() { return g_resLoader && g_origResLoad && kRva_StringDataAlloc && kRva_PathNormalizeCtor; }
-bool GameReadFile(const std::string& path, std::vector<uint8_t>& out) {
+bool GameReadFile(const std::string& path, std::vector<uint8_t>& out, bool* notFound) {
+    bool nf = false; if (notFound) *notFound = false;
     if (!GameReadAvailable()) return false;
     auto sdAlloc = (uintptr_t(*)(int))(g_base + kRva_StringDataAlloc);
     auto normalize = (void*(*)(void*, const void*))(g_base + kRva_PathNormalizeCtor);
@@ -388,7 +393,8 @@ bool GameReadFile(const std::string& path, std::vector<uint8_t>& out) {
     strncpy_s((char*)*(uintptr_t*)sd, path.size() + 1, path.c_str(), _TRUNCATE);
     uintptr_t holder = sd; normalize(pathObj, &holder);
     static bool s_logged = false; char rtti[160] = { 0 };
-    bool ok = GameReadFileGuarded(pathObj, &out, s_logged ? nullptr : rtti, sizeof rtti);
+    bool ok = GameReadFileGuarded(pathObj, &out, s_logged ? nullptr : rtti, sizeof rtti, &nf);
+    if (notFound) *notFound = nf;
     if (!s_logged) { s_logged = true; Log("game loader first read: %s -> %s, %zu bytes (%s)", path.c_str(), ok ? "ok" : "FAILED", out.size(), rtti); }
     return ok;
 }
@@ -2455,7 +2461,7 @@ static void Attach(HMODULE h) {
     CreateDirectoryA(g_modDir.c_str(), nullptr);
     g_log = fopen((g_modDir + "\\cdmodkit.log").c_str(), "a");
     ReadGameVersion();
-    Log("cdmodkit.asi v0.86 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
+    Log("cdmodkit.asi v0.87 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
     LoadSettings();
     ReserveHookGap();            // before the game fills the address space around its image (see ReserveHookGap)
     CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);

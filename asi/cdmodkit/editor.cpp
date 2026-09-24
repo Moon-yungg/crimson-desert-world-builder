@@ -27,7 +27,7 @@ namespace editor {
         for (int i = 0; i < count; i++) shown[i] = T(items[i]);   // stays valid: T keeps its last 16 decorated results
         return ImGui::Combo(label, cur, shown, count);
     }
-    static constexpr const char* kEditorVersion = "0.86";
+    static constexpr const char* kEditorVersion = "0.87";
     static bool g_open = false;
     // browser state
     static char  g_filter[128] = "";
@@ -830,6 +830,7 @@ namespace editor {
         if (!ImGui::BeginPopupContextItem(id)) return;
         g_selPrefab = i;
         if (ImGui::MenuItem(T(core::IsFavorite(i) ? "remove favorite" : "add favorite"))) core::ToggleFavorite(i);
+        if (thumbgen::Ready() && ImGui::MenuItem(T("render preview again"))) thumbgen::Refresh(pi.path);   // a broken or missing image from an earlier read error
         ImGui::Separator();
         for (int ci = 0; ci < (int)g_colls.size(); ci++) { bool in = InColl(g_colls[ci], pi.path); if (ImGui::MenuItem((std::string(T(in ? "remove from " : "add to ")) + g_colls[ci].name).c_str())) { auto& v = g_colls[ci].paths; if (in) v.erase(std::remove(v.begin(), v.end(), pi.path), v.end()); else v.push_back(pi.path); SaveColls(); g_lastKey.clear(); } }
         if (g_colls.empty()) ImGui::TextDisabled(T("no collections yet (left pane)"));
