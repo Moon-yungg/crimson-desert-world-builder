@@ -602,8 +602,10 @@ static void PumpJobs() {
     { std::lock_guard<std::mutex> l(g_qMutex); if (!g_queue.empty()) { job = std::move(g_queue.front()); g_queue.pop_front(); InterlockedDecrement(&g_queueCount); } }
     if (job) RunJobGuarded(&job);
 }
+static void InstallCrashFilter(const char* when);
 static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
     const uint64_t r = g_origPump(a1, a2, a3, a4, a5, a6, a7, a8);
+    static bool s_filter = false; if (!s_filter) { s_filter = true; InstallCrashFilter("on the first game tick"); }
     PumpJobs();
     return r;
 }
@@ -2420,7 +2422,47 @@ static void ReadGameVersion() {
     g_gameVersion = b;
 }
 
-// process-wide first-chance fault logger (so a crash anywhere leaves a trace, like master-looter's [fault] lines)
+// Fault logging. First chance: the handler sees every OS error exception in the process, also the ones other mods catch on
+// purpose (guarded reads of their own) - those filled the old 40-line budget and would have hidden a later real crash.
+// Logged now: only our faults (FaultIsOurs), each address once. Unhandled: the exception nobody caught, i.e. the crash
+// itself, from any module, logged as [crash].
+static void LogFaultContext(const char* tag, EXCEPTION_POINTERS* ep) {
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+    HMODULE m = nullptr; char mod[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)at, &m)) GetModuleFileNameA(m, mod, MAX_PATH);
+    Log("[%s] 0x%08x at %p (%s+0x%llx) thread %lu addr %p", tag, code, (void*)at, strrchr(mod, '\\') ? strrchr(mod, '\\') + 1 : mod,
+        (unsigned long long)(at - (uintptr_t)m), GetCurrentThreadId(), ep->ExceptionRecord->NumberParameters > 1 ? (void*)ep->ExceptionRecord->ExceptionInformation[1] : nullptr);
+    {   // the call chain from the faulting context (image-relative), and the argument registers: which caller handed the bad pointer down
+        CONTEXT c = *ep->ContextRecord; char chain[600] = { 0 }; int k = 0;
+        Log("[%s] rcx=%p rdx=%p r8=%p r9=%p rax=%p rbx=%p rsi=%p rdi=%p rbp=%p rsp=%p", tag, (void*)c.Rcx, (void*)c.Rdx, (void*)c.R8, (void*)c.R9, (void*)c.Rax, (void*)c.Rbx, (void*)c.Rsi, (void*)c.Rdi, (void*)c.Rbp, (void*)c.Rsp);
+        for (int i = 0; i < 24 && c.Rip; i++) {
+            DWORD64 ib = 0; PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &ib, nullptr);
+            if (!rf) { k += snprintf(chain + k, sizeof chain - k, " [leaf %llx]", (unsigned long long)(InImage(c.Rip) ? c.Rip - g_base : c.Rip)); c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; }
+            else { void* hd = nullptr; DWORD64 est = 0; RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, c.Rip, rf, &c, &hd, &est, nullptr); }
+            if (!c.Rip || k > (int)sizeof chain - 24) break;
+            k += snprintf(chain + k, sizeof chain - k, " %llx", (unsigned long long)(InImage(c.Rip) ? c.Rip - g_base : c.Rip));
+        }
+        Log("[%s] chain:%s", tag, chain);
+    }
+}
+static uintptr_t g_selfBase = 0, g_selfEnd = 0;   // our own image, set at attach
+// Our fault = the faulting address or one of the next few callers is in cdmodkit.asi. That also catches a game function we
+// called with bad data (the fault itself is then in the exe). Only the top frames count: the pump and Present hooks sit
+// below every game tick and frame, so deeper frames would claim the game's own faults as ours.
+static bool FaultIsOurs(EXCEPTION_POINTERS* ep) {
+    if (!g_selfBase) return true;
+    CONTEXT c = *ep->ContextRecord;
+    for (int i = 0; i < 8 && c.Rip; i++) {
+        if (c.Rip >= g_selfBase && c.Rip < g_selfEnd) return true;
+        DWORD64 ib = 0; PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &ib, nullptr);
+        if (!rf) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; }   // leaf: return address on top (no IsBadReadPtr: it faults itself and would re-enter this handler)
+        else { void* hd = nullptr; DWORD64 est = 0; RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, c.Rip, rf, &c, &hd, &est, nullptr); }
+    }
+    return false;
+}
+static volatile LONG64 g_faultSites[64];   // fault addresses already logged (lock-free: the handler can run on any thread at once)
+static volatile LONG g_faultRepeats = 0, g_faultForeign = 0;
 static LONG CALLBACK VectoredHandler(EXCEPTION_POINTERS* ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     // every error-class OS exception (severity bits 11, customer bit clear: access violation, illegal instruction, in-page
@@ -2431,37 +2473,44 @@ static LONG CALLBACK VectoredHandler(EXCEPTION_POINTERS* ep) {
     if (osError && code != EXCEPTION_STACK_OVERFLOW) cdk::GuardDispatch(ep);   // does not return when a guard is active on this thread (MSVC: __except catches the same set)
 #endif
     if (t_guardedRead) return EXCEPTION_CONTINUE_SEARCH;
-    static volatile LONG s_count = 0;
-    if (InterlockedIncrement(&s_count) > 40) return EXCEPTION_CONTINUE_SEARCH;
-    uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
-    HMODULE m = nullptr; char mod[MAX_PATH] = "?";
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)at, &m)) GetModuleFileNameA(m, mod, MAX_PATH);
-    Log("[fault] 0x%08x at %p (%s+0x%llx) thread %lu addr %p", code, (void*)at, strrchr(mod, '\\') ? strrchr(mod, '\\') + 1 : mod,
-        (unsigned long long)(at - (uintptr_t)m), GetCurrentThreadId(), ep->ExceptionRecord->NumberParameters > 1 ? (void*)ep->ExceptionRecord->ExceptionInformation[1] : nullptr);
-    {   // the call chain from the faulting context (image-relative), and the argument registers: which caller handed the bad pointer down
-        CONTEXT c = *ep->ContextRecord; char chain[600]; int k = 0;
-        Log("[fault] rcx=%p rdx=%p r8=%p r9=%p rax=%p rbx=%p rsi=%p rdi=%p rbp=%p rsp=%p", (void*)c.Rcx, (void*)c.Rdx, (void*)c.R8, (void*)c.R9, (void*)c.Rax, (void*)c.Rbx, (void*)c.Rsi, (void*)c.Rdi, (void*)c.Rbp, (void*)c.Rsp);
-        for (int i = 0; i < 24 && c.Rip; i++) {
-            DWORD64 ib = 0; PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &ib, nullptr);
-            if (!rf) { k += snprintf(chain + k, sizeof chain - k, " [leaf %llx]", (unsigned long long)(InImage(c.Rip) ? c.Rip - g_base : c.Rip)); c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; }
-            else { void* hd = nullptr; DWORD64 est = 0; RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, c.Rip, rf, &c, &hd, &est, nullptr); }
-            if (!c.Rip || k > (int)sizeof chain - 24) break;
-            k += snprintf(chain + k, sizeof chain - k, " %llx", (unsigned long long)(InImage(c.Rip) ? c.Rip - g_base : c.Rip));
-        }
-        Log("[fault] chain:%s", chain);
+    if (!FaultIsOurs(ep)) { InterlockedIncrement(&g_faultForeign); return EXCEPTION_CONTINUE_SEARCH; }   // other mods and the game: only an unhandled one matters, CrashFilter logs it
+    const LONG64 at = (LONG64)ep->ExceptionRecord->ExceptionAddress; int slot = -1;
+    for (int i = 0; i < 64; i++) {
+        const LONG64 v = g_faultSites[i];
+        if (v == at) { InterlockedIncrement(&g_faultRepeats); return EXCEPTION_CONTINUE_SEARCH; }   // known site: counted, not logged again
+        if (v == 0 && InterlockedCompareExchange64(&g_faultSites[i], at, 0) == 0) { slot = i; break; }
+        if (g_faultSites[i] == at) { InterlockedIncrement(&g_faultRepeats); return EXCEPTION_CONTINUE_SEARCH; }   // another thread claimed it with this address
     }
+    if (slot < 0) return EXCEPTION_CONTINUE_SEARCH;   // 64 distinct sites logged: the [crash] line still comes from the unhandled filter
+    LogFaultContext("fault", ep);
+    if (slot == 0) Log("[fault] (first-chance, caught or not: only faults with cdmodkit.asi near the top of the call chain, each address once; a real crash from anywhere is logged as [crash])");
     return EXCEPTION_CONTINUE_SEARCH;
+}
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prevCrashFilter = nullptr;
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    static volatile LONG s_once = 0;
+    if (InterlockedExchange(&s_once, 1) == 0) { LogFaultContext("crash", ep); Log("[crash] unhandled, the game terminates (not logged before: %ld repeats of our faults, %ld faults outside cdmodkit)", g_faultRepeats, g_faultForeign); }
+    return g_prevCrashFilter ? g_prevCrashFilter(ep) : EXCEPTION_CONTINUE_SEARCH;   // the game's own crash reporter still runs
+}
+// The game may install its own filter after our attach, which replaces ours: called again once it is running, then chained.
+static void InstallCrashFilter(const char* when) {
+    LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(CrashFilter);
+    if (prev == CrashFilter) return;
+    if (g_prevCrashFilter && prev != g_prevCrashFilter) Log("crash filter re-installed %s (the game had replaced it), chained to %p", when, (void*)prev);
+    g_prevCrashFilter = prev;
 }
 
 static void Attach(HMODULE h) {
     g_self = h;
+    g_selfBase = (uintptr_t)h; { auto dos = (const IMAGE_DOS_HEADER*)h; auto nt = (const IMAGE_NT_HEADERS*)((const uint8_t*)h + dos->e_lfanew); g_selfEnd = g_selfBase + nt->OptionalHeader.SizeOfImage; }
     AddVectoredExceptionHandler(1, VectoredHandler);
+    InstallCrashFilter("at attach");
     g_base = (uintptr_t)GetModuleHandleA(nullptr);
     g_modDir = DirOf(h) + "\\cdmodkit";
     CreateDirectoryA(g_modDir.c_str(), nullptr);
     g_log = fopen((g_modDir + "\\cdmodkit.log").c_str(), "a");
     ReadGameVersion();
-    Log("cdmodkit.asi v0.87 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
+    Log("cdmodkit.asi v0.88 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
     LoadSettings();
     ReserveHookGap();            // before the game fills the address space around its image (see ReserveHookGap)
     CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);

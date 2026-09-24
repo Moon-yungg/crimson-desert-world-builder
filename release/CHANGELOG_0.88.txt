@@ -1,0 +1,10 @@
+World Builder 0.88
+
+Fixed
+- The log no longer fills up with [fault] lines from other mods that catch their own memory faults on purpose. Those used
+  up the 40-line budget within seconds, so a later real crash would have left no trace. [fault] lines are now only
+  written when cdmodkit is near the top of the call chain, and each address only once.
+
+Added
+- A real crash is logged as [crash] with module, address and call chain, whichever mod or game module caused it (the
+  game's own crash handler still runs afterwards).

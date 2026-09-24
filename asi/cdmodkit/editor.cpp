@@ -27,7 +27,7 @@ namespace editor {
         for (int i = 0; i < count; i++) shown[i] = T(items[i]);   // stays valid: T keeps its last 16 decorated results
         return ImGui::Combo(label, cur, shown, count);
     }
-    static constexpr const char* kEditorVersion = "0.87";
+    static constexpr const char* kEditorVersion = "0.88";
     static bool g_open = false;
     // browser state
     static char  g_filter[128] = "";
