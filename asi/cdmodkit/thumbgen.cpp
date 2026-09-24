@@ -74,7 +74,8 @@ static bool GetFile(std::string path, std::vector<uint8_t>& out) {
 // ---------------------------------------------------------------- reflection serializer (prefab / level objects)
 struct RProp { std::string name, typeName; uint16_t type, fixed; uint32_t flags; };
 struct RType { std::string name; std::vector<RProp> props; };
-struct Node { bool hasXf = false; float xf[10] = { 0 }; std::string path, sub; std::vector<Node> kids; };   // sub: instance of another prefab (its type name is the prefab path)
+struct Node { bool hasXf = false; float xf[10] = { 0 }; std::string path, sub; std::vector<Node> kids;   // sub: instance of another prefab (its type name is the prefab path)
+              bool hasDecalXf = false; float decalXf[10] = { 0 }; std::string decalTex; };   // DecalComponent _offsetTransform (box: scale, quat, pos) / DecalInfo _textureFilename
 
 struct Reader {
     const uint8_t* d; size_t n, pos;
@@ -166,12 +167,14 @@ private:
         case 0: {   // fixed size value
             const uint8_t* b = r.bytes(p.fixed);
             if (p.fixed >= 40 && p.name == "_worldTransform" && p.typeName == "Transform") { obj.hasXf = true; for (int i = 0; i < 10; i++) obj.xf[i] = rdf(b + 4 * i); }
+            if (p.fixed >= 40 && p.name == "_offsetTransform") { obj.hasDecalXf = true; for (int i = 0; i < 10; i++) obj.decalXf[i] = rdf(b + 4 * i); }
             break; }
         case 1: {   // size prefixed (strings), shared string table when present
             std::string s; bool got = false;
             if (!shared.empty()) { int32_t idx = r.i32(); if (idx != -1) { auto it = shared.find(idx); if (it != shared.end()) s = it->second; got = true; } }
             if (!got) { uint32_t len = r.u32(); s = r.str(len); }
             if (p.name == "_path") obj.path = s;
+            else if (p.name == "_textureFilename") obj.decalTex = s;
             break; }
         case 2: r.bytes(p.fixed); break;
         case 3: { uint32_t c = r.u32(); r.bytes((size_t)c * p.fixed); break; }
@@ -235,7 +238,7 @@ static bool LoadPrefabRoots(const std::string& logical, std::vector<Node>& roots
 // Sub-prefab instances (a child whose type is another prefab's path) are expanded in place with their transform, so the
 // preview shows what spawning the parent shows. chain guards against a prefab that contains itself.
 struct CollectCtx { std::vector<std::string> chain; int subs = 0; };
-static void Collect(const Node& o, const float* pm, const float* pt, std::vector<Inst>& out, CollectCtx& cx, int depth = 0) {
+static void Collect(const Node& o, const float* pm, const float* pt, std::vector<Inst>& out, CollectCtx& cx, int depth = 0, bool decalDone = false) {
     float m[9], t[3]; memcpy(m, pm, sizeof m); memcpy(t, pt, sizeof t);
     if (o.hasXf) {
         float r[9]; QuatToMat(o.xf + 3, r); float local[9];
@@ -244,11 +247,24 @@ static void Collect(const Node& o, const float* pm, const float* pt, std::vector
         for (int i = 0; i < 3; i++) t[i] = pm[i * 3] * o.xf[7] + pm[i * 3 + 1] * o.xf[8] + pm[i * 3 + 2] * o.xf[9] + pt[i];
     }
     if (EndsWith(o.path, ".pami") || EndsWith(o.path, ".pam") || EndsWith(o.path, ".pac")) { Inst in; in.path = o.path; memcpy(in.m, m, sizeof m); memcpy(in.t, t, sizeof t); out.push_back(std::move(in)); }
+    if (o.hasDecalXf) {   // decal: a texture projected down its box; previewed as the texture on a flat quad of the box's footprint
+        std::string tex = o.decalTex;
+        for (const auto& k : o.kids) { if (!tex.empty()) break; if (!k.decalTex.empty()) tex = k.decalTex; for (const auto& kk : k.kids) if (tex.empty() && !kk.decalTex.empty()) tex = kk.decalTex; }
+        if (!tex.empty()) {
+            float r[9], local[9], dm[9], dt[3]; QuatToMat(o.decalXf + 3, r);
+            for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) local[i * 3 + j] = r[i * 3 + j] * o.decalXf[j];
+            for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { float s = 0; for (int k = 0; k < 3; k++) s += m[i * 3 + k] * local[k * 3 + j]; dm[i * 3 + j] = s; }
+            for (int i = 0; i < 3; i++) dt[i] = m[i * 3] * o.decalXf[7] + m[i * 3 + 1] * o.decalXf[8] + m[i * 3 + 2] * o.decalXf[9] + t[i];
+            Inst in; in.path = "decal:" + tex; memcpy(in.m, dm, sizeof dm); memcpy(in.t, dt, sizeof dt); out.push_back(std::move(in));
+        }
+    } else if (!decalDone && !o.decalTex.empty()) {   // DecalInfo whose component has no _offsetTransform: default 1 m box
+        Inst in; in.path = "decal:" + o.decalTex; memcpy(in.m, m, sizeof m); memcpy(in.t, t, sizeof t); out.push_back(std::move(in));
+    }
     if (!o.sub.empty() && cx.subs < 64 && cx.chain.size() < 8 && std::find(cx.chain.begin(), cx.chain.end(), o.sub) == cx.chain.end()) {
         std::vector<Node> roots; cx.subs++;
         if (LoadPrefabRoots(o.sub, roots, nullptr)) { cx.chain.push_back(o.sub); for (const auto& r : roots) Collect(r, m, t, out, cx, depth + 1); cx.chain.pop_back(); }
     }
-    if (depth < 200) for (const auto& k : o.kids) Collect(k, m, t, out, cx, depth + 1);
+    if (depth < 200) for (const auto& k : o.kids) Collect(k, m, t, out, cx, depth + 1, decalDone || o.hasDecalXf || !o.decalTex.empty());
 }
 
 // ---------------------------------------------------------------- .pam static mesh (CDMW mesh_parser.parse_pam)
@@ -636,6 +652,10 @@ static void LoadPacMaterials(const std::string& s, std::unordered_map<std::strin
     }
 }
 static const std::unordered_map<std::string, MatInfo>* LoadMaterials(const std::string& pamiPath) {
+    if (pamiPath.compare(0, 6, "decal:") == 0) {   // the decal texture itself; alpha cuts the shape out
+        auto it = g_pamiMats.find(pamiPath); if (it != g_pamiMats.end()) return &it->second;
+        MatInfo m; m.tex = pamiPath.substr(6); return &(g_pamiMats[pamiPath] = { { "decal", m } });
+    }
     const bool pac = EndsWith(pamiPath, ".pac");
     if (!pac && !EndsWith(pamiPath, ".pami")) return nullptr;
     auto it = g_pamiMats.find(pamiPath); if (it != g_pamiMats.end()) return &it->second;
@@ -766,6 +786,12 @@ static std::string ResolvePam(const std::string& path) {
     return res;
 }
 static std::shared_ptr<Mesh> LoadMesh(const std::string& path) {
+    if (path.compare(0, 6, "decal:") == 0) {   // unit quad in the box's XZ plane (decals project along their local Y), uv 0..1
+        static std::shared_ptr<Mesh> quad = [] { auto q = std::make_shared<Mesh>();
+            q->v = { -0.5f, 0, -0.5f, 0.5f, 0, -0.5f, 0.5f, 0, 0.5f, -0.5f, 0, 0.5f }; q->uv = { 0, 0, 1, 0, 1, 1, 0, 1 };
+            q->f = { 0, 1, 2, 0, 2, 3 }; q->fm = { 0, 0 }; q->mats = { "decal" }; return q; }();
+        return quad;
+    }
     std::string pam = ResolvePam(path);
     auto it = g_meshes.find(pam); if (it != g_meshes.end()) return it->second;
     if (g_meshBytes > (400u << 20)) { g_meshes.clear(); g_meshBytes = 0; }
@@ -795,12 +821,12 @@ static void FillTri(uint8_t* buf, int W, const float* x, const float* y, uint8_t
         for (int px = px0; px <= px1; px++, row += 4) { row[0] = r; row[1] = g; row[2] = b; row[3] = 255; }
     }
 }
-static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const std::vector<Surface>& surf, const std::string& file, float azDeg = 35.0f) {
+static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const std::vector<Surface>& surf, const std::string& file, float azDeg = 35.0f, float elDeg = 25.0f) {
     const int S = 256, SS = 2, W = S * SS;
     const size_t nv = mesh.v.size() / 3; if (!nv || mesh.f.size() < 3) return false;
     const bool haveUv = mesh.uv.size() == nv * 2;
     // camera: azimuth 35 deg around Y, then elevation 25 deg around X (matches scripts/render_thumbs.py)
-    const float az = azDeg * 3.14159265f / 180.0f, el = 25.0f * 3.14159265f / 180.0f;
+    const float az = azDeg * 3.14159265f / 180.0f, el = elDeg * 3.14159265f / 180.0f;
     const float ca = cosf(az), sa = sinf(az), ce = cosf(el), se = sinf(el);
     std::vector<float> p(nv * 3);
     float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
@@ -997,7 +1023,8 @@ static bool Generate(const std::string& logical, float dims[6], std::string& why
     if (g_recheckOnly && !g_recheckForce && !anyCompressed && GetFileAttributesA(core::ThumbFile(logical).c_str()) != INVALID_FILE_ATTRIBUTES) { g_lastSkipped = true; return true; }
     // characters face the other way than static objects: a preview made only of skinned meshes is seen from the front
     const bool skinnedOnly = std::all_of(inst.begin(), inst.end(), [](const Inst& in) { return EndsWith(in.path, ".pac"); });
-    if (!RenderPng(all, fs, surf, core::ThumbFile(logical), skinnedOnly ? 215.0f : 35.0f)) { why = "render"; return false; }
+    const bool decalOnly = std::all_of(inst.begin(), inst.end(), [](const Inst& in) { return in.path.compare(0, 6, "decal:") == 0; });   // flat: seen from above
+    if (!RenderPng(all, fs, surf, core::ThumbFile(logical), skinnedOnly ? 215.0f : 35.0f, decalOnly ? 70.0f : 25.0f)) { why = "render"; return false; }
     return true;
 }
 static bool GenerateGuarded(const std::string& logical, float dims[6], std::string& why) {
@@ -1030,12 +1057,15 @@ static DWORD WINAPI Worker(LPVOID) {
             for (const auto& p : failedSet) g_processed.erase(p);
             Log("[thumbs] %zu prefabs without a preview are tried again (earlier failures may have been read errors)", failedSet.size());
             failedSet.clear();
-        } else if (!failedSet.empty() && retryVer < 2) {
+        } else if (!failedSet.empty() && retryVer < 3) {   // marker 3: decals render since 0.93
             size_t n = 0;
-            for (const auto& pi : core::PrefabIndex()) if ((pi.tags.find("SkinnedMesh") != std::string::npos || pi.tags.find("SubPrefab") != std::string::npos) && failedSet.erase(pi.path)) { g_processed.erase(pi.path); n++; }
-            if (n) Log("[thumbs] %zu prefabs with skinned meshes or sub-prefabs are rendered now (earlier versions could not)", n);
+            for (const auto& pi : core::PrefabIndex()) {
+                const bool again = (retryVer < 2 && (pi.tags.find("SkinnedMesh") != std::string::npos || pi.tags.find("SubPrefab") != std::string::npos)) || pi.tags.find("Decal") != std::string::npos;
+                if (again && failedSet.erase(pi.path)) { g_processed.erase(pi.path); n++; }
+            }
+            if (n) Log("[thumbs] %zu prefabs that earlier versions could not preview are rendered now", n);
         }
-        if (FILE* rf = fopen(retryPath.c_str(), "w")) { fprintf(rf, "2\n"); fclose(rf); }
+        if (FILE* rf = fopen(retryPath.c_str(), "w")) { fprintf(rf, "3\n"); fclose(rf); }
         g_failed = (int)failedSet.size(); g_done = (int)g_processed.size() - g_failed;
     }
     g_sizes = fopen(sizesPath.c_str(), "a");
@@ -1050,7 +1080,7 @@ static DWORD WINAPI Worker(LPVOID) {
         // "no meshes" without reading the file. ~1.6k of them (decals, effects, logic objects) would otherwise be read one by
         // one. A parse-error row is read anyway.
         std::lock_guard<std::mutex> l(g_mu); int skipped = 0;
-        for (const auto& pi : idx) if (pi.meshes == 0 && pi.tags.find("SkinnedMesh") == std::string::npos && pi.tags.find("SubPrefab") == std::string::npos && pi.tags.find("parse-error") == std::string::npos) { noMesh++; if (g_processed.insert(pi.path).second) skipped++; }
+        for (const auto& pi : idx) if (pi.meshes == 0 && pi.tags.find("SkinnedMesh") == std::string::npos && pi.tags.find("SubPrefab") == std::string::npos && pi.tags.find("Decal") == std::string::npos && pi.tags.find("parse-error") == std::string::npos) { noMesh++; if (g_processed.insert(pi.path).second) skipped++; }
         g_failed += skipped;
         Log("[thumbs] %d prefabs have no mesh in the index (decals, effects, logic objects): no preview, not read", noMesh);
     }
