@@ -81,6 +81,9 @@ python scripts\make_release.py 0.79     # bumps the version strings, builds, che
   not `cat <<EOF`. `python - <<'PY'` also eats `\x` escapes - prefer a real file.
 - `python scripts\render_thumbs.py` needs `MSYS_NO_PATHCONV=1` in Git Bash, otherwise the filter argument is emptied.
 - `pycrimson` on PyPI is an unrelated squatter. Use the clone in `tools/pycrimson` (editable, patched).
+- `scripts/ingame_test.py` spawns a prefab list in the running game over the HTTP API and screenshots each one (`--launch`
+  starts the game and continues the save). **Run it only when the user asks for an in-game test**, never on your own to verify
+  a change: it takes over the user's PC (game window focus, keystrokes).
 - There is no test suite; the user verifies in game. Pure logic (file parsers, name handling) can be checked by
   copying the function into a scratch `.cpp` and running it standalone - do that before asking for an in-game test.
 - The exe build number is logged at attach (`game build 1.0.0.2944`). Ask for it in any bug report after a patch.
