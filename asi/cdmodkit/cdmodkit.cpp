@@ -631,6 +631,7 @@ static void PumpJobs() {
     }
     if (job) RunJobGuarded(&job);
     ApplyCameraControl();   // post-game-tick camera write wins over the controller's follow update
+    CameraControlRenderOverride();   // renderer keeps separate per-frame view copies; keep those on the same pose
 }
 static void InstallCrashFilter(const char* when);
 static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
@@ -2320,6 +2321,18 @@ void CameraControlStop() {
     });
 }
 bool CameraControlActive() { std::lock_guard<std::mutex> l(g_cameraControlMutex); return g_cameraControl.active; }
+bool CameraControlBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd) {
+    CameraControlState state;
+    { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (!g_cameraControl.active) return false; state = g_cameraControl; }
+    alignas(16) float xf[12] = {};
+    MakeTransform(xf, state.pos, { state.yaw, state.pitch, state.roll }, 1.0f, true);
+    const float x = xf[3], y = xf[4], z = xf[5], w = xf[6];
+    if (right) *right = { 1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w) };
+    if (up)    *up    = { 2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w) };
+    if (fwd)   *fwd   = { 2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y) };
+    if (pos) *pos = state.pos;
+    return true;
+}
 void CameraControlStep(float forward, float right, float up, float zoom, float dt, bool fast) {
     if (!std::isfinite(dt) || dt <= 0) return;
     dt = std::min(dt, 0.1f);
@@ -2374,6 +2387,13 @@ bool CameraFov(float* deg) {
     return false;
 }
 bool CameraPose(Vec3* fwd, Vec3* pos) {
+    if (CameraControlActive()) {
+        Vec3 cf{};
+        if (CameraControlBasis(pos, nullptr, nullptr, &cf)) {
+            const float l = sqrtf(cf.x * cf.x + cf.z * cf.z);
+            if (l >= 0.05f) { if (fwd) *fwd = { cf.x / l, 0, cf.z / l }; return true; }
+        }
+    }
     uintptr_t so = CameraSceneObject(); if (!so) return false;
     float xf[10]; int16_t tile[2];
     if (!ReadBytes(so + 0x1A4, xf, 40) || !ReadBytes(so + 0x1CC, tile, 4)) return false;   // world TiledTransform: scale3, quat4, pos3, tile

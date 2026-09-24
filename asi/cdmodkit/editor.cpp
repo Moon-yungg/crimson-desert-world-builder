@@ -27,7 +27,8 @@ namespace editor {
         for (int i = 0; i < count; i++) shown[i] = T(items[i]);   // stays valid: T keeps its last 16 decorated results
         return ImGui::Combo(label, cur, shown, count);
     }
-    // Sliders/drags keep their normal UI; double-click switches the same field to direct numeric entry.
+    // Sliders/drags keep their native interaction. A separate small ">" control beside them expands a numeric field;
+    // direct entry never takes over the slider itself, so double-clicking/dragging the slider cannot corrupt the value.
     static ImGuiID g_numericEditId = 0, g_numericEditEndedId = 0;
     static bool g_numericEditFocus = false, g_numericEditWasActive = false;
     static int g_numericEditStartedFrame = -1, g_numericEditLastSeenFrame = -1, g_numericEditEndedFrame = -1;
@@ -41,11 +42,11 @@ namespace editor {
         if (g_numericEditFocus) ImGui::SetKeyboardFocusHere();
         float before[3] = { value[0], vec3 ? value[1] : 0.0f, vec3 ? value[2] : 0.0f };
         ImGui::PushID("##numeric_edit");
-        const bool entered = vec3 ? ImGui::InputFloat3(label, value, format) : ImGui::InputFloat(label, value, 0.0f, 0.0f, format);
+        const bool entered = vec3 ? ImGui::InputFloat3("##value", value, format) : ImGui::InputFloat("##value", value, 0.0f, 0.0f, format);
         ImGui::PopID();
         const ImGuiIO& io = ImGui::GetIO(); const bool active = ImGui::IsItemActive() || io.WantTextInput;
         if (active) { g_numericEditWasActive = true; g_numericEditFocus = false; }
-        const bool clickedOutside = ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsItemHovered();
+        const bool clickedOutside = ImGui::GetFrameCount() > g_numericEditStartedFrame && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsItemHovered();
         const bool stableDeactivation = g_numericEditWasActive && ImGui::GetFrameCount() > g_numericEditStartedFrame + 1 && ImGui::IsItemDeactivated();
         const bool submit = g_numericEditWasActive && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
         if (stableDeactivation || submit || ((g_numericEditFocus || g_numericEditWasActive) && clickedOutside)) {
@@ -55,24 +56,41 @@ namespace editor {
         *changed = entered; for (int i = 0; i < (vec3 ? 3 : 1); ++i) *changed |= before[i] != value[i];
         return true;
     }
-    static void NumericEditDoubleClick(const char* label) {
-        if (g_numericEditId != ImGui::GetID(label) && ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            g_numericEditId = ImGui::GetID(label); g_numericEditFocus = true; g_numericEditWasActive = false;
-            g_numericEditStartedFrame = g_numericEditLastSeenFrame = ImGui::GetFrameCount();
+    static bool NumericEditFoldout(const char* label, float* value, float min, float max, const char* format, bool vec3) {
+        const ImGuiID id = ImGui::GetID(label);
+        const float gap = ImGui::GetStyle().ItemSpacing.x, buttonW = ImGui::GetFrameHeight();
+        const float right = ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
+        if (ImGui::GetItemRectMax().x + gap + buttonW <= right) ImGui::SameLine();
+        ImGui::PushID(label);
+        const bool clicked = ImGui::SmallButton(g_numericEditId == id ? "v##number" : ">##number");
+        ImGui::PopID();
+        if (clicked) {
+            if (g_numericEditId == id) {
+                const int count = vec3 ? 3 : 1; for (int i = 0; i < count; ++i) value[i] = std::max(min, std::min(max, value[i]));
+                g_numericEditEndedId = id; g_numericEditEndedFrame = ImGui::GetFrameCount(); CancelNumericEdit();
+            } else {
+                g_numericEditId = id; g_numericEditFocus = true; g_numericEditWasActive = false;
+                g_numericEditStartedFrame = g_numericEditLastSeenFrame = ImGui::GetFrameCount();
+            }
         }
+        if (g_numericEditId != id) return false;
+        const float inputW = vec3 ? 240.0f : 120.0f;
+        if (ImGui::GetItemRectMax().x + gap + inputW <= right) ImGui::SameLine();
+        ImGui::SetNextItemWidth(std::min(inputW, ImGui::GetContentRegionAvail().x));
+        bool edited = false; NumericEditInput(label, value, min, max, format, vec3, &edited); return edited;
     }
     static bool NumericEditEnded(const char* label) { return g_numericEditEndedFrame == ImGui::GetFrameCount() && g_numericEditEndedId == ImGui::GetID(label); }
     static bool SliderFloatEdit(const char* label, float* value, float min, float max, const char* format, ImGuiSliderFlags flags = 0) {
-        bool edited = false; if (NumericEditInput(label, value, min, max, format, false, &edited)) return edited;
-        const bool changed = ImGui::SliderFloat(label, value, min, max, format, flags); NumericEditDoubleClick(label); return changed;
+        const bool changed = ImGui::SliderFloat(label, value, min, max, format, flags);
+        return NumericEditFoldout(label, value, min, max, format, false) || changed;
     }
     static bool DragFloatEdit(const char* label, float* value, float speed, float min, float max, const char* format, ImGuiSliderFlags flags = 0) {
-        bool edited = false; if (NumericEditInput(label, value, min, max, format, false, &edited)) return edited;
-        const bool changed = ImGui::DragFloat(label, value, speed, min, max, format, flags); NumericEditDoubleClick(label); return changed;
+        const bool changed = ImGui::DragFloat(label, value, speed, min, max, format, flags);
+        return NumericEditFoldout(label, value, min, max, format, false) || changed;
     }
     static bool DragFloat3Edit(const char* label, float value[3], float speed, float min, float max, const char* format) {
-        bool edited = false; if (NumericEditInput(label, value, min, max, format, true, &edited)) return edited;
-        const bool changed = ImGui::DragFloat3(label, value, speed, min, max, format); NumericEditDoubleClick(label); return changed;
+        const bool changed = ImGui::DragFloat3(label, value, speed, min, max, format);
+        return NumericEditFoldout(label, value, min, max, format, true) || changed;
     }
     static void SameLineOrWrap(bool compact, float nextWidth = 80.0f, float spacing = -1.0f) {
         const float gap = spacing >= 0 ? spacing : ImGui::GetStyle().ItemSpacing.x;
@@ -402,10 +420,13 @@ namespace editor {
         // pose from the camera scene object (live every frame, verified against the renderer's view matrix to a few centimetres);
         // the projection from the renderer's own block when it is known, since the game changes the field of view with the
         // situation (50 degrees outdoors, 40 in town were measured); until then the manual / traced value
-        if (!core::CameraBasis(&c.pos, &c.right, &c.up, &c.fwd)) return c;
-        const float sgn = g_camSign != 0 ? g_camSign : 1.0f;   // forward sign as calibrated from the camera -> character vector
-        c.fwd = { c.fwd.x * sgn, c.fwd.y * sgn, c.fwd.z * sgn };
-        if (core::g_camMirror) c.right = { -c.right.x, -c.right.y, -c.right.z };
+        const bool controlled = core::CameraControlActive() && core::CameraControlBasis(&c.pos, &c.right, &c.up, &c.fwd);
+        if (!controlled && !core::CameraBasis(&c.pos, &c.right, &c.up, &c.fwd)) return c;
+        if (!controlled) {
+            const float sgn = g_camSign != 0 ? g_camSign : 1.0f;   // forward sign as calibrated from the camera -> character vector
+            c.fwd = { c.fwd.x * sgn, c.fwd.y * sgn, c.fwd.z * sgn };
+            if (core::g_camMirror) c.right = { -c.right.x, -c.right.y, -c.right.z };
+        }
         float m00 = 0, m11 = 0; Vec3 rp;
         if (core::g_fovAuto && core::RenderCamera(&rp, nullptr, nullptr, nullptr, &m00, &m11, core::g_camLag)) { c.f = m11; c.aspect = m11 / m00; c.ok = true; g_renderCamUsed = true; return c; }
         g_renderCamUsed = false;
@@ -1210,7 +1231,7 @@ namespace editor {
             if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("list view: name, folder, tags"));
             ImGui::SameLine(0, 2); ImGui::PushStyleColor(ImGuiCol_Button, g_cardView ? on : off); if (ImGui::Button(T(ICON_COPY " cards"))) g_cardView = true; ImGui::PopStyleColor();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("tile view with the preview images (same search and filters)"));
-            if (g_cardView) { ImGui::SameLine(); ImGui::SetNextItemWidth(100 * ui); SliderFloatEdit("##cardsize", &g_cardSize, 64.0f, 200.0f, "%.0f px"); if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("tile size; double-click to type a value")); }
+            if (g_cardView) { ImGui::SameLine(); ImGui::SetNextItemWidth(100 * ui); SliderFloatEdit("##cardsize", &g_cardSize, 64.0f, 200.0f, "%.0f px"); if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("tile size")); }
             ImGui::SameLine();
         }
         ImGui::SetNextItemWidth(std::max(120.0f * ui, ImGui::GetContentRegionAvail().x - 400.0f * ui));

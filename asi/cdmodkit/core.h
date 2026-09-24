@@ -41,6 +41,8 @@ namespace core {
     void CameraControlStart();                 // capture the live pose and switch CameraManager's active stack entry to its native FreeCamCamera
     void CameraControlStop();                  // restore the camera stack entry captured at activation
     bool CameraControlActive();
+    bool CameraControlBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd);
+    bool CameraControlRenderOverride();        // overwrite tracked renderer view copies with the controlled pose
     void CameraControlStep(float forward, float right, float up, float zoom, float dt, bool fast);
     void CameraControlLook(float dx, float dy);
     extern float g_fovDeg; extern bool g_camMirror; extern bool g_fovAuto;   // projection settings (settings.txt fov=, mirror=, fovauto=)
