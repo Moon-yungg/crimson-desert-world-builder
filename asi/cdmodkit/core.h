@@ -35,6 +35,11 @@ namespace core {
     bool SetPlayerPos(Vec3 world);             // writes the transform component (experimental: the game may correct it)
     bool CameraPose(Vec3* fwd, Vec3* pos);     // horizontal view direction (local +Z of the camera object) and world position of the active camera
     bool CameraBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd);   // full camera frame from the camera object's quaternion (fwd = local +Z, sign applied by the editor)
+    void CameraControlStart();                 // capture the live camera and start overriding its transform
+    void CameraControlStop();                  // restore the captured camera transform
+    bool CameraControlActive();
+    void CameraControlStep(float forward, float right, float up, float zoom, float dt, bool fast);
+    void CameraControlLook(float dx, float dy);
     extern float g_fovDeg; extern bool g_camMirror; extern bool g_fovAuto;   // projection settings (settings.txt fov=, mirror=, fovauto=)
     extern int g_camLag;                                                     // settings.txt camlag=: frames the overlay camera trails the game camera (the game simulates ahead of the frame on screen)
     bool CameraFov(float* deg);                // live vertical field of view read from the camera object (PhotoCamera +0x1DC), false if implausible

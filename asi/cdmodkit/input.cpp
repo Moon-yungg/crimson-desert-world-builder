@@ -15,6 +15,7 @@ namespace input {
     static HWND    g_hwnd = nullptr;
     static CRITICAL_SECTION g_cs; static bool g_csReady = false;
     static float g_vx = 0, g_vy = 0;
+    static float g_pendingDx = 0, g_pendingDy = 0;
     static bool  g_rawButtons = false;
     static int   g_pendingButtons[5][2];
     static float g_pendingWheel = 0;
@@ -51,6 +52,8 @@ namespace input {
         } else {
             g_vx += static_cast<float>(m.lLastX);
             g_vy += static_cast<float>(m.lLastY);
+            g_pendingDx += static_cast<float>(m.lLastX);
+            g_pendingDy += static_cast<float>(m.lLastY);
         }
         if (g_vx < 0) g_vx = 0;
         if (g_vy < 0) g_vy = 0;
@@ -84,6 +87,14 @@ namespace input {
         Unlock();
     }
 
+    void TakeMouseDelta(float* dx, float* dy) {
+        Lock();
+        if (dx) *dx = g_pendingDx;
+        if (dy) *dy = g_pendingDy;
+        g_pendingDx = g_pendingDy = 0;
+        Unlock();
+    }
+
     // ImGui's Win32 backend polls GetCursorPos every frame; on the render thread while the menu is open it gets the virtual cursor.
     static BOOL WINAPI hkGetCursorPos(LPPOINT p) {
         if (p && core::g_menuOpen && g_renderTid && GetCurrentThreadId() == g_renderTid && g_hwnd) {
@@ -112,9 +123,12 @@ namespace input {
 
     void MenuOpened() {
         int w, h; ClientSize(&w, &h);
-        Lock(); g_vx = w * 0.5f; g_vy = h * 0.5f; for (auto& b : g_pendingButtons) b[0] = b[1] = 0; g_pendingWheel = 0; Unlock();
+        Lock(); g_vx = w * 0.5f; g_vy = h * 0.5f; g_pendingDx = g_pendingDy = 0; for (auto& b : g_pendingButtons) b[0] = b[1] = 0; g_pendingWheel = 0; Unlock();
     }
-    void MenuClosed() {}
+    void MenuClosed() {
+        ClearKeys();
+        Lock(); g_pendingDx = g_pendingDy = 0; for (auto& b : g_pendingButtons) b[0] = b[1] = 0; g_pendingWheel = 0; Unlock();
+    }
 
     // scan code key state: set on key-down, cleared on key-up (both extended variants: Shift+Numpad flips the flag), on focus loss
     // and when the placement mode starts/ends. No time-out: Windows auto-repeats only the last pressed key, so a held key may stay silent.

@@ -34,7 +34,7 @@ void* CdHeapAlloc(size_t n); void* CdHeapRealloc(void* p, size_t n); void CdHeap
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
-namespace editor { void Draw(); void Toggle(); bool IsOpen(); void ApplyStyle(float scale); bool PlayMode(); void TogglePlay(); bool Placing(); bool MouseMode(); }
+namespace editor { void Draw(); void Toggle(); bool IsOpen(); void ApplyStyle(float scale); bool PlayMode(); void TogglePlay(); void ToggleCameraMode(); bool Placing(); bool MouseMode(); }
 
 namespace overlay {
     typedef HRESULT (STDMETHODCALLTYPE* FactoryCreateSwapChainForHwnd_t)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
@@ -335,9 +335,12 @@ namespace overlay {
         bool down = (GetAsyncKeyState(core::g_keyToggle) & 0x8000) != 0;
         if (down && !s_insDown) editor::Toggle();
         s_insDown = down;
-        static bool s_homeDown = false;   // Home switches between edit mode (menu takes all input) and play mode (game takes all input)
+        static bool s_homeDown = false;   // Home enters/exits free camera; placement's existing play state still returns to edit first
         bool home = (GetAsyncKeyState(core::g_keyMode) & 0x8000) != 0;
-        if (home && !s_homeDown && editor::IsOpen()) editor::TogglePlay();
+        if (home && !s_homeDown && editor::IsOpen()) {
+            if (editor::PlayMode()) editor::TogglePlay();
+            else editor::ToggleCameraMode();
+        }
         s_homeDown = home;
         bool open = editor::IsOpen() || editor::Placing();
         if (open != g_wasOpen) { if (open) input::MenuOpened(); else input::MenuClosed(); g_wasOpen = open; }

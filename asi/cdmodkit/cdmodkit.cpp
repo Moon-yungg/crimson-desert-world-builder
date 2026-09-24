@@ -12,6 +12,7 @@
 #include <map>
 #include <set>
 #include <algorithm>
+#include <atomic>
 #include <intrin.h>
 #include <winver.h>
 #include "MinHook.h"
@@ -412,6 +413,19 @@ bool GameReadFileRange(const std::string& path, std::vector<uint8_t>& out, uint3
 // ---- game call tracing (reverse engineering aid, console "trace on|off"): logs the game's own setWorldTransform / setEnable calls
 // with the caller RVA, every object the game creates, and transform changes of the most recently created game object per tick.
 static SetWorldTransformFn g_origSetXf = nullptr; static SetEnableFn g_origSetEnable = nullptr;
+struct CameraControlState {
+    bool active = false;
+    uintptr_t manager = 0;
+    uintptr_t object = 0;
+    float original[11] = {};
+    Vec3 pos{};
+    float yaw = 0, pitch = 0, roll = 0;
+};
+static std::mutex g_cameraControlMutex;
+static CameraControlState g_cameraControl;
+static std::atomic<uint64_t> g_cameraControlRequest{ 0 };
+static uintptr_t CameraSceneObject(uintptr_t* managerOut = nullptr);
+static void ApplyCameraControl();
 static std::map<uintptr_t, long> g_traceCallers; static long g_traceLines = 0; static DWORD g_traceSec = 0;
 static bool TraceBudget() { DWORD s = GetTickCount() / 1000; if (s != g_traceSec) { g_traceSec = s; g_traceLines = 0; } return g_traceLines++ < 80; }
 static void __fastcall HookSetXf(void* obj, const float* xf, uint8_t a, uint8_t b) {
@@ -607,10 +621,13 @@ static void PumpJobs() {
     g_pumpTicks++; g_gameThread = GetCurrentThreadId();
     if (g_trace) TraceTick();
     if ((g_pumpTicks & 15) == 0) AutoloadTick();
-    if (InterlockedCompareExchange(&g_queueCount, 0, 0) == 0) return;
     std::function<void()> job;
-    { std::lock_guard<std::mutex> l(g_qMutex); if (!g_queue.empty()) { job = std::move(g_queue.front()); g_queue.pop_front(); InterlockedDecrement(&g_queueCount); } }
+    if (InterlockedCompareExchange(&g_queueCount, 0, 0) != 0) {
+        std::lock_guard<std::mutex> l(g_qMutex);
+        if (!g_queue.empty()) { job = std::move(g_queue.front()); g_queue.pop_front(); InterlockedDecrement(&g_queueCount); }
+    }
     if (job) RunJobGuarded(&job);
+    ApplyCameraControl();   // post-game-tick camera write wins over the controller's follow update
 }
 static void InstallCrashFilter(const char* when);
 static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
@@ -1997,18 +2014,204 @@ static void FindCameraObjects(std::vector<std::pair<std::string, uintptr_t>>& ou
 }
 // The CameraManager (reachable from the world root) keeps the active camera's SceneObject at +0x40; its world transform
 // sits at +0x1A4 like every SceneObject (scale3, quat4 at +0x1B0, pos3). camtrace showed the quaternion turning with the view.
-static uintptr_t g_camMgr = 0; static DWORD g_camSearchAt = 0;
+static uintptr_t g_camMgr = 0; static DWORD g_camSearchAt = 0; static bool g_camSearchRunning = false; static std::mutex g_camMgrMutex;
+static uintptr_t FindCameraManagerFromWorld() {
+    if (!g_base || !kRva_WorldGlobal) return 0;
+    const uintptr_t world = Deref(g_base + kRva_WorldGlobal, 0);
+    const uintptr_t actorMgr = FindPtrWithRtti(world, 0x100, "ClientActorManager@");
+    const uintptr_t user = FindPtrWithRtti(actorMgr, 0x200, "ClientUserActor@");
+    const uintptr_t roots[3] = { world, actorMgr, user };
+    std::set<uintptr_t> seen;
+    for (uintptr_t root : roots) {
+        if (!root) continue;
+        for (unsigned o1 = 0; o1 < 0x800; o1 += 8) {
+            const uintptr_t p = Deref(root, o1);
+            if (!p || !seen.insert(p).second) continue;
+            const char* name = RttiName(p);
+            if (name && strstr(name, "CameraManager@")) return p;
+            if (!name) continue;
+            for (unsigned o2 = 0; o2 < 0x400; o2 += 8) {
+                const uintptr_t q = Deref(p, o2);
+                if (!q || !seen.insert(q).second) continue;
+                const char* childName = RttiName(q);
+                if (childName && strstr(childName, "CameraManager@")) return q;
+            }
+        }
+    }
+    return 0;
+}
+static DWORD WINAPI CameraManagerSearchThread(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    const uintptr_t found = FindCameraManagerFromWorld();
+    { std::lock_guard<std::mutex> l(g_camMgrMutex); if (found) g_camMgr = found; g_camSearchRunning = false; }
+    if (found) Log("camera manager %p", (void*)found);
+    return 0;
+}
 static uintptr_t CameraManagerPtr() {
-    if (g_camMgr) { const char* n = RttiName(g_camMgr); if (n && strstr(n, "CameraManager@")) return g_camMgr; g_camMgr = 0; }
-    const DWORD now = GetTickCount(); if (now - g_camSearchAt < 2000) return 0; g_camSearchAt = now;
-    std::vector<std::pair<std::string, uintptr_t>> found; FindCameraObjects(found);
-    for (auto& f : found) if (f.first.find("CameraManager@") != std::string::npos) { g_camMgr = f.second; Log("camera manager %p", (void*)g_camMgr); break; }
-    return g_camMgr;
+    uintptr_t cached = 0;
+    { std::lock_guard<std::mutex> l(g_camMgrMutex); cached = g_camMgr; }
+    if (cached) {
+        const char* n = RttiName(cached);
+        if (n && strstr(n, "CameraManager@")) return cached;
+        std::lock_guard<std::mutex> l(g_camMgrMutex);
+        if (g_camMgr == cached) g_camMgr = 0;
+    }
+    const DWORD now = GetTickCount(); bool startSearch = false;
+    {
+        std::lock_guard<std::mutex> l(g_camMgrMutex);
+        if (g_camMgr) return g_camMgr;
+        if (!g_camSearchRunning && now - g_camSearchAt >= 2000) {
+            g_camSearchAt = now;
+            g_camSearchRunning = true;
+            startSearch = true;
+        }
+    }
+    if (startSearch) {
+        HANDLE thread = CreateThread(nullptr, 0, CameraManagerSearchThread, nullptr, 0, nullptr);
+        if (thread) CloseHandle(thread);
+        else { std::lock_guard<std::mutex> l(g_camMgrMutex); g_camSearchRunning = false; }
+    }
+    return 0;
+}
+static uintptr_t CameraSceneObjectFromManager(uintptr_t manager) {
+    const char* managerName = manager ? RttiName(manager) : nullptr;
+    if (!managerName || !strstr(managerName, "CameraManager@")) return 0;
+    uintptr_t so = Deref(manager, 0x40);
+    const char* objectName = so ? RttiName(so) : nullptr;
+    return objectName && strstr(objectName, "SceneObject") ? so : 0;
+}
+static uintptr_t CameraSceneObject(uintptr_t* managerOut) {
+    const uintptr_t manager = CameraManagerPtr();
+    if (managerOut) *managerOut = manager;
+    return CameraSceneObjectFromManager(manager);
+}
+static void QueueCameraControlCapture(uint64_t request, int retryCount);
+static void ApplyCameraControl() {
+    CameraControlState state;
+    { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (!g_cameraControl.active) return; state = g_cameraControl; }
+    // Use the manager captured at activation. CameraManagerPtr() may recursively scan
+    // the world graph when its cache expires, which must never run in the per-tick path.
+    const uintptr_t activeCamera = CameraSceneObjectFromManager(state.manager);
+    if (activeCamera != state.object || !CheckSO(state.object, "camera control")) {
+        std::lock_guard<std::mutex> l(g_cameraControlMutex);
+        if (g_cameraControl.object == state.object) g_cameraControl = {};
+        Log("camera control: disabled because the active camera changed (%p -> %p)", (void*)state.object, (void*)activeCamera);
+        return;
+    }
+    alignas(16) float transform[12];
+    MakeTransform(transform, state.pos, { state.yaw, state.pitch, state.roll }, state.original[0], true);
+    transform[0] = state.original[0]; transform[1] = state.original[1]; transform[2] = state.original[2];
+    // The active camera's SceneObject exposes a TiledTransform at +0x1A4, but calling
+    // SceneObject::setWorldTransform on it crashes in the game (logged on build 1.0.0.2976).
+    // The renderer reads this transform directly, so write its validated 44-byte value on the game thread.
+    if (!WriteBytes(state.object + 0x1A4, transform, 44)) {
+        std::lock_guard<std::mutex> l(g_cameraControlMutex);
+        if (g_cameraControl.object == state.object) g_cameraControl = {};
+        Log("camera control: disabled after a guarded transform write failed");
+        return;
+    }
+    static DWORD s_lastApplyLog = 0;
+    const DWORD now = GetTickCount();
+    if (now - s_lastApplyLog >= 1000) {
+        s_lastApplyLog = now;
+        Log("camera control: applied pose (%.1f %.1f %.1f) yaw %.1f pitch %.1f", state.pos.x, state.pos.y, state.pos.z, state.yaw, state.pitch);
+    }
+}
+static void QueueCameraControlCapture(uint64_t request, int retryCount) {
+    RunOnGameThread([request, retryCount]() {
+        if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) return;
+        { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (g_cameraControl.active) return; }
+        uintptr_t manager = 0;
+        const uintptr_t so = CameraSceneObject(&manager);
+        if (!so) {
+            if (retryCount < 90 && g_cameraControlRequest.load(std::memory_order_relaxed) == request)
+                QueueCameraControlCapture(request, retryCount + 1);
+            else Log("camera control: active camera transform is unavailable");
+            return;
+        }
+        float original[11] = {};
+        if (!ReadBytes(so + 0x1A4, original, 40) || !ReadBytes(so + 0x1CC, original + 10, 4)) {
+            Log("camera control: active camera transform is unavailable"); return;
+        }
+        const float qx = original[3], qy = original[4], qz = original[5], qw = original[6];
+        const float qlen = qx * qx + qy * qy + qz * qz + qw * qw;
+        if (!std::isfinite(qlen) || fabsf(qlen - 1.0f) > 0.1f || !std::isfinite(original[7] + original[8] + original[9]) ||
+            !std::isfinite(original[0]) || !std::isfinite(original[1]) || !std::isfinite(original[2]) ||
+            original[0] <= 0.0001f || original[1] <= 0.0001f || original[2] <= 0.0001f ||
+            original[0] > 10000.0f || original[1] > 10000.0f || original[2] > 10000.0f) {
+            Log("camera control: active camera transform failed validation"); return;
+        }
+        int16_t tile[2]; memcpy(tile, original + 10, sizeof tile);
+        CameraControlState state;
+        state.active = true; state.manager = manager; state.object = so;
+        memcpy(state.original, original, sizeof original);
+        state.pos = { original[7] + tile[0] * kTileSize, original[8], original[9] + tile[1] * kTileSize };
+        // MakeTransform builds Ry(yaw) * Rx(pitch) * Rz(roll). Extract yaw from the rotated +Z
+        // axis (R02/R22); the common ZYX denominator is wrong here when the camera is pitched.
+        state.yaw = atan2f(2.0f * (qx * qz + qy * qw), 1.0f - 2.0f * (qx * qx + qy * qy)) * (180.0f / 3.14159265f);
+        state.pitch = asinf(std::max(-1.0f, std::min(1.0f, -2.0f * (qy * qz - qx * qw)))) * (180.0f / 3.14159265f);
+        state.pitch = std::max(-85.0f, std::min(85.0f, state.pitch));
+        state.roll = atan2f(2.0f * (qx * qy + qz * qw), 1.0f - 2.0f * (qx * qx + qz * qz)) * (180.0f / 3.14159265f);
+        { std::lock_guard<std::mutex> l(g_cameraControlMutex);
+          if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) return;
+          g_cameraControl = state; }
+        Log("camera control: captured camera %p at (%.1f %.1f %.1f)", (void*)so, state.pos.x, state.pos.y, state.pos.z);
+    });
+}
+void CameraControlStart() {
+    if (!HooksReady()) { Log("camera control: game hooks are not ready"); return; }
+    const uint64_t request = g_cameraControlRequest.fetch_add(1, std::memory_order_relaxed) + 1;
+    Log("camera control: capture queued for the next game tick");
+    QueueCameraControlCapture(request, 0);
+}
+void CameraControlStop() {
+    const uint64_t request = g_cameraControlRequest.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!HooksReady()) return;
+    RunOnGameThread([request]() {
+        if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) return;
+        CameraControlState state;
+        { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (!g_cameraControl.active) return; state = g_cameraControl; }
+        alignas(16) float original[12] = {};
+        memcpy(original, state.original, sizeof state.original);
+        const uintptr_t activeCamera = CameraSceneObjectFromManager(state.manager);
+        const bool restored = activeCamera == state.object && CheckSO(state.object, "camera restore") && WriteBytes(state.object + 0x1A4, original, 44);
+        { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (g_cameraControl.object == state.object) g_cameraControl = {}; }
+        Log("camera control: %s camera %p%s", restored ? "restored" : "could not restore", (void*)state.object,
+            activeCamera != state.object ? " (active camera changed; skipped stale object)" : "");
+    });
+}
+bool CameraControlActive() { std::lock_guard<std::mutex> l(g_cameraControlMutex); return g_cameraControl.active; }
+void CameraControlStep(float forward, float right, float up, float zoom, float dt, bool fast) {
+    if (!std::isfinite(dt) || dt <= 0) return;
+    dt = std::min(dt, 0.1f);
+    std::lock_guard<std::mutex> l(g_cameraControlMutex);
+    if (!g_cameraControl.active) return;
+    const float speed = (fast ? 32.0f : 8.0f) * dt;
+    const float ry = g_cameraControl.yaw * (3.14159265f / 180.0f), rp = g_cameraControl.pitch * (3.14159265f / 180.0f);
+    const Vec3 fwd = { sinf(ry) * cosf(rp), -sinf(rp), cosf(ry) * cosf(rp) };
+    const Vec3 side = { cosf(ry), 0, -sinf(ry) };
+    g_cameraControl.pos.x += (fwd.x * forward + side.x * right) * speed;
+    g_cameraControl.pos.y += (fwd.y * forward + up) * speed;
+    g_cameraControl.pos.z += (fwd.z * forward + side.z * right) * speed;
+    g_cameraControl.pos.x += fwd.x * zoom * 3.0f;
+    g_cameraControl.pos.y += fwd.y * zoom * 3.0f;
+    g_cameraControl.pos.z += fwd.z * zoom * 3.0f;
+    g_cameraControl.pos.x = std::max(-32000000.0f, std::min(32000000.0f, g_cameraControl.pos.x));
+    g_cameraControl.pos.y = std::max(-1000000.0f, std::min(1000000.0f, g_cameraControl.pos.y));
+    g_cameraControl.pos.z = std::max(-32000000.0f, std::min(32000000.0f, g_cameraControl.pos.z));
+}
+void CameraControlLook(float dx, float dy) {
+    if (!std::isfinite(dx) || !std::isfinite(dy)) return;
+    std::lock_guard<std::mutex> l(g_cameraControlMutex);
+    if (!g_cameraControl.active) return;
+    g_cameraControl.yaw += dx * 0.12f;
+    g_cameraControl.yaw = fmodf(g_cameraControl.yaw + 180.0f, 360.0f);
+    if (g_cameraControl.yaw < 0) g_cameraControl.yaw += 360.0f;
+    g_cameraControl.yaw -= 180.0f;
+    g_cameraControl.pitch = std::max(-85.0f, std::min(85.0f, g_cameraControl.pitch + dy * 0.12f));
 }
 bool CameraBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd) {
-    uintptr_t mgr = CameraManagerPtr(); if (!mgr) return false;
-    uintptr_t so = Deref(mgr, 0x40); if (!so) return false;
-    const char* n = RttiName(so); if (!n || !strstr(n, "SceneObject")) return false;
+    uintptr_t so = CameraSceneObject(); if (!so) return false;
     float xf[10]; int16_t tile[2];
     if (!ReadBytes(so + 0x1A4, xf, 40) || !ReadBytes(so + 0x1CC, tile, 4)) return false;
     const float x = xf[3], y = xf[4], z = xf[5], w = xf[6];
@@ -2032,9 +2235,7 @@ bool CameraFov(float* deg) {
     return false;
 }
 bool CameraPose(Vec3* fwd, Vec3* pos) {
-    uintptr_t mgr = CameraManagerPtr(); if (!mgr) return false;
-    uintptr_t so = Deref(mgr, 0x40); if (!so) return false;
-    const char* n = RttiName(so); if (!n || !strstr(n, "SceneObject")) return false;
+    uintptr_t so = CameraSceneObject(); if (!so) return false;
     float xf[10]; int16_t tile[2];
     if (!ReadBytes(so + 0x1A4, xf, 40) || !ReadBytes(so + 0x1CC, tile, 4)) return false;   // world TiledTransform: scale3, quat4, pos3, tile
     const float x = xf[3], y = xf[4], z = xf[5], w = xf[6];
