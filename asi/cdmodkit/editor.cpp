@@ -60,6 +60,7 @@ namespace editor {
     static bool  g_snap = false; static int g_snapPosIdx = 3, g_snapYawIdx = 2;
     static const float kSnapPos[] = { 0.1f, 0.25f, 0.5f, 1.0f, 2.0f }; static const char* kSnapPosNames[] = { "0.1 m", "0.25 m", "0.5 m", "1 m", "2 m" };
     static const float kSnapYaw[] = { 5.0f, 15.0f, 30.0f, 45.0f, 90.0f }; static const char* kSnapYawNames[] = { "5 deg", "15 deg", "30 deg", "45 deg", "90 deg" };
+    static float g_rotationStep = 25.0f;
 
     static bool  g_preview = false; static bool g_previewShown = false; static bool g_previewSuppressed = false;
     static float g_catW = 260.0f;
@@ -707,6 +708,32 @@ namespace editor {
     }
     // ---- selection helpers, undo, copy/paste ----
     static std::vector<int> SelUids() { return std::vector<int>(g_sel.begin(), g_sel.end()); }
+    struct SelectionUnit { int key = 0; std::vector<const SpawnedObj*> objects; Vec3 center{}; };
+    static std::vector<SelectionUnit> SelectionUnits(const std::set<int>& selection, const std::vector<SpawnedObj>& all) {
+        std::set<int> candidates;
+        for (int uid : selection) { const SpawnedObj* o = Find(all, uid); if (o && !o->hidden && o->group > 0) candidates.insert(o->group); }
+        std::set<int> wholeGroups;
+        for (int gid : candidates) {
+            bool whole = true;
+            for (const auto& o : all) if (!o.hidden && o.group == gid && !selection.count(o.uid)) { whole = false; break; }
+            if (whole) wholeGroups.insert(gid);
+        }
+        std::map<int, SelectionUnit> grouped;
+        std::vector<SelectionUnit> units;
+        for (int uid : selection) {
+            const SpawnedObj* o = Find(all, uid); if (!o || o->hidden) continue;
+            if (o->group > 0 && wholeGroups.count(o->group)) { auto& u = grouped[o->group]; u.key = o->group; u.objects.push_back(o); }
+            else { SelectionUnit u; u.key = -o->uid; u.objects.push_back(o); u.center = o->pos; units.push_back(std::move(u)); }
+        }
+        for (auto& pair : grouped) {
+            SelectionUnit& u = pair.second;
+            for (const SpawnedObj* o : u.objects) { u.center.x += o->pos.x; u.center.y += o->pos.y; u.center.z += o->pos.z; }
+            const float n = static_cast<float>(u.objects.size());
+            if (n > 0) { u.center.x /= n; u.center.y /= n; u.center.z /= n; }
+            units.push_back(std::move(u));
+        }
+        return units;
+    }
     static void SelectUid(int uid, bool add, const std::vector<SpawnedObj>& list) {
         if (g_place.active) DropCarried();   // selecting something else ends the placement
         if (!add) g_sel.clear();
@@ -842,6 +869,44 @@ namespace editor {
         }
         Push(std::move(acts));
         Note(T("%s %d objects"), T(group ? "grouped" : "ungrouped"), n);
+    }
+    static void RotateSel(float degrees) {
+        if (g_sel.empty() || !std::isfinite(degrees)) return;
+        auto list = core::Spawned(); Vec3 c{}; int n = 0;
+        for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; c.x += o->pos.x; c.y += o->pos.y; c.z += o->pos.z; ++n; }
+        if (!n) return; c.x /= n; c.y /= n; c.z /= n;
+        const float a = degrees * 3.14159265f / 180.0f, cs = cosf(a), sn = sinf(a);
+        std::vector<Act> acts; std::vector<core::MoveReq> moves;
+        for (int uid : g_sel) {
+            const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue;
+            const float dx = o->pos.x - c.x, dz = o->pos.z - c.z;
+            const Vec3 pos{ c.x + cs * dx + sn * dz, o->pos.y, c.z - sn * dx + cs * dz };
+            const Rot rot{ WrapYaw(o->rot.yaw + degrees), o->rot.pitch, o->rot.roll };
+            Act act; act.kind = Act::Move; act.uid = uid; act.prefab = o->prefab; act.pos0 = o->pos; act.rot0 = o->rot; act.sc0 = o->scale; act.pos1 = pos; act.rot1 = rot; act.sc1 = o->scale;
+            acts.push_back(act); moves.push_back({ uid, pos, rot, o->scale });
+        }
+        if (!moves.empty()) { if (!core::MoveMany(moves, true)) { Note(T("rotation could not be queued; game thread is not ready")); return; } Push(std::move(acts)); g_editUid = 0; }
+    }
+    static void AlignSel(int axis) {
+        if (g_sel.size() < 2 || axis < 0 || axis > 2) return;
+        auto list = core::Spawned(); const auto units = SelectionUnits(g_sel, list);
+        if (units.size() < 2) return;
+        const SelectionUnit* base = nullptr;
+        for (const auto& unit : units) for (const SpawnedObj* o : unit.objects) if (o->uid == g_primary) { base = &unit; break; }
+        if (!base) return;
+        const float target = axis == 0 ? base->center.x : axis == 1 ? base->center.y : base->center.z;
+        std::vector<Act> acts; std::vector<core::MoveReq> moves;
+        for (const auto& unit : units) {
+            const float current = axis == 0 ? unit.center.x : axis == 1 ? unit.center.y : unit.center.z;
+            const float delta = target - current;
+            if (fabsf(delta) < 0.001f) continue;
+            for (const SpawnedObj* o : unit.objects) {
+                Vec3 pos = o->pos; if (axis == 0) pos.x += delta; else if (axis == 1) pos.y += delta; else pos.z += delta;
+                Act act; act.kind = Act::Move; act.uid = o->uid; act.prefab = o->prefab; act.pos0 = o->pos; act.rot0 = o->rot; act.sc0 = o->scale; act.pos1 = pos; act.rot1 = o->rot; act.sc1 = o->scale;
+                acts.push_back(act); moves.push_back({ o->uid, pos, o->rot, o->scale });
+            }
+        }
+        if (!moves.empty()) { if (!core::MoveMany(moves, true)) { Note(T("alignment could not be queued; game thread is not ready")); return; } Push(std::move(acts)); g_editUid = 0; }
     }
     static void QuickGimmickSpawn() {   // Log tab button: spawn the override prefab (or a standtorch) through the game's own spawn path, newest capture as the template
         if (!core::GimmickReplayPrefab()[0]) core::SetGimmickReplayPrefab("/object/cd_gimmick/00_common/lamp/gimmick_lamp_standtorch_03_on.prefab");
@@ -1176,6 +1241,17 @@ namespace editor {
                 if (ImGui::MenuItem(T("To ground"))) SnapSelToGround();
                 if (ImGui::MenuItem(T("Duplicate"))) { CopySel(); Paste(havePos); }
                 if (ImGui::MenuItem(T(o.group > 0 ? "Ungroup" : "Group selection"))) GroupSel(o.group == 0);
+                if (ImGui::BeginMenu(T("Rotate"))) {
+                    if (ImGui::MenuItem(T("Rotate left"))) RotateSel(-g_rotationStep);
+                    if (ImGui::MenuItem(T("Rotate right"))) RotateSel(g_rotationStep);
+                    ImGui::EndMenu();
+                }
+                if (ImGui::BeginMenu(T("Align to primary"))) {
+                    if (ImGui::MenuItem(T("X"))) AlignSel(0);
+                    if (ImGui::MenuItem(T("Y"))) AlignSel(1);
+                    if (ImGui::MenuItem(T("Z"))) AlignSel(2);
+                    ImGui::EndMenu();
+                }
                 if (ImGui::MenuItem(T("Delete"))) DeleteSel();
                 ImGui::EndPopup();
             }
@@ -1292,6 +1368,8 @@ namespace editor {
         ImGui::SetNextItemWidth(80); ComboT("##snappos", &g_snapPosIdx, kSnapPosNames, 5); ImGui::SameLine();
         ImGui::SetNextItemWidth(80); ComboT("##snapyaw", &g_snapYawIdx, kSnapYawNames, 5); ImGui::SameLine();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("grid and angle steps for the placement mode (%s toggles while placing)"), core::KeyName(core::g_placeKeys[core::PK_SNAP]));
+        ImGui::SetNextItemWidth(70); ImGui::DragFloat("##rotstep", &g_rotationStep, 1.0f, 1.0f, 90.0f, "%.0f deg"); ImGui::SameLine();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("rotation step for Rotate - / Rotate +"));
         ImGui::BeginDisabled(g_undo.empty()); if (ImGui::SmallButton(T("Undo"))) Undo(); ImGui::EndDisabled(); ImGui::SameLine();
         ImGui::BeginDisabled(g_redo.empty()); if (ImGui::SmallButton(T("Redo"))) Redo(); ImGui::EndDisabled(); ImGui::SameLine();
         ImGui::TextDisabled(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select"));
@@ -1386,6 +1464,13 @@ namespace editor {
         ImGui::SameLine(); if (ImGui::Button(T(ICON_COPY " Duplicate"))) { CopySel(); Paste(havePos); }
         ImGui::SameLine(); if (ImGui::Button(T("Group"))) GroupSel(true);
         ImGui::SameLine(); if (ImGui::Button(T("Ungroup"))) GroupSel(false);
+        ImGui::SameLine(); if (ImGui::Button(T("Rotate -"))) RotateSel(-g_rotationStep);
+        ImGui::SameLine(); if (ImGui::Button(T("Rotate +"))) RotateSel(g_rotationStep);
+        ImGui::BeginDisabled(g_sel.size() < 2);
+        ImGui::SameLine(); if (ImGui::Button(T("Align X"))) AlignSel(0);
+        ImGui::SameLine(); if (ImGui::Button(T("Align Y"))) AlignSel(1);
+        ImGui::SameLine(); if (ImGui::Button(T("Align Z"))) AlignSel(2);
+        ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.15f, 0.12f, 1)); if (ImGui::Button(T(ICON_TRASH " Delete"))) DeleteSel(); ImGui::PopStyleColor();
         ImGui::SameLine(); if (ImGui::Button(T("Forget"))) { for (int uid : g_sel) core::ForgetUid(uid); g_sel.clear(); g_primary = 0; }
@@ -1659,6 +1744,17 @@ namespace editor {
             if (ImGui::MenuItem(T("Duplicate"))) { CopySel(); Paste(havePos); }
             if (ImGui::MenuItem(T("Group selection"))) GroupSel(true);
             if (ImGui::MenuItem(T("Ungroup"), nullptr, false, hasGroup)) GroupSel(false);
+            if (ImGui::BeginMenu(T("Rotate"))) {
+                if (ImGui::MenuItem(T("Rotate left"))) RotateSel(-g_rotationStep);
+                if (ImGui::MenuItem(T("Rotate right"))) RotateSel(g_rotationStep);
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu(T("Align to primary"))) {
+                if (ImGui::MenuItem(T("X"))) AlignSel(0);
+                if (ImGui::MenuItem(T("Y"))) AlignSel(1);
+                if (ImGui::MenuItem(T("Z"))) AlignSel(2);
+                ImGui::EndMenu();
+            }
             if (ImGui::MenuItem(T("Delete"))) DeleteSel();
             ImGui::EndDisabled();
             ImGui::EndPopup();
