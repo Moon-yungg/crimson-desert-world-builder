@@ -105,6 +105,8 @@ namespace core {
     void SetTrace(bool on); bool Trace();       // log the game's own setWorldTransform/setEnable calls (reverse engineering aid)
     bool GameReadAvailable();                   // the game's resource loader can be used (instance captured, functions resolved)
     bool GameReadFile(const std::string& packPath, std::vector<uint8_t>& out, bool* notFound = nullptr);   // read a pack file through the game's loader; notFound: no entry (false = the read itself failed)
+    // length > 0: only [offset, offset+length) of the entry as stored (partial textures keep their LZ4 blocks); storedTotal = its full stored size
+    bool GameReadFileRange(const std::string& packPath, std::vector<uint8_t>& out, uint32_t offset, uint32_t length, uint32_t* storedTotal = nullptr, bool* notFound = nullptr);
 
     // Prefab index (bin64\cdmodkit\prefabs.tsv, fallback prefabs.txt): logical path, display name, category tree, tags
     struct PrefabInfo { std::string path, name, tags, mesh; int cat = 0; int meshes = 0, children = 0;

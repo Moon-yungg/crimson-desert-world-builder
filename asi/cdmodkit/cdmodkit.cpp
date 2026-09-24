@@ -353,7 +353,7 @@ static void* __fastcall HookResLoad(void* self, void** out, void* path, uint32_t
     if (!g_resLoader && self) { g_resLoader = self; Log("resource loader captured %p (%s)", self, RttiName((uintptr_t)self) ? RttiName((uintptr_t)self) : "?"); }
     return g_origResLoad(self, out, path, flags);
 }
-static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* rtti, size_t rttiLen, bool* notFound) {
+static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* rtti, size_t rttiLen, bool* notFound, uint32_t offset, uint32_t length, uint32_t* storedTotal) {
     // load() returns a ResourceHandler_Paz: +0x20 worker (ResourceLoadWorker_Package), +0x34 / +0x38 sizes, +0x3c flags
     // (low nibble compression: 0 none, 1 partial, 2 LZ4; high nibble crypto). The worker's slot 5 reads, decrypts and
     // decompresses the entry into a caller buffer: read(worker, handler, u8* buf, u32 capacity, u32 offset, u32 length).
@@ -366,7 +366,15 @@ static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* 
         const uint32_t need = ((fl & 0xF) == 1) ? s34 : s38, cap = s34 > s38 ? s34 : s38;
         bool ok = false;
         if (rtti) snprintf(rtti, rttiLen, "%s / worker %s, flags 0x%02x, sizes %u/%u", RttiName(h) ? RttiName(h) : "?", worker && RttiName(worker) ? RttiName(worker) : "?", fl, s34, s38);
-        if (worker && need && cap < (512u << 20)) {
+        if (storedTotal) *storedTotal = need;
+        if (worker && need && length) {   // a range of the stored entry (texture tails): offset/length as read() takes them
+            if (offset < need) {
+                const uint32_t len = length < need - offset ? length : need - offset; out->resize(len);
+                auto read5 = *(uint8_t(__fastcall**)(void*, void*, void*, uint32_t, uint32_t, uint32_t))(*(uintptr_t*)worker + 0x28);
+                ok = read5((void*)worker, res, out->data(), len, offset, len) != 0;
+                if (!ok) out->clear();
+            }
+        } else if (worker && need && cap < (512u << 20)) {
             out->resize(cap);
             auto read5 = *(uint8_t(__fastcall**)(void*, void*, void*, uint32_t, uint32_t, uint32_t))(*(uintptr_t*)worker + 0x28);
             ok = read5((void*)worker, res, out->data(), cap, 0, 0) != 0;
@@ -383,7 +391,9 @@ static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* 
     return false;
 }
 bool GameReadAvailable() { return g_resLoader && g_origResLoad && kRva_StringDataAlloc && kRva_PathNormalizeCtor; }
-bool GameReadFile(const std::string& path, std::vector<uint8_t>& out, bool* notFound) {
+bool GameReadFileRange(const std::string& path, std::vector<uint8_t>& out, uint32_t offset, uint32_t length, uint32_t* storedTotal, bool* notFound);
+bool GameReadFile(const std::string& path, std::vector<uint8_t>& out, bool* notFound) { return GameReadFileRange(path, out, 0, 0, nullptr, notFound); }
+bool GameReadFileRange(const std::string& path, std::vector<uint8_t>& out, uint32_t offset, uint32_t length, uint32_t* storedTotal, bool* notFound) {
     bool nf = false; if (notFound) *notFound = false;
     if (!GameReadAvailable()) return false;
     auto sdAlloc = (uintptr_t(*)(int))(g_base + kRva_StringDataAlloc);
@@ -393,7 +403,7 @@ bool GameReadFile(const std::string& path, std::vector<uint8_t>& out, bool* notF
     strncpy_s((char*)*(uintptr_t*)sd, path.size() + 1, path.c_str(), _TRUNCATE);
     uintptr_t holder = sd; normalize(pathObj, &holder);
     static bool s_logged = false; char rtti[160] = { 0 };
-    bool ok = GameReadFileGuarded(pathObj, &out, s_logged ? nullptr : rtti, sizeof rtti, &nf);
+    bool ok = GameReadFileGuarded(pathObj, &out, s_logged ? nullptr : rtti, sizeof rtti, &nf, offset, length, storedTotal);
     if (notFound) *notFound = nf;
     if (!s_logged) { s_logged = true; Log("game loader first read: %s -> %s, %zu bytes (%s)", path.c_str(), ok ? "ok" : "FAILED", out.size(), rtti); }
     return ok;

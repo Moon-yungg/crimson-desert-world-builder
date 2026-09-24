@@ -71,6 +71,21 @@ static bool GetFile(std::string path, std::vector<uint8_t>& out) {
     return false;
 }
 
+// A range of an entry as stored. Only used for texture tails once the start-up self test proved that the game's read()
+// returns exactly the bytes of a full read at that offset (g_tailReads); otherwise every texture is read whole.
+static bool g_tailReads = false;
+static bool GetFileRange(std::string path, std::vector<uint8_t>& out, uint32_t offset, uint32_t length, uint32_t* total) {
+    if (!path.empty() && path[0] == '/') path.erase(0, 1);
+    bool notFound = false;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (core::GameReadFileRange(path, out, offset, length, total, &notFound) && !out.empty()) { g_reads++; return true; }
+        if (notFound) return false;
+        Sleep(15 + attempt * 100);
+    }
+    g_readError = true;
+    return false;
+}
+
 // ---------------------------------------------------------------- reflection serializer (prefab / level objects)
 struct RProp { std::string name, typeName; uint16_t type, fixed; uint32_t flags; };
 struct RType { std::string name; std::vector<RProp> props; };
@@ -794,8 +809,24 @@ static std::shared_ptr<TexImg> LoadTexture(const std::string& path) {
     auto it = g_texs.find(path); if (it != g_texs.end()) return it->second;
     if (g_texBytes > (192u << 20)) { g_texs.clear(); g_texBytes = 0; }
     std::shared_ptr<TexImg> t; std::vector<uint8_t> d; const char* kind = "?";
-    DdsPlan p;
-    if (GetFile(path, d) && PlanDds(d.data(), d.size(), d.size(), p)) {
+    DdsPlan p; bool tailDone = false;
+    if (g_tailReads) {   // header, then only the stored tail from the chosen mip on (~10 % of the bytes of a full read)
+        const bool errBefore = g_readError; std::vector<uint8_t> hd, tail; uint32_t total = 0;
+        if (GetFileRange(path, hd, 0, 148, &total) && PlanDds(hd.data(), hd.size(), total, p) && !p.single && p.off < total
+            && GetFileRange(path, tail, (uint32_t)p.off, (uint32_t)(total - p.off), nullptr) && tail.size() >= p.len) {
+            std::vector<uint8_t> mip; const uint8_t* src = nullptr; size_t srcLen = 0;
+            if (p.lz4) { if (Lz4Block(tail.data(), p.len, mip, p.full)) { src = mip.data(); srcLen = mip.size(); } }
+            else { src = tail.data(); srcLen = tail.size(); }
+            if (src) {
+                t = std::make_shared<TexImg>();
+                if (p.fmt <= 3) DecodeBc(src, srcLen, p.w, p.h, p.fmt == 3, *t); else DecodeBc45(src, srcLen, p.w, p.h, p.fmt == 5, *t);
+                g_texBytes += t->rgba.size(); kind = p.fmt == 1 ? "bc1 tail" : p.fmt == 3 ? "bc3 tail" : p.fmt == 4 ? "bc4 tail" : "bc5 tail";
+                tailDone = true; d.swap(hd);   // d non-empty: the read-error check below must not fire
+            }
+        }
+        if (!tailDone) g_readError = errBefore;   // a failed tail read falls back to the full read, which decides
+    }
+    if (!tailDone && GetFile(path, d) && PlanDds(d.data(), d.size(), d.size(), p)) {
         if (p.single) {   // one compressed block over the start of the payload: unpack it, then plan on the unpacked file
             std::vector<uint8_t> blk, un;
             if (p.hdr + p.singleStored <= d.size() && p.singleFull < (64u << 20) && Lz4Block(d.data() + p.hdr, p.singleStored, blk, p.singleFull)) {
@@ -1154,6 +1185,22 @@ static DWORD WINAPI Worker(LPVOID) {
         for (const char* t : tests) { std::vector<uint8_t> a; bool ok = GetFile(t, a);
             Log("[thumbs] selftest %s: %s, %zu bytes, magic %.4s", t, ok ? "ok" : "FAILED", a.size(), a.size() >= 4 ? (const char*)a.data() : "----"); }
     }
+    {   // texture tail reads: only when a ranged read returns the very bytes of a full read, for a raw and a partial texture
+        const char* texTests[] = { "object/texture/cd_metal_02.dds", "object/texture/cd_straw_15c.dds" };
+        int good = 0, tried = 0;
+        for (const char* tp : texTests) {
+            std::vector<uint8_t> full, part; uint32_t total = 0;
+            if (!GetFile(tp, full) || full.size() < 4096) continue;
+            tried++;
+            const uint32_t off = (uint32_t)(full.size() / 2) & ~15u, len = std::min<uint32_t>(4096, (uint32_t)full.size() - off);
+            const bool ok = GetFileRange(tp, part, off, len, &total) && total == full.size() && part.size() == len && memcmp(part.data(), full.data() + off, len) == 0;
+            if (ok) good++;
+            Log("[thumbs] tail-read test %s: %s (full %zu, stored total %u, range %u@%u -> %zu)", tp, ok ? "identical" : "DIFFERENT", full.size(), total, len, off, part.size());
+        }
+        g_tailReads = tried > 0 && good == tried;
+        Log("[thumbs] texture tail reads %s", g_tailReads ? "on" : "off (full reads)");
+        g_readError = false;
+    }
     size_t cursor = 0; DWORD lastLog = GetTickCount(); int sessionDone = 0;
     std::map<std::string, int> reasons;
     // version marker: 2 = LZ4 geometry supported. Older caches get one pass over every rendered prefab that re-renders only those
@@ -1161,16 +1208,21 @@ static DWORD WINAPI Worker(LPVOID) {
     const std::string verPath = core::ModDir() + "\\thumbs_version.txt"; int cacheVer = 0;
     { FILE* vf = fopen(verPath.c_str(), "r"); if (vf) { if (fscanf(vf, "%d", &cacheVer) != 1) cacheVer = 0; fclose(vf); } }
     std::deque<std::string> recheck; int rechecked = 0, rerendered = 0;
-    const int kCacheVersion = 4;   // 2 = LZ4 meshes decoded, 3 = textured previews, 4 = .pam uv read as halves (every textured image was off)
+    // 5 = "partial" textures read at their stored mip offsets (their images were garbage in game)
+    const int kCacheVersion = 5;   // 2 = LZ4 meshes decoded, 3 = textured previews, 4 = .pam uv read as halves (every textured image was off)
     // progress file: one prefab per line that this pass already rendered. Without it every session started the pass from
     // the beginning and re-rendered the same first few thousand prefabs, so the rest never got their textured image.
+    // Its first line "#<version>" says which pass wrote it: entries of an older pass were rendered with the old code.
     const std::string passPath = core::ModDir() + "\\thumbs_pass.txt"; FILE* passOut = nullptr;
     if (cacheVer < kCacheVersion) { std::lock_guard<std::mutex> l(g_mu);
-        { FILE* pf = fopen(passPath.c_str(), "r"); if (pf) { char line[1024]; while (fgets(line, sizeof line, pf)) { std::string s = line; while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back(); if (!s.empty()) g_passDone.insert(s); } fclose(pf); } }
+        bool passCurrent = false;
+        { FILE* pf = fopen(passPath.c_str(), "r"); if (pf) { char line[1024]; bool first = true; while (fgets(line, sizeof line, pf)) { std::string s = line; while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+            if (first) { first = false; passCurrent = s == "#" + std::to_string(kCacheVersion); if (!passCurrent) break; continue; }
+            if (!s.empty()) g_passDone.insert(s); } fclose(pf); } }
         for (auto& pi : idx) if (g_processed.count(pi.path) && pi.sx > 0 && !g_passDone.count(pi.path)) recheck.push_back(pi.path);
-        g_recheckForce = cacheVer < 4; g_passActive = !recheck.empty();
+        g_recheckForce = cacheVer < kCacheVersion; g_passActive = !recheck.empty();
         if (!g_passDone.empty()) Log("[thumbs] re-render pass continues: %zu done in earlier sessions, %zu to go", g_passDone.size(), recheck.size());
-        if (!recheck.empty()) passOut = fopen(passPath.c_str(), "a");
+        if (!recheck.empty()) { passOut = fopen(passPath.c_str(), passCurrent ? "a" : "w"); if (passOut && !passCurrent) fprintf(passOut, "#%d\n", kCacheVersion); }
         if (!recheck.empty()) Log("[thumbs] cache version %d -> %d: %zu rendered prefabs are %s in the background", cacheVer, kCacheVersion, recheck.size(), g_recheckForce ? "rendered again with textures" : "checked for LZ4 meshes"); }
     auto writeVersion = [&]() { FILE* vf = fopen(verPath.c_str(), "w"); if (vf) { fprintf(vf, "%d\n", kCacheVersion); fclose(vf); } if (passOut) { fclose(passOut); passOut = nullptr; } DeleteFileA(passPath.c_str()); };
     if (recheck.empty()) writeVersion();
