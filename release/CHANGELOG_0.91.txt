@@ -1,0 +1,21 @@
+World Builder 0.91
+
+Added
+- Previews for characters, monsters and armour: skinned meshes (.pac) are read now, with their textures. About 15,000 prefabs
+  that had no preview get one. Monsters stored as one prefab show the whole creature; human characters are assembled by the
+  game at runtime, so their prefabs show the single parts (body, head, upper body, gloves, ...). They are listed when the
+  browser filter "meshes only" is off (they still spawn nothing visible through the editor).
+- Previews for prefabs made of other prefabs (sets, presets, spots): the referenced prefabs are rendered in place, so the
+  preview shows what spawning the prefab shows. About 1,100 more prefabs get a preview.
+- Better previews: dye colours (characters and monsters whose colour comes from the dye mask instead of a texture were plain
+  beige), normal maps, specular highlights and glow.
+- Settings tab: "preview quality" (base colour / + dye colours / + normal maps / + specular and glow, default the best). Previews
+  on screen are always rendered first; a lower level only makes the background pass faster.
+
+Fixed
+- Every textured preview used wrong texture coordinates. Tiling materials (wood, stone, metal) still looked plausible, atlas
+  textures (cloth, props) turned into noise. All existing previews are rendered again once in the background, the tiles on
+  screen first.
+- After scrolling quickly through the browser, the tiles you stopped at waited behind every tile you had scrolled past. The
+  newest request is rendered first now, and tiles that left the screen drop out of the queue.
+- Characters were previewed from behind.

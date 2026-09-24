@@ -27,7 +27,7 @@ namespace editor {
         for (int i = 0; i < count; i++) shown[i] = T(items[i]);   // stays valid: T keeps its last 16 decorated results
         return ImGui::Combo(label, cur, shown, count);
     }
-    static constexpr const char* kEditorVersion = "0.90";
+    static constexpr const char* kEditorVersion = "0.91";
     static bool g_open = false;
     // browser state
     static char  g_filter[128] = "";
@@ -1668,6 +1668,12 @@ namespace editor {
                         if (ImGui::Selectable(languageOptions[i].name, i == languageIndex) && i18n::SetPreference(languageOptions[i].id)) core::SaveSettings();
                     }
                     ImGui::EndCombo();
+                }
+                {   // preview quality: each step loads more textures per surface, so it is also the speed of the background pass
+                    static const char* kQ[] = { "base colour (fastest)", "+ dye colours", "+ normal maps", "+ specular and glow (best)" };
+                    int q = thumbgen::Quality(); ImGui::SetNextItemWidth(260);
+                    if (ImGui::BeginCombo(T("preview quality"), T(kQ[q]))) { for (int i = 0; i < 4; i++) if (ImGui::Selectable(T(kQ[i]), i == q)) { thumbgen::SetQuality(i); core::SaveSettings(); } ImGui::EndCombo(); }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("previews on screen are always rendered first; a lower level only makes the background pass faster. Applies to new previews, right-click a tile to render it again"));
                 }
                 ImGui::TextDisabled(T("Hotkeys (saved to settings.txt in the cdmodkit folder, active immediately)"));
                 auto keyCombo = [](const char* label, int* vk) {

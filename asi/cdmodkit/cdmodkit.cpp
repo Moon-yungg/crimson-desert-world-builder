@@ -2079,6 +2079,7 @@ static void LoadSettings() {
         if (k == "fovauto") { g_fovAuto = v != "0" && v != "off" && v != "false"; continue; }
         if (k == "gimmick_spawn") { g_gimmickSpawn = v != "0" && v != "off" && v != "false"; continue; }
         if (k == "trace_hooks") { g_traceHooks = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "preview_quality") { thumbgen::SetQuality(atoi(v.c_str())); continue; }
         if (k == "camlag") { const int c = atoi(v.c_str()); g_camLag = c < 0 ? 0 : c > 4 ? 4 : c; continue; }
         // manual fallback for snap to ground if the collector vtable cannot be resolved after a game patch; deliberately
         // never written back by SaveSettings, otherwise a stale value would outrank the signature on the next build
@@ -2096,6 +2097,7 @@ void SaveSettings() {
     FILE* f = fopen(SettingsPath().c_str(), "w"); if (!f) return;
     fprintf(f, "# World Builder hotkeys. Names: INSERT HOME END DELETE PAGEUP PAGEDOWN F1..F12 SCROLLLOCK PAUSE BACKQUOTE MINUS EQUALS BACKSLASH NUMPAD* NUMPAD/ NUMLOCK CAPSLOCK TAB or a single letter/digit\n");
     fprintf(f, "key_toggle=%s\nkey_mode=%s\n# console=0 hides the console window (log file only)\nconsole=%d\n# projection for the gizmo: vertical field of view in degrees and horizontal mirror (calibrate in the Settings tab)\nfov=%.1f\nmirror=%d\n# fovauto=1 reads the field of view from the game's camera object (fov= is the fallback)\nfovauto=%d\n# camlag: frames the overlay camera trails the game camera (0..4). Outlines run ahead while panning: raise it; they lag: lower it\ncamlag=%d\n", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? 1 : 0, g_fovDeg, g_camMirror ? 1 : 0, g_fovAuto ? 1 : 0, g_camLag);
+    fprintf(f, "# preview_quality: 0 base colour, 1 + dye colours, 2 + normal maps, 3 + specular/emissive. Lower renders the background pass faster\npreview_quality=%d\n", thumbgen::Quality());
     fprintf(f, "# gimmick_spawn=0: place gimmick prefabs (/object/cd_gimmick/...) as plain objects instead of through the game spawn path\ngimmick_spawn=%d\n", g_gimmickSpawn ? 1 : 0);
     fprintf(f, "# placement keys (any key name from the list above, NUMPAD0..9, NUMPAD+ NUMPAD- NUMPAD. NUMPAD* NUMPAD/, ENTER, BACKSPACE, SPACE, UP/DOWN/LEFT/RIGHT, SHIFT/CTRL/ALT for 'fast')\n");
     for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
@@ -2510,7 +2512,7 @@ static void Attach(HMODULE h) {
     CreateDirectoryA(g_modDir.c_str(), nullptr);
     g_log = fopen((g_modDir + "\\cdmodkit.log").c_str(), "a");
     ReadGameVersion();
-    Log("cdmodkit.asi v0.90 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
+    Log("cdmodkit.asi v0.91 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
     LoadSettings();
     ReserveHookGap();            // before the game fills the address space around its image (see ReserveHookGap)
     CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);

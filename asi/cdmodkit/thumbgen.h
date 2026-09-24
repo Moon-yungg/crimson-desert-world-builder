@@ -12,6 +12,8 @@ namespace thumbgen {
     bool Ready();                                   // pack index opened, worker running
     bool Idle();                                    // nothing queued and the background pass has reached the end (a few prefabs may stay unrenderable)
     void SetBackground(bool on);                    // false: only render what the browser asks for
+    void SetQuality(int q);                         // 0 base colour, 1 + dye/tint, 2 + normal maps, 3 + specular/emissive (default); applies to new renders
+    int  Quality();
     bool Background();
     int  Done();                                    // prefabs with a rendered image
     int  Failed();                                  // prefabs without usable geometry

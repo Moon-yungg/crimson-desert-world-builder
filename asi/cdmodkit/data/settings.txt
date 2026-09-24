@@ -13,3 +13,5 @@ http_port=8765
 fovauto=1
 fov=55.0
 mirror=0
+# preview quality of the thumbnails: 0 base colour, 1 + dye colours, 2 + normal maps, 3 + specular/emissive (best, default). Previews on screen are always rendered first
+preview_quality=3

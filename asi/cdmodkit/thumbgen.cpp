@@ -18,6 +18,8 @@
 #include <deque>
 #include <mutex>
 #include <set>
+#include <array>
+#include <cstdint>
 #include <atomic>
 #include <memory>
 #include <algorithm>
@@ -72,7 +74,7 @@ static bool GetFile(std::string path, std::vector<uint8_t>& out) {
 // ---------------------------------------------------------------- reflection serializer (prefab / level objects)
 struct RProp { std::string name, typeName; uint16_t type, fixed; uint32_t flags; };
 struct RType { std::string name; std::vector<RProp> props; };
-struct Node { bool hasXf = false; float xf[10] = { 0 }; std::string path; std::vector<Node> kids; };
+struct Node { bool hasXf = false; float xf[10] = { 0 }; std::string path, sub; std::vector<Node> kids; };   // sub: instance of another prefab (its type name is the prefab path)
 
 struct Reader {
     const uint8_t* d; size_t n, pos;
@@ -142,6 +144,7 @@ private:
     }
     void ParseObject(const Meta& m, Node& out) {
         if (++depth > 200) throw std::runtime_error("depth");
+        if (!m.type->name.empty() && m.type->name[0] == '/' && EndsWith(m.type->name, ".prefab")) out.sub = m.type->name;
         if (serVer >= 0xA) r.u8();
         bool noTags = false; if (serVer >= 5) noTags = r.u8() == 1;
         if (!noTags && serVer >= 6) { uint16_t c = r.u16(); for (uint16_t i = 0; i < c; i++) { r.u16(); r.str(r.u32()); } }
@@ -214,7 +217,25 @@ static void QuatToMat(const float* q, float* r) {
     r[3] = 2 * (x * y + z * w);     r[4] = 1 - 2 * (x * x + z * z); r[5] = 2 * (y * z - x * w);
     r[6] = 2 * (x * z - y * w);     r[7] = 2 * (y * z + x * w);     r[8] = 1 - 2 * (x * x + y * y);
 }
-static void Collect(const Node& o, const float* pm, const float* pt, std::vector<Inst>& out, int depth = 0) {
+// a prefab's root objects; logical "/object/x/y.prefab" is stored as "object/bin__/x/y.prefab" (older ones without bin__)
+static bool LoadPrefabRoots(const std::string& logical, std::vector<Node>& roots, std::string* why) {
+    std::string phys = logical; if (!phys.empty() && phys[0] == '/') phys.erase(0, 1);
+    const size_t sl = phys.find('/');
+    const std::string physBin = sl == std::string::npos ? phys : phys.substr(0, sl) + "/bin__/" + phys.substr(sl + 1);
+    std::vector<uint8_t> data;
+    if (!GetFile(physBin, data) && !GetFile(phys, data)) { if (why) *why = g_readError ? "read error" : "prefab missing"; return false; }
+    try { ParsePrefab(data, roots); } catch (const std::exception& e) { if (why) *why = std::string("prefab: ") + e.what(); return false; }
+    if (roots.empty() && why) {   // an empty object list from a non-empty file is suspicious: the first bytes tell a bad read from an empty prefab
+        static int s_logged = 0;
+        if (s_logged < 5) { s_logged++; char hex[64] = { 0 }; for (size_t i = 0; i < 16 && i < data.size(); i++) snprintf(hex + i * 3, 4, "%02X ", data[i]);
+            Log("[thumbs] %s: no objects in %zu bytes (%s)", logical.c_str(), data.size(), hex); }
+    }
+    return true;
+}
+// Sub-prefab instances (a child whose type is another prefab's path) are expanded in place with their transform, so the
+// preview shows what spawning the parent shows. chain guards against a prefab that contains itself.
+struct CollectCtx { std::vector<std::string> chain; int subs = 0; };
+static void Collect(const Node& o, const float* pm, const float* pt, std::vector<Inst>& out, CollectCtx& cx, int depth = 0) {
     float m[9], t[3]; memcpy(m, pm, sizeof m); memcpy(t, pt, sizeof t);
     if (o.hasXf) {
         float r[9]; QuatToMat(o.xf + 3, r); float local[9];
@@ -222,8 +243,12 @@ static void Collect(const Node& o, const float* pm, const float* pt, std::vector
         for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { float s = 0; for (int k = 0; k < 3; k++) s += pm[i * 3 + k] * local[k * 3 + j]; m[i * 3 + j] = s; }
         for (int i = 0; i < 3; i++) t[i] = pm[i * 3] * o.xf[7] + pm[i * 3 + 1] * o.xf[8] + pm[i * 3 + 2] * o.xf[9] + pt[i];
     }
-    if (EndsWith(o.path, ".pami") || EndsWith(o.path, ".pam")) { Inst in; in.path = o.path; memcpy(in.m, m, sizeof m); memcpy(in.t, t, sizeof t); out.push_back(std::move(in)); }
-    if (depth < 200) for (const auto& k : o.kids) Collect(k, m, t, out, depth + 1);
+    if (EndsWith(o.path, ".pami") || EndsWith(o.path, ".pam") || EndsWith(o.path, ".pac")) { Inst in; in.path = o.path; memcpy(in.m, m, sizeof m); memcpy(in.t, t, sizeof t); out.push_back(std::move(in)); }
+    if (!o.sub.empty() && cx.subs < 64 && cx.chain.size() < 8 && std::find(cx.chain.begin(), cx.chain.end(), o.sub) == cx.chain.end()) {
+        std::vector<Node> roots; cx.subs++;
+        if (LoadPrefabRoots(o.sub, roots, nullptr)) { cx.chain.push_back(o.sub); for (const auto& r : roots) Collect(r, m, t, out, cx, depth + 1); cx.chain.pop_back(); }
+    }
+    if (depth < 200) for (const auto& k : o.kids) Collect(k, m, t, out, cx, depth + 1);
 }
 
 // ---------------------------------------------------------------- .pam static mesh (CDMW mesh_parser.parse_pam)
@@ -236,6 +261,11 @@ struct PamCtx { const uint8_t* d; size_t n; uint32_t geomOff; float bmin[3], bma
 static inline float DequantU16(uint16_t v, float mn, float mx) { return mn + (v / 65535.0f) * (mx - mn); }
 static inline float DequantI16(int16_t v, float mn, float mx) { return mn + ((v + 32768) / 65536.0f) * (mx - mn); }
 
+static inline float HalfToFloat(uint16_t h) {
+    const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
+    float v = e == 0 ? m / 16777216.0f : e == 31 ? 0.0f : ldexpf((float)(m | 1024), (int)e - 25);   // inf/nan -> 0, like CDMW
+    return s ? -v : v;
+}
 // indices at idxOff (u16), unique vertices gathered from vertBase + gi*stride (xyz u16), faces remapped
 static void AppendIndexed(PamCtx& c, size_t idxOff, uint32_t ni, int64_t vertBase, uint32_t stride, Mesh& out, uint8_t mat = 0) {
     if (ni == 0 || idxOff + (size_t)ni * 2 > c.n) return;
@@ -249,8 +279,9 @@ static void AppendIndexed(PamCtx& c, size_t idxOff, uint32_t ni, int64_t vertBas
         if (off < (int64_t)c.geomOff) c.invalidOffsets = true;
         const uint8_t* p = c.d + off;
         out.v.push_back(DequantU16(rd16(p), c.bmin[0], c.bmax[0])); out.v.push_back(DequantU16(rd16(p + 2), c.bmin[1], c.bmax[1])); out.v.push_back(DequantU16(rd16(p + 4), c.bmin[2], c.bmax[2]));
-        // vertex layout (stride 20): pos u16x3, normal i8x4, uv u16x2 (0..1), 2 bytes, color rgba8
-        if (stride >= 14 && (size_t)off + 14 <= c.n) { out.uv.push_back(rd16(p + 10) / 65535.0f); out.uv.push_back(rd16(p + 12) / 65535.0f); } else { out.uv.push_back(0); out.uv.push_back(0); }
+        // uv: two halves at +8 (as CDMW reads them). The old u16/65535 at +10 was wrong everywhere but only showed on atlas
+        // textures (cloth, props); tiling ones looked plausible with any uv.
+        if (stride >= 12 && (size_t)off + 12 <= c.n) { out.uv.push_back(HalfToFloat(rd16(p + 8))); out.uv.push_back(HalfToFloat(rd16(p + 10))); } else { out.uv.push_back(0); out.uv.push_back(0); }
         remap[gi] = (int32_t)(base + cnt++);
     }
     for (uint32_t j = 0; j + 2 < ni; j += 3) {
@@ -403,20 +434,217 @@ static bool ParsePam(const std::vector<uint8_t>& dataIn, Mesh& out) {
     return !out.v.empty() && !out.f.empty();
 }
 
+// ---------------------------------------------------------------- .pac skinned mesh (CDMW mesh_parser.parse_pac)
+// PAR header: 8 section slots at 0x10 {u32 compressed size (0 = stored), u32 size}, sections follow 0x50 back to back, each
+// LZ4 on its own when compressed ("partial" pack entries arrive like that). Section 0 holds one descriptor per submesh
+// (bbox, per-LOD vertex and index counts), sections 4..1 the geometry of LOD 0..3: 40-byte vertex records (pos u16x3 over
+// the descriptor bbox / 32767, uv f16x2 at +8), then u16 indices. Only the rest pose is drawn, bone weights are not needed.
+struct PacDesc { std::string name, material; float bmin[3], bext[3]; uint32_t vc[10] = { 0 }, ic[10] = { 0 }; size_t start; };
+static std::string PacName(const uint8_t* r, size_t n, size_t cursor, bool* ok) {   // length-prefixed ASCII record ending at cursor
+    *ok = false;
+    for (size_t back = 1; back < 200 && back <= cursor; back++) {
+        const size_t pos = cursor - back; const uint8_t len = r[pos];
+        if (len == 0 || len != back - 1) continue;
+        bool ascii = true; for (size_t k = pos + 1; k < cursor; k++) if (r[k] < 32 || r[k] >= 127) { ascii = false; break; }
+        if (!ascii) continue;
+        *ok = true; return std::string((const char*)r + pos + 1, cursor - pos - 1);
+    }
+    return "";
+}
+static void PacNames(const uint8_t* r, size_t n, size_t start, PacDesc& d) {
+    if (start > 1 && r[start - 1] == 0) {   // newer layout: one shared record "len + ASCII + NUL" before the descriptor
+        bool ok; std::string s = PacName(r, n, start - 1, &ok); if (ok && !s.empty()) { d.name = d.material = s; return; }
+    }
+    size_t cursor = start; std::string found[2];   // older layout: name record, then material record, both right before the descriptor
+    for (int k = 0; k < 2; k++) { bool ok; found[k] = PacName(r, n, cursor, &ok); if (!ok) break; cursor -= found[k].size() + 1; }
+    d.material = found[0]; d.name = found[1];
+}
+static bool ParsePac(const std::vector<uint8_t>& in, Mesh& out) {
+    if (in.size() < 0x50 || memcmp(in.data(), "PAR ", 4) != 0) return false;
+    struct Sec { size_t off = 0, size = 0; bool present = false; } sec[8];
+    std::vector<uint8_t> d(in.begin(), in.begin() + 0x50);
+    size_t fo = 0x50;
+    for (int s = 0; s < 8; s++) {
+        const uint32_t cs = rd32(in.data() + 0x10 + s * 8), ds = rd32(in.data() + 0x14 + s * 8);
+        if (!ds) continue;
+        const size_t stored = cs ? cs : ds; if (fo + stored > in.size() || ds > (256u << 20)) return false;
+        sec[s].off = d.size(); sec[s].size = ds; sec[s].present = true;
+        if (cs) { std::vector<uint8_t> x; if (!Lz4Block(in.data() + fo, cs, x, ds)) return false; d.insert(d.end(), x.begin(), x.end()); out.compressed = true; }
+        else d.insert(d.end(), in.begin() + fo, in.begin() + fo + ds);
+        fo += stored;
+    }
+    if (!sec[0].present || sec[0].size < 5) return false;
+    const uint8_t* R = d.data() + sec[0].off; const size_t RN = sec[0].size;
+    const int nLods = R[4]; if (nLods <= 0 || nLods > 10) return false;
+    // descriptors: found by the LOD index pattern that sits 35 bytes into each one
+    std::vector<PacDesc> descs; std::set<size_t> seen;
+    struct Pat { uint8_t b[5]; int len, lods, vcOff, icOff, rule; };
+    static const Pat pats[] = { { { 4, 0, 1, 2, 3 }, 5, 4, 40, 48, 0 }, { { 3, 0, 1, 1, 2 }, 5, 3, 40, 46, 0 }, { { 3, 0, 1, 2 }, 4, 3, 40, 46, 1 }, { { 2, 0, 1 }, 3, 2, 40, 44, 2 } };
+    for (const Pat& p : pats) {
+        for (size_t idx = 0; idx + p.len <= RN; idx++) {
+            if (memcmp(R + idx, p.b, p.len) != 0) continue;
+            if (p.rule == 1 && idx >= 1 && R[idx - 1] == 4) continue;
+            if (p.rule == 2 && idx >= 1 && (R[idx - 1] == 3 || R[idx - 1] == 4)) continue;
+            if (idx < 35) continue; const size_t st = idx - 35;
+            if (seen.count(st) || st + p.icOff + (size_t)p.lods * 4 > RN || R[st] != 1) continue;
+            PacDesc ds; ds.start = st; float fl[8]; memcpy(fl, R + st + 3, sizeof fl);
+            for (int k = 0; k < 3; k++) { ds.bmin[k] = fl[2 + k]; ds.bext[k] = fl[5 + k]; }
+            bool any = false, bad = false;
+            for (int l = 0; l < p.lods; l++) { ds.vc[l] = rd16(R + st + p.vcOff + l * 2); ds.ic[l] = rd32(R + st + p.icOff + l * 4); if (ds.vc[l]) any = true; if (ds.vc[l] > 200000 || ds.ic[l] > 20000000) bad = true; }
+            if (!any || bad) continue;
+            PacNames(R, RN, st, ds); seen.insert(st); descs.push_back(ds);
+        }
+    }
+    if (descs.empty()) return false;
+    std::sort(descs.begin(), descs.end(), [](const PacDesc& a, const PacDesc& b) { return a.start < b.start; });
+    {   // drop trailing false matches when a prefix of the descriptors fills every LOD section exactly
+        for (size_t cnt = descs.size(); cnt >= 2; cnt--) {
+            bool exact = true, anySec = false;
+            for (int s = 1; s <= 4; s++) { if (!sec[s].present) continue; anySec = true; const int lod = 4 - s; uint64_t need = 0;
+                for (size_t i = 0; i < cnt; i++) need += (uint64_t)descs[i].vc[lod] * 40 + (uint64_t)descs[i].ic[lod] * 2;
+                if (need != sec[s].size) { exact = false; break; } }
+            if (!anySec) break;
+            if (exact) { descs.resize(cnt); break; }
+        }
+    }
+    for (const auto& ds : descs) out.mats.push_back(ds.name.empty() ? ds.material : ds.name);
+    for (int s = 4; s >= 1; s--) {   // LOD 0 first; a lower LOD only when it fails
+        if (!sec[s].present) continue;
+        const int lod = 4 - s; const size_t so = sec[s].off, ss = sec[s].size; const uint8_t* S = d.data() + so;
+        uint64_t totalV = 0, totalI = 0; for (auto& ds : descs) { totalV += ds.vc[lod]; totalI += ds.ic[lod]; }
+        const size_t primary = (size_t)totalV * 40, idxBytes = (size_t)totalI * 2;
+        size_t vBase = 0, iStart = primary;
+        if (primary + idxBytes < ss) {   // extra records before the vertices: find the split whose first triangles are the shortest
+            const size_t gap = ss - primary - idxBytes;
+            const PacDesc* first = nullptr; for (auto& ds : descs) if (ds.vc[lod]) { first = &ds; break; }
+            if (first) {
+                const uint32_t fvc = first->vc[lod];
+                auto quality = [&](size_t vs, size_t is) -> double {
+                    if (is + idxBytes > ss) return 1e300;
+                    uint32_t fic = 0; for (auto& ds : descs) if (ds.ic[lod]) { fic = ds.ic[lod]; break; }
+                    const uint32_t nt = fic / 3; if (!nt) return 0;
+                    const uint32_t step = std::max<uint32_t>(1, nt / 30); std::set<uint32_t> tri; for (uint32_t t = 0; t < std::min<uint32_t>(12, nt); t++) tri.insert(t); for (uint32_t t = 0; t < nt; t += step) tri.insert(t);
+                    uint32_t mx = 0; std::vector<std::array<uint16_t, 3>> st;
+                    for (uint32_t t : tri) { if (is + (size_t)t * 6 + 6 > ss) return 1e300; std::array<uint16_t, 3> a = { rd16(S + is + t * 6), rd16(S + is + t * 6 + 2), rd16(S + is + t * 6 + 4) }; st.push_back(a); mx = std::max<uint32_t>({ mx, a[0], a[1], a[2] }); }
+                    const uint32_t need = std::max<uint32_t>(fvc, mx + 1); if (is <= vs || need > (is - vs) / 40) return 1e300;
+                    auto pos = [&](uint16_t i, float* p) { const uint8_t* q = S + vs + (size_t)i * 40; for (int k = 0; k < 3; k++) p[k] = fabsf(first->bext[k]) < 1e-8f ? first->bmin[k] : first->bmin[k] + rd16(q + k * 2) / 32767.0f * first->bext[k]; };
+                    double tot = 0; for (auto& a : st) { float p[3][3]; for (int k = 0; k < 3; k++) pos(a[k], p[k]);
+                        auto dist = [](const float* x, const float* y) { return sqrt((double)(x[0] - y[0]) * (x[0] - y[0]) + (double)(x[1] - y[1]) * (x[1] - y[1]) + (double)(x[2] - y[2]) * (x[2] - y[2])); };
+                        tot += std::max({ dist(p[0], p[1]), dist(p[1], p[2]), dist(p[2], p[0]) }); }
+                    return tot;
+                };
+                size_t bestV = 0, bestI = primary + (gap / 40) * 40; double best = quality(bestV, bestI);
+                for (size_t nsec = 0; nsec <= gap / 40; nsec++) {
+                    const size_t vs = nsec * 40, end = vs + primary; if (end >= ss) break;
+                    size_t found = SIZE_MAX;
+                    for (size_t t = end; t + 6 <= ss; t += 2) if (rd16(S + t) == 0 && rd16(S + t + 2) < fvc && rd16(S + t + 4) < fvc) { found = t; break; }
+                    if (found == SIZE_MAX || found + idxBytes > ss) continue;
+                    const double q = quality(vs, found); if (q < best) { best = q; bestV = vs; bestI = found; }
+                }
+                vBase = bestV; iStart = bestI;
+            }
+        }
+        Mesh m; m.mats = out.mats; m.compressed = out.compressed;
+        std::vector<size_t> vOff; size_t cur = vBase; for (auto& ds : descs) { vOff.push_back(cur); cur += (size_t)ds.vc[lod] * 40; }
+        size_t io = iStart;
+        for (size_t di = 0; di < descs.size(); di++) {
+            const PacDesc& ds = descs[di]; const uint32_t vc = ds.vc[lod], ic = ds.ic[lod];
+            if (!vc && !ic) continue;
+            const size_t icn = io >= ss ? 0 : std::min<size_t>(ic, (ss - io) / 2);
+            std::vector<uint16_t> idx(icn); if (icn) memcpy(idx.data(), S + io, icn * 2);
+            size_t owner = di; uint32_t ownerVc = vc; uint32_t mxI = 0; for (uint16_t x : idx) mxI = std::max<uint32_t>(mxI, x);
+            if (icn && mxI >= vc) {   // a submesh can index the vertex block of another one
+                size_t partner = SIZE_MAX; for (size_t pj = 0; pj < descs.size(); pj++) if (pj != di && descs[pj].vc[lod] > mxI) { partner = pj; break; }
+                if (partner != SIZE_MAX) { owner = partner; ownerVc = descs[partner].vc[lod]; }
+                else { const size_t avail = iStart > vOff[di] ? (iStart - vOff[di]) / 40 : 0; if (mxI < avail) ownerVc = mxI + 1; }
+            }
+            const PacDesc& od = descs[owner]; (void)od;
+            const uint32_t base = (uint32_t)(m.v.size() / 3); uint32_t nv = 0;
+            for (uint32_t vi = 0; vi < ownerVc; vi++) {
+                const size_t ro = vOff[owner] + (size_t)vi * 40; if (so + ro + 40 > d.size()) break;
+                const uint8_t* q = S + ro;
+                for (int k = 0; k < 3; k++) m.v.push_back(fabsf(ds.bext[k]) < 1e-8f ? ds.bmin[k] : ds.bmin[k] + rd16(q + k * 2) / 32767.0f * ds.bext[k]);   // decoded with this submesh's bbox, as CDMW does
+                m.uv.push_back(HalfToFloat(rd16(q + 8))); m.uv.push_back(HalfToFloat(rd16(q + 10)));
+                nv++;
+            }
+            for (size_t j = 0; j + 2 < icn; j += 3) {
+                const uint16_t a = idx[j], b = idx[j + 1], c = idx[j + 2];
+                if (a >= nv || b >= nv || c >= nv || a == b || b == c || a == c) continue;
+                m.f.push_back(base + a); m.f.push_back(base + b); m.f.push_back(base + c); m.fm.push_back((uint8_t)std::min<size_t>(di, 255));
+            }
+            io += (size_t)ic * 2;
+        }
+        if (!m.v.empty() && !m.f.empty()) { out = std::move(m); return true; }
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------- materials (.pami XML) and textures (DDS)
-struct MatInfo { std::string tex; float rc[3] = { 0.72f, 0.66f, 0.56f }; float uvScale = 1.0f; bool decal = false; };   // decal: MeshDecal shader, drawn on top of other geometry
+// Preview quality: 0 = base colour only, 1 = + dye / tint colours, 2 = + normal maps, 3 = + specular and emissive.
+// Each level loads more textures per surface, so it is also a speed setting for the background pass.
+static int g_quality = 3;
+struct MatInfo {
+    std::string tex, norm, spec, emi, mask, overlay;   // _baseColorTexture, _normalTexture, _materialTexture (r ao, g roughness, b metal), emissive, dye mask, overlay
+    float rc[3] = { 0.72f, 0.66f, 0.56f };             // RepresentColor: fallback when there is no texture
+    float tint[3] = { 1, 1, 1 }; bool hasTint = false;  // .pami _tintColor: multiplies the base colour
+    float zone[3][3] = { { 1, 1, 1 }, { 1, 1, 1 }, { 1, 1, 1 } }; bool hasZones = false;   // _tintColorR/G/B: colours of the mask's r/g/b zones (characters)
+    float emiCol[3] = { 1, 1, 1 }; float emiInt = 1.0f;
+    float uvScale = 1.0f; bool decal = false;           // decal: MeshDecal shader, drawn on top of other geometry
+};
 static std::unordered_map<std::string, std::unordered_map<std::string, MatInfo>> g_pamiMats;
 static std::string XmlAttr(const std::string& s, size_t from, size_t to, const char* key) {   // value of key="..." inside [from,to)
     size_t p = s.find(key, from); if (p == std::string::npos || p >= to) return "";
     p += strlen(key); size_t q = s.find('"', p); if (q == std::string::npos || q > to) return "";
     return s.substr(p, q - p);
 }
+static bool ParseColor(const std::string& v, float* c) {   // "#rrggbbaa" (.pac_xml) or "r g b" floats (.pami)
+    if (v.size() >= 7 && v[0] == '#') { for (int k = 0; k < 3; k++) c[k] = strtol(v.substr(1 + k * 2, 2).c_str(), nullptr, 16) / 255.0f; return true; }
+    float r, g, b; if (sscanf(v.c_str(), "%f %f %f", &r, &g, &b) == 3) { c[0] = r; c[1] = g; c[2] = b; return true; }
+    return false;
+}
+static void ApplyMatParam(MatInfo& m, const std::string& name, const std::string& value) {
+    const bool none = value.empty() || value.find("nonetexture") != std::string::npos;
+    if (name == "_baseColorTexture") { if (!none) m.tex = value; }
+    else if (name == "_normalTexture") { if (!none) m.norm = value; }
+    else if (name == "_materialTexture") { if (!none) m.spec = value; }
+    else if (name == "_emissiveTexture" || name == "_emissiveIntensityTexture") { if (!none) m.emi = value; }
+    else if (name == "_colorBlendingMaskTexture") { if (!none) m.mask = value; }
+    else if (name == "_overlayColorTexture") { if (!none) m.overlay = value; }
+    else if (name == "_tintColor") m.hasTint = ParseColor(value, m.tint);
+    else if (name == "_tintColorR" || name == "_tintColorG" || name == "_tintColorB") { if (ParseColor(value, m.zone[name.back() == 'R' ? 0 : name.back() == 'G' ? 1 : 2])) m.hasZones = true; }
+    else if (name == "_emissiveColor") ParseColor(value, m.emiCol);
+    else if (name == "_emissiveIntensity") { if (!value.empty()) m.emiInt = (float)atof(value.c_str()); }
+    else if (name == "_uvScale") { if (!value.empty()) m.uvScale = (float)atof(value.c_str()); if (!(m.uvScale > 0.01f && m.uvScale < 100.0f)) m.uvScale = 1.0f; }
+}
 // <Material PrimitiveName="x"> ... <RepresentColor x= y= z=/> ... <MaterialParameterTexture Name="_baseColorTexture" Value="..."/> ... <MaterialParameterFloat Name="_uvScale" Value=.../>
+// .pac: character/model/<p>.pac -> character/modelproperty/<p>.pac_xml, <SkinnedMeshMaterialWrapper _subMeshName="x"> ... _baseColorTexture ... _path="...dds"
+static void LoadPacMaterials(const std::string& s, std::unordered_map<std::string, MatInfo>& mats) {
+    static const char kTag[] = "<SkinnedMeshMaterialWrapper"; size_t p = 0;
+    while ((p = s.find(kTag, p)) != std::string::npos) {
+        size_t end = s.find("</SkinnedMeshMaterialWrapper>", p); if (end == std::string::npos) end = s.size();
+        const size_t tagEnd = s.find('>', p); std::string name = XmlAttr(s, p, tagEnd == std::string::npos ? end : tagEnd, "_subMeshName=\"");
+        MatInfo m;   // <MaterialParameterX ... _name="n" _value="v"/>, textures: _path="..." inside <MaterialParameterTexture>...</MaterialParameterTexture>
+        for (size_t q = s.find("<MaterialParameter", p); q != std::string::npos && q < end; q = s.find("<MaterialParameter", q + 1)) {
+            const size_t te = s.find('>', q); if (te == std::string::npos || te > end) break;
+            const std::string pn = XmlAttr(s, q, te, "_name=\""); if (pn.empty()) continue;
+            std::string pv = XmlAttr(s, q, te, "_value=\"");
+            if (s.compare(q, 25, "<MaterialParameterTexture") == 0) { const size_t ce = s.find("</MaterialParameterTexture>", te); pv = XmlAttr(s, te, ce == std::string::npos ? end : std::min(ce, end), "_path=\""); }
+            ApplyMatParam(m, pn, pv);
+        }
+        if (!name.empty()) { for (char& c : name) c = (char)tolower((unsigned char)c); mats.emplace(name, m); }   // lower case: descriptor names differ in case; emplace: the first ModelProperty is the default look
+        p = end;
+    }
+}
 static const std::unordered_map<std::string, MatInfo>* LoadMaterials(const std::string& pamiPath) {
-    if (!EndsWith(pamiPath, ".pami")) return nullptr;
+    const bool pac = EndsWith(pamiPath, ".pac");
+    if (!pac && !EndsWith(pamiPath, ".pami")) return nullptr;
     auto it = g_pamiMats.find(pamiPath); if (it != g_pamiMats.end()) return &it->second;
     std::unordered_map<std::string, MatInfo> mats; std::vector<uint8_t> x;
-    if (GetFile(pamiPath, x)) {
+    if (pac) {
+        std::string xml = pamiPath; const size_t mp = xml.find("/model/"); if (mp != std::string::npos) xml.replace(mp, 7, "/modelproperty/"); xml += "_xml";
+        if (GetFile(xml, x)) LoadPacMaterials(std::string((const char*)x.data(), x.size()), mats);
+    }
+    else if (GetFile(pamiPath, x)) {
         std::string s((const char*)x.data(), x.size()); size_t p = 0;
         static const char kTag[] = "<Material PrimitiveName=\""; const size_t tagLen = sizeof(kTag) - 1;
         while ((p = s.find(kTag, p)) != std::string::npos) {
@@ -425,9 +653,11 @@ static const std::unordered_map<std::string, MatInfo>* LoadMaterials(const std::
             MatInfo m;
             size_t rc = s.find("<RepresentColor", q);
             if (rc != std::string::npos && rc < end) { std::string xs = XmlAttr(s, rc, end, " x=\""), ys = XmlAttr(s, rc, end, " y=\""), zs = XmlAttr(s, rc, end, " z=\""); if (!xs.empty() && !ys.empty() && !zs.empty()) { m.rc[0] = (float)atof(xs.c_str()); m.rc[1] = (float)atof(ys.c_str()); m.rc[2] = (float)atof(zs.c_str()); } }
-            size_t bt = s.find("Name=\"_baseColorTexture\"", q); if (bt != std::string::npos && bt < end) m.tex = XmlAttr(s, bt, end, "Value=\"");
+            for (size_t t = s.find("<MaterialParameter", q); t != std::string::npos && t < end; t = s.find("<MaterialParameter", t + 1)) {   // <MaterialParameterX Name="n" Value="v"/>
+                const size_t te = s.find('>', t); if (te == std::string::npos || te > end) break;
+                ApplyMatParam(m, XmlAttr(s, t, te, " Name=\""), XmlAttr(s, t, te, " Value=\""));
+            }
             size_t mn = s.find("MaterialName=\"", q); if (mn != std::string::npos && mn < end) { std::string shader = XmlAttr(s, mn, end, "MaterialName=\""); if (shader.find("Decal") != std::string::npos) m.decal = true; }
-            size_t us = s.find("Name=\"_uvScale\"", q); if (us != std::string::npos && us < end) { std::string v = XmlAttr(s, us, end, "Value=\""); if (!v.empty()) m.uvScale = (float)atof(v.c_str()); if (!(m.uvScale > 0.01f && m.uvScale < 100.0f)) m.uvScale = 1.0f; }
             mats[name] = m; p = end;
         }
     }
@@ -463,29 +693,57 @@ static void DecodeBc(const uint8_t* src, size_t n, int w, int h, bool bc3, TexIm
         }
     }
 }
-// DDS: the mip level with at most 256 px on the long side is decoded (BC1 and BC3 only; everything else falls back to the material colour)
+// BC4 block (one channel: two endpoints + 16 3-bit indices, same as the BC3 alpha block) into channel ch of rgba
+static void DecodeBc4Block(const uint8_t* b, int bx, int by, int ch, TexImg& out) {
+    const int a0 = b[0], a1 = b[1]; int pal[8] = { a0, a1 };
+    if (a0 > a1) for (int i = 1; i < 7; i++) pal[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+    else { for (int i = 1; i < 5; i++) pal[i + 1] = ((5 - i) * a0 + i * a1) / 5; pal[6] = 0; pal[7] = 255; }
+    uint64_t bits = 0; for (int i = 0; i < 6; i++) bits |= (uint64_t)b[2 + i] << (8 * i);
+    for (int i = 0; i < 16; i++) { const int x = bx * 4 + (i & 3), y = by * 4 + (i >> 2); if (x >= out.w || y >= out.h) continue; out.rgba[((size_t)y * out.w + x) * 4 + ch] = (uint8_t)pal[(bits >> (3 * i)) & 7]; }
+}
+// BC4 (emissive masks: r) / BC5 (normal maps: r = x, g = y)
+static void DecodeBc45(const uint8_t* src, size_t n, int w, int h, bool bc5, TexImg& out) {
+    const int bw = (w + 3) / 4, bh = (h + 3) / 4, bs = bc5 ? 16 : 8;
+    out.w = w; out.h = h; out.alpha = false; out.rgba.assign((size_t)w * h * 4, 255);
+    for (int by = 0; by < bh; by++) for (int bx = 0; bx < bw; bx++) {
+        const size_t bo = ((size_t)by * bw + bx) * bs; if (bo + bs > n) return;
+        DecodeBc4Block(src + bo, bx, by, 0, out); if (bc5) DecodeBc4Block(src + bo + 8, bx, by, 1, out);
+    }
+}
+// DDS: the mip level with at most 256 px on the long side is decoded (BC1, BC3, BC4, BC5; anything else falls back to the material colour)
 static std::shared_ptr<TexImg> LoadTexture(const std::string& path) {
     auto it = g_texs.find(path); if (it != g_texs.end()) return it->second;
     if (g_texBytes > (192u << 20)) { g_texs.clear(); g_texBytes = 0; }
-    std::shared_ptr<TexImg> t; std::vector<uint8_t> d;
+    std::shared_ptr<TexImg> t; std::vector<uint8_t> d; const char* kind = "?";
     if (GetFile(path, d) && d.size() >= 128 && memcmp(d.data(), "DDS ", 4) == 0) {
         int h = (int)rd32(d.data() + 12), w = (int)rd32(d.data() + 16), mips = std::max(1, (int)rd32(d.data() + 28));
-        const uint32_t fourcc = rd32(d.data() + 84); size_t off = 128; bool bc3 = false, ok = true;
+        const uint32_t fourcc = rd32(d.data() + 84); size_t off = 128; int fmt = 0;   // 1 BC1, 3 BC3, 4 BC4, 5 BC5
         if (fourcc == 0x30315844) {   // "DX10": dxgi format follows
             const uint32_t dxgi = rd32(d.data() + 128); off = 148;
-            if (dxgi == 71 || dxgi == 72) bc3 = false; else if (dxgi == 77 || dxgi == 78) bc3 = true; else ok = false;
-        } else if (fourcc == 0x31545844) bc3 = false; else if (fourcc == 0x35545844) bc3 = true; else ok = false;   // DXT1 / DXT5
-        if (ok && w > 0 && h > 0 && w <= 16384 && h <= 16384) {
-            while ((w > 256 || h > 256) && mips > 1) { off += (size_t)((w + 3) / 4) * ((h + 3) / 4) * (bc3 ? 16 : 8); w = std::max(1, w / 2); h = std::max(1, h / 2); mips--; }
-            if (off < d.size()) { t = std::make_shared<TexImg>(); DecodeBc(d.data() + off, d.size() - off, w, h, bc3, *t); g_texBytes += t->rgba.size(); }
+            fmt = (dxgi == 71 || dxgi == 72) ? 1 : (dxgi == 77 || dxgi == 78) ? 3 : (dxgi == 80 || dxgi == 81) ? 4 : (dxgi == 83 || dxgi == 84) ? 5 : 0;
+        } else fmt = fourcc == 0x31545844 ? 1 : fourcc == 0x35545844 ? 3 : (fourcc == 0x55344342 || fourcc == 0x31495441) ? 4 : (fourcc == 0x55354342 || fourcc == 0x32495441) ? 5 : 0;   // DXT1 DXT5 BC4U/ATI1 BC5U/ATI2
+        if (fmt && w > 0 && h > 0 && w <= 16384 && h <= 16384) {
+            const int bs = (fmt == 1 || fmt == 4) ? 8 : 16;
+            while ((w > 256 || h > 256) && mips > 1) { off += (size_t)((w + 3) / 4) * ((h + 3) / 4) * bs; w = std::max(1, w / 2); h = std::max(1, h / 2); mips--; }
+            if (off < d.size()) {
+                t = std::make_shared<TexImg>();
+                if (fmt <= 3) DecodeBc(d.data() + off, d.size() - off, w, h, fmt == 3, *t); else DecodeBc45(d.data() + off, d.size() - off, w, h, fmt == 5, *t);
+                g_texBytes += t->rgba.size(); kind = fmt == 1 ? "bc1" : fmt == 3 ? "bc3" : fmt == 4 ? "bc4" : "bc5";
+            }
         }
     }
     if (d.empty() && g_readError) return t;   // read error: not cached
-    static int s_logged = 0; if (s_logged < 6) { s_logged++; Log("[thumbs] texture %s: %s%s", path.c_str(), t ? "ok" : "FAILED", t ? (std::string(" ") + std::to_string(t->w) + "x" + std::to_string(t->h) + (t->alpha ? " bc3" : " bc1")).c_str() : (d.empty() ? " (read failed)" : " (format)")); }
+    static int s_logged = 0; if (s_logged < 6) { s_logged++; Log("[thumbs] texture %s: %s%s", path.c_str(), t ? "ok" : "FAILED", t ? (std::string(" ") + std::to_string(t->w) + "x" + std::to_string(t->h) + " " + kind).c_str() : (d.empty() ? " (read failed)" : " (format)")); }
     g_texs[path] = t;
     return t;
 }
-struct Surface { std::shared_ptr<TexImg> tex; float col[3]; float uvScale; bool skip = false; };
+struct Surface {
+    std::shared_ptr<TexImg> tex, norm, spec, emi, mask, overlay;   // only the ones g_quality asks for are loaded
+    float col[3]; float uvScale; bool skip = false;
+    float tint[3] = { 1, 1, 1 }; bool hasTint = false;
+    float zone[3][3] = { { 1, 1, 1 }, { 1, 1, 1 }, { 1, 1, 1 } }; bool hasZones = false;
+    float emiCol[3] = { 1, 1, 1 }; float emiInt = 1.0f;
+};
 
 // ---------------------------------------------------------------- mesh cache
 static std::unordered_map<std::string, std::shared_ptr<Mesh>> g_meshes;
@@ -493,7 +751,7 @@ static std::unordered_map<std::string, std::string> g_pami;
 static size_t g_meshBytes = 0;
 
 static std::string ResolvePam(const std::string& path) {
-    if (EndsWith(path, ".pam")) return path;
+    if (EndsWith(path, ".pam") || EndsWith(path, ".pac")) return path;
     auto it = g_pami.find(path); if (it != g_pami.end()) return it->second;
     size_t dot = path.rfind('.'); std::string res = (dot == std::string::npos ? path : path.substr(0, dot)) + ".pam";
     std::vector<uint8_t> x;
@@ -513,7 +771,7 @@ static std::shared_ptr<Mesh> LoadMesh(const std::string& path) {
     if (g_meshBytes > (400u << 20)) { g_meshes.clear(); g_meshBytes = 0; }
     std::shared_ptr<Mesh> m;
     std::vector<uint8_t> data;
-    if (GetFile(pam, data)) { auto mm = std::make_shared<Mesh>(); if (ParsePam(data, *mm)) { m = mm; g_meshBytes += mm->v.size() * 4 + mm->f.size() * 4; } }
+    if (GetFile(pam, data)) { auto mm = std::make_shared<Mesh>(); if (EndsWith(pam, ".pac") ? ParsePac(data, *mm) : ParsePam(data, *mm)) { m = mm; g_meshBytes += mm->v.size() * 4 + mm->f.size() * 4; } }
     else if (g_readError) return m;   // read error: not cached, a later render reads it again
     g_meshes[pam] = m;
     return m;
@@ -537,12 +795,12 @@ static void FillTri(uint8_t* buf, int W, const float* x, const float* y, uint8_t
         for (int px = px0; px <= px1; px++, row += 4) { row[0] = r; row[1] = g; row[2] = b; row[3] = 255; }
     }
 }
-static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const std::vector<Surface>& surf, const std::string& file) {
+static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const std::vector<Surface>& surf, const std::string& file, float azDeg = 35.0f) {
     const int S = 256, SS = 2, W = S * SS;
     const size_t nv = mesh.v.size() / 3; if (!nv || mesh.f.size() < 3) return false;
     const bool haveUv = mesh.uv.size() == nv * 2;
     // camera: azimuth 35 deg around Y, then elevation 25 deg around X (matches scripts/render_thumbs.py)
-    const float az = 35.0f * 3.14159265f / 180.0f, el = 25.0f * 3.14159265f / 180.0f;
+    const float az = azDeg * 3.14159265f / 180.0f, el = 25.0f * 3.14159265f / 180.0f;
     const float ca = cosf(az), sa = sinf(az), ce = cosf(el), se = sinf(el);
     std::vector<float> p(nv * 3);
     float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
@@ -571,16 +829,45 @@ static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const s
     }
     if (tris.empty()) return false;
     std::vector<uint8_t> buf((size_t)W * W * 4, 0); std::vector<float> zbuf((size_t)W * W, -1e30f);
+    auto texel = [](const TexImg* t, float u, float v) -> const uint8_t* {   // nearest sample, wrapping
+        u -= floorf(u); v -= floorf(v);
+        const int tx = std::min(t->w - 1, (int)(u * t->w)), ty = std::min(t->h - 1, (int)(v * t->h));
+        return &t->rgba[((size_t)ty * t->w + tx) * 4];
+    };
+    const float hv[3] = { light[0], light[1], light[2] + 1.0f }; float half[3]; { const float l = sqrtf(hv[0] * hv[0] + hv[1] * hv[1] + hv[2] * hv[2]); for (int k = 0; k < 3; k++) half[k] = hv[k] / l; }   // Blinn half vector, the view looks down -z
     for (const Tri& tr : tris) {   // z-buffered rasterizer with barycentric uv interpolation (orthographic view, so no perspective correction)
         float xs[3], ys[3], zs[3], us[3] = { 0, 0, 0 }, vs[3] = { 0, 0, 0 };
         const Surface* sf = (tr.i < fs.size() && fs[tr.i] < surf.size()) ? &surf[fs[tr.i]] : nullptr;
-        const TexImg* tex = sf && sf->tex && sf->tex->w > 0 ? sf->tex.get() : nullptr;
+        auto ok = [](const std::shared_ptr<TexImg>& t) -> const TexImg* { return t && t->w > 0 ? t.get() : nullptr; };
+        const TexImg* tex = sf ? ok(sf->tex) : nullptr;
+        const TexImg* mask = sf && sf->hasZones ? ok(sf->mask) : nullptr; const TexImg* ovl = mask ? ok(sf->overlay) : nullptr;
+        const TexImg* nrm = sf && haveUv ? ok(sf->norm) : nullptr; const TexImg* spc = sf ? ok(sf->spec) : nullptr; const TexImg* emi = sf ? ok(sf->emi) : nullptr;
+        const bool anyTex = tex || mask || nrm || spc || emi;
         for (int k = 0; k < 3; k++) { const uint32_t vi = mesh.f[tr.i * 3 + k]; const float* P = &p[vi * 3]; xs[k] = (P[0] - cx) * scale + W / 2.0f; ys[k] = W / 2.0f - (P[1] - cy) * scale; zs[k] = P[2];
-            if (tex && haveUv) { us[k] = mesh.uv[vi * 2] * sf->uvScale; vs[k] = mesh.uv[vi * 2 + 1] * sf->uvScale; } }
+            if (anyTex && haveUv) { us[k] = mesh.uv[vi * 2] * sf->uvScale; vs[k] = mesh.uv[vi * 2 + 1] * sf->uvScale; } }
         const float det = (xs[1] - xs[0]) * (ys[2] - ys[0]) - (xs[2] - xs[0]) * (ys[1] - ys[0]); if (fabsf(det) < 1e-6f) continue;
         const int x0 = std::max(0, (int)floorf(std::min({ xs[0], xs[1], xs[2] }))), x1 = std::min(W - 1, (int)ceilf(std::max({ xs[0], xs[1], xs[2] })));
         const int y0 = std::max(0, (int)floorf(std::min({ ys[0], ys[1], ys[2] }))), y1 = std::min(W - 1, (int)ceilf(std::max({ ys[0], ys[1], ys[2] })));
         float base[3] = { 214, 196, 168 }; if (sf) { base[0] = sf->col[0] * 255; base[1] = sf->col[1] * 255; base[2] = sf->col[2] * 255; }
+        // tangent frame in view space for the normal map: N faces the camera, T/B follow the uv directions of this triangle
+        float N[3] = { 0, 0, 1 }, T[3] = { 1, 0, 0 }, Bt[3] = { 0, 1, 0 }; bool frame = false;
+        if (nrm || spc) {
+            const float* A = &p[mesh.f[tr.i * 3] * 3]; const float* B = &p[mesh.f[tr.i * 3 + 1] * 3]; const float* C = &p[mesh.f[tr.i * 3 + 2] * 3];
+            const float e1[3] = { B[0] - A[0], B[1] - A[1], B[2] - A[2] }, e2[3] = { C[0] - A[0], C[1] - A[1], C[2] - A[2] };
+            N[0] = e1[1] * e2[2] - e1[2] * e2[1]; N[1] = e1[2] * e2[0] - e1[0] * e2[2]; N[2] = e1[0] * e2[1] - e1[1] * e2[0];
+            float ln = sqrtf(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]); if (ln > 1e-12f) { for (float& x : N) x /= ln; if (N[2] < 0) for (float& x : N) x = -x; }
+            const float du1 = us[1] - us[0], dv1 = vs[1] - vs[0], du2 = us[2] - us[0], dv2 = vs[2] - vs[0], dd = du1 * dv2 - du2 * dv1;
+            if (nrm && fabsf(dd) > 1e-12f) {
+                const float r = 1.0f / dd; float t[3], b[3];
+                for (int k = 0; k < 3; k++) { t[k] = (e1[k] * dv2 - e2[k] * dv1) * r; b[k] = (e2[k] * du1 - e1[k] * du2) * r; }
+                const float tn = t[0] * N[0] + t[1] * N[1] + t[2] * N[2]; for (int k = 0; k < 3; k++) t[k] -= N[k] * tn;   // Gram-Schmidt
+                const float lt = sqrtf(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+                if (lt > 1e-12f) { for (int k = 0; k < 3; k++) T[k] = t[k] / lt;
+                    float c3[3] = { N[1] * T[2] - N[2] * T[1], N[2] * T[0] - N[0] * T[2], N[0] * T[1] - N[1] * T[0] };
+                    const float hand = (c3[0] * b[0] + c3[1] * b[1] + c3[2] * b[2]) < 0 ? -1.0f : 1.0f;
+                    for (int k = 0; k < 3; k++) Bt[k] = c3[k] * hand; frame = true; }
+            }
+        }
         for (int py = y0; py <= y1; py++) for (int px = x0; px <= x1; px++) {
             const float fx = px + 0.5f, fy = py + 0.5f;
             const float l1 = ((fx - xs[0]) * (ys[2] - ys[0]) - (xs[2] - xs[0]) * (fy - ys[0])) / det;
@@ -588,16 +875,43 @@ static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const s
             const float l0 = 1.0f - l1 - l2; if (l0 < 0 || l1 < 0 || l2 < 0) continue;
             const float z = l0 * zs[0] + l1 * zs[1] + l2 * zs[2]; float& zb = zbuf[(size_t)py * W + px]; if (z <= zb) continue;
             float c[3] = { base[0], base[1], base[2] };
+            const float u = l0 * us[0] + l1 * us[1] + l2 * us[2], v = l0 * vs[0] + l1 * vs[1] + l2 * vs[2];
             if (tex) {
-                float u = l0 * us[0] + l1 * us[1] + l2 * us[2], v = l0 * vs[0] + l1 * vs[1] + l2 * vs[2];
-                u -= floorf(u); v -= floorf(v);
-                int tx = std::min(tex->w - 1, (int)(u * tex->w)), ty = std::min(tex->h - 1, (int)(v * tex->h));
-                const uint8_t* q = &tex->rgba[((size_t)ty * tex->w + tx) * 4];
+                const uint8_t* q = texel(tex, u, v);
                 if (tex->alpha && q[3] < 128) continue;   // cut-out (leaves, grates)
                 c[0] = q[0]; c[1] = q[1]; c[2] = q[2];
+                if (sf->hasTint) for (int k = 0; k < 3; k++) c[k] *= sf->tint[k];
+            } else if (mask) {   // dye zones: mask r/g/b pick the zone colours, the grey overlay texture shades them (overlay blend)
+                const uint8_t* m = texel(mask, u, v); const float w0 = m[0] / 255.0f, w1 = m[1] / 255.0f, w2 = m[2] / 255.0f, ws = w0 + w1 + w2;
+                for (int k = 0; k < 3; k++) {
+                    float col = ws > 1e-3f ? (w0 * sf->zone[0][k] + w1 * sf->zone[1][k] + w2 * sf->zone[2][k]) / ws : sf->zone[0][k];
+                    if (ovl) { const float o = texel(ovl, u, v)[0] / 255.0f; col = col < 0.5f ? 2 * col * o : 1 - 2 * (1 - col) * (1 - o); }
+                    c[k] = col * 255.0f;
+                }
+            }
+            float shade = tr.shade, spec = 0, ao = 1, metal = 0;
+            if (frame || spc) {
+                float n[3] = { N[0], N[1], N[2] };
+                if (frame) {   // BC5 normal map: x, y in r, g (DirectX: green points down the texture), z rebuilt
+                    const uint8_t* q = texel(nrm, u, v); const float nx = q[0] / 127.5f - 1.0f, ny = -(q[1] / 127.5f - 1.0f), nz = sqrtf(std::max(0.0f, 1.0f - nx * nx - ny * ny));
+                    for (int k = 0; k < 3; k++) n[k] = T[k] * nx + Bt[k] * ny + N[k] * nz;
+                    const float ln = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]); if (ln > 1e-6f) for (float& x : n) x /= ln;
+                    shade = fabsf(n[0] * light[0] + n[1] * light[1] + n[2] * light[2]) * 0.75f + 0.25f;
+                }
+                if (spc) {   // _materialTexture: r ambient occlusion, g roughness, b metal -> Blinn-Phong highlight
+                    const uint8_t* q = texel(spc, u, v); ao = 0.75f + 0.25f * q[0] / 255.0f; const float rough = q[1] / 255.0f; metal = q[2] / 255.0f;
+                    const float nh = std::max(0.0f, n[0] * half[0] + n[1] * half[1] + n[2] * half[2]), gloss = (1 - rough) * (1 - rough);
+                    spec = powf(nh, 4.0f + gloss * 124.0f) * (0.08f + gloss * 0.9f);
+                }
+            }
+            float outc[3];
+            for (int k = 0; k < 3; k++) {
+                const float specCol = 255.0f * (1 - metal) + c[k] * metal;   // metals tint their highlight
+                outc[k] = c[k] * shade * ao + specCol * spec;   // no environment to reflect: metals keep their diffuse light, they only tint the highlight
+                if (emi) outc[k] += texel(emi, u, v)[0] / 255.0f * sf->emiCol[k] * sf->emiInt * 255.0f;
             }
             zb = z; uint8_t* o = &buf[((size_t)py * W + px) * 4];
-            o[0] = (uint8_t)std::min(255.0f, c[0] * tr.shade); o[1] = (uint8_t)std::min(255.0f, c[1] * tr.shade); o[2] = (uint8_t)std::min(255.0f, c[2] * tr.shade); o[3] = 255;
+            o[0] = (uint8_t)std::min(255.0f, outc[0]); o[1] = (uint8_t)std::min(255.0f, outc[1]); o[2] = (uint8_t)std::min(255.0f, outc[2]); o[3] = 255;
         }
     }
     // 2x2 box filter, alpha weighted
@@ -614,6 +928,10 @@ static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const s
 // ---------------------------------------------------------------- worker
 static std::mutex g_mu;
 static std::deque<std::string> g_requests;
+// browser requests: last time the tile asked (every frame while visible); 0 = sticky (Refresh). The worker takes the newest
+// and drops the ones not asked for in 1.5 s, so after scrolling through hundreds of tiles the ones on screen come first.
+static std::unordered_map<std::string, DWORD> g_reqSeen;
+static void RequestSticky(const std::string& p);
 static std::unordered_set<std::string> g_pending, g_processed;
 static std::atomic<int> g_done{ 0 }, g_failed{ 0 }, g_total{ 0 }, g_gen{ 0 };
 static std::atomic<bool> g_ready{ false }, g_background{ true }, g_idle{ false };
@@ -626,20 +944,13 @@ static bool g_recheckOnly = false, g_recheckForce = false, g_lastSkipped = false
 static std::vector<std::string> g_refreshed;               // images overwritten by the re-render pass (the overlay drops its cached textures)
 static bool g_passActive = false; static std::unordered_set<std::string> g_passDone;   // re-render pass: browser requests jump the queue
 static bool Generate(const std::string& logical, float dims[6], std::string& why) {
-    std::string phys = logical; if (!phys.empty() && phys[0] == '/') phys.erase(0, 1);
-    size_t sl = phys.find('/');
-    std::string physBin = sl == std::string::npos ? phys : phys.substr(0, sl) + "/bin__/" + phys.substr(sl + 1);
-    std::vector<uint8_t> data; g_readError = false;
-    if (!GetFile(physBin, data) && !GetFile(phys, data)) { why = g_readError ? "read error" : "prefab missing"; return false; }
-    std::vector<Node> roots;
-    try { ParsePrefab(data, roots); } catch (const std::exception& e) { why = std::string("prefab: ") + e.what(); return false; }
+    g_readError = false;
+    std::vector<Node> roots; if (!LoadPrefabRoots(logical, roots, &why)) return false;
     std::vector<Inst> inst; const float I[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }, Z[3] = { 0, 0, 0 };
-    for (const auto& r : roots) Collect(r, I, Z, inst);
-    if (inst.empty()) {
-        static int s_logged = 0;   // an empty object list from a non-empty file is suspicious: the first bytes tell a bad read from a real prefab without meshes
-        if (roots.empty() && s_logged < 5) { s_logged++; char hex[64] = { 0 }; for (size_t i = 0; i < 16 && i < data.size(); i++) snprintf(hex + i * 3, 4, "%02X ", data[i]);
-            Log("[thumbs] %s: no objects in %zu bytes (%s)", logical.c_str(), data.size(), hex); }
-        why = "no meshes"; return false; }
+    CollectCtx cx; cx.chain.push_back(logical);
+    for (const auto& r : roots) Collect(r, I, Z, inst, cx);
+    if (g_readError) { why = "read error"; return false; }   // a sub-prefab could not be read
+    if (inst.empty()) { why = "no meshes"; return false; }
     Mesh all; bool anyCompressed = false; std::vector<uint16_t> fs; std::vector<Surface> surf; g_statInst = (int)inst.size(); g_statSurf = g_statMat = g_statTex = 0;
     for (size_t k = 0; k < inst.size() && k < 400; k++) {
         auto m = LoadMesh(inst[k].path); if (!m) continue; if (m->compressed) anyCompressed = true;
@@ -657,7 +968,19 @@ static bool Generate(const std::string& logical, float dims[6], std::string& why
         auto surfaceFor = [&](uint8_t sub) -> uint16_t {
             const size_t si = std::min<size_t>(sub, m->mats.size()); if (subSurf[si] != 0xFFFF) return subSurf[si];
             Surface sfc; sfc.col[0] = 0.72f; sfc.col[1] = 0.66f; sfc.col[2] = 0.56f; sfc.uvScale = 1.0f;
-            if (mats && si < m->mats.size()) { auto mi = mats->find(m->mats[si]); if (mi != mats->end()) { g_statMat++; memcpy(sfc.col, mi->second.rc, sizeof sfc.col); sfc.uvScale = mi->second.uvScale; sfc.skip = mi->second.decal; if (!sfc.skip && !mi->second.tex.empty()) { sfc.tex = LoadTexture(mi->second.tex); if (sfc.tex) g_statTex++; } } }
+            if (mats && si < m->mats.size()) { auto mi = mats->find(m->mats[si]);
+                if (mi == mats->end()) { std::string lk = m->mats[si]; for (char& ch : lk) ch = (char)tolower((unsigned char)ch); mi = mats->find(lk); }   // .pac_xml names are lower case
+                if (mi == mats->end() && mats->size() == 1) mi = mats->begin();   // one material in the file: it is this submesh's
+                if (mi != mats->end()) { const MatInfo& mt = mi->second; g_statMat++; memcpy(sfc.col, mt.rc, sizeof sfc.col); sfc.uvScale = mt.uvScale; sfc.skip = mt.decal;
+                    if (!sfc.skip) {
+                        if (!mt.tex.empty()) { sfc.tex = LoadTexture(mt.tex); if (sfc.tex) g_statTex++; }
+                        if (g_quality >= 1) {   // dye: characters colour the mask's zones, props multiply their base colour with one tint
+                            sfc.hasTint = mt.hasTint; memcpy(sfc.tint, mt.tint, sizeof sfc.tint);
+                            if (mt.hasZones && !mt.mask.empty() && !sfc.tex) { sfc.hasZones = true; memcpy(sfc.zone, mt.zone, sizeof sfc.zone); sfc.mask = LoadTexture(mt.mask); if (!mt.overlay.empty()) sfc.overlay = LoadTexture(mt.overlay); }
+                        }
+                        if (g_quality >= 2 && !mt.norm.empty()) sfc.norm = LoadTexture(mt.norm);
+                        if (g_quality >= 3) { if (!mt.spec.empty()) sfc.spec = LoadTexture(mt.spec); if (!mt.emi.empty()) { sfc.emi = LoadTexture(mt.emi); memcpy(sfc.emiCol, mt.emiCol, sizeof sfc.emiCol); sfc.emiInt = mt.emiInt; } }
+                    } } }
             g_statSurf++;
             if (surf.size() >= 0xFFFE) return 0; surf.push_back(sfc); return subSurf[si] = (uint16_t)(surf.size() - 1);
         };
@@ -672,7 +995,9 @@ static bool Generate(const std::string& logical, float dims[6], std::string& why
     for (int k = 0; k < 3; k++) { dims[k] = mx[k] - mn[k]; dims[3 + k] = (mn[k] + mx[k]) * 0.5f; }   // size + center relative to the pivot
     if (g_measureOnly && GetFileAttributesA(core::ThumbFile(logical).c_str()) != INVALID_FILE_ATTRIBUTES) return true;
     if (g_recheckOnly && !g_recheckForce && !anyCompressed && GetFileAttributesA(core::ThumbFile(logical).c_str()) != INVALID_FILE_ATTRIBUTES) { g_lastSkipped = true; return true; }
-    if (!RenderPng(all, fs, surf, core::ThumbFile(logical))) { why = "render"; return false; }
+    // characters face the other way than static objects: a preview made only of skinned meshes is seen from the front
+    const bool skinnedOnly = std::all_of(inst.begin(), inst.end(), [](const Inst& in) { return EndsWith(in.path, ".pac"); });
+    if (!RenderPng(all, fs, surf, core::ThumbFile(logical), skinnedOnly ? 215.0f : 35.0f)) { why = "render"; return false; }
     return true;
 }
 static bool GenerateGuarded(const std::string& logical, float dims[6], std::string& why) {
@@ -698,27 +1023,34 @@ static DWORD WINAPI Worker(LPVOID) {
         }
         // up to v0.86 an unfilled read from the game loader was recorded as "no meshes" for good (thousands of prefabs when the
         // pass ran during a loading screen): every recorded failure is tried once more, the real ones are recorded again
-        const std::string retryPath = core::ModDir() + "\\thumbs_retry.txt";
-        if (!failedSet.empty() && GetFileAttributesA(retryPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        // marker 2: skinned meshes (.pac) and sub-prefabs render since 0.91, their old "no meshes" lines are tried again as well
+        const std::string retryPath = core::ModDir() + "\\thumbs_retry.txt"; int retryVer = 0;
+        if (FILE* rf = fopen(retryPath.c_str(), "r")) { if (fscanf(rf, "%d", &retryVer) != 1) retryVer = 0; fclose(rf); }
+        if (!failedSet.empty() && retryVer < 1) {
             for (const auto& p : failedSet) g_processed.erase(p);
             Log("[thumbs] %zu prefabs without a preview are tried again (earlier failures may have been read errors)", failedSet.size());
             failedSet.clear();
+        } else if (!failedSet.empty() && retryVer < 2) {
+            size_t n = 0;
+            for (const auto& pi : core::PrefabIndex()) if ((pi.tags.find("SkinnedMesh") != std::string::npos || pi.tags.find("SubPrefab") != std::string::npos) && failedSet.erase(pi.path)) { g_processed.erase(pi.path); n++; }
+            if (n) Log("[thumbs] %zu prefabs with skinned meshes or sub-prefabs are rendered now (earlier versions could not)", n);
         }
-        if (FILE* rf = fopen(retryPath.c_str(), "w")) { fprintf(rf, "1\n"); fclose(rf); }
+        if (FILE* rf = fopen(retryPath.c_str(), "w")) { fprintf(rf, "2\n"); fclose(rf); }
         g_failed = (int)failedSet.size(); g_done = (int)g_processed.size() - g_failed;
     }
     g_sizes = fopen(sizesPath.c_str(), "a");
     const auto& idx = core::PrefabIndex(); g_total = (int)idx.size();
-    int noMesh = 0;   // index rows without a static mesh (never a preview), for the log lines
-    {   // prefabs.tsv counts the same .pam/.pami _path entries Collect() looks for: 0 means "no meshes" without reading the file.
-        // ~17.8k of them (characters with skinned meshes, decals, effects) head the index; reading them first took over
-        // five minutes before the first image, which looked like nothing was rendered at all. A parse-error row is read anyway.
+    int noMesh = 0;   // index rows without any mesh (never a preview), for the log lines
+    {   // prefabs.tsv counts the .pam/.pami _path entries: 0 without a SkinnedMesh or SubPrefab tag (the .pac and the meshes of
+        // referenced prefabs are not counted there) means
+        // "no meshes" without reading the file. ~1.6k of them (decals, effects, logic objects) would otherwise be read one by
+        // one. A parse-error row is read anyway.
         std::lock_guard<std::mutex> l(g_mu); int skipped = 0;
-        for (const auto& pi : idx) if (pi.meshes == 0 && pi.tags.find("parse-error") == std::string::npos) { noMesh++; if (g_processed.insert(pi.path).second) skipped++; }
+        for (const auto& pi : idx) if (pi.meshes == 0 && pi.tags.find("SkinnedMesh") == std::string::npos && pi.tags.find("SubPrefab") == std::string::npos && pi.tags.find("parse-error") == std::string::npos) { noMesh++; if (g_processed.insert(pi.path).second) skipped++; }
         g_failed += skipped;
-        Log("[thumbs] %d prefabs have no static mesh in the index (skinned characters, decals, effects): no preview, not read", noMesh);
+        Log("[thumbs] %d prefabs have no mesh in the index (decals, effects, logic objects): no preview, not read", noMesh);
     }
-    Log("[thumbs] worker ready: %d prefabs, %d with preview, %d without (%d no static mesh), %d to go", g_total.load(), g_done.load(), g_failed.load(), noMesh,
+    Log("[thumbs] worker ready: %d prefabs, %d with preview, %d without (%d no mesh), %d to go", g_total.load(), g_done.load(), g_failed.load(), noMesh,
         std::max(0, g_total.load() - g_done.load() - g_failed.load()));
     g_ready = true;
     {   // self test: one prefab and one mesh through the game's loader (logged once per start)
@@ -733,14 +1065,14 @@ static DWORD WINAPI Worker(LPVOID) {
     const std::string verPath = core::ModDir() + "\\thumbs_version.txt"; int cacheVer = 0;
     { FILE* vf = fopen(verPath.c_str(), "r"); if (vf) { if (fscanf(vf, "%d", &cacheVer) != 1) cacheVer = 0; fclose(vf); } }
     std::deque<std::string> recheck; int rechecked = 0, rerendered = 0;
-    const int kCacheVersion = 3;   // 2 = LZ4 meshes decoded, 3 = textured previews
+    const int kCacheVersion = 4;   // 2 = LZ4 meshes decoded, 3 = textured previews, 4 = .pam uv read as halves (every textured image was off)
     // progress file: one prefab per line that this pass already rendered. Without it every session started the pass from
     // the beginning and re-rendered the same first few thousand prefabs, so the rest never got their textured image.
     const std::string passPath = core::ModDir() + "\\thumbs_pass.txt"; FILE* passOut = nullptr;
     if (cacheVer < kCacheVersion) { std::lock_guard<std::mutex> l(g_mu);
         { FILE* pf = fopen(passPath.c_str(), "r"); if (pf) { char line[1024]; while (fgets(line, sizeof line, pf)) { std::string s = line; while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back(); if (!s.empty()) g_passDone.insert(s); } fclose(pf); } }
         for (auto& pi : idx) if (g_processed.count(pi.path) && pi.sx > 0 && !g_passDone.count(pi.path)) recheck.push_back(pi.path);
-        g_recheckForce = cacheVer < 3; g_passActive = !recheck.empty();
+        g_recheckForce = cacheVer < 4; g_passActive = !recheck.empty();
         if (!g_passDone.empty()) Log("[thumbs] re-render pass continues: %zu done in earlier sessions, %zu to go", g_passDone.size(), recheck.size());
         if (!recheck.empty()) passOut = fopen(passPath.c_str(), "a");
         if (!recheck.empty()) Log("[thumbs] cache version %d -> %d: %zu rendered prefabs are %s in the background", cacheVer, kCacheVersion, recheck.size(), g_recheckForce ? "rendered again with textures" : "checked for LZ4 meshes"); }
@@ -755,7 +1087,18 @@ static DWORD WINAPI Worker(LPVOID) {
         std::string path; bool prio = false; bool measure = false, check = false;
         {
             std::lock_guard<std::mutex> l(g_mu);
-            if (!g_requests.empty()) { path = g_requests.front(); g_requests.pop_front(); prio = true; }
+            if (!g_requests.empty()) {   // newest request first; tiles that scrolled away (not asked for in 1.5 s) leave the queue
+                const DWORD now = GetTickCount(); size_t best = SIZE_MAX; DWORD bestT = 0;
+                for (size_t i = 0; i < g_requests.size();) {
+                    auto it = g_reqSeen.find(g_requests[i]); const DWORD t = it == g_reqSeen.end() ? now : it->second;
+                    if (t && now - t > 1500) { g_pending.erase(g_requests[i]); if (it != g_reqSeen.end()) g_reqSeen.erase(it); g_requests.erase(g_requests.begin() + i); continue; }
+                    const DWORD key = t ? t : now + 1;   // sticky requests rank above everything
+                    if (best == SIZE_MAX || key >= bestT) { best = i; bestT = key; }
+                    i++;
+                }
+                if (best != SIZE_MAX) { path = g_requests[best]; g_requests.erase(g_requests.begin() + best); g_reqSeen.erase(path); prio = true; }
+            }
+            if (!path.empty()) {}
             else if (!remeasure.empty()) { path = remeasure.front(); remeasure.pop_front(); measure = true; }
             else if (!recheck.empty()) { path = recheck.front(); recheck.pop_front(); check = true; }
             else if (g_background) { while (cursor < idx.size() && g_processed.count(idx[cursor].path)) cursor++; if (cursor < idx.size()) path = idx[cursor++].path;
@@ -806,7 +1149,7 @@ static DWORD WINAPI Worker(LPVOID) {
         if (GetTickCount() - lastLog > 60000) {
             std::string rs; for (auto& kv : reasons) rs += kv.first + "=" + std::to_string(kv.second) + " ";
             // worded for players who read the log: "failed" alone looked like errors piling up
-            Log("[thumbs] progress: %d with preview, %d without (%d no static mesh), %d to go, %d rendered this session | reads %d %s", g_done.load(), g_failed.load(), noMesh,
+            Log("[thumbs] progress: %d with preview, %d without (%d no mesh), %d to go, %d rendered this session | reads %d %s", g_done.load(), g_failed.load(), noMesh,
                 std::max(0, g_total.load() - g_done.load() - g_failed.load()), sessionDone, g_reads.load(), rs.c_str());
             lastLog = GetTickCount();
         }
@@ -814,18 +1157,25 @@ static DWORD WINAPI Worker(LPVOID) {
     }
 }
 void SetBackground(bool on) { g_background = on; }
+void SetQuality(int q) { g_quality = q < 0 ? 0 : q > 3 ? 3 : q; }   // read by the worker per surface, a plain int is enough
+int Quality() { return g_quality; }
 bool Background() { return g_background; }
 
 void Start() { CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr); }
 void Refresh(const std::string& p) {   // render again (e.g. an old prefab_size.tsv line without the center columns)
     { std::lock_guard<std::mutex> l(g_mu); g_processed.erase(p); }
-    Request(p);
+    RequestSticky(p);
 }
 void Request(const std::string& p) {
     std::lock_guard<std::mutex> l(g_mu);
-    if (g_pending.count(p)) return;
+    if (g_pending.count(p)) { auto it = g_reqSeen.find(p); if (it != g_reqSeen.end() && it->second) it->second = GetTickCount(); return; }   // still visible: keep it fresh
     if (g_processed.count(p) && !(g_passActive && !g_passDone.count(p))) return;   // during a re-render pass a processed prefab may still be queued once
-    g_pending.insert(p); g_requests.push_back(p);
+    g_pending.insert(p); g_requests.push_back(p); g_reqSeen[p] = GetTickCount();
+}
+static void RequestSticky(const std::string& p) {   // one-shot callers (Refresh): never expires
+    std::lock_guard<std::mutex> l(g_mu);
+    if (!g_pending.count(p)) { g_pending.insert(p); g_requests.push_back(p); }
+    g_reqSeen[p] = 0;
 }
 bool Pending(const std::string& p) { std::lock_guard<std::mutex> l(g_mu); return g_pending.count(p) != 0; }
 bool Processed(const std::string& p) { std::lock_guard<std::mutex> l(g_mu); return g_processed.count(p) != 0; }

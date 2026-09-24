@@ -22,8 +22,12 @@ Die Oberflächensprache lässt sich im Tab **Settings** unter **Language** ände
 ## Vorschaubilder
 
 Die Mod enthält keine Spieldaten und keinen Archiv-Code. Die Dateien lädt das Spiel selbst über seinen eigenen Resource-Loader,
-die Mod rendert daraus beim ersten Start die Vorschaubilder und unter `bin64\cdmodkit\thumbs\` abgelegt (ca. 33.000 Bilder, rund 20 Minuten im Hintergrund mit niedriger Priorität).
-Das im Browser ausgewählte Prefab wird immer sofort gerendert. Der Fortschritt steht unten im Browser-Tab ("previews x / y").
+die Mod rendert daraus beim ersten Start die Vorschaubilder und unter `bin64\cdmodkit\thumbs\` abgelegt (ca. 47.000 Bilder inklusive Figuren
+und Rüstungen, rund eine Stunde im Hintergrund mit niedriger Priorität).
+Sichtbare Kacheln und das im Browser ausgewählte Prefab werden immer zuerst gerendert. Der Fortschritt steht unten im Browser-Tab ("previews x / y").
+Im Tab "Settings" stellt "preview quality" die Qualität ein (Grundfarbe, + Färbung, + Normal-Maps, + Glanz und Leuchten; Standard ist die beste Stufe).
+Eine niedrigere Stufe macht nur den Hintergrund-Durchlauf schneller.
+Vorschauen von Figuren, Monstern und Rüstungsteilen erscheinen erst, wenn der Filter "meshes only" aus ist.
 Zum Neuaufbau einfach den Ordner `thumbs` und die Datei `prefab_size.tsv` löschen.
 
 ## Bedienung

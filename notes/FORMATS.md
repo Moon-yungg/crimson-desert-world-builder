@@ -113,6 +113,27 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Worker thread (below normal priority) renders on demand (selection in the Browser) first, then walks the whole index; results are
   recorded in bin64\cdmodkit\prefab_size.tsv (0 0 0 = no usable geometry) so nothing is retried on later starts.
 
+## Preview formats (v0.91)
+- .pam vertex: pos u16x3 over the header bbox, uv = two halves at +8/+10 (as CDMW). Until v0.90 uv was read as u16/65535 at +10:
+  wrong for every mesh, only visible on atlas textures (cloth, props). Cache version 4 re-renders all old images.
+- .pac (skinned mesh, CDMW parse_pac): PAR header, 8 section slots at 0x10 {u32 compressed size (0 = stored), u32 size}, sections
+  back to back from 0x50, each LZ4 on its own when compressed ("partial" pack entries arrive raw like that). Section 0: one descriptor
+  per submesh, found 35 bytes before the LOD pattern 04 00 01 02 03 (3/2-LOD variants too): u8 1, floats at +3 (bbox min at [2..4],
+  extent [5..7]), u16 vertex counts at +40, u32 index counts at +44/46/48. Sections 4..1 = LOD 0..3: 40-byte vertices (pos u16x3,
+  v = min + u16/32767 * extent, uv halves at +8/+10, packed normal u32 at +16, bone slots +20/+24) then u16 indices.
+  Validated: 300/300 random .pac give CDMW's vertex and face counts. Characters face the other way than props (preview camera 215 deg).
+- Materials: .pami <MaterialParameterX Name= Value=>; .pac -> character/modelproperty/<same path>.pac_xml,
+  <SkinnedMeshMaterialWrapper _subMeshName> with <MaterialParameterX _name= _value=>, textures as nested _path=; the first
+  <ModelProperty Index="0"> is the default look, later ones are variants. Submesh names match case-insensitively.
+- Dye: many character/monster materials have no _baseColorTexture. Colour = _colorBlendingMaskTexture (_ma, DXT1) r/g/b weights of
+  _tintColorR/G/B ("#rrggbbaa"), overlay-blended with the grey _overlayColorTexture (_o). Props: base texture * _tintColor ("r g b").
+- Textures: _n normal maps BC5 (x, y; DirectX green), _sp = r ambient occlusion, g roughness, b metal (DXT1), emissive BC4.
+- Sub-prefab: a child object whose reflection type name is a prefab path ("/object/.../x.prefab") with its own _worldTransform;
+  the preview expands it in place. prefabs.tsv tags it "SubPrefab" and does not count its meshes.
+- Characters are assembled at runtime from character/appearance/.../*.app_xml (<Nude>, <Head>, <Hair>, <Armor> list prefab names).
+- Game data tables: gamedata/binarystaticinfo__/bin/<name>.staticinfoheader + .staticinfobody (characterinfo, faction,
+  factionrelationgroup, allygroupinfo, aiactionattributeinfo, dropsetinfo, ...), 134 files; format per table not decoded yet.
+
 ## TiledTransform und setWorldTransform (v0.45, Build 2944)
 - SceneObject::setWorldTransform(this, TiledTransform*, u8 a, u8 b) erwartet 44 Bytes: scale3, quat4, pos3 (relativ zur Kachel), int16 tileX, int16 tileZ.
   Die Funktion liest das Kachel-Paar bei +0x28 (mov eax,[rbx+0x28]). Bis v0.44 uebergab das Plugin 40 Bytes, das Kachel-Paar war Stack-Muell:
