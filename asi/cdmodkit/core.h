@@ -42,7 +42,8 @@ namespace core {
     // the view + projection the renderer really uses (found by a memory scan, read every frame); rank 0 = newest copy in flight
     bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11, int rank);
     bool RenderCameraNative();                // the last RenderCamera() answer came from the renderer's camera object (no copy guessing, rank ignored)
-    void FindRenderCamera();                  // (re)starts the background scan; RenderCamera() does this itself when it has nothing
+    void FindRenderCamera();
+    void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object                  // (re)starts the background scan; RenderCamera() does this itself when it has nothing
     int  RenderCameraBlocks();                // how many copies are currently tracked (0 = falling back to the camera object + fov setting)
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)
     struct GimmickCapInfo { int id; uintptr_t caller; uint32_t k1, k2; Vec3 pos; unsigned long ageMs; char name[96]; char path[200]; };
@@ -95,7 +96,14 @@ namespace core {
     void ForgetSpawned(size_t idx);
     extern bool g_recreateOnMove;               // false: disable/setTransform/enable in place; true: remove + re-create
     extern int  g_liveMode;                     // live-drag method, see DoLiveMove
-    extern int  g_keyToggle, g_keyMode;         // configurable hotkeys (virtual key codes), settings.txt in the mod folder
+    extern bool g_uiTextInput, g_uiMouseOverUi;  // a text field is active / the cursor is over a World Builder window (finer than g_uiWants*: edit mode claims all input)
+    extern int  g_keyToggle, g_keyMode, g_keyFreeCam;
+    extern float g_fcSpeed, g_fcSens;           // free camera: m/s and degrees per mouse count
+    bool FreeCamAvailable();                    // the camera pose function and the renderer camera were found
+    bool FreeCamActive();
+    void SetFreeCam(bool on);
+    bool FreeCamPose(Vec3* pos, Vec3* fwd);
+    void FreeCamTurn(float dyaw, float dpitch);  // degrees, as the mouse would     // current free camera position and view direction (false while off)         // configurable hotkeys (virtual key codes), settings.txt in the mod folder
     extern bool g_showConsole;                  // settings.txt console=0 hides the console window (takes effect on the next start)
     extern bool g_httpEnabled;                  // settings.txt http_api=1 runs the loopback HTTP API (off by default, switched live in the Settings tab)
     extern int  g_httpPort;                     // settings.txt http_port= (1..65535)

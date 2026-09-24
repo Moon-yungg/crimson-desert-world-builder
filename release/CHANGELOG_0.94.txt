@@ -14,3 +14,7 @@ Changed
 - Gizmo, selection outlines and the line/circle preview use the renderer's own camera (path from
   CrimsonDesertTelemetry, thanks): no search for camera copies, no "camera copy in flight" setting to tune, and it
   works right after loading a save. The old search stays as a fallback if a game update moves the camera.
+- Free camera (F6 or the button in the editor's header): fly freely with W/A/S/D, E/Space up, Q/Ctrl down, Shift faster;
+  the mouse looks around (with the editor open: hold the right mouse button over the world). Your character stays where it
+  is, new objects appear in front of the camera, and gizmo and outlines follow it. Speed, mouse sensitivity and the key are in
+  Settings. The world keeps loading around your character, so very distant flights show coarser detail.

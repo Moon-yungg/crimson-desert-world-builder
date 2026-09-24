@@ -289,7 +289,8 @@ namespace overlay {
         // edit mode: every input belongs to the menu (the game keeps running but does not react); play mode / placement: everything to the game
         { const bool edit = editor::IsOpen() && !editor::PlayMode();
           const bool gizmo = editor::Placing() && editor::MouseMode();   // Numpad 5 while placing: the mouse drives the gizmo instead of the camera
-          core::g_uiWantsMouse = edit || gizmo; core::g_uiWantsKeyboard = edit; }
+          core::g_uiWantsMouse = edit || gizmo; core::g_uiWantsKeyboard = edit;
+          const ImGuiIO& io = ImGui::GetIO(); core::g_uiTextInput = io.WantTextInput; core::g_uiMouseOverUi = io.WantCaptureMouse; }
 
         const UINT idx = sc->GetCurrentBackBufferIndex();
         if (idx >= g_frames.size()) return;
@@ -335,6 +336,10 @@ namespace overlay {
         bool down = (GetAsyncKeyState(core::g_keyToggle) & 0x8000) != 0;
         if (down && !s_insDown) editor::Toggle();
         s_insDown = down;
+        static bool s_fcDown = false;   // free camera on / off
+        const bool fcKey = (GetAsyncKeyState(core::g_keyFreeCam) & 0x8000) != 0;
+        if (fcKey && !s_fcDown && !core::g_uiTextInput) core::SetFreeCam(!core::FreeCamActive());
+        s_fcDown = fcKey;
         static bool s_homeDown = false;   // Home switches between edit mode (menu takes all input) and play mode (game takes all input)
         bool home = (GetAsyncKeyState(core::g_keyMode) & 0x8000) != 0;
         if (home && !s_homeDown && editor::IsOpen()) editor::TogglePlay();
@@ -342,7 +347,7 @@ namespace overlay {
         bool open = editor::IsOpen() || editor::Placing();
         if (open != g_wasOpen) { if (open) input::MenuOpened(); else input::MenuClosed(); g_wasOpen = open; }
         core::g_menuOpen = open;
-        if (!open) { core::g_uiWantsMouse = false; core::g_uiWantsKeyboard = false; return; }
+        if (!open) { core::g_uiWantsMouse = false; core::g_uiWantsKeyboard = false; core::g_uiTextInput = false; core::g_uiMouseOverUi = false; return; }
         RenderGuarded(sc);
     }
 

@@ -255,6 +255,8 @@ namespace editor {
     }
 
     static void TrackFacing(const PosInfo& p, bool havePos) {
+        { Vec3 fp, ff; if (core::FreeCamPose(&fp, &ff)) {   // flying: spawn spots and the placement start in front of the camera, not the character
+            g_lastPlayer = fp; g_havePlayer = true; const float l = sqrtf(ff.x * ff.x + ff.z * ff.z); if (l > 0.05f) { g_fx = ff.x / l; g_fz = ff.z / l; } return; } }
         if (!havePos) return;
         bool moved = false;
         if (g_havePlayer) { float dx = p.world.x - g_lastPlayer.x, dz = p.world.z - g_lastPlayer.z; float l2 = dx * dx + dz * dz; if (l2 > 0.0004f) { float l = sqrtf(l2); g_mx = dx / l; g_mz = dz / l; moved = true; } }
@@ -1815,6 +1817,19 @@ namespace editor {
         }
         if (ImGui::SmallButton(T(ICON_COPY " dock"))) g_compact = true; if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("narrow side window: search, cards in one column, PLACE"));
         ImGui::SameLine();
+        {   // free-fly camera
+            const bool fc = core::FreeCamActive();
+            ImGui::BeginDisabled(!core::FreeCamAvailable());
+            if (fc) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f));
+            char fl[96]; snprintf(fl, sizeof fl, "%s (%s)###freecam", T(fc ? ICON_EYE " flying" : ICON_EYE " free camera"), core::KeyName(core::g_keyFreeCam));
+            if (ImGui::SmallButton(fl)) core::SetFreeCam(!fc);
+            if (fc) ImGui::PopStyleColor();
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", T(core::FreeCamAvailable()
+                ? "Free camera: W/A/S/D move, E or Space up, Q or Ctrl down, Shift faster. Hold the right mouse button over the world to look around (with the editor hidden the mouse always looks). Your character stays where it is; new objects appear in front of the camera."
+                : "The free camera is not available in this game build (see the log)."));
+            ImGui::SameLine();
+        }
         if (havePos) ImGui::Text(T(ICON_LOCATION_DOT "  %.1f  %.1f  %.1f   tile %d,%d"), p.world.x, p.world.y, p.world.z, p.tileX, p.tileZ);
         else ImGui::TextDisabled(T("player position not available (load a save)"));
         ImGui::SameLine(ImGui::GetWindowWidth() - 330);
@@ -1858,6 +1873,9 @@ namespace editor {
                 };
                 keyCombo("show / hide the editor", &core::g_keyToggle);
                 keyCombo("edit mode / play mode", &core::g_keyMode);
+                keyCombo("free camera on / off", &core::g_keyFreeCam);
+                ImGui::SetNextItemWidth(160); ImGui::SliderFloat(T("free camera speed"), &core::g_fcSpeed, 1.0f, 100.0f, "%.0f m/s"); if (ImGui::IsItemDeactivatedAfterEdit()) core::SaveSettings();
+                ImGui::SameLine(); ImGui::SetNextItemWidth(160); ImGui::SliderFloat(T("mouse sensitivity"), &core::g_fcSens, 0.02f, 0.5f, "%.2f"); if (ImGui::IsItemDeactivatedAfterEdit()) core::SaveSettings();
                 ImGui::Separator();
                 ImGui::TextDisabled(T("Gizmo projection (stage 1: display). Calibrate once: enable the marker, switch to play mode (Home) and adjust until the yellow circles sit at your character's feet and head."));
                 ImGui::Checkbox(T("show calibration marker"), &g_calib); ImGui::SameLine(); ImGui::Checkbox(T("axis gizmo while placing"), &g_gizmo);

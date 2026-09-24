@@ -6,6 +6,7 @@
 //   camtrace  - which camera field follows the view direction
 //   traceio   - log the game's call chain when it reads from a .paz pack (hooks kernel32!ReadFile, opt-in only)
 #include "core_internal.h"
+#include <tlhelp32.h>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -279,5 +280,88 @@ void InstallIoTrace() {
     HMODULE k32 = GetModuleHandleA("kernel32.dll"); if (!k32) return;
     void* t = (void*)GetProcAddress(k32, "ReadFile"); if (!t) return;
     if (MH_CreateHook(t, (void*)HookReadFile, (void**)&g_origReadFile) == MH_OK && MH_EnableHook(t) == MH_OK) Log("[io] ReadFile hooked (trace %s)", g_traceIo ? "on" : "off");
+}
+
+// ---- camwatch: which code writes the renderer camera's pose (free-fly camera research) ----
+// Hardware write breakpoints (DR0..DR3) on the camera object's fields, set on every thread of the process except our own;
+// a vectored handler counts each writing instruction (the RIP after the write) with its call chain. Removed after the time.
+struct CwSite { volatile LONG64 rip; volatile LONG hits; volatile LONG slot; uintptr_t chain[8]; };
+static CwSite g_cwSites[48]; static volatile LONG g_cwActive = 0; static uintptr_t g_cwAddr[4] = {};
+static PVOID g_cwVeh = nullptr;
+static LONG CALLBACK CamWatchVeh(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !g_cwActive) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = ep->ContextRecord; const DWORD64 dr6 = c->Dr6;
+    if (!(dr6 & 0xF)) return EXCEPTION_CONTINUE_SEARCH;
+    int slot = 0; while (slot < 4 && !(dr6 & (1ull << slot))) slot++;
+    const LONG64 rip = (LONG64)c->Rip;
+    for (auto& s : g_cwSites) {
+        if (s.rip == rip && s.slot == slot) { InterlockedIncrement(&s.hits); break; }
+        if (s.rip == 0 && InterlockedCompareExchange64(&s.rip, rip, 0) == 0) {
+            s.slot = slot; s.hits = 1;
+            CONTEXT u = *c;   // call chain via the unwind tables
+            for (int i = 0; i < 8 && u.Rip; i++) {
+                s.chain[i] = (uintptr_t)u.Rip;
+                DWORD64 ib = 0; PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(u.Rip, &ib, nullptr);
+                if (!rf) break;
+                void* hd = nullptr; DWORD64 ef = 0; RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, u.Rip, rf, &u, &hd, &ef, nullptr);
+            }
+            break;
+        }
+    }
+    c->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+static void CwSetAll(bool on) {   // debug registers on every other thread of this process
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{ sizeof te }; const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId(); int n = 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID); if (!t) continue;
+        if (SuspendThread(t) != (DWORD)-1) {
+            CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(t, &c)) {
+                c.Dr0 = on ? g_cwAddr[0] : 0; c.Dr1 = on ? g_cwAddr[1] : 0; c.Dr2 = on ? g_cwAddr[2] : 0; c.Dr3 = on ? g_cwAddr[3] : 0;
+                DWORD64 dr7 = 0;
+                if (on) for (int i = 0; i < 4; i++) if (g_cwAddr[i]) dr7 |= (1ull << (i * 2)) | (1ull << (16 + i * 4)) | (3ull << (18 + i * 4));   // local enable, break on write, length 4 (LEN 11)
+                c.Dr7 = dr7; c.Dr6 = 0;
+                if (SetThreadContext(t, &c)) n++;
+            }
+            ResumeThread(t);
+        }
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    Log("[camwatch] debug registers %s on %d threads", on ? "set" : "cleared", n);
+}
+static DWORD WINAPI CamWatchThread(LPVOID arg) {
+    const int seconds = (int)(intptr_t)arg % 100, mode = (int)(intptr_t)arg / 100; const uintptr_t rcam = NativeCameraObject();
+    // mode 0: the renderer camera (+0xC8 position x, +0xD0 z, +0xD8 / +0xE0); mode 1: the camera scene object's TiledTransform
+    // (+0x1B0 rotation x, +0x1BC position x, +0x1C4 position z, +0x1CC tile), the pose the renderer camera copies every frame
+    const uintptr_t so = CameraSceneObject(), cam = mode == 1 ? so : rcam;
+    if (!cam) { Log("[camwatch] %s not resolved", mode == 1 ? "camera scene object" : "renderer camera"); InterlockedExchange(&g_cwActive, 0); return 0; }
+    if (rcam) { uintptr_t link = 0; ReadBytes(rcam + 0x2A0, &link, 8); Log("[camwatch] renderer camera %p links %p (-0x28 = %p), camera scene object %p (%s)", (void*)rcam, (void*)link, (void*)(link ? link - 0x28 : 0), (void*)so, so && RttiName(so) ? RttiName(so) : "?"); }
+    for (auto& s : g_cwSites) { s.rip = 0; s.hits = 0; s.slot = 0; memset(s.chain, 0, sizeof s.chain); }
+    if (mode == 1) { g_cwAddr[0] = cam + 0x1B0; g_cwAddr[1] = cam + 0x1BC; g_cwAddr[2] = cam + 0x1C4; g_cwAddr[3] = cam + 0x1CC; }
+    else { g_cwAddr[0] = cam + 0xC8; g_cwAddr[1] = cam + 0xD0; g_cwAddr[2] = cam + 0xD8; g_cwAddr[3] = cam + 0xE0; }
+    { float v[8] = {}; ReadBytes(cam + 0xC0, v, sizeof v); Log("[camwatch] camera %p: +0xC0.. %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f", (void*)cam, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); }
+    if (!g_cwVeh) g_cwVeh = AddVectoredExceptionHandler(1, CamWatchVeh);
+    CwSetAll(true);
+    Sleep(seconds * 1000);
+    CwSetAll(false);
+    InterlockedExchange(&g_cwActive, 0);
+    int n = 0;
+    for (const auto& s : g_cwSites) {
+        if (!s.rip) continue; n++;
+        char line[400]; int k = 0;
+        for (int i = 0; i < 8 && s.chain[i]; i++) k += snprintf(line + k, sizeof line - k, InImage(s.chain[i]) ? " %llx" : " ?%llx", (unsigned long long)(InImage(s.chain[i]) ? s.chain[i] - g_base : s.chain[i]));
+        Log("[camwatch] DR%ld (+0x%llx) written before rva 0x%llx, %ld hits, chain:%s", s.slot, (unsigned long long)(g_cwAddr[s.slot] - cam),
+            (unsigned long long)(InImage((uintptr_t)s.rip) ? (uintptr_t)s.rip - g_base : (uintptr_t)s.rip), s.hits, line);
+    }
+    Log("[camwatch] done: %d writing sites", n);
+    return 0;
+}
+void CamWatch(int seconds, int mode) {
+    if (InterlockedCompareExchange(&g_cwActive, 1, 0) != 0) { Log("[camwatch] already running"); return; }
+    CreateThread(nullptr, 0, CamWatchThread, (LPVOID)(intptr_t)((seconds < 1 ? 1 : seconds > 30 ? 30 : seconds) + 100 * (mode == 1 ? 1 : 0)), 0, nullptr);
 }
 }   // namespace core

@@ -33,6 +33,7 @@ uintptr_t g_base = 0;
 bool      g_menuOpen = false;
 bool      g_uiWantsMouse = false;
 bool      g_uiWantsKeyboard = false;
+bool      g_uiTextInput = false, g_uiMouseOverUi = false;
 bool      g_placing = false;
 static HMODULE g_self = nullptr;
 static FILE*   g_log = nullptr;
@@ -414,7 +415,14 @@ bool GameReadFileRange(const std::string& path, std::vector<uint8_t>& out, uint3
 static SetWorldTransformFn g_origSetXf = nullptr; static SetEnableFn g_origSetEnable = nullptr;
 static std::map<uintptr_t, long> g_traceCallers; static long g_traceLines = 0; static DWORD g_traceSec = 0;
 static bool TraceBudget() { DWORD s = GetTickCount() / 1000; if (s != g_traceSec) { g_traceSec = s; g_traceLines = 0; } return g_traceLines++ < 80; }
+static float g_fcSoLast[11] = {}; static volatile bool g_fcSoSeen = false;   // the scene object's last game pose (free camera)
+static volatile uintptr_t g_fcSceneObj = 0;   // the camera scene object while the free camera is on (set once per frame by the pose hook)
+static bool FreeCamSceneXf(const float* in, float* out);   // free camera section below
 static void __fastcall HookSetXf(void* obj, const float* xf, uint8_t a, uint8_t b) {
+    // the camera manager holds the scene object 0x28 into it (a base subobject); setWorldTransform gets the object itself
+    if (g_fcSceneObj && ((uintptr_t)obj == g_fcSceneObj - 0x28 || (uintptr_t)obj == g_fcSceneObj) && xf) {   // the game camera moves its scene object every frame: culling, LOD and sound follow it
+        alignas(16) float t[12]; if (FreeCamSceneXf(xf, t)) { g_origSetXf(obj, t, a, b); return; }
+    }
     uintptr_t ret = (uintptr_t)_ReturnAddress();
     if (g_trace && InImage(ret)) {
         g_traceCallers[ret - g_base]++;
@@ -1801,6 +1809,10 @@ static void ResolveNativeCamera() {
     g_natCamGlobal = global; g_natCamVt = vt;
     Log("resolved %-20s rva 0x%llx (global rva 0x%llx, vtable rva 0x%llx)", "native render camera", (unsigned long long)(ref - g_base), (unsigned long long)(global - g_base), (unsigned long long)(vt - g_base));
 }
+uintptr_t NativeCameraObject() {
+    uintptr_t cam = 0, vt = 0;
+    return g_natCamGlobal && ReadPtr(g_natCamGlobal, &cam) && cam && ReadPtr(cam, &vt) && vt == g_natCamVt ? cam : 0;
+}
 bool NativeRenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11) {
     if (!g_natCamGlobal) return false;
     uintptr_t cam = 0, vt = 0, src = 0;
@@ -1820,6 +1832,142 @@ bool NativeRenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00,
         return true;
     }
     return false;
+}
+
+// ---- free-fly camera ----
+// The renderer camera's pose is set once per frame by one function (found with camwatch): (camera, float rot[16], float pos[3],
+// float a[3], float tilePos[3], float eye[3], ...). rot holds the view rotation with right / up / forward as columns (m[0],m[4],m[8] =
+// right), pos (world) goes to camera+0xC8 (what the renderer and our gizmo read), tilePos is the same position relative to its
+// world tile (+0xEC), eye is (0,0,0): the view translation is camera-relative (rendering happens around the camera). While the free
+// camera is on, the hook passes our own rotation and position instead; everything built from the camera (scene constants,
+// culling, the gizmo) follows. The game keeps simulating its own follow camera, which comes back the moment we let go.
+typedef void* (__fastcall* SetCamPoseFn)(void*, const float*, const float*, const float*, const float*, const float*, void*);
+static SetCamPoseFn g_origSetCamPose = nullptr; static uintptr_t kRva_SetCamPose = 0;
+static volatile bool g_fcOn = false; static volatile bool g_fcInit = false;
+static float g_fcPos[3] = {}, g_fcYaw = 0, g_fcPitch = 0, g_fcRightSign = 1, g_fcUpSign = 1;
+static LARGE_INTEGER g_fcLast = {};
+// camera scene object vs. view: S = V * C and p_so = p_view + V * d, both measured on the first free frame and kept
+static float g_fcC[9] = {}, g_fcD[3] = {}; static volatile bool g_fcRel = false;
+static void QToM(const float* q, float* m) {   // columns = rotated basis (same as CameraBasis), m[col*3+row]
+    const float x = q[0], y = q[1], z = q[2], w = q[3];
+    m[0] = 1 - 2 * (y * y + z * z); m[1] = 2 * (x * y + z * w); m[2] = 2 * (x * z - y * w);
+    m[3] = 2 * (x * y - z * w); m[4] = 1 - 2 * (x * x + z * z); m[5] = 2 * (y * z + x * w);
+    m[6] = 2 * (x * z + y * w); m[7] = 2 * (y * z - x * w); m[8] = 1 - 2 * (x * x + y * y);
+}
+static void MToQ(const float* m, float* q) {   // inverse of QToM; R[row][col] = m[col*3+row]
+    auto R = [&](int r, int c) { return m[c * 3 + r]; };
+    const float tr = R(0, 0) + R(1, 1) + R(2, 2);
+    if (tr > 0) { const float s = sqrtf(tr + 1.0f) * 2; q[3] = 0.25f * s; q[0] = (R(2, 1) - R(1, 2)) / s; q[1] = (R(0, 2) - R(2, 0)) / s; q[2] = (R(1, 0) - R(0, 1)) / s; }
+    else if (R(0, 0) > R(1, 1) && R(0, 0) > R(2, 2)) { const float s = sqrtf(1.0f + R(0, 0) - R(1, 1) - R(2, 2)) * 2; q[3] = (R(2, 1) - R(1, 2)) / s; q[0] = 0.25f * s; q[1] = (R(0, 1) + R(1, 0)) / s; q[2] = (R(0, 2) + R(2, 0)) / s; }
+    else if (R(1, 1) > R(2, 2)) { const float s = sqrtf(1.0f + R(1, 1) - R(0, 0) - R(2, 2)) * 2; q[3] = (R(0, 2) - R(2, 0)) / s; q[0] = (R(0, 1) + R(1, 0)) / s; q[1] = 0.25f * s; q[2] = (R(1, 2) + R(2, 1)) / s; }
+    else { const float s = sqrtf(1.0f + R(2, 2) - R(0, 0) - R(1, 1)) * 2; q[3] = (R(1, 0) - R(0, 1)) / s; q[0] = (R(0, 2) + R(2, 0)) / s; q[1] = (R(1, 2) + R(2, 1)) / s; q[2] = 0.25f * s; }
+    const float l = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]); if (l > 1e-6f) for (int i = 0; i < 4; i++) q[i] /= l;
+}
+static void M3Mul(const float* a, const float* b, float* o) { for (int c = 0; c < 3; c++) for (int r = 0; r < 3; r++) o[c * 3 + r] = a[0 * 3 + r] * b[c * 3 + 0] + a[1 * 3 + r] * b[c * 3 + 1] + a[2 * 3 + r] * b[c * 3 + 2]; }
+static void M3TMul(const float* a, const float* b, float* o) { for (int c = 0; c < 3; c++) for (int r = 0; r < 3; r++) o[c * 3 + r] = a[r * 3 + 0] * b[c * 3 + 0] + a[r * 3 + 1] * b[c * 3 + 1] + a[r * 3 + 2] * b[c * 3 + 2]; }   // a^T * b
+static void FcBasis(float* r, float* u, float* f);
+// one step of the free camera (mouse turn, key movement). Runs where the camera scene object gets its pose, the first camera
+// update of a frame, so culling and the renderer's view use the same pose; a step in the later renderer hook would leave the
+// culling one frame behind and cut the world's edges while turning.
+static void FcStep() {
+    LARGE_INTEGER now, freq; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&freq);
+    float dt = (float)(now.QuadPart - g_fcLast.QuadPart) / (float)freq.QuadPart; g_fcLast = now; if (dt < 0 || dt > 0.1f) dt = 0.1f;
+    float dx = 0, dy = 0; input::TakeLookDelta(&dx, &dy);
+    g_fcYaw += dx * g_fcSens; g_fcPitch -= dy * g_fcSens;
+    if (g_fcPitch > 89.0f) g_fcPitch = 89.0f; if (g_fcPitch < -89.0f) g_fcPitch = -89.0f;
+    if (g_fcYaw > 180.0f) g_fcYaw -= 360.0f; if (g_fcYaw < -180.0f) g_fcYaw += 360.0f;
+    float r[3], u[3], f[3]; FcBasis(r, u, f);
+    if (!g_uiTextInput) {   // W/S along the view, A/D sideways, E/Space up, Q/Ctrl down; Shift x4
+        float v = g_fcSpeed * dt * (input::ScanDown(0x2A, false) ? 4.0f : 1.0f);
+        const float fw = (input::ScanDown(0x11, false) ? 1.0f : 0.0f) - (input::ScanDown(0x1F, false) ? 1.0f : 0.0f);
+        const float sd = (input::ScanDown(0x20, false) ? 1.0f : 0.0f) - (input::ScanDown(0x1E, false) ? 1.0f : 0.0f);
+        const float up = (input::ScanDown(0x12, false) || input::ScanDown(0x39, false) ? 1.0f : 0.0f) - (input::ScanDown(0x10, false) || input::ScanDown(0x1D, false) ? 1.0f : 0.0f);
+        for (int i = 0; i < 3; i++) g_fcPos[i] += v * (f[i] * fw + r[i] * sd) + (i == 1 ? v * up : 0.0f);
+    }
+}
+static bool FreeCamSceneXf(const float* in, float* out) {
+    float t[11]; if (!ReadBytes((uintptr_t)in, t, 44)) return false;
+    if (!g_fcRel) { memcpy(g_fcSoLast, t, sizeof t); g_fcSoSeen = true; return false; }   // not yet related: the game's pose passes, and is remembered
+    FcStep();
+    float r[3], u[3], f[3]; FcBasis(r, u, f);
+    const float V[9] = { r[0], r[1], r[2], u[0], u[1], u[2], f[0], f[1], f[2] }; float S[9]; M3Mul(V, g_fcC, S);
+    float q[4]; MToQ(S, q);
+    Vec3 p = { g_fcPos[0], g_fcPos[1], g_fcPos[2] };
+    for (int i = 0; i < 3; i++) { const float d = V[0 * 3 + i] * g_fcD[0] + V[1 * 3 + i] * g_fcD[1] + V[2 * 3 + i] * g_fcD[2]; (&p.x)[i] += d; }
+    memcpy(out, t, 44); out[3] = q[0]; out[4] = q[1]; out[5] = q[2]; out[6] = q[3];
+    const int tx = (int)(p.x * 0.001), tz = (int)(p.z * 0.001);   // like MakeTransform
+    out[7] = p.x - tx * 1000.0f; out[8] = p.y; out[9] = p.z - tz * 1000.0f;
+    const int16_t tile[2] = { (int16_t)tx, (int16_t)tz }; memcpy(&out[10], tile, 4); out[11] = 0;
+    return true;
+}
+float g_fcSpeed = 10.0f, g_fcSens = 0.12f;   // m/s, degrees per mouse count
+static void V3Cross(const float* a, const float* b, float* o) { o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0]; }
+static void V3Norm(float* v) { const float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); if (l > 1e-6f) { v[0] /= l; v[1] /= l; v[2] /= l; } }
+static void FcBasis(float* r, float* u, float* f) {   // from yaw/pitch, with the game's handedness learned at the start
+    const float y = g_fcYaw * 3.14159265f / 180.0f, p = g_fcPitch * 3.14159265f / 180.0f;
+    f[0] = cosf(p) * sinf(y); f[1] = sinf(p); f[2] = cosf(p) * cosf(y);
+    const float wu[3] = { 0, 1, 0 }; V3Cross(wu, f, r); V3Norm(r); for (int i = 0; i < 3; i++) r[i] *= g_fcRightSign;
+    V3Cross(f, r, u); V3Norm(u); for (int i = 0; i < 3; i++) u[i] *= g_fcUpSign;
+}
+static void* __fastcall HookSetCamPose(void* cam, const float* rot, const float* pos, const float* a, const float* b, const float* eye, void* c) {
+    if (!g_fcOn || (uintptr_t)cam != NativeCameraObject() || !rot || !pos || !eye) { g_fcInit = false; g_fcRel = false; g_fcSceneObj = 0; return g_origSetCamPose(cam, rot, pos, a, b, eye, c); }
+    g_fcSceneObj = CameraSceneObject();
+    float m[16]; if (!ReadBytes((uintptr_t)rot, m, sizeof m)) return g_origSetCamPose(cam, rot, pos, a, b, eye, c);
+    LARGE_INTEGER now, freq; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&freq);
+    if (!g_fcInit) {   // start where the game camera is, looking the same way; learn which way its right / up vectors point
+        float p[3]; if (!ReadBytes((uintptr_t)pos, p, sizeof p)) return g_origSetCamPose(cam, rot, pos, a, b, eye, c);
+        const float f0[3] = { m[2], m[6], m[10] }, r0[3] = { m[0], m[4], m[8] }, u0[3] = { m[1], m[5], m[9] };
+        memcpy(g_fcPos, p, sizeof p);
+        g_fcYaw = atan2f(f0[0], f0[2]) * 180.0f / 3.14159265f; g_fcPitch = asinf(f0[1] < -1.0f ? -1.0f : f0[1] > 1.0f ? 1.0f : f0[1]) * 180.0f / 3.14159265f;
+        g_fcRightSign = g_fcUpSign = 1; float r[3], u[3], f[3]; FcBasis(r, u, f);
+        g_fcRightSign = (r[0] * r0[0] + r[1] * r0[1] + r[2] * r0[2]) >= 0 ? 1.0f : -1.0f; FcBasis(r, u, f);
+        g_fcUpSign = (u[0] * u0[0] + u[1] * u0[1] + u[2] * u0[2]) >= 0 ? 1.0f : -1.0f;
+        float ea[3] = {}, ba[3] = {}, aa[3] = {}; ReadBytes((uintptr_t)eye, ea, 12); ReadBytes((uintptr_t)b, ba, 12); ReadBytes((uintptr_t)a, aa, 12);
+        Log("[freecam] on at (%.2f %.2f %.2f) yaw %.1f pitch %.1f, right %+.0f up %+.0f; eye (%.2f %.2f %.2f) a (%.3f %.3f %.3f) b (%.3f %.3f %.3f)",
+            p[0], p[1], p[2], g_fcYaw, g_fcPitch, g_fcRightSign, g_fcUpSign, ea[0], ea[1], ea[2], aa[0], aa[1], aa[2], ba[0], ba[1], ba[2]);
+        g_fcLast = now; g_fcInit = true;
+    }
+    if (!g_fcRel && g_fcSoSeen) {   // relation camera scene object <-> view from this frame's game poses (the scene object was set just before)
+        float p[3]; ReadBytes((uintptr_t)pos, p, sizeof p);
+        const float V0[9] = { m[0], m[4], m[8], m[1], m[5], m[9], m[2], m[6], m[10] }; float S0[9]; QToM(&g_fcSoLast[3], S0);
+        M3TMul(V0, S0, g_fcC);
+        int16_t tile[2]; memcpy(tile, &g_fcSoLast[10], 4);
+        const float ps[3] = { g_fcSoLast[7] + tile[0] * 1000.0f, g_fcSoLast[8], g_fcSoLast[9] + tile[1] * 1000.0f }, dw[3] = { ps[0] - p[0], ps[1] - p[1], ps[2] - p[2] };
+        for (int i = 0; i < 3; i++) g_fcD[i] = V0[i * 3 + 0] * dw[0] + V0[i * 3 + 1] * dw[1] + V0[i * 3 + 2] * dw[2];
+        Log("[freecam] camera scene object related: offset in view space (%.2f %.2f %.2f), C diag %.2f %.2f %.2f", g_fcD[0], g_fcD[1], g_fcD[2], g_fcC[0], g_fcC[4], g_fcC[8]);
+        g_fcRel = true;
+    }
+    if (!g_fcRel) FcStep();   // normally advanced earlier in the frame, where the camera scene object gets its pose
+    float r[3], u[3], f[3]; FcBasis(r, u, f);
+    m[0] = r[0]; m[4] = r[1]; m[8] = r[2]; m[1] = u[0]; m[5] = u[1]; m[9] = u[2]; m[2] = f[0]; m[6] = f[1]; m[10] = f[2];
+    // tile-relative position: the game's own offset between its world and tile position, applied to ours (a flight across a tile
+    // border keeps the old tile's origin, which only costs float precision far away)
+    float po[3], bo[3]; static float s_pos[3], s_tile[3], s_rot[16];   // the game thread is the only caller
+    if (!ReadBytes((uintptr_t)pos, po, sizeof po) || !b || !ReadBytes((uintptr_t)b, bo, sizeof bo)) return g_origSetCamPose(cam, rot, pos, a, b, eye, c);
+    for (int i = 0; i < 3; i++) { s_pos[i] = g_fcPos[i]; s_tile[i] = g_fcPos[i] - (po[i] - bo[i]); }
+    memcpy(s_rot, m, sizeof m);
+    return g_origSetCamPose(cam, s_rot, s_pos, a, s_tile, eye, c);
+}
+static void ResolveSetCamPose() {
+    int n = 0;
+    const uintptr_t f = FindPatternCount("48 81 EC 88 00 00 00 C5 FC 10 02 C5 FC 11 41 48 C5 FC 10 4A 20 C5 FA 10 2D ?? ?? ?? ?? 48 8B 84 24 B8 00 00 00", &n);
+    if (!f || n != 1) { Log("[freecam] camera pose function: %d matches, free camera off", n); return; }
+    kRva_SetCamPose = f - g_base; Log("resolved %-20s rva 0x%llx (via signature)", "camera pose", (unsigned long long)kRva_SetCamPose);
+}
+bool FreeCamAvailable() { return g_origSetCamPose != nullptr && g_natCamGlobal != 0; }
+bool FreeCamActive() { return g_fcOn; }
+void SetFreeCam(bool on) {
+    if (on && !FreeCamAvailable()) { Log("[freecam] not available in this game build (see the log)"); return; }
+    if (on == g_fcOn) return;
+    g_fcInit = false; g_fcRel = false; g_fcSoSeen = false; if (!on) g_fcSceneObj = 0; input::SetFreeCam(on); g_fcOn = on;
+    Log("[freecam] %s", on ? "requested" : "off");
+}
+void FreeCamTurn(float dyaw, float dpitch) { g_fcYaw += dyaw; g_fcPitch += dpitch; }   // tests without a mouse
+bool FreeCamPose(Vec3* pos, Vec3* fwd) {
+    if (!g_fcOn || !g_fcInit) return false;
+    float r[3], u[3], f[3]; FcBasis(r, u, f);
+    if (pos) *pos = { g_fcPos[0], g_fcPos[1], g_fcPos[2] }; if (fwd) *fwd = { f[0], f[1], f[2] };
+    return true;
 }
 
 // ---- NPC and creature spawn: the game's own "spawn character" cheat request, executed on the server thread ----
@@ -2159,6 +2307,11 @@ static uintptr_t CameraManagerPtr() {
     for (auto& f : found) if (f.first.find("CameraManager@") != std::string::npos) { g_camMgr = f.second; Log("camera manager %p", (void*)g_camMgr); break; }
     return g_camMgr;
 }
+uintptr_t CameraSceneObject() {
+    uintptr_t mgr = CameraManagerPtr(); if (!mgr) return 0;
+    uintptr_t so = Deref(mgr, 0x40); const char* n = so ? RttiName(so) : nullptr;
+    return n && strstr(n, "SceneObject") ? so : 0;
+}
 bool CameraBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd) {
     uintptr_t mgr = CameraManagerPtr(); if (!mgr) return false;
     uintptr_t so = Deref(mgr, 0x40); if (!so) return false;
@@ -2203,7 +2356,7 @@ bool CameraPose(Vec3* fwd, Vec3* pos) {
 
 
 // ---- configurable hotkeys (bin64\cdmodkit\settings.txt: key_toggle=INSERT, key_mode=HOME, key_pos=F9) ----
-int g_keyToggle = VK_INSERT, g_keyMode = VK_HOME; bool g_showConsole = false;
+int g_keyToggle = VK_INSERT, g_keyMode = VK_HOME, g_keyFreeCam = VK_F6; bool g_showConsole = false;
 float g_fovDeg = 55.0f; bool g_camMirror = false; bool g_fovAuto = true; int g_camLag = 0;
 struct KeyEntry { const char* name; int vk; };
 static const KeyEntry kKeyNames[] = {
@@ -2246,6 +2399,8 @@ static void LoadSettings() {
         if (k == "gimmick_spawn") { g_gimmickSpawn = v != "0" && v != "off" && v != "false"; continue; }
         if (k == "trace_hooks") { g_traceHooks = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "preview_quality") { thumbgen::SetQuality(atoi(v.c_str())); continue; }
+        if (k == "freecam_speed") { const float s = (float)atof(v.c_str()); if (s >= 0.5f && s <= 200.0f) g_fcSpeed = s; continue; }
+        if (k == "freecam_sens") { const float s = (float)atof(v.c_str()); if (s >= 0.01f && s <= 2.0f) g_fcSens = s; continue; }
         if (k == "camlag") { const int c = atoi(v.c_str()); g_camLag = c < 0 ? 0 : c > 4 ? 4 : c; continue; }
         // manual fallback for snap to ground if the collector vtable cannot be resolved after a game patch; deliberately
         // never written back by SaveSettings, otherwise a stale value would outrank the signature on the next build
@@ -2253,7 +2408,7 @@ static void LoadSettings() {
         if (k == "groundsnap") continue;   // 0.74: snap to ground is always on, the old switch is ignored
         int vk = KeyFromName(v);
         if (!vk) continue;
-        if (k == "key_toggle") g_keyToggle = vk; else if (k == "key_mode") g_keyMode = vk;
+        if (k == "key_toggle") g_keyToggle = vk; else if (k == "key_mode") g_keyMode = vk; else if (k == "key_freecam") g_keyFreeCam = vk;
         else if (k.rfind("key_", 0) == 0) { for (int i = 0; i < PK_COUNT; i++) if (k == std::string("key_") + kPlaceKeyIds[i]) g_placeKeys[i] = vk; }
     }
     ApplyPlaceKeys();
@@ -2267,6 +2422,7 @@ void SaveSettings() {
     fprintf(f, "# gimmick_spawn=0: place gimmick prefabs (/object/cd_gimmick/...) as plain objects instead of through the game spawn path\ngimmick_spawn=%d\n", g_gimmickSpawn ? 1 : 0);
     fprintf(f, "# placement keys (any key name from the list above, NUMPAD0..9, NUMPAD+ NUMPAD- NUMPAD. NUMPAD* NUMPAD/, ENTER, BACKSPACE, SPACE, UP/DOWN/LEFT/RIGHT, SHIFT/CTRL/ALT for 'fast')\n");
     for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
+    fprintf(f, "# free camera: key_freecam switches it (WASD, E/Space up, Q/Ctrl down, Shift faster, mouse turns; with the editor open hold the right mouse button), speed in m/s, mouse sensitivity in degrees per count\nkey_freecam=%s\nfreecam_speed=%.1f\nfreecam_sens=%.3f\n", KeyName(g_keyFreeCam), g_fcSpeed, g_fcSens);
     fprintf(f, "# Interface language: auto, en, zh-CN, zh-TW, de, fr, ko, ja, es, pt-BR, ru, tr\nlanguage=%s\n", i18n::Preference());
     fprintf(f, "# HTTP API for programs on this PC (127.0.0.1 only, see HTTP_API.md): http_api=1 runs it, http_port= its port. The Settings tab switches it at once\nhttp_api=%d\nhttp_port=%d\n", g_httpEnabled ? 1 : 0, g_httpPort);
     ApplyPlaceKeys(); fclose(f);
@@ -2320,6 +2476,7 @@ static DWORD WINAPI ConsoleThread(LPVOID) {
         else if (cmd == "fovtrace") FovTrace(12);
         else if (cmd == "raytrace") RayTrace(12);
         else if (cmd == "probe") ProbeGround(3.0f, 10.0f);
+        else if (cmd.rfind("camwatch", 0) == 0) { int s = 8, m = 0; sscanf(cmd.c_str() + 8, "%d %d", &s, &m); CamWatch(s, m); }
         else if (cmd == "traceio on" || cmd == "traceio off") SetIoTrace(cmd == "traceio on");
         else if (cmd.rfind("npc ", 0) == 0) {   // npc <characterKey> [type]: spawn 4 m east of the player
             unsigned key = 0; int type = 1; Vec3 p{};
@@ -2406,6 +2563,7 @@ static DWORD WINAPI InitThread(LPVOID) {
             if (g_traceHooks) { InstallVtableTracer(0, ".?AVServerSyncSceneObjectManager@pa@@", "ServerSyncSceneObjectManager", 19); InstallVtableTracer(1, ".?AVSceneObjectServer@pa@@", "SceneObjectServer", 156); InstallVtableTracer(3, ".?AVServerNormalInGameActor@pa@@", "ServerNormalInGameActor", 145); InstallVtableTracer(4, ".?AVTrocTrSpawnCharacterCheatReq@pa@@", "TrocTrSpawnCharacterCheatReq", 3); }
         }   // ServerField: which slots run per tick (a place to run our own spawns) and which run on a pickup (removal)   // research: how the server makes and fills its scene objects
         ResolveNativeCamera();   // gizmo projection: the renderer's own camera, else the copy scan in diag.cpp
+        ResolveSetCamPose(); if (kRva_SetCamPose && g_natCamGlobal) { void* t14 = (void*)(g_base + kRva_SetCamPose); HookFn(t14, (void*)HookSetCamPose, (void**)&g_origSetCamPose, "camera pose (free camera)"); }
         InstallNpcSpawn();   // NPC spawn research: the game's spawn-character cheat request
         if (g_traceHooks && kRva_UuidLookup) { void* t10 = (void*)(g_base + kRva_UuidLookup); HookFn(t10, (void*)HookUuidLookup, (void**)&g_origUuidLookup, "uuid lookup (trace)"); }
         if (kRva_SoServerCreate) { void* t9 = (void*)(g_base + kRva_SoServerCreate); HookFn(t9, (void*)HookSoServerCreate, (void**)&g_origSoServerCreate, "SceneObjectServer new (trace)"); }

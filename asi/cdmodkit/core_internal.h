@@ -9,6 +9,8 @@ namespace core {
     void ExpandCameraManager(std::vector<std::pair<std::string, uintptr_t>>& out);
 
     // the renderer camera through its own object (cdmodkit.cpp); false when unresolved or the block does not validate
+    uintptr_t CameraSceneObject();    // the camera manager's scene object (the pose the game's camera logic produces), 0 if unknown
+    uintptr_t NativeCameraObject();   // the renderer camera object itself (0 when unresolved or its type does not match)
     bool NativeRenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11);
 
     // pack I/O tracing (diag.cpp): installed once at startup, switched by the console command "traceio on|off"

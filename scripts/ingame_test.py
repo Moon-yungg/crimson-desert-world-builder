@@ -74,10 +74,13 @@ def launch_and_continue():
     def overlay_ready():
         with open(GAME_LOG, "rb") as f: f.seek(start if os.path.getsize(GAME_LOG) >= start else 0); return b"[overlay] ready" in f.read()
     if not wait(overlay_ready, 300): sys.exit("overlay never became ready")
-    time.sleep(12)   # title screen
-    if not focus_game(): sys.exit("could not bring the game to the front")
-    press(0x12)   # E = "Spielen" (continue). Never Z (new game) or ESC (quit) on this screen
-    print("continue pressed, loading ...")
+    time.sleep(20)   # title screen: an E pressed while it is still fading in is lost
+    # E = "Spielen" (continue). Never Z (new game) or ESC (quit) on this screen. Pressed again while the player is not in the
+    # world after a while, in case the first press came too early; once loading runs, extra presses on the loading screen are ignored
+    for attempt in range(4):
+        if not focus_game(): sys.exit("could not bring the game to the front")
+        press(0x12); print("continue pressed%s, loading ..." % (" again" if attempt else ""))
+        if wait(in_world, 45 if attempt == 0 else 120): return
 
 def main():
     ap = argparse.ArgumentParser()

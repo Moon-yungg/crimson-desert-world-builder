@@ -111,6 +111,14 @@ Nach dem Laden eines Spielstands zeigt der Tab "walk a few steps first", bis du 
 die Server-Figur deines Charakters, und die liefert das Spiel beim Laufen. Ein Spiel-Update kann den Weg blockieren; dann sagt
 der Tab das, alles andere läuft weiter.
 
+## Freie Kamera
+
+**F6** (oder der Button „free camera“ oben im Editor) schaltet eine frei fliegende Kamera ein: W/A/S/D bewegen, E oder
+Leertaste hoch, Q oder Strg runter, Shift schneller. Die Maus steuert den Blick; bei offenem Editor hältst du dafür die
+rechte Maustaste über der Welt gedrückt, damit die Maus sonst für den Editor frei bleibt. Deine Figur bleibt stehen, neue
+Objekte erscheinen vor der Kamera, Gizmo und Rahmen folgen ihr. Tempo, Mausempfindlichkeit und Taste stehen im Tab
+Settings. Die Welt lädt Details weiterhin rund um deine Figur, bei sehr weiten Flügen wird es daher gröber.
+
 ## Bekannte Einschränkungen
 
 - Prefabs außerhalb von `/object/cd_gimmick/` sind rein visuell mit Kollision.

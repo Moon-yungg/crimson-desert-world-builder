@@ -211,6 +211,15 @@ static std::string Handle(const std::string& method, const std::string& path, co
         }
         return PageTail((int)list.size(), offset, limit, items);
     }
+    if (method == "POST" && path == "/api/freecam") {   // {"on":true}: free-fly camera on / off
+        if (!core::FreeCamAvailable()) { status = 503; return Error("free camera not available in this game build (see log)"); }
+        core::SetFreeCam(Flag(arg, "on"));
+        float ty = 0, tp = 0; Number(arg, "turnYaw", ty); Number(arg, "turnPitch", tp); if (ty != 0 || tp != 0) core::FreeCamTurn(ty, tp);
+        return core::FreeCamActive() ? "{\"on\":true}" : "{\"on\":false}";
+    }
+    if (method == "POST" && path == "/api/research/camwatch") {   // research: {"seconds":8} logs the code writing the renderer camera pose
+        float sec = 8, mode = 0; Number(arg, "seconds", sec); Number(arg, "mode", mode); core::CamWatch((int)sec, (int)mode); status = 202; return "{\"started\":true}";
+    }
     if (method == "POST" && path == "/api/npc") {   // {"key":30191,"x":..,"y":..,"z":..,"type":1}: key = characterinfo row, type = spawn reason (default 1)
         float x = 0, y = 0, z = 0, key = 0, type = 1;
         if (!Number(arg, "key", key, true) || !Number(arg, "x", x, true) || !Number(arg, "y", y, true) || !Number(arg, "z", z, true) || !Number(arg, "type", type)) { status = 400; return Error("key and x/y/z required"); }
