@@ -7,6 +7,7 @@
 #include "guard.h"
 #include "core.h"
 #include "thumbgen.h"
+#include "i18n.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -1140,6 +1141,7 @@ static bool LoadGameNames(const std::string& lang) {
         if (renamed) Log("[names] %d prefabs share their in-game name with others: file name part appended", renamed);
     }
     Log("[names] %zu gimmick names (%s) from %zu table rows", names->size(), PalocFolder(lang), rows.size());
+    { std::string all; for (const auto& kv : *names) { all += kv.second; all += ' '; } i18n::AddGlyphText(all); }   // CJK names need their glyphs in the atlas
     std::atomic_store(&g_names, std::shared_ptr<const std::unordered_map<std::string, std::string>>(names));
     return true;
 }

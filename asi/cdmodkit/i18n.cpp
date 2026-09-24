@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <mutex>
+#include <atomic>
 #include <set>
 #include <string_view>
 #include <unordered_map>
@@ -31,6 +33,8 @@ namespace i18n {
         using PackRow = std::array<std::string, 11>;
         std::unordered_map<std::string, PackRow> g_pack;
         std::vector<unsigned short> g_glyphRanges;
+        // code points of text that does not come from locales.tsv (the game's own item names, read after the atlas was built)
+        std::mutex g_extraMutex; std::set<unsigned short> g_extra, g_inAtlas; std::atomic<bool> g_glyphsDirty{ false };
         std::string g_preference = "auto";
         std::string g_systemLanguage = "en";
         bool g_initialized = false;
@@ -94,6 +98,7 @@ namespace i18n {
             };
             for (const auto& row : g_pack) { collect(row.first); for (const std::string& text : row.second) collect(text); }
             for (const auto& l : kLanguages) if (l.native) collect(l.native);   // the selector needs them even without locales.tsv
+            { std::lock_guard<std::mutex> lock(g_extraMutex); codepoints.insert(g_extra.begin(), g_extra.end()); g_inAtlas = codepoints; }
             g_glyphRanges.clear();
             g_glyphRanges.push_back(0x0020); g_glyphRanges.push_back(0x00FF);
             for (auto it = codepoints.begin(); it != codepoints.end();) {
@@ -197,6 +202,16 @@ namespace i18n {
         for (const auto& option : kLanguages) if (_stricmp(option.id, id) == 0) { g_preference = option.id; return true; }
         return false;
     }
+    void AddGlyphText(const std::string& text) {
+        if (text.empty()) return;
+        const int count = MultiByteToWideChar(CP_UTF8, 0, text.data(), (int)text.size(), nullptr, 0); if (count <= 0) return;
+        std::vector<wchar_t> wide((size_t)count); MultiByteToWideChar(CP_UTF8, 0, text.data(), (int)text.size(), wide.data(), count);
+        std::lock_guard<std::mutex> lock(g_extraMutex); bool added = false;
+        for (wchar_t c : wide) if ((unsigned)c >= 0x0100 && (unsigned)c <= 0xFFFF && !g_inAtlas.count((unsigned short)c) && g_extra.insert((unsigned short)c).second) added = true;
+        if (added) g_glyphsDirty = true;
+    }
+    bool TakeGlyphsDirty() { return g_glyphsDirty.exchange(false); }
+    void RebuildGlyphRanges() { BuildGlyphRanges(); }
     const unsigned short* GlyphRanges() { return g_glyphRanges.empty() ? nullptr : g_glyphRanges.data(); }
     void MergeSystemFonts(ImFontAtlas* atlas, float size) {
         if (!atlas || g_glyphRanges.empty()) return;

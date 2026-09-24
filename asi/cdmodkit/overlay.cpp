@@ -191,6 +191,24 @@ namespace overlay {
         if (g_fence->GetCompletedValue() < g_fenceValue) { g_fence->SetEventOnCompletion(g_fenceValue, g_fenceEvent); WaitForSingleObject(g_fenceEvent, 2000); }
     }
 
+    // text font + system fonts for other scripts + the plugin's icons; again after in-game names brought new characters
+    static float g_fontScale = 1.0f;
+    static void BuildFonts(bool first) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (!first) io.Fonts->Clear();
+        const char* fonts[] = { "C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\calibri.ttf" };
+        ImFont* textFont = nullptr; const ImWchar* ranges = (const ImWchar*)i18n::GlyphRanges();
+        for (const char* fp : fonts) if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES) { textFont = io.Fonts->AddFontFromFileTTF(fp, 17.0f * g_fontScale, nullptr, ranges); if (first) core::Log("[overlay] font %s", fp); break; }
+        if (!textFont) textFont = io.Fonts->AddFontDefault();
+        if (first) core::Log("[overlay] init: system fonts");
+        i18n::MergeSystemFonts(io.Fonts, 17.0f * g_fontScale);
+        // icons are drawn by the plugin into the atlas (icons.cpp); no icon font is needed
+        icons::Register(io.Fonts, textFont, 17.0f * g_fontScale);
+        if (first) core::Log("[overlay] init: atlas build");
+        io.Fonts->Build();
+        icons::Paint(io.Fonts);
+        i18n::ReleaseMergedFontData(io.Fonts);
+    }
     static bool Init(IDXGISwapChain3* sc) {   // each step is logged: a crash report then shows how far the first frame got
         core::Log("[overlay] init: device");
         if (FAILED(sc->GetDevice(IID_PPV_ARGS(&g_device)))) { core::Log("[overlay] GetDevice failed"); return false; }
@@ -219,20 +237,7 @@ namespace overlay {
         core::Log("[overlay] init: locales");
         i18n::Initialize(core::ModDir());
         core::Log("[overlay] init: fonts (language %s)", i18n::Preference());
-        const char* fonts[] = { "C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\calibri.ttf" };
-        bool haveFont = false;
-        ImFont* textFont = nullptr;
-        const ImWchar* ranges = (const ImWchar*)i18n::GlyphRanges();
-        for (const char* fp : fonts) if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES) { textFont = io.Fonts->AddFontFromFileTTF(fp, 17.0f * scale, nullptr, ranges); core::Log("[overlay] font %s", fp); haveFont = true; break; }
-        if (!haveFont) textFont = io.Fonts->AddFontDefault();
-        core::Log("[overlay] init: system fonts");
-        i18n::MergeSystemFonts(io.Fonts, 17.0f * scale);
-        // icons are drawn by the plugin into the atlas (icons.cpp); no icon font is needed
-        icons::Register(io.Fonts, textFont, 17.0f * scale);
-        core::Log("[overlay] init: atlas build");
-        io.Fonts->Build();
-        icons::Paint(io.Fonts);
-        i18n::ReleaseMergedFontData(io.Fonts);
+        g_fontScale = scale; BuildFonts(true);
         core::Log("[overlay] init: backends (atlas %dx%d)", io.Fonts->TexWidth, io.Fonts->TexHeight);
         ImGui_ImplWin32_Init(g_hwnd);
         ImGui_ImplDX12_Init(g_device, (int)g_bufferCount, g_format, g_srvHeap, g_srvHeap->GetCPUDescriptorHandleForHeapStart(), g_srvHeap->GetGPUDescriptorHandleForHeapStart());
@@ -265,6 +270,11 @@ namespace overlay {
         for (const auto& file : thumbgen::TakeRefreshed()) {   // re-rendered image: drop the cached texture so the next Thumb() reloads it
             auto it = g_texs.find(file); if (it == g_texs.end()) continue;
             if (it->second.uploaded && it->second.res) { g_retire.push_back({ it->second.res, g_fenceValue + 1 }); g_freeSlots.push_back(it->second.slot); g_texs.erase(it); }
+        }
+        if (i18n::TakeGlyphsDirty()) {   // in-game names brought characters the atlas lacks (they showed as "?"): rebuild it once
+            WaitIdle(); ImGui_ImplDX12_InvalidateDeviceObjects();
+            i18n::RebuildGlyphRanges(); BuildFonts(false);   // NewFrame below recreates the font texture and the pipeline
+            core::Log("[overlay] font atlas rebuilt for new characters (%dx%d)", ImGui::GetIO().Fonts->TexWidth, ImGui::GetIO().Fonts->TexHeight);
         }
         Stage("newframe dx12");
         ImGui_ImplDX12_NewFrame();

@@ -20,6 +20,9 @@ namespace i18n {
     const LanguageOption* Languages(int* count);  // names: native spelling first, then the name in the current UI language
     bool SetPreference(const char* id);
     const unsigned short* GlyphRanges();
+    void AddGlyphText(const std::string& utf8);   // text shown later (in-game names): its characters join the next atlas build
+    bool TakeGlyphsDirty();                       // new characters arrived since the last build (the overlay rebuilds the atlas)
+    void RebuildGlyphRanges();
     void MergeSystemFonts(ImFontAtlas* atlas, float size);
     void ReleaseMergedFontData(ImFontAtlas* atlas);   // after the atlas was built; it must not be built again
 }
