@@ -1,0 +1,6 @@
+World Builder 0.90
+
+Changed
+- The preview progress in the log is worded plainly: "12345 with preview, 18000 without (17827 no static mesh), 900 to go,
+  4000 rendered this session" instead of "failed 18000", which read like errors piling up. Prefabs without a preview are
+  the ones that can never get one (no static mesh, or a mesh the renderer cannot decode).

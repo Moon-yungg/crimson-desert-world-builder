@@ -709,15 +709,17 @@ static DWORD WINAPI Worker(LPVOID) {
     }
     g_sizes = fopen(sizesPath.c_str(), "a");
     const auto& idx = core::PrefabIndex(); g_total = (int)idx.size();
+    int noMesh = 0;   // index rows without a static mesh (never a preview), for the log lines
     {   // prefabs.tsv counts the same .pam/.pami _path entries Collect() looks for: 0 means "no meshes" without reading the file.
         // ~17.8k of them (characters with skinned meshes, decals, effects) head the index; reading them first took over
         // five minutes before the first image, which looked like nothing was rendered at all. A parse-error row is read anyway.
         std::lock_guard<std::mutex> l(g_mu); int skipped = 0;
-        for (const auto& pi : idx) if (pi.meshes == 0 && pi.tags.find("parse-error") == std::string::npos && g_processed.insert(pi.path).second) skipped++;
+        for (const auto& pi : idx) if (pi.meshes == 0 && pi.tags.find("parse-error") == std::string::npos) { noMesh++; if (g_processed.insert(pi.path).second) skipped++; }
         g_failed += skipped;
-        if (skipped) Log("[thumbs] %d prefabs have no static mesh in the index (skinned characters, decals, effects): no preview, not read", skipped);
+        Log("[thumbs] %d prefabs have no static mesh in the index (skinned characters, decals, effects): no preview, not read", noMesh);
     }
-    Log("[thumbs] worker ready: %d done, %d failed, %d prefabs", g_done.load(), g_failed.load(), g_total.load());
+    Log("[thumbs] worker ready: %d prefabs, %d with preview, %d without (%d no static mesh), %d to go", g_total.load(), g_done.load(), g_failed.load(), noMesh,
+        std::max(0, g_total.load() - g_done.load() - g_failed.load()));
     g_ready = true;
     {   // self test: one prefab and one mesh through the game's loader (logged once per start)
         const char* tests[] = { "object/bin__/00_common/dungeon/akapen/cd_akapen_dungeon_wall_01_broken_01_kwe.prefab", "object/00_common/ancient/cd_ancient_altarmarble_01.pam" };
@@ -803,7 +805,9 @@ static DWORD WINAPI Worker(LPVOID) {
         if (prio) Log("[thumbs] %s: %s (instances %d, surfaces %d, with material %d, with texture %d)", path.c_str(), ok ? "rendered" : why.c_str(), g_statInst, g_statSurf, g_statMat, g_statTex);
         if (GetTickCount() - lastLog > 60000) {
             std::string rs; for (auto& kv : reasons) rs += kv.first + "=" + std::to_string(kv.second) + " ";
-            Log("[thumbs] progress %d/%d (failed %d, this session %d) reads %d %s", g_done.load(), g_total.load(), g_failed.load(), sessionDone, g_reads.load(), rs.c_str());
+            // worded for players who read the log: "failed" alone looked like errors piling up
+            Log("[thumbs] progress: %d with preview, %d without (%d no static mesh), %d to go, %d rendered this session | reads %d %s", g_done.load(), g_failed.load(), noMesh,
+                std::max(0, g_total.load() - g_done.load() - g_failed.load()), sessionDone, g_reads.load(), rs.c_str());
             lastLog = GetTickCount();
         }
         if (!prio) Sleep(20);   // background pass: roughly half duty cycle, the game keeps its cores
