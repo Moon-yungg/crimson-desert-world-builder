@@ -87,6 +87,8 @@ namespace core {
 
     // Spawning (queued to the game thread). The registry keeps every object we created.
     int  SpawnAt(const std::string& prefab, Vec3 world, Rot rot = {}, float scale = 1.0f, int group = 0, int proj = 0);   // returns the uid (0 = not queued)
+    bool SpawnNpc(uint32_t characterKey, Vec3 world, int type = 1, uint32_t extra = 0);   // NPC / creature via the game's spawn-character request (queued to the server tick)
+    int  NpcState();                                  // 0 = not available in this game build, 1 = walk a few steps first (player actor unknown), 2 = ready
     std::vector<SpawnedObj> Spawned();
     int  IndexOfUid(int uid);                   // -1 when the object was forgotten
     void SetGroup(int uid, int group); int NewGroupId();

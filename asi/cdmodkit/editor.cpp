@@ -386,7 +386,7 @@ namespace editor {
     static void SpawnSelected(const PosInfo& p) {
         if (g_selPrefab < 0) return;
         const auto& pi = core::PrefabIndex()[g_selPrefab];
-        if (IsAppearance(pi)) { Note(T("characters can only be previewed for now, spawning them comes later")); return; }
+        if (IsAppearance(pi)) { Note(T("these appearances can only be previewed; living characters are spawned from the NPCs tab")); return; }
         Vec3 at = SpawnSpot(pi, g_spawnYaw, g_spawnScale);
         if (g_previewShown && core::PreviewCommit()) { g_previewShown = false; g_previewSuppressed = true; Note(T("placed %s"), ShownName(pi).c_str()); }
         else { int uid = core::SpawnAt(pi.path, at, Rot{ g_spawnYaw }, g_spawnScale); std::vector<Act> acts; RecordSpawn(acts, uid, pi.path, at, Rot{ g_spawnYaw }, g_spawnScale, 0); Push(acts); Note(T("spawn %s"), ShownName(pi).c_str()); }
@@ -563,7 +563,7 @@ namespace editor {
     static void StartPlaceNew(const PosInfo& p, bool havePos) {
         if (g_selPrefab < 0 || !havePos || !core::GameThreadReady()) return;
         const auto& pi = core::PrefabIndex()[g_selPrefab];
-        if (IsAppearance(pi)) { Note(T("characters can only be previewed for now, spawning them comes later")); return; }
+        if (IsAppearance(pi)) { Note(T("these appearances can only be previewed; living characters are spawned from the NPCs tab")); return; }
         if (g_place.active) {   // PLACE / double-click while something is already carried
             const Place& P = g_place;
             if (P.isNew && !P.touched && P.m.size() == 1 && P.m[0].prefab == pi.path) { Note(T("%s is already in your hands: %s drops it, %s cancels"), ShownName(pi).c_str(), core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL])); return; }   // a repeated double-click, not a second copy
@@ -1099,6 +1099,88 @@ namespace editor {
         }
         ImGui::EndChild();
     }
+    // ---- NPCs and creatures: every character of the game's characterinfo, spawned through the game's own spawn request ----
+    // They become ordinary actors of the world (AI, combat, own despawn rules), so they are not scene objects: no moving, undo
+    // or project saving. The list is read from the installed game at runtime (thumbgen::Characters), names in the UI language.
+    static char g_npcFilter[128] = ""; static int g_npcCat = 0, g_npcSel = -1, g_npcCount = 1; static float g_npcDist = 5.0f;
+    static std::vector<int> g_npcRows; static std::string g_npcKey;
+    static const char* kNpcCats[] = { "all", "people", "animals and mounts", "monsters", "bosses", "other" };
+    static int NpcCategory(const std::string& n) {   // from the internal name's first token: NHM_ = human male, NGW_ = goblin female, ...
+        const std::string t = n.substr(0, n.find('_'));
+        if (t == "Animal" || t == "Riding" || t == "NatureCreature") return 2;
+        if (t == "MON" || t == "Mon" || t == "Marni" || t == "Marionette") return 3;
+        if (t == "Boss" || t == "MiddleBoss") return 4;
+        if (t.size() >= 3 && t.size() <= 4 && t[0] == 'N' && (t.back() == 'M' || t.back() == 'W')) return 1;
+        return 5;
+    }
+    static void DrawNpcs(const PosInfo& p, bool havePos) {
+        const auto chars = thumbgen::Characters();
+        const float ui = ImGui::GetFontSize() / 17.0f;
+        const int st = core::NpcState();
+        if (st == 0) { ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), T("NPC spawning is not available in this game build (see the log).")); }
+        else if (st == 1) { ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), T("walk a few steps first: the game's spawn request needs your character's server actor")); }
+        else ImGui::TextDisabled(T("Spawned characters are part of the game world: they fight, walk and despawn by the game's rules, and are not in the scene list or in projects."));
+        if (!chars) { ImGui::TextDisabled(T("reading the character list from the game files...")); return; }
+        ImGui::SetNextItemWidth(std::max(120.0f * ui, ImGui::GetContentRegionAvail().x - 260.0f * ui));
+        ImGui::InputTextWithHint("##npcfilter", T("search  (name, internal name or key)"), g_npcFilter, sizeof g_npcFilter);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(180 * ui); ComboT("##npccat", &g_npcCat, kNpcCats, 6);
+        const std::string key = std::string(g_npcFilter) + "|" + std::to_string(g_npcCat) + "|" + std::to_string((uintptr_t)chars.get());
+        if (key != g_npcKey) {
+            g_npcKey = key; g_npcRows.clear(); g_npcSel = -1;
+            std::vector<std::string> words; { std::string w; for (const char* c = g_npcFilter;; c++) { if (!*c || *c == ' ') { if (!w.empty()) words.push_back(w); w.clear(); if (!*c) break; } else w += (char)tolower((unsigned char)*c); } }
+            for (int i = 0; i < (int)chars->size(); i++) {
+                const auto& c = (*chars)[i];
+                if (g_npcCat && NpcCategory(c.internal) != g_npcCat) continue;
+                const std::string hay = c.name + " " + c.internal + " " + std::to_string(c.key); bool ok = true;
+                for (const auto& w : words) if (!ContainsCI(hay, w)) { ok = false; break; }
+                if (ok) g_npcRows.push_back(i);
+            }
+            std::stable_sort(g_npcRows.begin(), g_npcRows.end(), [&](int a, int b) { const auto& x = (*chars)[a]; const auto& y = (*chars)[b]; if (x.name.empty() != y.name.empty()) return !x.name.empty(); return (x.name.empty() ? x.internal : x.name) < (y.name.empty() ? y.internal : y.name); });
+        }
+        ImGui::TextDisabled(T("%d characters"), (int)g_npcRows.size());
+        const float detailsH = 96.0f * ui;
+        float listH = ImGui::GetContentRegionAvail().y - detailsH - ImGui::GetStyle().ItemSpacing.y; if (listH < 80 * ui) listH = 80 * ui;
+        if (ImGui::BeginTable("npcs", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable, ImVec2(0, listH))) {
+            ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch, 3);
+            ImGui::TableSetupColumn(T("internal name"), ImGuiTableColumnFlags_WidthStretch, 4);
+            ImGui::TableSetupColumn(T("key"), ImGuiTableColumnFlags_WidthFixed, 70 * ui);
+            ImGui::TableSetupScrollFreeze(0, 1); ImGui::TableHeadersRow();
+            ImGuiListClipper clip; clip.Begin((int)g_npcRows.size());
+            while (clip.Step()) for (int r = clip.DisplayStart; r < clip.DisplayEnd; r++) {
+                const int i = g_npcRows[r]; const auto& c = (*chars)[i];
+                ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::PushID(i);
+                if (ImGui::Selectable(c.name.empty() ? "-" : c.name.c_str(), g_npcSel == i, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                    g_npcSel = i;
+                    if (ImGui::IsMouseDoubleClicked(0) && havePos && st == 2) { Vec3 at = { g_lastPlayer.x + g_fx * g_npcDist, g_lastPlayer.y, g_lastPlayer.z + g_fz * g_npcDist }; core::SpawnNpc(c.key, at); Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str()); }
+                }
+                ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", c.internal.c_str());
+                ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%u", c.key);
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::BeginChild("npcdetails", ImVec2(0, detailsH), ImGuiChildFlags_Borders);
+        if (g_npcSel >= 0 && g_npcSel < (int)chars->size()) {
+            const auto& c = (*chars)[g_npcSel];
+            ImGui::Text("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str()); ImGui::SameLine(); ImGui::TextDisabled("  %s   key %u", c.internal.c_str(), c.key);
+            ImGui::SetNextItemWidth(140 * ui); ImGui::SliderFloat(T("distance"), &g_npcDist, 1.0f, 30.0f, "%.0f m"); ImGui::SameLine();
+            ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, 20);
+            ImGui::BeginDisabled(!havePos || st != 2);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
+            if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS "   SPAWN   "), ImVec2(150 * ui, 0))) {
+                for (int k = 0; k < g_npcCount; k++) {   // side by side across the view direction, 1.5 m apart, centred
+                    const float side = (k - (g_npcCount - 1) * 0.5f) * 1.5f;
+                    Vec3 at = { g_lastPlayer.x + g_fx * g_npcDist + g_fz * side, g_lastPlayer.y, g_lastPlayer.z + g_fz * g_npcDist - g_fx * side };
+                    core::SpawnNpc(c.key, at);
+                }
+                Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str());
+            }
+            ImGui::PopStyleColor(2); ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(T("spawns the character <distance> in front of you; it appears after a few seconds. Hostile ones attack, wild animals may flee."));
+        } else ImGui::TextDisabled(T("select a character, then SPAWN. Double-click on a row spawns it right away."));
+        ImGui::EndChild();
+    }
+
     static void DrawBrowser(const PosInfo& p, bool havePos) {
         const auto& idx = core::PrefabIndex();
         ImGui::BeginChild("cats", ImVec2(g_catW, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
@@ -2068,6 +2150,7 @@ namespace editor {
             bool inBrowser = false;
             const ImGuiTabItemFlags browserFlags = g_selectMainTab && g_mainTab == 0 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
             if (ImGui::BeginTabItem(TStable(ICON_MAGNIFYING_GLASS " Browser"), nullptr, browserFlags)) { inBrowser = true; g_mainTab = 0; DrawBrowser(p, havePos); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem(TStable(ICON_LOCATION_DOT " NPCs"))) { DrawNpcs(p, havePos); ImGui::EndTabItem(); }
             const ImGuiTabItemFlags sceneFlags = g_selectMainTab && g_mainTab == 1 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
             if (ImGui::BeginTabItem(TStable(ICON_CUBE " Scene"), nullptr, sceneFlags)) { g_mainTab = 1; { const int gp = core::GimmickPending(); if (gp > 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), core::GimmickTemplateReady() ? T("%d interactive object(s) spawning...") : T("%d interactive object(s) waiting for a spawn template: walk a few meters"), gp); } DrawScene(p, havePos); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(TStable(ICON_FLOPPY_DISK " Project"))) { g_mainTab = 2; DrawProject(); ImGui::EndTabItem(); }

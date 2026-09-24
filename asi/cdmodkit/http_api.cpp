@@ -211,6 +211,16 @@ static std::string Handle(const std::string& method, const std::string& path, co
         }
         return PageTail((int)list.size(), offset, limit, items);
     }
+    if (method == "POST" && path == "/api/npc") {   // {"key":30191,"x":..,"y":..,"z":..,"type":1}: key = characterinfo row, type = spawn reason (default 1)
+        float x = 0, y = 0, z = 0, key = 0, type = 1;
+        if (!Number(arg, "key", key, true) || !Number(arg, "x", x, true) || !Number(arg, "y", y, true) || !Number(arg, "z", z, true) || !Number(arg, "type", type)) { status = 400; return Error("key and x/y/z required"); }
+        std::string out; if (!Ready(status, out)) return out;
+        const int st = core::NpcState();
+        if (st == 0) { status = 503; return Error("npc spawn not available in this game build (see log)"); }
+        if (st == 1) { status = 409; return Error("player actor not known yet: walk a few steps"); }
+        if (!core::SpawnNpc((uint32_t)key, { x, y, z }, (int)type)) { status = 503; return Error("npc spawn failed (see log)"); }
+        status = 202; return "{\"queued\":true}";
+    }
     if (method == "POST" && path == "/api/objects") {
         std::string prefab; auto it = arg.find("prefab"); if (it != arg.end()) prefab = it->second;
         float x = 0, y = 0, z = 0, yaw = 0, pitch = 0, roll = 0, scale = 1;

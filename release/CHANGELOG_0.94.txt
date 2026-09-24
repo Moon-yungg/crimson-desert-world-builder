@@ -1,0 +1,11 @@
+World Builder 0.94
+
+Added
+- NPCs and creatures can be spawned: the new NPCs tab lists all ~7,250 characters of the game (people, goblins, animals,
+  mounts, monsters, bosses) with their in-game name in your interface language, the internal name and the key. Search and
+  a category filter narrow the list; SPAWN (or a double-click) puts the character in front of you, "count" places several
+  side by side. The list is read from your installed game at runtime, nothing of it ships with the mod.
+  The characters are created through the game's own spawn request and then live by the game's rules: they walk, fight,
+  flee and despawn like any other. Hostile ones attack. They are therefore not scene objects (no moving, undo or saving in
+  projects). After loading a save, walk a few steps before the first spawn.
+- HTTP API: POST /api/npc {"key", "x", "y", "z", "type"} spawns a character (see HTTP_API.md).
