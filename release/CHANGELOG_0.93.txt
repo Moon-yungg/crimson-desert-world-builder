@@ -7,7 +7,9 @@ Added
 - Previews for decals (blood, dirt, moss, paint ...): the decal texture on a flat tile, seen from above.
 - The browser shows interactive objects (gimmicks, about 14,000) under their in-game name in your interface language,
   e.g. "Privates Lager" / "Private Storage" / "Dépôt personnel" instead of basecamp warehouse box 0002, and the search
-  finds them by that name. The names are read from your installed game; the file name stays in the tooltip.
+  finds them by that name. The names are read from your installed game; the file name stays in the tooltip and in a new
+  "prefab" column of the list view. Objects that share a name get the part of the file name that tells them apart
+  ("Kiste zur Lagerung von Produkten 01", "... 02").
 
 Fixed
 - About 13 % of the game's textures were decoded wrongly in previews (flat or blotchy colours, missing patterns): they are

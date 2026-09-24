@@ -1114,6 +1114,31 @@ static bool LoadGameNames(const std::string& lang) {
         if (it != keyOf.end() && tl) { std::string t((const char*)u.data() + pos + 16 + kl, tl); while (!t.empty() && (unsigned char)t.back() <= ' ') t.pop_back(); if (!t.empty()) (*names)[it->second] = t; }
         pos += 16 + kl + tl;
     }
+    {   // many prefabs share a name (six "Kiste zur Lagerung von Produkten", 127 doors): append what tells them apart in the file
+        // name: its tokens after the ones the whole group shares ("... 01", "... box 0002 cover"), "gimmick"/"cd" left out
+        std::unordered_map<std::string, std::vector<std::string>> byName;
+        for (const auto& kv : *names) byName[kv.second].push_back(kv.first);
+        auto tokens = [](const std::string& path) {
+            std::string b = path.substr(path.rfind('/') + 1); if (EndsWith(b, ".prefab")) b.resize(b.size() - 7);
+            for (char& c : b) c = (char)tolower((unsigned char)c);
+            std::vector<std::string> t; size_t s = 0;
+            for (size_t i = 0; i <= b.size(); i++) if (i == b.size() || b[i] == '_') { if (i > s) t.push_back(b.substr(s, i - s)); s = i + 1; }
+            while (!t.empty() && (t[0] == "gimmick" || t[0] == "cd")) t.erase(t.begin());
+            return t;
+        };
+        int renamed = 0;
+        for (auto& g : byName) {
+            if (g.second.size() < 2) continue;
+            std::vector<std::vector<std::string>> tk; for (const auto& p : g.second) tk.push_back(tokens(p));
+            size_t common = 0;
+            for (;; common++) { bool same = true; for (const auto& t : tk) if (t.size() <= common || t[common] != tk[0][common]) { same = false; break; } if (!same) break; }
+            for (size_t i = 0; i < g.second.size(); i++) {
+                std::string sfx; for (size_t k = common; k < tk[i].size(); k++) { if (!sfx.empty()) sfx += ' '; sfx += tk[i][k]; }
+                if (!sfx.empty()) { (*names)[g.second[i]] = g.first + " " + sfx; renamed++; }
+            }
+        }
+        if (renamed) Log("[names] %d prefabs share their in-game name with others: file name part appended", renamed);
+    }
     Log("[names] %zu gimmick names (%s) from %zu table rows", names->size(), PalocFolder(lang), rows.size());
     std::atomic_store(&g_names, std::shared_ptr<const std::unordered_map<std::string, std::string>>(names));
     return true;

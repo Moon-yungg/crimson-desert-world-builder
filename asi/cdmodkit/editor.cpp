@@ -967,9 +967,10 @@ namespace editor {
         float listH = ImGui::GetContentRegionAvail().y - detailsH - ImGui::GetStyle().ItemSpacing.y;
         if (listH < 80 * ui) listH = 80 * ui;
         if (g_cardView) DrawCards(p, havePos, listH, ui);
-        else if (ImGui::BeginTable("list", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable, ImVec2(0, listH))) {
+        else if (ImGui::BeginTable("list", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable, ImVec2(0, listH))) {
             ImGui::TableSetupColumn("*", ImGuiTableColumnFlags_WidthFixed, 22);
             ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch, 3);
+            ImGui::TableSetupColumn(T("prefab"), ImGuiTableColumnFlags_WidthStretch, 3);   // file-derived name next to the in-game one
             ImGui::TableSetupColumn(T("folder"), ImGuiTableColumnFlags_WidthStretch, 2);
             ImGui::TableSetupColumn(T("tags"), ImGuiTableColumnFlags_WidthStretch, 2);
             ImGui::TableSetupScrollFreeze(0, 1); ImGui::TableHeadersRow();
@@ -984,7 +985,7 @@ namespace editor {
                     std::string shown = row.base.substr(row.base.find('/') + 1); shown = shown.substr(0, shown.rfind('/'));
                     char lbl[200]; snprintf(lbl, sizeof lbl, "%s  %s...  (%d variants)", open ? "v" : ">", shown.c_str(), row.count);
                     if (ImGui::Selectable(lbl, false, ImGuiSelectableFlags_SpanAllColumns)) { if (open) g_openVar.erase(row.base); else g_openVar.insert(row.base); g_rowsDirty = true; }
-                    ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", core::Categories()[pi.cat].name.c_str());
+                    ImGui::TableSetColumnIndex(3); ImGui::TextDisabled("%s", core::Categories()[pi.cat].name.c_str());
                     ImGui::PopID(); continue;
                 }
                 bool fav = core::IsFavorite(i);
@@ -999,8 +1000,9 @@ namespace editor {
                 }
                 PrefabContextMenu(i, pi, "rowctx");
                 if (row.head == 2) ImGui::Unindent(18.0f);
-                ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", core::Categories()[pi.cat].name.c_str());
-                ImGui::TableSetColumnIndex(3); ImGui::TextDisabled("%s", pi.tags.c_str());
+                ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", pi.name.c_str());
+                ImGui::TableSetColumnIndex(3); ImGui::TextDisabled("%s", core::Categories()[pi.cat].name.c_str());
+                ImGui::TableSetColumnIndex(4); ImGui::TextDisabled("%s", pi.tags.c_str());
                 ImGui::PopID();
             }
             ImGui::EndTable();
