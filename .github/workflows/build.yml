@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Two builds of the same sources, so a change that only breaks one toolchain is caught, and so that anyone can download a
+# freshly built cdmodkit.asi (Actions tab, artifacts) without a local toolchain. Releases still use the MSVC build.
+jobs:
+  msvc:
+    name: MSVC (Visual Studio)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install lz4
+      - name: Dependencies (MinHook, Dear ImGui)
+        shell: bash
+        run: |
+          git clone --depth 1 --branch v1.3.3 https://github.com/TsudaKageyu/minhook tools/minhook
+          git clone --depth 1 --branch v1.91.5 https://github.com/ocornut/imgui tools/imgui
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build
+        shell: cmd
+        run: asi\cdmodkit\build.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cdmodkit-msvc
+          path: |
+            asi/cdmodkit/build/cdmodkit.asi
+            asi/cdmodkit/data/prefabs.tsv
+            asi/cdmodkit/data/settings.txt
+            asi/cdmodkit/data/errnames.txt
+            asi/cdmodkit/data/locales.tsv
+
+  mingw:
+    name: GCC (MinGW-w64, winlibs)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install lz4
+      - name: Dependencies (MinHook, Dear ImGui, winlibs GCC 14.2 UCRT)
+        shell: bash
+        run: |
+          git clone --depth 1 --branch v1.3.3 https://github.com/TsudaKageyu/minhook tools/minhook
+          git clone --depth 1 --branch v1.91.5 https://github.com/ocornut/imgui tools/imgui
+          curl -sL -o winlibs.zip https://github.com/brechtsanders/winlibs_mingw/releases/download/14.2.0posix-19.1.1-12.0.0-ucrt-r2/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2.zip
+          mkdir -p tools && tar -xf winlibs.zip -C tools
+          echo "$GITHUB_WORKSPACE/tools/mingw64/bin" >> "$GITHUB_PATH"
+      - name: Build
+        shell: cmd
+        run: asi\cdmodkit\build-mingw.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cdmodkit-mingw
+          path: |
+            asi/cdmodkit/build/cdmodkit.asi
+            asi/cdmodkit/data/prefabs.tsv
+            asi/cdmodkit/data/settings.txt
+            asi/cdmodkit/data/errnames.txt
+            asi/cdmodkit/data/locales.tsv
