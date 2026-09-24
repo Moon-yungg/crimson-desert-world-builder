@@ -2014,64 +2014,25 @@ static void FindCameraObjects(std::vector<std::pair<std::string, uintptr_t>>& ou
 }
 // The CameraManager (reachable from the world root) keeps the active camera's SceneObject at +0x40; its world transform
 // sits at +0x1A4 like every SceneObject (scale3, quat4 at +0x1B0, pos3). camtrace showed the quaternion turning with the view.
-static uintptr_t g_camMgr = 0; static DWORD g_camSearchAt = 0; static bool g_camSearchRunning = false; static std::mutex g_camMgrMutex;
-static uintptr_t FindCameraManagerFromWorld() {
-    if (!g_base || !kRva_WorldGlobal) return 0;
-    const uintptr_t world = Deref(g_base + kRva_WorldGlobal, 0);
-    const uintptr_t actorMgr = FindPtrWithRtti(world, 0x100, "ClientActorManager@");
-    const uintptr_t user = FindPtrWithRtti(actorMgr, 0x200, "ClientUserActor@");
-    const uintptr_t roots[3] = { world, actorMgr, user };
-    std::set<uintptr_t> seen;
-    for (uintptr_t root : roots) {
-        if (!root) continue;
-        for (unsigned o1 = 0; o1 < 0x800; o1 += 8) {
-            const uintptr_t p = Deref(root, o1);
-            if (!p || !seen.insert(p).second) continue;
-            const char* name = RttiName(p);
-            if (name && strstr(name, "CameraManager@")) return p;
-            if (!name) continue;
-            for (unsigned o2 = 0; o2 < 0x400; o2 += 8) {
-                const uintptr_t q = Deref(p, o2);
-                if (!q || !seen.insert(q).second) continue;
-                const char* childName = RttiName(q);
-                if (childName && strstr(childName, "CameraManager@")) return q;
-            }
-        }
-    }
-    return 0;
-}
-static DWORD WINAPI CameraManagerSearchThread(LPVOID) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    const uintptr_t found = FindCameraManagerFromWorld();
-    { std::lock_guard<std::mutex> l(g_camMgrMutex); if (found) g_camMgr = found; g_camSearchRunning = false; }
-    if (found) Log("camera manager %p", (void*)found);
-    return 0;
-}
+static uintptr_t g_camMgr = 0; static DWORD g_camSearchAt = 0; static std::mutex g_camMgrMutex;
 static uintptr_t CameraManagerPtr() {
-    uintptr_t cached = 0;
-    { std::lock_guard<std::mutex> l(g_camMgrMutex); cached = g_camMgr; }
-    if (cached) {
-        const char* n = RttiName(cached);
-        if (n && strstr(n, "CameraManager@")) return cached;
-        std::lock_guard<std::mutex> l(g_camMgrMutex);
-        if (g_camMgr == cached) g_camMgr = 0;
+    std::lock_guard<std::mutex> lock(g_camMgrMutex);
+    if (g_camMgr) {
+        const char* n = RttiName(g_camMgr);
+        if (n && strstr(n, "CameraManager@")) return g_camMgr;
+        g_camMgr = 0;
     }
-    const DWORD now = GetTickCount(); bool startSearch = false;
-    {
-        std::lock_guard<std::mutex> l(g_camMgrMutex);
-        if (g_camMgr) return g_camMgr;
-        if (!g_camSearchRunning && now - g_camSearchAt >= 2000) {
-            g_camSearchAt = now;
-            g_camSearchRunning = true;
-            startSearch = true;
-        }
+    const DWORD now = GetTickCount();
+    if (now - g_camSearchAt < 2000) return 0;
+    g_camSearchAt = now;
+    std::vector<std::pair<std::string, uintptr_t>> found;
+    FindCameraObjects(found);   // keep this on the caller/game thread: this is the upstream v0.92 path
+    for (auto& f : found) if (f.first.find("CameraManager@") != std::string::npos) {
+        g_camMgr = f.second;
+        Log("camera manager %p", (void*)g_camMgr);
+        break;
     }
-    if (startSearch) {
-        HANDLE thread = CreateThread(nullptr, 0, CameraManagerSearchThread, nullptr, 0, nullptr);
-        if (thread) CloseHandle(thread);
-        else { std::lock_guard<std::mutex> l(g_camMgrMutex); g_camSearchRunning = false; }
-    }
-    return 0;
+    return g_camMgr;
 }
 static uintptr_t CameraSceneObjectFromManager(uintptr_t manager) {
     const char* managerName = manager ? RttiName(manager) : nullptr;
@@ -2121,17 +2082,23 @@ static void QueueCameraControlCapture(uint64_t request, int retryCount) {
     RunOnGameThread([request, retryCount]() {
         if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) return;
         { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (g_cameraControl.active) return; }
+        auto retry = [request, retryCount]() {
+            if (retryCount < 360 && g_cameraControlRequest.load(std::memory_order_relaxed) == request) {
+                QueueCameraControlCapture(request, retryCount + 1);
+                return true;
+            }
+            return false;
+        };
         uintptr_t manager = 0;
         const uintptr_t so = CameraSceneObject(&manager);
         if (!so) {
-            if (retryCount < 90 && g_cameraControlRequest.load(std::memory_order_relaxed) == request)
-                QueueCameraControlCapture(request, retryCount + 1);
-            else Log("camera control: active camera transform is unavailable");
+            if (!retry()) Log("camera control: active camera transform is unavailable");
             return;
         }
         float original[11] = {};
         if (!ReadBytes(so + 0x1A4, original, 40) || !ReadBytes(so + 0x1CC, original + 10, 4)) {
-            Log("camera control: active camera transform is unavailable"); return;
+            if (!retry()) Log("camera control: active camera transform is unavailable");
+            return;
         }
         const float qx = original[3], qy = original[4], qz = original[5], qw = original[6];
         const float qlen = qx * qx + qy * qy + qz * qz + qw * qw;
@@ -2139,7 +2106,8 @@ static void QueueCameraControlCapture(uint64_t request, int retryCount) {
             !std::isfinite(original[0]) || !std::isfinite(original[1]) || !std::isfinite(original[2]) ||
             original[0] <= 0.0001f || original[1] <= 0.0001f || original[2] <= 0.0001f ||
             original[0] > 10000.0f || original[1] > 10000.0f || original[2] > 10000.0f) {
-            Log("camera control: active camera transform failed validation"); return;
+            if (!retry()) Log("camera control: active camera transform failed validation");
+            return;
         }
         int16_t tile[2]; memcpy(tile, original + 10, sizeof tile);
         CameraControlState state;
@@ -2161,21 +2129,28 @@ static void QueueCameraControlCapture(uint64_t request, int retryCount) {
 void CameraControlStart() {
     if (!HooksReady()) { Log("camera control: game hooks are not ready"); return; }
     const uint64_t request = g_cameraControlRequest.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Do not inherit a recent failed/probing lookup from CameraPose(). Free-camera activation
+    // needs one immediate authoritative manager search on the next game tick.
+    { std::lock_guard<std::mutex> l(g_camMgrMutex); g_camMgr = 0; g_camSearchAt = GetTickCount() - 2000; }
     Log("camera control: capture queued for the next game tick");
     QueueCameraControlCapture(request, 0);
 }
 void CameraControlStop() {
     const uint64_t request = g_cameraControlRequest.fetch_add(1, std::memory_order_relaxed) + 1;
+    CameraControlState state;
+    {
+        std::lock_guard<std::mutex> l(g_cameraControlMutex);
+        if (!g_cameraControl.active) return;
+        state = g_cameraControl;
+        g_cameraControl = {};   // stop overriding immediately; a quick restart must be able to capture again
+    }
     if (!HooksReady()) return;
-    RunOnGameThread([request]() {
+    RunOnGameThread([request, state]() {
         if (g_cameraControlRequest.load(std::memory_order_relaxed) != request) return;
-        CameraControlState state;
-        { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (!g_cameraControl.active) return; state = g_cameraControl; }
         alignas(16) float original[12] = {};
         memcpy(original, state.original, sizeof state.original);
         const uintptr_t activeCamera = CameraSceneObjectFromManager(state.manager);
         const bool restored = activeCamera == state.object && CheckSO(state.object, "camera restore") && WriteBytes(state.object + 0x1A4, original, 44);
-        { std::lock_guard<std::mutex> l(g_cameraControlMutex); if (g_cameraControl.object == state.object) g_cameraControl = {}; }
         Log("camera control: %s camera %p%s", restored ? "restored" : "could not restore", (void*)state.object,
             activeCamera != state.object ? " (active camera changed; skipped stale object)" : "");
     });

@@ -120,7 +120,7 @@ namespace editor {
     static float g_catW = 260.0f;
     static bool  g_playMode = false;      // menu visible but every input goes to the game (Home toggles)
     static bool  g_cameraMode = false;    // free camera keeps the upstream editor/input UI; no full-screen input window
-    static DWORD g_cameraStartAt = 0;
+    static DWORD g_cameraStartAt = 0; static bool g_cameraEverActive = false;
     static float g_fx = 1, g_fz = 0; static Vec3 g_lastPlayer{}; static bool g_havePlayer = false;   // "in front": camera view (default) or last movement direction
     static bool  g_useCamera = true; static float g_camSign = 0;   // camSign: +1/-1 once the camera axis was compared with a walking direction
     static float g_mx = 1, g_mz = 0;                                // last movement direction
@@ -148,7 +148,7 @@ namespace editor {
     static Place g_place;
     static void StopCameraMode() {
         if (!g_cameraMode) return;
-        g_cameraMode = false; g_cameraStartAt = 0;
+        g_cameraMode = false; g_cameraStartAt = 0; g_cameraEverActive = false;
         g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0;
         core::CameraControlStop(); input::ClearKeys(); ImGui::GetIO().ClearInputKeys();
     }
@@ -162,7 +162,8 @@ namespace editor {
     void ToggleCameraMode() {
         if (!g_open) return;
         if (g_cameraMode) { StopCameraMode(); return; }
-        g_playMode = false; g_cameraMode = true; g_cameraStartAt = GetTickCount();
+        g_playMode = false; g_cameraMode = true; g_cameraStartAt = GetTickCount(); g_cameraEverActive = false;
+        input::TakeMouseDelta(nullptr, nullptr);
         input::ClearKeys(); ImGui::GetIO().ClearInputKeys(); core::CameraControlStart();
     }
     bool Placing() { return g_place.active; }
@@ -1744,6 +1745,11 @@ namespace editor {
             }
         }
         if (overUi && !g_boxSelecting) return;
+        // Camera look must not depend on projection/selection being available. Start the RMB gesture
+        // as soon as the click happens in world space; object picking below only fills in its context target.
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            g_rightGesture = true; g_rightMoved = false; g_rightStart = io.MousePos; g_rightUid = 0;
+        }
         CamFrame cf = CurrentCam();
         if (!cf.ok) {
             if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) { g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear(); }
@@ -1765,7 +1771,7 @@ namespace editor {
         }
         g_hoverUid = best;
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-            g_rightGesture = true; g_rightMoved = false; g_rightStart = io.MousePos; g_rightUid = best;
+            g_rightUid = best;
             return;
         }
         if (!best) {
@@ -1917,13 +1923,16 @@ namespace editor {
         float dx = 0, dy = 0; input::TakeMouseDelta(&dx, &dy);   // always consume: entering camera mode must never replay old motion
         if (g_rightGesture && ImGui::GetIO().MouseDown[ImGuiMouseButton_Right] && dx * dx + dy * dy > 16.0f) g_rightMoved = true;
         if (!g_cameraMode) return;
-        if (!core::CameraControlActive() && g_cameraStartAt && GetTickCount() - g_cameraStartAt > 2500) {
-            core::Log("camera control: leaving camera mode because the active camera could not be held");
+        if (core::CameraControlActive()) g_cameraEverActive = true;
+        else if (g_cameraEverActive || (g_cameraStartAt && GetTickCount() - g_cameraStartAt > 7000)) {
+            core::Log("camera control: leaving camera mode after %s", g_cameraEverActive ? "camera control stopped" : "active camera capture timed out");
             StopCameraMode(); return;
         }
 
         ImGuiIO& io = ImGui::GetIO();
-        const auto down = [](int vk) { return input::VkDown(vk); };
+        // The game may use raw keyboard input, so do not depend on legacy WM_KEYDOWN reaching our WndProc.
+        // The original working free-camera path used GetAsyncKeyState for this reason.
+        const auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
         const bool ctrl = down(VK_CONTROL);
         const bool ctrlCommand = ctrl && (down('Z') || down('Y') || down('C') || down('X') || down('V') || down('D') || down('G') || down('A'));
         const bool movementAllowed = !g_worldPopupOpen && !io.WantTextInput && !ImGui::IsAnyItemActive() && !ctrlCommand;
@@ -1933,8 +1942,15 @@ namespace editor {
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
         const float wheel = overUi ? 0.0f : io.MouseWheel;
         core::CameraControlStep(forward, side, up, wheel, io.DeltaTime, down(VK_SHIFT));
-        if (g_rightGesture && g_rightMoved && !overUi && !g_worldPopupOpen && !io.WantTextInput && !ImGui::IsAnyItemActive() && io.MouseDown[ImGuiMouseButton_Right])
+        const bool looking = g_rightGesture && g_rightMoved && !overUi && !g_worldPopupOpen && !io.WantTextInput && !ImGui::IsAnyItemActive() && io.MouseDown[ImGuiMouseButton_Right];
+        if (looking)
             core::CameraControlLook(dx, dy);
+        static DWORD s_lastInputLog = 0; const DWORD now = GetTickCount();
+        if ((forward != 0 || side != 0 || up != 0 || wheel != 0 || (looking && (dx != 0 || dy != 0))) && now - s_lastInputLog >= 1000) {
+            s_lastInputLog = now;
+            core::Log("camera input: forward %.0f side %.0f up %.0f wheel %.1f look %.0f %.0f fast %d",
+                forward, side, up, wheel, looking ? dx : 0.0f, looking ? dy : 0.0f, down(VK_SHIFT) ? 1 : 0);
+        }
     }
 
 
