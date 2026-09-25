@@ -129,8 +129,12 @@ namespace editor {
     static int   g_selCat = 0;            // 0 = all
     static int   g_selPrefab = -1;
     static bool  g_favOnly = false; static bool g_meshOnly = true;
-    static bool  g_compact = false; static int g_dockCols = 2;   // narrow dock window; Browser/Scene use the same functions as the full editor
-    static int g_mainTab = 0, g_compactPage = 0; static bool g_selectMainTab = false;
+    enum MainTabId {
+        TabBrowser = 0, TabScene = 1, TabProject = 2, TabTravel = 3, TabSettings = 4,
+        TabLog = 5, TabHistory = 6, TabNpcs = 7, TabEnvironment = 8
+    };
+    static bool  g_compact = false; static int g_dockCols = 2;   // narrow dock window; supported pages reuse the full editor functions
+    static int g_mainTab = TabBrowser, g_compactPage = TabBrowser; static bool g_selectMainTab = false;
     static bool  g_showSpawnOpts = false, g_showMass = false; static int g_hoverUid = 0;
     static bool  g_cardView = false; static float g_cardSize = 96.0f;   // browser: tile view instead of the list (same matches / filters)
     static int   g_browserDragPrefab = -1;   // browser row/card being dragged out into the game view
@@ -193,7 +197,7 @@ namespace editor {
         g_redo.clear();
     }
 
-    // ---- placement mode: one or many objects carried as a rigid set around a center; keys move/rotate/scale the set ----
+    // ---- placement mode: one or many objects carried as a rigid set around a center; the gizmo edits the set ----
     struct Member { int uid; std::string prefab; Vec3 rel{}; Rot rot0; float scale0 = 1; Vec3 origPos{}; Rot origRot; float origScale = 1; };
     struct Place {
         bool active = false, isNew = false, reopen = false;
@@ -203,8 +207,7 @@ namespace editor {
         float radius = 1.0f;
         DWORD lastSend = 0; bool dirty = true; bool touched = false; Vec3 lastCenter{}; float lastYaw = 1e9f, lastScale = 1e9f, lastPitch = 1e9f, lastRoll = 1e9f;
         bool haveCenter = false; int prefabIdx = -1;   // single object: bbox center known (rotation about it) or still being measured
-        float snapAx = 0, snapAz = 1;   // world axis used as 'away' while snapping (chosen from the facing at grab start)
-        bool mouse = false; int hover = 0, drag = 0;   // gizmo: 1 X, 2 Y, 3 Z, 4 yaw ring, 5 center dot, 6 scale cube, 7 pitch ring, 8 roll ring
+        int hover = 0, drag = 0;   // gizmo: 1 X, 2 Y, 3 Z, 4 yaw ring, 5 center dot, 6 scale cube, 7 pitch ring, 8 roll ring
         float drag0 = 0; Vec3 dragCenter0{}; float dragYaw0 = 0, dragScale0 = 1, dragPitch0 = 0, dragRoll0 = 0;
         int groundTicket = 0, groundIter = 0; float groundBottom = 0, groundTop = 0, groundStartY = 0;   // snap to ground in flight (see GroundStep)
     };
@@ -233,7 +236,7 @@ namespace editor {
         input::ClearKeys(); ImGui::GetIO().ClearInputKeys(); core::SetFreeCam(true);
     }
     bool Placing() { return g_place.active; }
-    bool MouseMode() { return g_place.active && (g_open ? !g_playMode : g_place.mouse); }
+    bool MouseMode() { return g_place.active && (g_open ? !g_playMode : true); }
     static void DrawCameraViewTool() {
         const char* labels[4] = { "F", "H", "D", "U" };
         const float side = ImGui::GetFrameHeight();
@@ -481,7 +484,6 @@ namespace editor {
 
     // ---- world -> screen (perspective from the camera object's frame; fov and mirror are user-calibrated settings) ----
     struct CamFrame { Vec3 pos, right, up, fwd; bool ok = false; float f = 1, aspect = 1, w = 1, h = 1; };
-    static bool g_renderCamUsed = false;
     static CamFrame LiveCam() {
         CamFrame c; ImGuiIO& io = ImGui::GetIO(); c.w = io.DisplaySize.x; c.h = io.DisplaySize.y; c.aspect = c.w / std::max(1.0f, c.h);
         // pose from the camera scene object (live every frame, verified against the renderer's view matrix to a few centimetres);
@@ -493,20 +495,13 @@ namespace editor {
         c.fwd = { c.fwd.x * sgn, c.fwd.y * sgn, c.fwd.z * sgn };
         if (core::g_camMirror) c.right = { -c.right.x, -c.right.y, -c.right.z };
         float m00 = 0, m11 = 0; Vec3 rp;
-        if (core::g_fovAuto && core::RenderCamera(&rp, nullptr, nullptr, nullptr, &m00, &m11, core::g_camLag)) { c.f = m11; c.aspect = m11 / m00; c.ok = true; g_renderCamUsed = true; return c; }
-        g_renderCamUsed = false;
+        if (core::g_fovAuto && core::RenderCamera(&rp, nullptr, nullptr, nullptr, &m00, &m11)) { c.f = m11; c.aspect = m11 / m00; c.ok = true; return c; }
         float fov = core::g_fovDeg; if (core::g_fovAuto) { float live; if (core::CameraFov(&live)) fov = live; }
         c.f = 1.0f / tanf(fov * 3.14159265f / 360.0f); c.ok = true; return c;
     }
-    // The renderer's view matrix equals the camera scene object's pose (verified: same basis, same eye, 50 deg / 16:9), but the game
-    // simulates one or two frames ahead of the frame on screen. The overlay therefore uses the pose sampled g_camLag presents ago.
-    static CamFrame g_camRing[8]; static int g_camHead = 0;
-    static void SampleCamera() { g_camRing[g_camHead & 7] = LiveCam(); g_camHead++; }
-    static CamFrame CurrentCam() {
-        if (!g_camHead) return LiveCam();
-        const int lag = g_renderCamUsed ? 0 : std::min(core::g_camLag, std::min(7, g_camHead - 1));   // with the renderer's matrices the rank already selects the frame
-        return g_camRing[(g_camHead - 1 - lag) & 7];
-    }
+    static CamFrame g_currentCam;
+    static void SampleCamera() { g_currentCam = LiveCam(); }
+    static CamFrame CurrentCam() { return g_currentCam.ok ? g_currentCam : LiveCam(); }
     static bool WorldToScreen(const CamFrame& c, const Vec3& p, ImVec2* out) {
         const float dx = p.x - c.pos.x, dy = p.y - c.pos.y, dz = p.z - c.pos.z;
         const float x = dx * c.right.x + dy * c.right.y + dz * c.right.z, y = dx * c.up.x + dy * c.up.y + dz * c.up.z, z = dx * c.fwd.x + dy * c.fwd.y + dz * c.fwd.z;
@@ -619,25 +614,27 @@ namespace editor {
         ImVec2 h; if (WorldToScreen(c, { p.world.x, p.world.y + 1.8f, p.world.z }, &h)) { dl->AddCircle(h, 10, IM_COL32(255, 220, 40, 255), 24, 2); dl->AddText(ImVec2(h.x + 14, h.y - 8), IM_COL32(255, 220, 40, 255), T("head (1.8 m)")); }
         DrawGizmo(p.world, 0, 0, 1.0f);
     }
+    static void DropCarried();
+    static void CancelCarried(bool notify = true);
+    static void StartGroundSnap(Place& P);
     static void DrawPlaceHud() {
-        const Place& P = g_place; ImGuiIO& io = ImGui::GetIO();
+        Place& P = g_place; ImGuiIO& io = ImGui::GetIO();
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 28.0f), ImGuiCond_Always, ImVec2(0.5f, 0));
         ImGui::SetNextWindowBgAlpha(0.75f);
-        if (ImGui::Begin("##placehud", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
+        if (ImGui::Begin("##placehud", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
             ImGui::Text(ICON_CUBE "  %s  %s%s", T(P.isNew ? "Place" : "Grab"), P.name.c_str(), P.m.size() > 1 ? T("  (group)") : "");
             ImGui::TextDisabled(T("center %.1f  %.1f  %.1f    rotation %+.0f    tilt %+.0f / %+.0f    scale x%.2f    snap %s"), P.center.x, P.center.y, P.center.z, P.yaw, P.pitch, P.roll, P.scale,
                 g_snap ? (std::string(T(kSnapPosNames[g_snapPosIdx])) + " / " + T(kSnapYawNames[g_snapYawIdx])).c_str() : T("off"));
-            auto kn = [](int pk) { return core::KeyName(core::g_placeKeys[pk]); };
-            ImGui::TextDisabled(T("Move: %s %s %s %s%s     Rotate: %s %s     Height: %s %s     Size: %s %s"), kn(core::PK_FWD), kn(core::PK_BACK), kn(core::PK_LEFT), kn(core::PK_RIGHT),
-                g_snap ? T(" (one grid step per press)") : (std::string(" (") + kn(core::PK_FAST) + " = " + T("fast") + ")").c_str(), kn(core::PK_ROT_L), kn(core::PK_ROT_R), kn(core::PK_UP), kn(core::PK_DOWN), kn(core::PK_SCALE_UP), kn(core::PK_SCALE_DOWN));
-            ImGui::TextDisabled(T("%s = bring it in front of me     %s = snap %s     %s = mouse to %s     %s = level     %s = to ground     %s or placing / selecting something else = done     %s = %s"), kn(core::PK_FETCH), kn(core::PK_SNAP), T(g_snap ? "off" : "on"),
-                kn(core::PK_MOUSE), T((g_open ? !g_playMode : P.mouse) ? "the game (camera)" : "World Builder (gizmo)"), kn(core::PK_LEVEL), kn(core::PK_GROUND), kn(core::PK_DROP), kn(core::PK_CANCEL), T(P.isNew ? "cancel" : "put back"));
+            if (ImGui::Button(T("drop"))) DropCarried();
+            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) CancelCarried();
+            ImGui::SameLine(); if (ImGui::Button(T("To ground"))) StartGroundSnap(P);
+            ImGui::SameLine(); if (ImGui::Button(T("level"))) { if (P.m.size() == 1) { P.pitch = -P.m[0].rot0.pitch; P.roll = -P.m[0].rot0.roll; } else { P.pitch = P.roll = 0; } P.dirty = P.touched = true; }
+            ImGui::SameLine(); ImGui::Checkbox(T("snap"), &g_snap);
         }
         ImGui::End();
     }
 
     // ---- placement ----
-    static void DropCarried();
     static bool IsCarried(int uid);
     static void StartGrab(const std::vector<int>& uids, bool isNew, const std::string& name) {
         if (uids.empty() || !core::GameThreadReady()) return;
@@ -653,14 +650,13 @@ namespace editor {
                for (auto& m : P.m) { float dx = m.origPos.x - c.x, dz = m.origPos.z - c.z; P.radius = std::max(P.radius, sqrtf(dx * dx + dz * dz) + 1.0f); } }
         for (auto& m : P.m) m.rel = { m.origPos.x - c.x, m.origPos.y - c.y, m.origPos.z - c.z };
         P.center = c; P.lastCenter = c; P.lastYaw = 0; P.lastScale = 1; P.dirty = isNew;
-        if (fabsf(g_fx) >= fabsf(g_fz)) { P.snapAx = g_fx > 0 ? 1.0f : -1.0f; P.snapAz = 0; } else { P.snapAx = 0; P.snapAz = g_fz > 0 ? 1.0f : -1.0f; }
         if (keepCamera) { P.reopen = false; }                             // camera mode stays live while the gizmo is shown
         else if (g_compact && g_open) { P.reopen = false; }               // the dock stays where it is
         else { P.reopen = g_open; g_open = false; }
         if (!keepCamera) StopCameraMode();
-        g_playMode = false; core::g_placing = true; input::ClearKeys();
+        g_playMode = false; input::ClearKeys();
         g_place = P;
-        Note(T("%s: %s | %d objects | %s = done, %s %s"), T(isNew ? "placing" : "grabbed"), name.c_str(), (int)P.m.size(), core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL]), T(isNew ? "cancels" : "puts back"));
+        Note("%s: %s", T(isNew ? "placing" : "grabbed"), name.c_str());
     }
     static void StartPlaceNew(const PosInfo& p, bool havePos) {
         CamFrame cf = CurrentCam();
@@ -669,7 +665,7 @@ namespace editor {
         if (IsAppearance(pi)) { Note(T("these appearances can only be previewed; living characters are spawned from the NPCs tab")); return; }
         if (g_place.active) {   // PLACE / double-click while something is already carried
             const Place& P = g_place;
-            if (P.isNew && !P.touched && P.m.size() == 1 && P.m[0].prefab == pi.path) { Note(T("%s is already in your hands: %s drops it, %s cancels"), ShownName(pi).c_str(), core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL])); return; }   // a repeated double-click, not a second copy
+            if (P.isNew && !P.touched && P.m.size() == 1 && P.m[0].prefab == pi.path) { Note("%s: %s", T("placing"), ShownName(pi).c_str()); return; }   // a repeated double-click, not a second copy
         }
         if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
         Vec3 at;
@@ -688,10 +684,10 @@ namespace editor {
         if (uid) StartGrab({ uid }, true, ShownName(pi));
     }
     static void FinishPlace() {
-        g_place.active = false; core::g_placing = false; input::ClearKeys();
+        g_place.active = false; input::ClearKeys();
         if (g_place.reopen) { g_open = true; g_playMode = true; }   // visible again, but the game keeps the input (Home to edit)
     }
-    static void CancelCarried(bool notify = true) {
+    static void CancelCarried(bool notify) {
         Place& P = g_place; if (!P.active) return;
         if (P.isNew) { for (auto& m : P.m) { core::HideUid(m.uid); core::ForgetUid(m.uid); } }
         else { std::vector<core::MoveReq> r; for (auto& m : P.m) r.push_back({ m.uid, m.origPos, m.origRot, m.origScale }); core::MoveMany(r, true); }
@@ -773,23 +769,10 @@ namespace editor {
         Push(acts);
         Note(T(P.isNew ? "placed %s" : "dropped %s"), P.name.c_str()); FinishPlace();
     }
-    static void PlaceTick(const PosInfo& p, bool havePos) {
+    static void PlaceTick() {
         if (!g_place.active) return;
         Place& P = g_place;
-        const float dt = std::min(ImGui::GetIO().DeltaTime, 0.1f);
-        // keys by scan code from the window messages (numpad with or without NumLock, arrows and PgUp/PgDn map to the same codes)
-        using namespace core;
-        auto held = [](int pk) { return input::VkDown(g_placeKeys[pk]); };
-        static bool s_prev[PK_COUNT] = { false };
-        auto pressed = [&](int pk) { bool now = held(pk); bool r = now && !s_prev[pk]; s_prev[pk] = now; return r; };
-        const bool confirm = pressed(PK_DROP), cancel = pressed(PK_CANCEL), fetch = pressed(PK_FETCH);
-        if (pressed(PK_SNAP)) g_snap = !g_snap;
-        // two states only: the mouse belongs to World Builder (window + gizmo) or to the game (camera). With a window open that is the
-        // edit / play switch; with the window closed (placed from the full editor) the gizmo has its own flag.
-        if (pressed(PK_MOUSE)) { if (g_open) { g_playMode = !g_playMode; ImGui::GetIO().ClearInputKeys(); } else P.mouse = !P.mouse; P.drag = 0; P.hover = 0; }
-        const bool gizmoMouse = g_open ? !g_playMode : P.mouse;
-        if (pressed(PK_GROUND)) StartGroundSnap(P);
-        if (pressed(PK_LEVEL)) { if (P.m.size() == 1) { P.pitch = -P.m[0].rot0.pitch; P.roll = -P.m[0].rot0.roll; } else { P.pitch = P.roll = 0; } Note(T("levelled")); }   // Numpad *: remove the tilt
+        const bool gizmoMouse = g_open ? !g_playMode : true;
         if (P.m.size() == 1 && !P.haveCenter && P.prefabIdx >= 0 && core::PrefabIndex()[P.prefabIdx].hasCenter) {   // center measured meanwhile: keep the pivot, move the rotation center
             const auto& info = core::PrefabIndex()[P.prefabIdx]; Member& m = P.m[0];
             Vec3 pivot = { P.center.x + m.rel.x, P.center.y + m.rel.y, P.center.z + m.rel.z };   // current pivot (yaw/scale deltas are still 0 at this point in practice)
@@ -797,36 +780,6 @@ namespace editor {
             Vec3 bc = { pivot.x + off.x, pivot.y + off.y, pivot.z + off.z };
             m.rel = { pivot.x - bc.x, pivot.y - bc.y, pivot.z - bc.z }; P.center = bc; P.lastCenter = bc; P.haveCenter = true;
         }
-        const float speed = held(PK_FAST) ? 4.0f : 1.5f;   // m/s
-        // movement axes relative to the character: "away" = from the character towards the object, "right" perpendicular to it
-        float ax = P.center.x - g_lastPlayer.x, az = P.center.z - g_lastPlayer.z; float al = sqrtf(ax * ax + az * az);
-        if (al > 0.3f) { ax /= al; az /= al; } else { ax = g_fx; az = g_fz; }
-        const float rx = az, rz = -ax;   // right = up x forward (right-handed, Y up)
-        float fwd = 0, side = 0, up = 0, rot = 0;
-        if (g_snap) {   // snapping: every key press moves exactly one grid / angle step, holding repeats 4x per second
-            static DWORD s_rep[8] = { 0 }; static bool s_was[8] = { false };
-            auto step = [&](int k, int sc, int) { bool h = held(sc); bool fire = false;
-                if (h && !s_was[k]) { fire = true; s_rep[k] = GetTickCount() + 350; } else if (h && GetTickCount() >= s_rep[k]) { fire = true; s_rep[k] = GetTickCount() + 120; }
-                s_was[k] = h; return fire ? 1.0f : 0.0f; };
-            fwd += step(0, PK_FWD, 0); fwd -= step(1, PK_BACK, 0); side += step(2, PK_RIGHT, 0); side -= step(3, PK_LEFT, 0);
-            up += step(4, PK_UP, 0); up -= step(5, PK_DOWN, 0); rot -= step(6, PK_ROT_L, 0); rot += step(7, PK_ROT_R, 0);
-            const float ps = kSnapPos[g_snapPosIdx], ys = kSnapYaw[g_snapYawIdx];
-            // world-axis frame fixed at grab start: 8/2 along it, 4/6 across it, so the direction never flips with the distance
-            if (fwd || side) { const float sx = P.snapAz, sz = -P.snapAx; P.center.x += (P.snapAx * fwd + sx * side) * ps; P.center.z += (P.snapAz * fwd + sz * side) * ps; }
-            if (up) P.center.y += up * ps;
-            if (rot) P.yaw += rot * ys;
-            P.center = { SnapV(P.center.x, ps), SnapV(P.center.y, ps), SnapV(P.center.z, ps) }; P.yaw = WrapYaw(SnapV(P.yaw, ys));
-        } else {
-            if (held(PK_FWD)) fwd += 1;   if (held(PK_BACK)) fwd -= 1;
-            if (held(PK_RIGHT)) side += 1;  if (held(PK_LEFT)) side -= 1;
-            if (held(PK_UP)) up += 1;    if (held(PK_DOWN)) up -= 1;
-            if (held(PK_ROT_L)) P.yaw -= 60.0f * dt;      if (held(PK_ROT_R)) P.yaw += 60.0f * dt;
-            P.yaw = WrapYaw(P.yaw);
-            if (fwd || side || up) { P.center.x += (ax * fwd + rx * side) * speed * dt; P.center.z += (az * fwd + rz * side) * speed * dt; P.center.y += up * speed * dt; }
-        }
-        if (held(PK_SCALE_UP)) P.scale = std::min(10.0f, P.scale * (1.0f + dt));
-        if (held(PK_SCALE_DOWN)) P.scale = std::max(0.05f, P.scale / (1.0f + dt));
-        if (fetch && havePos) P.center = InFront(P.radius, P.center.y - g_lastPlayer.y);
         if (gizmoMouse) {   // gizmo dragging with the virtual cursor (the game does not see the mouse while this is on)
             ImGuiIO& io = ImGui::GetIO(); CamFrame cf = CurrentCam();
             const float gsize = GizmoScreenSize(cf, P.center, P.radius);
@@ -871,8 +824,6 @@ namespace editor {
             }
         }
         Vec3 c = P.center; float yaw = P.yaw, sc = P.scale;
-        if (cancel) { CancelCarried(); return; }
-        if (confirm) { DropCarried(); return; }
         const DWORD now = GetTickCount();
         const bool changed = fabsf(c.x - P.lastCenter.x) > 0.005f || fabsf(c.y - P.lastCenter.y) > 0.005f || fabsf(c.z - P.lastCenter.z) > 0.005f
             || fabsf(yaw - P.lastYaw) > 0.01f || fabsf(sc - P.lastScale) > 0.001f || fabsf(P.pitch - P.lastPitch) > 0.01f || fabsf(P.roll - P.lastRoll) > 0.01f;
@@ -1380,24 +1331,25 @@ namespace editor {
         }
         ImGui::EndChild();
     }
-    static void DrawNpcs(const PosInfo& p, bool havePos) {
+    static void DrawNpcs(const PosInfo& p, bool havePos, bool compact = false) {
         const auto chars = thumbgen::Characters();
         const float ui = ImGui::GetFontSize() / 17.0f;
         const int st = core::NpcState();
         if (st == 0) { ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), T("NPC spawning is not available in this game build (see the log).")); }
         else if (st == 1) { ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), T("walk a few steps first: the game's spawn request needs your character's server actor")); }
-        else ImGui::TextDisabled(T("Spawned characters are part of the game world: they fight, walk and despawn by the game's rules, and are not in the scene list or in projects."));
+        else if (!compact) ImGui::TextDisabled(T("Spawned characters are part of the game world: they fight, walk and despawn by the game's rules, and are not in the scene list or in projects."));
         if (!chars) { ImGui::TextDisabled(T("reading the character list from the game files...")); return; }
-        {   // view switch: list or tiles (tile size shared with the browser)
+        if (!compact) {   // view switch: list or tiles (tile size shared with the browser)
             const ImVec4 on = ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive), off = ImGui::GetStyleColorVec4(ImGuiCol_Button);
             ImGui::PushStyleColor(ImGuiCol_Button, g_npcCards ? off : on); if (ImGui::Button(T(ICON_LIST " list"))) g_npcCards = false; ImGui::PopStyleColor();
             ImGui::SameLine(0, 2); ImGui::PushStyleColor(ImGuiCol_Button, g_npcCards ? on : off); if (ImGui::Button(T(ICON_COPY " cards"))) g_npcCards = true; ImGui::PopStyleColor();
             if (g_npcCards) { ImGui::SameLine(); ImGui::SetNextItemWidth(100 * ui); ImGui::SliderFloat("##npccardsize", &g_cardSize, 64.0f, 200.0f, "%.0f px"); if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("tile size")); }
             ImGui::SameLine();
         }
-        ImGui::SetNextItemWidth(std::max(120.0f * ui, ImGui::GetContentRegionAvail().x - 260.0f * ui));
+        ImGui::SetNextItemWidth(compact ? -1.0f : std::max(120.0f * ui, ImGui::GetContentRegionAvail().x - 260.0f * ui));
         InputTextI18n("##npcfilter", T("search  (name, internal name or key)"), g_npcFilter, sizeof g_npcFilter);
-        ImGui::SameLine(); ImGui::SetNextItemWidth(180 * ui); ComboT("##npccat", &g_npcCat, kNpcCats, 6);
+        if (!compact) ImGui::SameLine();
+        ImGui::SetNextItemWidth(compact ? -1.0f : 180 * ui); ComboT("##npccat", &g_npcCat, kNpcCats, 6);
         const std::string key = std::string(g_npcFilter) + "|" + std::to_string(g_npcCat) + "|" + std::to_string((uintptr_t)chars.get());
         if (key != g_npcKey) {
             g_npcKey = key; g_npcRows.clear(); g_npcSel = -1;
@@ -1412,9 +1364,10 @@ namespace editor {
             std::stable_sort(g_npcRows.begin(), g_npcRows.end(), [&](int a, int b) { const auto& x = (*chars)[a]; const auto& y = (*chars)[b]; if (x.name.empty() != y.name.empty()) return !x.name.empty(); return (x.name.empty() ? x.internal : x.name) < (y.name.empty() ? y.internal : y.name); });
         }
         ImGui::TextDisabled(T("%d characters"), (int)g_npcRows.size());
-        const float detailsH = 118.0f * ui;
+        const float detailsH = (compact ? 170.0f : 118.0f) * ui;
         float listH = ImGui::GetContentRegionAvail().y - detailsH - ImGui::GetStyle().ItemSpacing.y; if (listH < 80 * ui) listH = 80 * ui;
-        if (g_npcCards) DrawNpcCards(*chars, listH, ui, havePos && st == 2);
+        const bool useCards = compact || g_npcCards;
+        if (useCards) DrawNpcCards(*chars, listH, ui, havePos && st == 2);
         else if (ImGui::BeginTable("npcs", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable, ImVec2(0, listH))) {
             ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch, 3);
             ImGui::TableSetupColumn(T("internal name"), ImGuiTableColumnFlags_WidthStretch, 4);
@@ -1438,7 +1391,7 @@ namespace editor {
         if (g_npcSel >= 0 && g_npcSel < (int)chars->size()) {
             const auto& c = (*chars)[g_npcSel];
             {   // the preview of its appearance (same renderer and cache as the character browser)
-                const float th = 96.0f * ui;
+                const float th = (compact ? 72.0f : 96.0f) * ui;
                 if (c.app.empty()) { ImGui::BeginChild("npcph", ImVec2(th, th), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar); ImGui::TextDisabled(T("no preview")); ImGui::EndChild(); }
                 else if (ImTextureID tex = overlay::Thumb(core::ThumbFile(c.app))) ImGui::Image(tex, ImVec2(th, th));
                 else {
@@ -1451,7 +1404,7 @@ namespace editor {
             }
             ImGui::BeginGroup();
             ImGui::Text("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str()); ImGui::SameLine(); ImGui::TextDisabled("  %s   ID %u", c.internal.c_str(), c.key);
-            ImGui::SetNextItemWidth(140 * ui); ImGui::SliderFloat(T("distance"), &g_npcDist, 1.0f, 30.0f, "%.0f m"); ImGui::SameLine();
+            ImGui::SetNextItemWidth(compact ? 100 * ui : 140 * ui); ImGui::SliderFloat(T("distance"), &g_npcDist, 1.0f, 30.0f, "%.0f m"); SameLineOrWrap(compact, 90 * ui);
             ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, 20);
             ImGui::BeginDisabled(!havePos || st != 2);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
@@ -1469,6 +1422,80 @@ namespace editor {
             ImGui::EndGroup();
         } else ImGui::TextDisabled(T("select a character, then SPAWN. Double-click on a row or card spawns it right away."));
         ImGui::EndChild();
+    }
+
+    static void DrawEnvironment(bool compact = false) {
+        const float ui = ImGui::GetFontSize() / 17.0f;
+        ImGui::SeparatorText(T("Time"));
+        if (!core::TimeControlAvailable()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), T("Time controls are not available in this game build (see the log)."));
+        } else {
+            float current = 0.0f;
+            if (core::TimeHour(&current)) {
+                int total = (int)floorf(current * 60.0f + 0.5f) % (24 * 60);
+                ImGui::TextDisabled(T("Current visual time: %02d:%02d"), total / 60, total % 60);
+            } else {
+                ImGui::TextDisabled(T("Current visual time: waiting for the world..."));
+            }
+
+            float target = core::TimeTargetHour();
+            ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui);
+            if (SliderFloatEdit(T("time of day"), &target, 0.0f, 23.9833f, "%.2f h"))
+                core::SetTimeHour(target);
+
+            if (ImGui::SmallButton(T("Dawn 06:00"))) core::SetTimeHour(6.0f);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(T("Noon 12:00"))) core::SetTimeHour(12.0f);
+            if (!compact) ImGui::SameLine();
+            if (ImGui::SmallButton(T("Sunset 18:00"))) core::SetTimeHour(18.0f);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(T("Midnight 00:00"))) core::SetTimeHour(0.0f);
+
+            bool frozen = core::TimeFrozen();
+            if (ImGui::Checkbox(T("freeze time (lighting only)"), &frozen)) core::SetTimeFrozen(frozen);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Stops the visual day/night and lighting progression. Gameplay, NPCs, physics and combat keep running."));
+            SameLineOrWrap(compact, 105.0f * ui);
+            if (ImGui::SmallButton(T("use native time"))) core::ResetTimeControl();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Restore the game's normal visual time progression."));
+        }
+
+        ImGui::Spacing();
+        ImGui::SeparatorText(T("Weather"));
+        if (!core::WeatherControlAvailable()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), T("Weather controls are not available in this game build (see the log)."));
+            return;
+        }
+
+        bool clear = core::WeatherClearSky();
+        if (ImGui::Checkbox(T("clear sky"), &clear)) core::SetWeatherClearSky(clear);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Suppresses rain, snow, clouds and the main weather fog while enabled."));
+
+        float rain = 0.0f; bool rainOn = core::WeatherRainOverride(&rain);
+        float snow = 0.0f; bool snowOn = core::WeatherSnowOverride(&snow);
+        float cloud = 1.0f; bool cloudOn = core::WeatherCloudOverride(&cloud);
+        float wind = 1.0f; bool windOn = core::WeatherWindOverride(&wind);
+
+        ImGui::BeginDisabled(clear);
+        if (ImGui::Checkbox(T("override rain"), &rainOn)) core::SetWeatherRainOverride(rainOn, rain);
+        if (rainOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("rain intensity"), &rain, 0.0f, 1.0f, "%.2f")) core::SetWeatherRainOverride(true, rain); }
+        const bool snowEffects = core::WeatherSnowEffectsAvailable();
+        ImGui::BeginDisabled(!snowEffects);
+        if (ImGui::Checkbox(T("override snow"), &snowOn)) core::SetWeatherSnowOverride(snowOn, snow);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !snowEffects)
+            ImGui::SetTooltip("%s", T("Snow particle control is not available in this game build."));
+        if (snowOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("snow intensity"), &snow, 0.0f, 1.0f, "%.2f")) core::SetWeatherSnowOverride(true, snow); }
+        ImGui::EndDisabled();
+        if (ImGui::Checkbox(T("override clouds"), &cloudOn)) core::SetWeatherCloudOverride(cloudOn, cloud);
+        if (cloudOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("cloud amount"), &cloud, 0.0f, 3.0f, "%.2f")) core::SetWeatherCloudOverride(true, cloud); }
+        ImGui::EndDisabled();
+
+        if (ImGui::Checkbox(T("override wind"), &windOn)) core::SetWeatherWindOverride(windOn, wind);
+        if (windOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("wind multiplier"), &wind, 0.0f, 3.0f, "x%.2f")) core::SetWeatherWindOverride(true, wind); }
+
+        if (ImGui::Button(T("use native weather"))) core::ResetWeatherControl();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Disable every World Builder weather override and return control to the game."));
+        if (!compact) ImGui::SameLine();
+        ImGui::TextDisabled(T("Weather values are applied to the game's composed environment each update."));
     }
 
     static void DrawBrowser(const PosInfo& p, bool havePos) {
@@ -1604,7 +1631,7 @@ namespace editor {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
             if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS "   PLACE   "), ImVec2(150 * ui, 0))) StartPlaceNew(p, havePos);
             ImGui::PopStyleColor(2);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("puts the object in front of you and lets you move it with the placement keys or the mouse gizmo; %s drops it (double-click on a row or card does the same)"), core::KeyName(core::g_placeKeys[core::PK_DROP]));
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("puts the object in front of you and lets you move it with the mouse gizmo"));
             ImGui::SameLine(); if (ImGui::SmallButton(T("spawn only"))) SpawnSelected(p);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("drops the object in front of you without the placement mode (offset, yaw and scale from the spawn options)"));
             ImGui::EndDisabled();
@@ -1837,7 +1864,7 @@ namespace editor {
         ImGui::Checkbox(T("snap"), &g_snap); SameLineOrWrap(compact, 80);
         ImGui::SetNextItemWidth(80); ComboT("##snappos", &g_snapPosIdx, kSnapPosNames, 5); SameLineOrWrap(compact, 80);
         ImGui::SetNextItemWidth(80); ComboT("##snapyaw", &g_snapYawIdx, kSnapYawNames, 5); SameLineOrWrap(compact, 70);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("grid and angle steps for the placement mode (%s toggles while placing)"), core::KeyName(core::g_placeKeys[core::PK_SNAP]));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("grid and angle steps for the placement mode"));
         ImGui::SetNextItemWidth(70); DragFloatEdit("##rotstep", &g_rotationStep, 1.0f, 1.0f, 90.0f, "%.0f deg"); SameLineOrWrap(compact, 45);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("rotation step for Rotate - / Rotate +"));
         ImGui::BeginDisabled(g_undo.empty()); if (ImGui::SmallButton(T("Undo"))) Undo(); ImGui::EndDisabled(); SameLineOrWrap(compact, 45);
@@ -1964,7 +1991,7 @@ namespace editor {
             ImGui::Text(T("%d objects selected"), (int)g_sel.size()); ImGui::SameLine();
         }
         if (ImGui::Button(T(ICON_HAND " Grab"))) StartGrab(SelUids(), false, g_sel.size() == 1 ? ShortName(prim->prefab) : "selection");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("carry the selection: move it with the placement keys or the mouse gizmo, %s drops it, %s puts it back"), core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL]));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("carry the selection and edit it with the mouse gizmo"));
         SameLineOrWrap(compact, 65); ImGui::BeginDisabled(!core::FreeCamAvailable()); if (ImGui::Button(T("Focus"))) FocusSelection(); ImGui::EndDisabled();
         SameLineOrWrap(compact, 75); if (ImGui::Button(T("To ground"))) SnapSelToGround(); if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("drops the selected objects onto the surface below them (a sphere cast of the game's physics)"));
         SameLineOrWrap(compact, 85); if (ImGui::Button(T(ICON_COPY " Duplicate"))) { CopySel(); Paste(havePos); }
@@ -2398,20 +2425,40 @@ namespace editor {
         ImGui::EndDisabled();
         ImGui::SameLine(0, 3); DrawCameraViewTool();
         ImGui::TextDisabled(T("%s = %s   %s = hide"), core::KeyName(core::g_keyMode), T(g_cameraMode ? "exit camera" : (g_playMode ? "edit" : "camera")), core::KeyName(core::g_keyToggle));
-        const char* dockPages[2] = { ICON_MAGNIFYING_GLASS " Browser", ICON_CUBE " Scene" };
-        for (int i = 0; i < 2; ++i) {
-            if (i) ImGui::SameLine(0, 4);
-            const bool act = g_compactPage == i;   // decided once: the click below may change the page
+        struct DockPage { int id; const char* label; };
+        static const DockPage dockPages[] = {
+            { TabBrowser, ICON_MAGNIFYING_GLASS " Browser" },
+            { TabScene, ICON_CUBE " Scene" },
+            { TabNpcs, ICON_LOCATION_DOT " NPCs" },
+            { TabEnvironment, ICON_CLOCK_ROTATE_LEFT " Time & Weather" },
+        };
+        for (int i = 0; i < (int)(sizeof(dockPages) / sizeof(dockPages[0])); ++i) {
+            if (i && i != 2) ImGui::SameLine(0, 4);   // two compact rows: Browser/Scene, NPCs/Time & Weather
+            const bool act = g_compactPage == dockPages[i].id;   // decided once: the click below may change the page
             if (act) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
-            if (ImGui::SmallButton(TStable(dockPages[i]))) { g_compactPage = i; g_mainTab = i; }
+            if (ImGui::SmallButton(TStable(dockPages[i].label))) { g_compactPage = dockPages[i].id; g_mainTab = dockPages[i].id; }
             if (act) ImGui::PopStyleColor();
         }
-        if (g_compactPage == 1) {
+        if (g_compactPage == TabScene) {
             if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
             const int gp = core::GimmickPending();
             if (gp > 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), core::GimmickTemplateReady() ? T("%d interactive object(s) spawning...") : T("%d interactive object(s) waiting for a spawn template: walk a few meters"), gp);
             DrawScene(p, havePos, true);
             ProcessBrowserDrag();
+            ImGui::End();
+            if (g_playMode) ImGui::PopStyleVar();
+            return;
+        }
+        if (g_compactPage == TabNpcs) {
+            if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
+            DrawNpcs(p, havePos, true);
+            ImGui::End();
+            if (g_playMode) ImGui::PopStyleVar();
+            return;
+        }
+        if (g_compactPage == TabEnvironment) {
+            if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
+            DrawEnvironment(true);
             ImGui::End();
             if (g_playMode) ImGui::PopStyleVar();
             return;
@@ -2503,7 +2550,7 @@ namespace editor {
     static void DrawFocusHud() {
         if (!g_open && !g_place.active) return;
         ImGuiIO& io = ImGui::GetIO();
-        const bool modMouse = g_open ? !g_playMode : (g_place.active && g_place.mouse);
+        const bool modMouse = g_open ? !g_playMode : g_place.active;
         ImGui::SetNextWindowPos(ImVec2(10.0f, 8.0f), ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(0.75f);
         if (ImGui::Begin("##focushud", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
@@ -2511,8 +2558,8 @@ namespace editor {
             ImGui::TextColored(modMouse ? mod : game, T(modMouse ? "MOUSE: World Builder" : "MOUSE: game"));
             ImGui::SameLine(); ImGui::TextDisabled("  |  ");
             ImGui::SameLine(); ImGui::TextColored(g_cameraMode ? mod : game, T(g_cameraMode ? "KEYS: camera" : "KEYS: game"));
-            if (g_place.active) { ImGui::SameLine(); ImGui::TextColored(mod, T("  placement keys: object")); }
-            ImGui::SameLine(); ImGui::TextDisabled("     %s = %s", g_open ? core::KeyName(core::g_keyMode) : core::KeyName(core::g_placeKeys[core::PK_MOUSE]), g_cameraMode ? "exit camera mode" : (modMouse ? "give the mouse to the game" : "mouse back to World Builder"));
+            if (g_place.active) { ImGui::SameLine(); ImGui::TextColored(mod, T("  placement: mouse gizmo")); }
+            if (g_open) { ImGui::SameLine(); ImGui::TextDisabled("     %s = %s", core::KeyName(core::g_keyMode), T(g_cameraMode ? "exit camera mode" : "camera mode")); }
             if (g_open && !g_playMode && io.WantTextInput) { ImGui::SameLine(); ImGui::TextColored(mod, T("   typing: keys go to the text field")); }
         }
         ImGui::End();
@@ -2528,13 +2575,13 @@ namespace editor {
         PosInfo p{}; bool havePos = core::PlayerPosInfo(&p);
         DrawFocusHud();
         TrackFacing(p, havePos);
-        PlaceTick(p, havePos);                 // runs with the menu closed as well
+        PlaceTick();                           // runs with the menu closed as well
         PumpSnapJobs();
         PumpBrowserDropJobs();                 // a drop whose ground probe returns after the window was hidden still spawns
         if (g_place.active) DrawPlaceHud();
         if (g_place.active && (g_gizmo || MouseMode())) { const bool one = g_place.m.size() == 1; const CamFrame cf = CurrentCam();
             DrawGizmo(g_place.center, one ? WrapYaw(g_place.m[0].rot0.yaw + g_place.yaw) : g_place.yaw, one ? WrapYaw(g_place.m[0].rot0.pitch + g_place.pitch) : g_place.pitch, GizmoScreenSize(cf, g_place.center, g_place.radius), g_place.drag ? g_place.drag : g_place.hover); }
-        if (g_place.active && !g_open) ImGui::GetIO().MouseDrawCursor = g_place.mouse;
+        if (g_place.active && !g_open) ImGui::GetIO().MouseDrawCursor = true;
         DrawCalibrationMarker(p, havePos);
         if (!g_open) { if (g_cameraMode) StopCameraMode(); return; }
         if (g_numericEditId && g_numericEditLastSeenFrame >= 0 && ImGui::GetFrameCount() - g_numericEditLastSeenFrame > 1) CancelNumericEdit();
@@ -2567,7 +2614,15 @@ namespace editor {
             ImGui::TextWrapped(T("Fix: open the World Builder zip, copy the folder 'cdmodkit' from its bin64 folder into <game>\\bin64\\ next to cdmodkit.asi, then restart the game."));
             ImGui::EndChild(); ImGui::PopStyleColor();
         }
-        if (ImGui::SmallButton(T(ICON_COPY " dock"))) { g_compactPage = g_mainTab == 1 ? 1 : 0; g_compact = true; } if (ImGui::IsItemHovered()) ImGui::SetTooltip(T(g_mainTab == 1 ? "narrow side window: Scene with the same editing controls" : "narrow side window: search, cards and PLACE"));
+        if (ImGui::SmallButton(T(ICON_COPY " dock"))) {
+            g_compactPage = (g_mainTab == TabScene || g_mainTab == TabNpcs || g_mainTab == TabEnvironment) ? g_mainTab : TabBrowser;
+            g_compact = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T(
+            g_mainTab == TabScene ? "narrow side window: Scene with the same editing controls" :
+            g_mainTab == TabNpcs ? "narrow side window: NPC browser and spawning" :
+            g_mainTab == TabEnvironment ? "narrow side window: time and weather controls" :
+            "narrow side window: search, cards and PLACE"));
         ImGui::SameLine();
         {   // free-fly camera
             const bool fc = g_cameraMode;
@@ -2594,17 +2649,20 @@ namespace editor {
         }
         if (ImGui::BeginTabBar("tabs")) {
             bool inBrowser = false;
-            const ImGuiTabItemFlags browserFlags = g_selectMainTab && g_mainTab == 0 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
-            if (ImGui::BeginTabItem(TStable(ICON_MAGNIFYING_GLASS " Browser"), nullptr, browserFlags)) { inBrowser = true; g_mainTab = 0; DrawBrowser(p, havePos); ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem(TStable(ICON_LOCATION_DOT " NPCs"))) { DrawNpcs(p, havePos); ImGui::EndTabItem(); }
-            const ImGuiTabItemFlags sceneFlags = g_selectMainTab && g_mainTab == 1 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
-            if (ImGui::BeginTabItem(TStable(ICON_CUBE " Scene"), nullptr, sceneFlags)) { g_mainTab = 1; { const int gp = core::GimmickPending(); if (gp > 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), core::GimmickTemplateReady() ? T("%d interactive object(s) spawning...") : T("%d interactive object(s) waiting for a spawn template: walk a few meters"), gp); } DrawScene(p, havePos); ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem(TStable(ICON_CLOCK_ROTATE_LEFT " History"))) { g_mainTab = 6; DrawHistory(); ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem(TStable(ICON_FLOPPY_DISK " Project"))) { g_mainTab = 2; DrawProject(); ImGui::EndTabItem(); }
+            const ImGuiTabItemFlags browserFlags = g_selectMainTab && g_mainTab == TabBrowser ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+            if (ImGui::BeginTabItem(TStable(ICON_MAGNIFYING_GLASS " Browser"), nullptr, browserFlags)) { inBrowser = true; g_mainTab = TabBrowser; DrawBrowser(p, havePos); ImGui::EndTabItem(); }
+            const ImGuiTabItemFlags npcFlags = g_selectMainTab && g_mainTab == TabNpcs ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+            if (ImGui::BeginTabItem(TStable(ICON_LOCATION_DOT " NPCs"), nullptr, npcFlags)) { g_mainTab = TabNpcs; DrawNpcs(p, havePos); ImGui::EndTabItem(); }
+            const ImGuiTabItemFlags sceneFlags = g_selectMainTab && g_mainTab == TabScene ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+            if (ImGui::BeginTabItem(TStable(ICON_CUBE " Scene"), nullptr, sceneFlags)) { g_mainTab = TabScene; { const int gp = core::GimmickPending(); if (gp > 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), core::GimmickTemplateReady() ? T("%d interactive object(s) spawning...") : T("%d interactive object(s) waiting for a spawn template: walk a few meters"), gp); } DrawScene(p, havePos); ImGui::EndTabItem(); }
+            const ImGuiTabItemFlags environmentFlags = g_selectMainTab && g_mainTab == TabEnvironment ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+            if (ImGui::BeginTabItem(TStable(ICON_CLOCK_ROTATE_LEFT " Time & Weather"), nullptr, environmentFlags)) { g_mainTab = TabEnvironment; DrawEnvironment(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem(TStable(ICON_CLOCK_ROTATE_LEFT " History"))) { g_mainTab = TabHistory; DrawHistory(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem(TStable(ICON_FLOPPY_DISK " Project"))) { g_mainTab = TabProject; DrawProject(); ImGui::EndTabItem(); }
             static const bool s_showTravel = false;   // hidden until the game's own teleport path is found
-            if (s_showTravel && ImGui::BeginTabItem(TStable(ICON_LOCATION_CROSSHAIRS " Travel"))) { g_mainTab = 3; DrawTravel(p, havePos); ImGui::EndTabItem(); }
+            if (s_showTravel && ImGui::BeginTabItem(TStable(ICON_LOCATION_CROSSHAIRS " Travel"))) { g_mainTab = TabTravel; DrawTravel(p, havePos); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(TStable(ICON_LIST " Settings"))) {
-                g_mainTab = 4;
+                g_mainTab = TabSettings;
                 int languageCount = 0; const auto* languageOptions = i18n::Languages(&languageCount); int languageIndex = 0;
                 for (int i = 0; i < languageCount; ++i) if (_stricmp(languageOptions[i].id, i18n::Preference()) == 0) { languageIndex = i; break; }
                 // always also says "Language" in English: someone who picked a language they cannot read must find this combo again
@@ -2637,30 +2695,18 @@ namespace editor {
                 { float live = 0; bool haveLive = core::CameraFov(&live);
                   if (ImGui::Checkbox(T("read the field of view from the game"), &core::g_fovAuto)) core::SaveSettings();
                   // the renderer's projection is the first source (LiveCam); the camera object's own field is only the fallback
-                  float rm00 = 0, rm11 = 0; Vec3 rp; const bool rc = core::RenderCamera(&rp, nullptr, nullptr, nullptr, &rm00, &rm11, core::g_camLag);
+                  float rm00 = 0, rm11 = 0; Vec3 rp; const bool rc = core::RenderCamera(&rp, nullptr, nullptr, nullptr, &rm00, &rm11);
                   ImGui::SameLine();
                   if (rc) ImGui::TextDisabled(T("(game says %.1f deg)"), 2.0f * atanf(1.0f / rm11) * 57.2958f);
                   else if (haveLive) ImGui::TextDisabled(T("(game says %.1f deg)"), live);
                   else ImGui::TextDisabled(T("(not available, using the manual value)")); }
                 ImGui::SetNextItemWidth(220); SliderFloatEdit(T("manual field of view"), &core::g_fovDeg, 20.0f, 120.0f, "%.1f deg"); if (ImGui::IsItemDeactivatedAfterEdit() || NumericEditEnded(T("manual field of view"))) core::SaveSettings();
                 ImGui::SameLine(); if (ImGui::Checkbox(T("mirror horizontally"), &core::g_camMirror)) core::SaveSettings();
-                { const int nb = core::RenderCameraBlocks(); float m00 = 0, m11 = 0; Vec3 d0;
-                  const bool haveRc = core::RenderCamera(&d0, nullptr, nullptr, nullptr, &m00, &m11, core::g_camLag);
-                  if (haveRc && core::RenderCameraNative()) ImGui::TextDisabled(T("render camera: the renderer's own camera, live field of view %.1f deg, aspect %.3f (the copy setting below is not needed)"), 2.0f * atanf(1.0f / m11) * 57.2958f, m11 / m00);
-                  else if (haveRc && nb) ImGui::TextDisabled(T("render camera: %d copies tracked, live field of view %.1f deg, aspect %.3f"), nb, 2.0f * atanf(1.0f / m11) * 57.2958f, m11 / m00);
-                  else { ImGui::TextDisabled(T("render camera: not found yet (camera object + field of view setting in use)")); ImGui::SameLine(); if (ImGui::SmallButton(T("search now"))) core::FindRenderCamera(); } }
-                ImGui::SetNextItemWidth(220); if (ImGui::SliderInt(T("camera copy in flight (0 = newest)"), &core::g_camLag, 0, 4)) core::SaveSettings();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("several frames are in flight between the game and the screen. Pan the camera with an object selected: if the outline runs ahead of the object, raise this; if it lags behind, lower it"));
-                if (ImGui::Button(T("find render camera (hold the camera still, ~20 s)"))) { core::ViewScan(); Note(T("view scan started: do not move the camera until the log says done")); }
-                ImGui::SameLine();
+                { float m00 = 0, m11 = 0; Vec3 d0;
+                  const bool haveRc = core::RenderCamera(&d0, nullptr, nullptr, nullptr, &m00, &m11);
+                  if (haveRc) ImGui::TextDisabled(T("render camera: live field of view %.1f deg, aspect %.3f"), 2.0f * atanf(1.0f / m11) * 57.2958f, m11 / m00);
+                  else ImGui::TextDisabled(T("render camera: not available, using the camera object fallback")); }
                 if (ImGui::Button(T("fov trace (12 s, zoom in and out)"))) { core::FovTrace(12); Note(T("fovtrace started: close the menu and zoom the camera in and out for 12 s")); }
-                ImGui::TextDisabled(T("Pick keys the game does not use."));
-                if (ImGui::CollapsingHeader(TStable("Placement keys (numpad by default; every action can be rebound, e.g. for keyboards without a numpad)"))) {
-                    ImGui::Columns(2, nullptr, false);
-                    for (int i = 0; i < core::PK_COUNT; i++) { ImGui::PushID(i); keyCombo(core::PlaceKeyLabel(i), &core::g_placeKeys[i]); ImGui::PopID(); if (i == core::PK_COUNT / 2) ImGui::NextColumn(); }
-                    ImGui::Columns(1);
-                    if (ImGui::SmallButton(T("reset to numpad defaults"))) { const int d[core::PK_COUNT] = { VK_NUMPAD8, VK_NUMPAD2, VK_NUMPAD4, VK_NUMPAD6, VK_NUMPAD9, VK_NUMPAD3, VK_NUMPAD7, VK_NUMPAD1, VK_ADD, VK_SUBTRACT, VK_NUMPAD0, VK_DECIMAL, VK_NUMPAD5, VK_MULTIPLY, VK_DIVIDE, VK_RETURN, VK_BACK, VK_SHIFT }; memcpy(core::g_placeKeys, d, sizeof d); core::SaveSettings(); }
-                }
                 ImGui::Separator();
                 if (ImGui::Checkbox(T("console window (log output; applies on the next start)"), &core::g_showConsole)) core::SaveSettings();
                 ImGui::Separator();
@@ -2689,7 +2735,7 @@ namespace editor {
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem(TStable(ICON_LIST " Log"))) {
-                g_mainTab = 5;
+                g_mainTab = TabLog;
                 if (ImGui::CollapsingHeader(TStable("Developer: how moves are applied"))) {
                     ImGui::Checkbox(T("live drag in the details pane"), &g_live); ImGui::SameLine();
                     ImGui::Checkbox(T("re-create on move"), &core::g_recreateOnMove); ImGui::SameLine();

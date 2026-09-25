@@ -34,7 +34,6 @@ bool      g_menuOpen = false;
 bool      g_uiWantsMouse = false;
 bool      g_uiWantsKeyboard = false;
 bool      g_uiTextInput = false, g_uiMouseOverUi = false;
-bool      g_placing = false;
 static HMODULE g_self = nullptr;
 static FILE*   g_log = nullptr;
 static bool    g_console = false;
@@ -629,6 +628,7 @@ static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uin
     const uint64_t r = g_origPump(a1, a2, a3, a4, a5, a6, a7, a8);
     static bool s_filter = false; if (!s_filter) { s_filter = true; InstallCrashFilter("on the first game tick"); }
     PumpJobs();
+    EnvironmentTick();
     return r;
 }
 
@@ -1964,14 +1964,14 @@ static uintptr_t FindVtableBySlots(uintptr_t f1, uintptr_t f2) {   // read-only 
 }
 static void ResolveNativeCamera() {
     int n = 0; const uintptr_t ref = FindPatternCount("48 8B 05 ?? ?? ?? ?? C5 FB 10 B0 C8 00 00 00 8B 98 D0 00 00 00", &n);
-    if (!ref || n != 1) { Log("[rendercam] native camera: global load %d matches, using the copy scan", n); return; }
+    if (!ref || n != 1) { Log("[rendercam] native camera: global load %d matches, renderer camera unavailable", n); return; }
     int32_t disp = 0; memcpy(&disp, (const void*)(ref + 3), 4); const uintptr_t global = ref + 7 + disp;
     int n1 = 0, n2 = 0;
     const uintptr_t f1 = FindPatternCount("48 8B C4 48 89 58 10 48 89 70 18 41 54 41 56 41 57 48 81 EC 10 01 00 00 8B B1 A8 02 00 00 4D 8B ?? 4D 8B ?? 4C 8B F2 48 8B D9 85 F6", &n1);
     const uintptr_t f2 = FindPatternCount("40 53 48 83 EC 20 48 8B 01 48 8B DA FF 50 68 4C 8B C8 48 63 48 08 85 C9 75 08 32 C0 48 83 C4 20 5B C3 48 89 7C 24 30 41 B0 01 33 FF 4C 8B D1 C5 F8 57 C0 48 83 F9 04", &n2);
-    if (!f1 || !f2 || n1 != 1 || n2 != 1) { Log("[rendercam] native camera: slot fingerprints %d / %d matches, using the copy scan", n1, n2); return; }
+    if (!f1 || !f2 || n1 != 1 || n2 != 1) { Log("[rendercam] native camera: slot fingerprints %d / %d matches, renderer camera unavailable", n1, n2); return; }
     const uintptr_t vt = FindVtableBySlots(f1, f2);
-    if (!vt) { Log("[rendercam] native camera: no unique vtable with both slots, using the copy scan"); return; }
+    if (!vt) { Log("[rendercam] native camera: no unique vtable with both slots, renderer camera unavailable"); return; }
     g_natCamGlobal = global; g_natCamVt = vt;
     Log("resolved %-20s rva 0x%llx (global rva 0x%llx, vtable rva 0x%llx)", "native render camera", (unsigned long long)(ref - g_base), (unsigned long long)(global - g_base), (unsigned long long)(vt - g_base));
 }
@@ -1979,7 +1979,7 @@ uintptr_t NativeCameraObject() {
     uintptr_t cam = 0, vt = 0;
     return g_natCamGlobal && ReadPtr(g_natCamGlobal, &cam) && cam && ReadPtr(cam, &vt) && vt == g_natCamVt ? cam : 0;
 }
-bool NativeRenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11) {
+bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11) {
     if (!g_natCamGlobal) return false;
     uintptr_t cam = 0, vt = 0, src = 0;
     if (!ReadPtr(g_natCamGlobal, &cam) || !cam || !ReadPtr(cam, &vt) || vt != g_natCamVt || !ReadPtr(cam + 0x428, &src) || !src) return false;
@@ -2573,12 +2573,12 @@ bool CameraPose(Vec3* fwd, Vec3* pos) {
     if (pos && (!std::isfinite(pos->x) || fabsf(pos->x) > 1e6f)) return false;
     return true;
 }
-// fovtrace / viewscan / camtrace live in diag.cpp (console-only reverse-engineering aids)
+// fovtrace / camtrace live in diag.cpp (console-only reverse-engineering aids)
 
 
-// ---- configurable hotkeys (bin64\cdmodkit\settings.txt: key_toggle=INSERT, key_mode=HOME, key_pos=F9) ----
+// ---- configurable hotkeys (bin64\cdmodkit\settings.txt: key_toggle=INSERT, key_mode=HOME) ----
 int g_keyToggle = VK_INSERT, g_keyMode = VK_HOME; bool g_showConsole = false;
-float g_fovDeg = 55.0f; bool g_camMirror = false; bool g_fovAuto = true; int g_camLag = 0;
+float g_fovDeg = 55.0f; bool g_camMirror = false; bool g_fovAuto = true;
 struct KeyEntry { const char* name; int vk; };
 static const KeyEntry kKeyNames[] = {
     { "INSERT", VK_INSERT }, { "HOME", VK_HOME }, { "END", VK_END }, { "DELETE", VK_DELETE }, { "PAGEUP", VK_PRIOR }, { "PAGEDOWN", VK_NEXT },
@@ -2592,12 +2592,6 @@ static const KeyEntry kKeyNames[] = {
     { "N", 'N' }, { "O", 'O' }, { "P", 'P' }, { "Q", 'Q' }, { "R", 'R' }, { "S", 'S' }, { "T", 'T' }, { "U", 'U' }, { "V", 'V' }, { "W", 'W' }, { "X", 'X' }, { "Y", 'Y' }, { "Z", 'Z' },
     { "0", '0' }, { "1", '1' }, { "2", '2' }, { "3", '3' }, { "4", '4' }, { "5", '5' }, { "6", '6' }, { "7", '7' }, { "8", '8' }, { "9", '9' },
     { nullptr, 0 } };
-int g_placeKeys[PK_COUNT] = { VK_NUMPAD8, VK_NUMPAD2, VK_NUMPAD4, VK_NUMPAD6, VK_NUMPAD9, VK_NUMPAD3, VK_NUMPAD7, VK_NUMPAD1, VK_ADD, VK_SUBTRACT, VK_NUMPAD0, VK_DECIMAL, VK_NUMPAD5, VK_MULTIPLY, VK_DIVIDE, VK_RETURN, VK_BACK, VK_SHIFT };
-static const char* kPlaceKeyIds[PK_COUNT] = { "move_fwd", "move_back", "move_left", "move_right", "move_up", "move_down", "rotate_left", "rotate_right", "scale_up", "scale_down", "fetch", "snap", "mouse", "level", "ground", "drop", "cancel", "fast" };
-static const char* kPlaceKeyLabels[PK_COUNT] = { "move away from me", "move closer", "move left", "move right", "move up", "move down", "rotate left", "rotate right", "scale up", "scale down", "bring it in front of me", "snapping on / off", "mouse to gizmo / camera", "level (remove the tilt)", "snap to ground", "drop", "cancel / put back", "fast (hold)" };
-const char* PlaceKeyId(int i) { return (i >= 0 && i < PK_COUNT) ? kPlaceKeyIds[i] : ""; }
-const char* PlaceKeyLabel(int i) { return (i >= 0 && i < PK_COUNT) ? kPlaceKeyLabels[i] : ""; }
-void ApplyPlaceKeys() { input::SetPlaceVks(g_placeKeys, PK_COUNT); }
 int KeyCount() { int n = 0; while (kKeyNames[n].name) n++; return n; }
 const char* KeyNameAt(int i) { return kKeyNames[i].name; }
 int KeyVkAt(int i) { return kKeyNames[i].vk; }
@@ -2622,7 +2616,6 @@ static void LoadSettings() {
         if (k == "preview_quality") { thumbgen::SetQuality(atoi(v.c_str())); continue; }
         if (k == "freecam_speed") { const float s = (float)atof(v.c_str()); if (s >= 0.5f && s <= 200.0f) g_fcSpeed = s; continue; }
         if (k == "freecam_sens") { const float s = (float)atof(v.c_str()); if (s >= 0.01f && s <= 2.0f) g_fcSens = s; continue; }
-        if (k == "camlag") { const int c = atoi(v.c_str()); g_camLag = c < 0 ? 0 : c > 4 ? 4 : c; continue; }
         // manual fallback for snap to ground if the collector vtable cannot be resolved after a game patch; deliberately
         // never written back by SaveSettings, otherwise a stale value would outrank the signature on the next build
         if (k == "probe_vtable") { g_probeVtableOverride = (uintptr_t)strtoull(v.c_str(), nullptr, 0); continue; }
@@ -2630,23 +2623,19 @@ static void LoadSettings() {
         int vk = KeyFromName(v);
         if (!vk) continue;
         if (k == "key_toggle") g_keyToggle = vk; else if (k == "key_mode") g_keyMode = vk;
-        else if (k.rfind("key_", 0) == 0) { for (int i = 0; i < PK_COUNT; i++) if (k == std::string("key_") + kPlaceKeyIds[i]) g_placeKeys[i] = vk; }
     }
-    ApplyPlaceKeys();
     Log("settings: toggle %s, mode %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off");
 }
 void SaveSettings() {
     FILE* f = fopen(SettingsPath().c_str(), "w"); if (!f) return;
     fprintf(f, "# World Builder hotkeys. Names: INSERT HOME END DELETE PAGEUP PAGEDOWN F1..F12 SCROLLLOCK PAUSE BACKQUOTE MINUS EQUALS BACKSLASH NUMPAD* NUMPAD/ NUMLOCK CAPSLOCK TAB or a single letter/digit\n");
-    fprintf(f, "key_toggle=%s\nkey_mode=%s\n# console=0 hides the console window (log file only)\nconsole=%d\n# projection for the gizmo: vertical field of view in degrees and horizontal mirror (calibrate in the Settings tab)\nfov=%.1f\nmirror=%d\n# fovauto=1 reads the field of view from the game's camera object (fov= is the fallback)\nfovauto=%d\n# camlag: frames the overlay camera trails the game camera (0..4). Outlines run ahead while panning: raise it; they lag: lower it\ncamlag=%d\n", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? 1 : 0, g_fovDeg, g_camMirror ? 1 : 0, g_fovAuto ? 1 : 0, g_camLag);
+    fprintf(f, "key_toggle=%s\nkey_mode=%s\n# console=0 hides the console window (log file only)\nconsole=%d\n# projection for the gizmo: vertical field of view in degrees and horizontal mirror (calibrate in the Settings tab)\nfov=%.1f\nmirror=%d\n# fovauto=1 reads the field of view from the game's renderer camera (fov= is the fallback)\nfovauto=%d\n", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? 1 : 0, g_fovDeg, g_camMirror ? 1 : 0, g_fovAuto ? 1 : 0);
     fprintf(f, "# preview_quality: 0 base colour, 1 + dye colours, 2 + normal maps, 3 + specular/emissive. Lower renders the background pass faster\npreview_quality=%d\n", thumbgen::Quality());
     fprintf(f, "# gimmick_spawn=0: place gimmick prefabs (/object/cd_gimmick/...) as plain objects instead of through the game spawn path\ngimmick_spawn=%d\n", g_gimmickSpawn ? 1 : 0);
-    fprintf(f, "# placement keys (any key name from the list above, NUMPAD0..9, NUMPAD+ NUMPAD- NUMPAD. NUMPAD* NUMPAD/, ENTER, BACKSPACE, SPACE, UP/DOWN/LEFT/RIGHT, SHIFT/CTRL/ALT for 'fast')\n");
-    for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
     fprintf(f, "# free camera (camera mode, key_mode in the editor): speed in m/s, mouse sensitivity in degrees per count\nfreecam_speed=%.1f\nfreecam_sens=%.3f\n", g_fcSpeed, g_fcSens);
     fprintf(f, "# Interface language: auto, en, zh-CN, zh-TW, de, fr, ko, ja, es, pt-BR, ru, tr\nlanguage=%s\n", i18n::Preference());
     fprintf(f, "# HTTP API for programs on this PC (127.0.0.1 only, see HTTP_API.md): http_api=1 runs it, http_port= its port. The Settings tab switches it at once\nhttp_api=%d\nhttp_port=%d\n", g_httpEnabled ? 1 : 0, g_httpPort);
-    ApplyPlaceKeys(); fclose(f);
+    fclose(f);
     Log("settings saved: toggle %s, mode %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off");
 }
 
@@ -2735,6 +2724,10 @@ static bool HookFn(void* target, void* detour, void** orig, const char* name) {
     }
     return false;
 }
+
+bool InstallInternalHook(void* target, void* detour, void** original, const char* name) {
+    return HookFn(target, detour, original, name);
+}
 // MinHook needs a free page within 2 GB of the hooked game function for its trampolines. The game fills the address space
 // around its 385 MB image during the first seconds; by the time the signatures are resolved (~9 s) there may be no gap left
 // and every MH_CreateHook returns MH_ERROR_MEMORY_ALLOC (seen twice). So the plugin reserves such a gap at attach, before
@@ -2783,9 +2776,10 @@ static DWORD WINAPI InitThread(LPVOID) {
             InstallVtableTracer(2, ".?AVServerField@pa@@", "ServerField", g_traceHooks ? 39 : 10);
             if (g_traceHooks) { InstallVtableTracer(0, ".?AVServerSyncSceneObjectManager@pa@@", "ServerSyncSceneObjectManager", 19); InstallVtableTracer(1, ".?AVSceneObjectServer@pa@@", "SceneObjectServer", 156); InstallVtableTracer(3, ".?AVServerNormalInGameActor@pa@@", "ServerNormalInGameActor", 145); InstallVtableTracer(4, ".?AVTrocTrSpawnCharacterCheatReq@pa@@", "TrocTrSpawnCharacterCheatReq", 3); }
         }   // ServerField: which slots run per tick (a place to run our own spawns) and which run on a pickup (removal)   // research: how the server makes and fills its scene objects
-        ResolveNativeCamera();   // gizmo projection: the renderer's own camera, else the copy scan in diag.cpp
+        ResolveNativeCamera();   // gizmo projection and free camera use the renderer's own camera
         ResolveSetCamPose(); if (kRva_SetCamPose && g_natCamGlobal) { void* t14 = (void*)(g_base + kRva_SetCamPose); HookFn(t14, (void*)HookSetCamPose, (void**)&g_origSetCamPose, "camera pose (free camera)"); }
         InstallNpcSpawn();   // NPC spawn research: the game's spawn-character cheat request
+        EnvironmentInstall(); // optional time-of-day / weather bridge; failures do not affect the editor or spawning
         if (g_traceHooks && kRva_UuidLookup) { void* t10 = (void*)(g_base + kRva_UuidLookup); HookFn(t10, (void*)HookUuidLookup, (void**)&g_origUuidLookup, "uuid lookup (trace)"); }
         if (kRva_SoServerCreate) { void* t9 = (void*)(g_base + kRva_SoServerCreate); HookFn(t9, (void*)HookSoServerCreate, (void**)&g_origSoServerCreate, "SceneObjectServer new (trace)"); }
         if (kRva_ActorCtor) { void* t13 = (void*)(g_base + kRva_ActorCtor); HookFn(t13, (void*)HookActorCtor, (void**)&g_origActorCtor, "actor constructor (trace)"); }

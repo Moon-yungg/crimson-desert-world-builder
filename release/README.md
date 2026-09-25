@@ -50,28 +50,25 @@ Zum Neuaufbau einfach den Ordner `thumbs` und die Datei `prefab_size.tsv` lösch
 - **Kachelansicht:** Knopf "cards" links neben der Suche zeigt die Treffer als Kacheln mit Vorschaubild (Größe per Regler),
   gleiche Filter wie die Liste. Die Vorschauen werden mit den echten Texturen des Spiels gerendert; beim ersten Start mit
   dieser Version werden vorhandene Bilder im Hintergrund einmal neu erzeugt, sichtbare Kacheln zuerst.
-- **Dock:** Knopf "dock" oben im Editor schaltet auf ein schmales Seitenfenster mit Suche, ein bis vier Spalten Kacheln und PLACE.
-  Es bleibt beim Platzieren offen, "full editor" schaltet zurück.
+- **Dock:** Knopf "dock" oben im Editor schaltet auf ein schmales Seitenfenster. Dort kannst du zwischen Browser, Scene,
+  NPCs sowie Time & Weather wechseln; "full editor" schaltet zurück.
 - **Anklicken:** Im Edit-Modus wählt ein Klick auf ein platziertes Objekt es aus (Strg fügt hinzu), Doppelklick greift es.
   Ausgewählte Objekte bekommen einen orangen Rahmen.
-- **Tasten:** Alle Platzierungstasten sind im Tab "Settings" oder in der settings.txt (key_move_fwd= ...) frei belegbar,
-  Numpad ist nur die Vorgabe. "fast" kann Shift, Strg oder Alt sein.
-- **Snap to ground:** Numpad / setzt das getragene Objekt auf die Fläche darunter,
-  "To ground" im Scene-Tab die Auswahl. Nutzt die Bodenprobe der Spielphysik.
-- **Place** (Browser) bzw. **Grab** (Scene): das Menü schließt sich, das Objekt erscheint vor der Figur (Abstand nach Objektgröße)
-  und bleibt dort stehen. Du kannst frei herumlaufen und es mit dem Numpad verschieben, relativ zu deiner Position:
-  8/2 weg/näher, 4/6 links/rechts, 9/3 hoch/runter, 7/1 drehen, +/- Größe, 0 holt es wieder vor dich, Shift = schnell.
-  **Numpad 5** gibt die Maus an World Builder: am Objekt erscheint ein Gizmo. Pfeile ziehen verschieben entlang der Achsen,
-  der Mittelpunkt schiebt über den Boden, die Würfel skalieren, der grüne Ring dreht, der rote und der blaue Ring kippen das Objekt
-  (Pitch/Roll). **Numpad *** stellt es wieder gerade, Numpad 5 gibt die Maus an die Kamera zurück. Numpad-Punkt schaltet Snap.
-  Das Objekt bleibt stehen, sobald du etwas Neues platzierst, ein anderes Objekt anklickst oder ins Leere doppelklickst (**Enter** geht auch); **Rücktaste** bricht ab (bei Grab springt das Objekt zurück). "Vor der Figur" ist die letzte Laufrichtung.
+- **Tasten:** Nur die Hotkeys für Editor und Kameramodus sind noch konfigurierbar. Die Objektplatzierung benutzt keinen eigenen
+  Tastensatz mehr, sondern das Maus-Gizmo.
+- **Snap to ground:** "To ground" im Platzierungs-HUD oder im Scene-Tab setzt Objekte auf die Fläche darunter.
+  Nutzt die Bodenprobe der Spielphysik.
+- **Place** (Browser) bzw. **Grab** (Scene): das Objekt erscheint vor der Figur bzw. Kamera und das Maus-Gizmo ist sofort aktiv.
+  Pfeile verschieben entlang der Achsen, der Mittelpunkt schiebt über den Boden, die Würfel skalieren, der grüne Ring dreht und
+  der rote bzw. blaue Ring kippt das Objekt (Pitch/Roll). Im Platzierungs-HUD stehen Drop, Cancel, To ground, level und Snap bereit.
+  Das Objekt bleibt außerdem stehen, sobald du etwas Neues platzierst, ein anderes Objekt anklickst oder ins Leere doppelklickst.
 - **Linie / Kreis** (Browser, unten): setzt N Kopien des gewählten Prefabs in einer Reihe oder auf einem Kreis vor dir ab, als Gruppe,
   und übergibt sie dem Platzierungsmodus. Ausrichtung wählbar (fest, entlang/nach innen, nach außen).
 - **Scene:** Objekte anklicken (Strg+Klick mehrere, Umschalt+Klick Bereich, Strg+A alle). Gruppieren mit Strg+G oder "Group",
   eine Gruppe wird beim Anklicken als Ganzes ausgewählt. "Grab" trägt die ganze Auswahl, gedreht wird um den gemeinsamen Mittelpunkt.
   Strg+Z / Strg+Y machen Spawnen, Verschieben und Löschen rückgängig bzw. wieder. Strg+C / Strg+V kopieren die Auswahl mit Ausrichtung
-  und setzen die Kopie vor dir ab (Platzierungsmodus), Entf löscht. "snap" schaltet Raster und Winkelschritte für den Platzierungsmodus
-  ein (Numpad-Punkt schaltet dort um). Einzelnes Objekt: Position/Yaw/Neigung/Scale ziehen, "level" nimmt die Neigung raus. Mit "live" folgt das Objekt sofort, beim Loslassen
+  und setzen die Kopie vor dir ab (Platzierungsmodus), Entf löscht. "snap" schaltet Raster und Winkelschritte für das Maus-Gizmo
+  ein. Einzelnes Objekt: Position/Yaw/Neigung/Scale ziehen, "level" nimmt die Neigung raus. Mit "live" folgt das Objekt sofort, beim Loslassen
   wird die Kollision nachgezogen (bei Yaw/Scale-Änderung wird das Objekt dafür kurz neu erzeugt). "Delete" entfernt es, "Duplicate" kopiert es.
 - **Project:** Aufbau unter einem Namen speichern/laden (`bin64\cdmodkit\projects\*.cdproj`, absolute Weltkoordinaten, Gruppen
   bleiben erhalten), optional Autoload beim Spielstart – beliebig viele Projekte gleichzeitig (Häkchen pro Zeile; die Liste steht in
@@ -107,9 +104,24 @@ Die Figuren entstehen über die Spawn-Anfrage des Spiels selbst und sind danach 
 kämpfen, fliehen und verschwinden nach den Regeln des Spiels. Feindliche Figuren greifen an. Deshalb stehen sie nicht in der
 Szenenliste, lassen sich nicht verschieben oder rückgängig machen und werden nicht in Projekten gespeichert.
 
+Der NPC-Browser funktioniert auch im Dock. Dort wird die Trefferliste automatisch als kompakte Kachelansicht gezeigt; Suche,
+Kategorie, Abstand, Anzahl und SPAWN bleiben verfügbar.
+
 Nach dem Laden eines Spielstands zeigt der Tab "walk a few steps first", bis du dich kurz bewegt hast: Die Anfrage braucht
 die Server-Figur deines Charakters, und die liefert das Spiel beim Laufen. Ein Spiel-Update kann den Weg blockieren; dann sagt
 der Tab das, alles andere läuft weiter.
+
+## Zeit und Wetter
+
+Der Tab **Time & Weather** steuert die visuelle Tageszeit und grundlegende Wetterwerte. Die Uhrzeit lässt sich frei einstellen
+oder mit 06:00, 12:00, 18:00 und 00:00 schnell setzen. **freeze time (lighting only)** hält die visuelle Tageszeit und damit
+Sonne/Himmel/Beleuchtung fest, pausiert aber nicht das Spiel: NPCs, Physik, Kampf und andere Simulation laufen weiter. Mit
+**use native time** übernimmt wieder der normale Zeitverlauf des Spiels.
+
+Für das Wetter gibt es Clear Sky sowie optionale Overrides für Regen, Schnee, Wolkenmenge und Wind. Schnee wird nur angeboten,
+wenn neben der Wettertabelle auch die Partikel-Steuerung des Spiels sicher aufgelöst wurde. **use native weather** schaltet alle
+World-Builder-Wettervorgaben wieder ab. Zeit und Wetter sind auch im Dock verfügbar. Die benötigten Spielpfade werden beim Start
+per Signatur aufgelöst; wenn ein Patch sie verändert, wird nur der betroffene Bereich deaktiviert.
 
 ## Freie Kamera
 

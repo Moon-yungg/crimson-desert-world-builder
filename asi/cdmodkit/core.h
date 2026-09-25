@@ -22,7 +22,6 @@ namespace core {
     extern bool      g_menuOpen;      // set by the editor UI
     extern bool      g_uiWantsMouse;  // cursor is over a World Builder window (ImGui WantCaptureMouse), updated every frame
     extern bool      g_uiWantsKeyboard; // a text field is active (ImGui WantTextInput)
-    extern bool      g_placing;         // placement mode: arrow/numpad/Enter/Backspace go to World Builder, everything else to the game
 
     void Log(const char* fmt, ...);
     std::string ModDir();             // bin64\cdmodkit
@@ -39,16 +38,11 @@ namespace core {
     bool CameraPose(Vec3* fwd, Vec3* pos);     // horizontal view direction (local +Z of the camera object) and world position of the active camera
     bool CameraBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd);   // full camera frame from the camera object's quaternion (fwd = local +Z, sign applied by the editor)
     extern float g_fovDeg; extern bool g_camMirror; extern bool g_fovAuto;   // projection settings (settings.txt fov=, mirror=, fovauto=)
-    extern int g_camLag;                                                     // settings.txt camlag=: frames the overlay camera trails the game camera (the game simulates ahead of the frame on screen)
     bool CameraFov(float* deg);                // live vertical field of view read from the camera object (PhotoCamera +0x1DC), false if implausible
-    void ViewScan();                          // logs every copy of the camera basis in memory (view matrices) and nearby projection blocks
-    // the view + projection the renderer really uses (found by a memory scan, read every frame); rank 0 = newest copy in flight
-    bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11, int rank);
-    bool RenderCameraNative();                // the last RenderCamera() answer came from the renderer's camera object (no copy guessing, rank ignored)
-    void FindRenderCamera();
+    // the view + projection the renderer really uses through the renderer's camera object
+    bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11);
     void ResearchGimmickSpawn(uint32_t gimmickKey, Vec3 world, float yawDeg, float scale, int reason);   // research: template-free spawn through the game's save-data builder
-    void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object                  // (re)starts the background scan; RenderCamera() does this itself when it has nothing
-    int  RenderCameraBlocks();                // how many copies are currently tracked (0 = falling back to the camera object + fov setting)
+    void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)
     struct GimmickCapInfo { int id; uintptr_t caller; uint32_t k1, k2; Vec3 pos; unsigned long ageMs; char name[96]; char path[200]; };
     int  GimmickCaptureList(GimmickCapInfo* out, int max);   // newest first
@@ -114,14 +108,35 @@ namespace core {
     void FreeCamTurn(float dyaw, float dpitch);  // degrees, as the mouse would (tests without a mouse)
     extern volatile bool g_fcHoldMove;          // editor: no key movement now (context menu open, a field being edited)
     extern bool g_showConsole;                  // settings.txt console=0 hides the console window (takes effect on the next start)
+
+    // Environment controls. These are optional runtime-resolved features: when a
+    // game patch moves the relevant code, TimeControlAvailable/WeatherControlAvailable
+    // return false and the editor disables only that part of the UI.
+    bool TimeControlAvailable();
+    bool TimeHour(float* hour);                 // current visual time of day, 0..24
+    float TimeTargetHour();                     // last hour requested by World Builder
+    bool TimeFrozen();                          // freezes visual time / lighting, not gameplay
+    void SetTimeHour(float hour);               // jump visual time; native progression continues unless frozen
+    void SetTimeFrozen(bool frozen);
+    void ResetTimeControl();                    // restore the game's native time limits / progression
+
+    bool WeatherControlAvailable();
+    bool WeatherSnowEffectsAvailable();          // snow particles can be started/stopped, not just the table value
+    bool WeatherClearSky();
+    void SetWeatherClearSky(bool enabled);
+    bool WeatherRainOverride(float* value);     // value 0..1; return true when override is active
+    bool WeatherSnowOverride(float* value);     // value 0..1; particle bridge must also be available
+    bool WeatherCloudOverride(float* value);    // direct cloud amount 0..3
+    bool WeatherWindOverride(float* multiplier);// native wind multiplier 0..3
+    void SetWeatherRainOverride(bool enabled, float value);
+    void SetWeatherSnowOverride(bool enabled, float value);
+    void SetWeatherCloudOverride(bool enabled, float value);
+    void SetWeatherWindOverride(bool enabled, float multiplier);
+    void ResetWeatherControl();                 // return all weather fields to native behavior
+
     extern bool g_httpEnabled;                  // settings.txt http_api=1 runs the loopback HTTP API (off by default, switched live in the Settings tab)
     extern int  g_httpPort;                     // settings.txt http_port= (1..65535)
     int KeyCount(); const char* KeyNameAt(int i); int KeyVkAt(int i); const char* KeyName(int vk); void SaveSettings();
-    // placement keys (virtual key codes, settings.txt key_move_fwd= ...); every action can be bound to any key, numpad is only the default
-    enum PlaceKey { PK_FWD, PK_BACK, PK_LEFT, PK_RIGHT, PK_UP, PK_DOWN, PK_ROT_L, PK_ROT_R, PK_SCALE_UP, PK_SCALE_DOWN, PK_FETCH, PK_SNAP, PK_MOUSE, PK_LEVEL, PK_GROUND, PK_DROP, PK_CANCEL, PK_FAST, PK_COUNT };
-    extern int g_placeKeys[PK_COUNT];
-    const char* PlaceKeyId(int i); const char* PlaceKeyLabel(int i);
-    void ApplyPlaceKeys();                      // hands the bound keys to the input layer (swallowed while placing)
     void SetTrace(bool on); bool Trace();       // log the game's own setWorldTransform/setEnable calls (reverse engineering aid)
     bool GameReadAvailable();                   // the game's resource loader can be used (instance captured, functions resolved)
     bool GameReadFile(const std::string& packPath, std::vector<uint8_t>& out, bool* notFound = nullptr);   // read a pack file through the game's loader; notFound: no entry (false = the read itself failed)

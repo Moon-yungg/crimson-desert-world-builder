@@ -39,10 +39,12 @@ python scripts\make_release.py 0.79     # bumps the version strings, builds, che
 
 - `cdmodkit.cpp` - core: logging, guarded memory reads, player/camera lookup, signature resolution, the
   createSceneObjectFrom hook, the game-thread pump, the spawn registry, projects/autoload, the console,
-  plus the reverse-engineering aids (trace hooks, `ViewScan`, `FovTrace`, `CamTrace`, ray/shape tracing).
-- `overlay.cpp` - D3D12: detours `CreateSwapChainForHwnd`, hooks Present/Present1/ResizeBuffers, draws ImGui into
+  plus reverse-engineering aids (trace hooks, `FovTrace`, `CamTrace`, ray/shape tracing).
+- `environment.cpp` - optional visual time-of-day and weather bridge: runtime signature resolution, lighting-only time freeze,
+  and composed weather-table overrides. Failures disable only the environment controls.
+- `overlay.cpp` - D3D12: intercepts the game's returned DXGI factory (including Streamline when present), hooks Present/Present1/ResizeBuffers, draws ImGui into
   the back buffer, manages the thumbnail textures (decode thread -> upload -> SRV heap).
-- `diag.cpp` - console-only reverse-engineering aids (`viewscan`, `fovtrace`, `camtrace`, `traceio`) behind `core_internal.h`.
+- `diag.cpp` - console-only reverse-engineering aids (`fovtrace`, `camtrace`, `traceio`) behind `core_internal.h`.
 - `editor.cpp` - the whole UI: browser, scene tree, placement mode, line/circle tools, projects, travel, settings.
 - `input.cpp` - window subclass, virtual cursor from raw mouse deltas, scan-code key state.
 - `thumbgen.cpp` - background worker that reads the game's packs through the game's own loader and renders prefab previews.
