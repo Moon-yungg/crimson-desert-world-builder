@@ -42,8 +42,9 @@ python scripts\make_release.py 0.79     # bumps the version strings, builds, che
   plus reverse-engineering aids (trace hooks, `FovTrace`, `CamTrace`, ray/shape tracing).
 - `environment.cpp` - optional visual time-of-day and weather bridge: runtime signature resolution, lighting-only time freeze,
   and composed weather-table overrides. Failures disable only the environment controls.
-- `overlay.cpp` - D3D12: uses the CrimsonRoute-derived DXGI/Streamline capture path (native-interface unwrap, game-window + COM/device/queue validation,
-  Present/Present1/ResizeBuffers/ResizeBuffers1 lifecycle), then draws World Builder's own ImGui and thumbnail renderer into the back buffer.
+- `overlay.cpp` - D3D12: ports CrimsonRoute's current DXGI/Streamline factory interception, swap-chain capture and Present lifecycle
+  (native-interface unwrap, COM/device/queue validation, per-backbuffer presentation queues, Present/Present1, ResizeBuffers/ResizeBuffers1,
+  SetColorSpace1, method-chain validation and retry/rebind state). World Builder keeps its own ImGui/editor/thumbnail drawing layer on top.
 - `diag.cpp` - console-only reverse-engineering aids (`fovtrace`, `camtrace`, `traceio`) behind `core_internal.h`.
 - `editor.cpp` - the whole UI: browser, scene tree, placement mode, line/circle tools, projects, travel, settings.
 - `input.cpp` - window subclass, virtual cursor from raw mouse deltas, scan-code key state.

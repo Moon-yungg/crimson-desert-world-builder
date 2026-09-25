@@ -53,6 +53,7 @@ namespace overlay {
     typedef HRESULT (STDMETHODCALLTYPE* Present1_t)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
     typedef HRESULT (STDMETHODCALLTYPE* ResizeBuffers_t)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
     typedef HRESULT (STDMETHODCALLTYPE* ResizeBuffers1_t)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*);
+    typedef HRESULT (STDMETHODCALLTYPE* SetColorSpace1_t)(IDXGISwapChain3*, DXGI_COLOR_SPACE_TYPE);
 
     static CreateDXGIFactory_t oCreateDXGIFactory = nullptr;
     static CreateDXGIFactory1_t oCreateDXGIFactory1 = nullptr;
@@ -68,20 +69,35 @@ namespace overlay {
     static Present1_t oPresent1 = nullptr;
     static ResizeBuffers_t oResizeBuffers = nullptr;
     static ResizeBuffers1_t oResizeBuffers1 = nullptr;
+    static SetColorSpace1_t oSetColorSpace1 = nullptr;
     static bool g_streamlineFactoryExportsHooked = false;
 
     struct HookTarget { void* target = nullptr; bool installed = false; };
+    static HookTarget g_dxgiExportHookTargets[3];
+    static HookTarget g_streamlineExportHookTargets[3];
     static HookTarget g_factoryHookTargets[4];
     static HookTarget g_presentHookTarget;
     static HookTarget g_present1HookTarget;
     static HookTarget g_resizeHookTarget;
     static HookTarget g_resize1HookTarget;
+    static HookTarget g_colorSpaceHookTarget;
+    static std::atomic<uint32_t> g_dxgiExportHookMask{0};
+    static std::atomic<uint32_t> g_streamlineExportHookMask{0};
+    static std::atomic<uint32_t> g_factoryImportHookMask{0};
+    static std::atomic<uint32_t> g_factoryMethodHookMask{0};
+    static std::atomic<uint32_t> g_swapChainMethodHookMask{0};
+    static std::atomic<long> g_factoryProbeResult{E_NOINTERFACE};
+    static std::atomic<int> g_presentHookReady{0};
     static std::mutex g_factoryHookMutex;
     static std::mutex g_swapChainHookMutex;
+    static std::mutex g_functionHookMutex;
 
     constexpr size_t kCapturedSwapChains = 16;
     constexpr size_t kMaximumCapturedPresentQueues = 16;
     struct CapturedD3D12Queue {
+        IDXGISwapChain* appSwapChain = nullptr;
+        IDXGISwapChain* nativeSwapChain = nullptr;
+        IDXGISwapChain* hookSwapChain = nullptr;
         uintptr_t appIdentity = 0;
         uintptr_t nativeIdentity = 0;
         uintptr_t hookIdentity = 0;
@@ -96,13 +112,21 @@ namespace overlay {
     static std::mutex g_capturedQueueMutex;
     static std::mutex g_renderMutex;
     static std::atomic<int> g_resizeInProgress{0};
-    static std::atomic<bool> g_rebuildPending{false};
+    enum class PresentRendererResizeState : uint8_t { Idle, ReleaseForRetry, RebindAfterSuccess };
+    static std::atomic<PresentRendererResizeState> g_rendererResizeState{PresentRendererResizeState::Idle};
+    static std::atomic<uint64_t> g_resizeCallbacks{0};
+    static std::atomic<uint64_t> g_resizeNonblockingReleases{0};
+    static std::atomic<void*> g_colorSpaceHintSwapChain{nullptr};
+    static std::atomic<int> g_colorSpaceHint{(int)DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
+    static std::atomic<int> g_colorSpaceHintValid{0};
     static std::atomic<HWND> g_gameWindow{nullptr};
     static thread_local bool g_insidePresent = false;
 
     static ID3D12CommandQueue* g_queue = nullptr;
     static ID3D12Device* g_device = nullptr;
     static uintptr_t g_swapChainIdentity = 0;
+    static std::atomic<IDXGISwapChain*> g_boundSwapChain{nullptr};
+    static std::atomic<HWND> g_boundSwapChainWindow{nullptr};
     static HWND g_hwnd = nullptr;
     static UINT g_bufferCount = 0, g_width = 0, g_height = 0;
     static DXGI_FORMAT g_format = DXGI_FORMAT_UNKNOWN;
@@ -123,6 +147,32 @@ namespace overlay {
 
     static uintptr_t CanonicalComIdentityToken(IUnknown* incoming);
     static bool SameCanonicalComIdentity(IUnknown* left, IUnknown* right);
+
+    static bool IsReadableRange(const void* address, size_t size) {
+        if (!address || size == 0) return false;
+        uintptr_t current = reinterpret_cast<uintptr_t>(address);
+        const uintptr_t end = current + size;
+        if (end < current) return false;
+        while (current < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) != sizeof(mbi) ||
+                mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+            const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                   PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            if ((mbi.Protect & readable) == 0) return false;
+            const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (regionEnd <= current) return false;
+            current = std::min(end, regionEnd);
+        }
+        return true;
+    }
+
+    static void* ComVtableSlot(void* instance, size_t index) {
+        if (!instance || !IsReadableRange(instance, sizeof(void*))) return nullptr;
+        void** vtable = *reinterpret_cast<void***>(instance);
+        if (!vtable || !IsReadableRange(vtable + index, sizeof(void*))) return nullptr;
+        return vtable[index];
+    }
 
     // ---- thumbnail textures (slot 0 of the SRV heap is the ImGui font) ----
     constexpr UINT kSrvSlots = 1024;
@@ -239,6 +289,20 @@ namespace overlay {
         for (UINT i = 0; i < g_bufferCount; i++) { g_frames[i].rtv = h; h.ptr += inc; }   // the views are written per frame
         return true;
     }
+
+    static bool IsSupportedPresentColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace) {
+        return colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ||
+               colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ||
+               colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+               colorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+    }
+
+    static bool RendererGpuIdleNoWait() {
+        if (!g_ready || !g_fence) return true;
+        UINT64 pending = 0;
+        for (const Frame& frame : g_frames) pending = std::max(pending, frame.fence);
+        return !pending || g_fence->GetCompletedValue() >= pending;
+    }
     static void WaitIdle() {
         if (!g_fence || !g_queue) return;
         g_queue->Signal(g_fence, ++g_fenceValue);
@@ -297,6 +361,8 @@ namespace overlay {
         ImGui_ImplDX12_Init(g_device, (int)g_bufferCount, g_format, g_srvHeap, g_srvHeap->GetCPUDescriptorHandleForHeapStart(), g_srvHeap->GetGPUDescriptorHandleForHeapStart());
         input::Init(g_hwnd);
         g_swapChainIdentity = CanonicalComIdentityToken(sc);
+        g_boundSwapChain.store(sc, std::memory_order_release);
+        g_boundSwapChainWindow.store(g_hwnd, std::memory_order_release);
         core::Log("[overlay] ready: %ux%u, %u buffers, format %d, hwnd %p", g_width, g_height, g_bufferCount, (int)g_format, (void*)g_hwnd);
         return true;
     }
@@ -311,7 +377,6 @@ namespace overlay {
             core::Log("[overlay] replacement swapchain belongs to a different D3D12 device");
             return false;
         }
-        WaitIdle();
         if (restartBackend) ImGui_ImplDX12_Shutdown();
         if (!CreateRenderTargets(sc)) return false;
         if (restartBackend && !ImGui_ImplDX12_Init(g_device, (int)g_bufferCount, g_format, g_srvHeap,
@@ -319,6 +384,8 @@ namespace overlay {
         DXGI_SWAP_CHAIN_DESC desc = {};
         if (SUCCEEDED(sc->GetDesc(&desc)) && desc.OutputWindow) g_hwnd = desc.OutputWindow;
         g_swapChainIdentity = CanonicalComIdentityToken(sc);
+        g_boundSwapChain.store(sc, std::memory_order_release);
+        g_boundSwapChainWindow.store(g_hwnd, std::memory_order_release);
         core::Log("[overlay] renderer rebound to swapchain %p (%ux%u, %u buffers, format %d)",
                   (void*)sc, g_width, g_height, g_bufferCount, (int)g_format);
         return true;
@@ -327,9 +394,6 @@ namespace overlay {
     static int g_drawCount = 0;
     static void Stage(const char* s) { if (g_drawCount < 2) core::Log("[overlay] frame %d: %s", g_drawCount, s); }
     static void DrawFrame(IDXGISwapChain3* sc) {
-        if (CanonicalComIdentityToken(sc) != g_swapChainIdentity) {   // the game replaced its swapchain: rebind
-            if (!RebindRenderer(sc, true)) { g_disabled = true; core::Log("[overlay] rebind failed; overlay disabled"); return; }
-        }
         g_loadsThisFrame = 0; RetireResources(); EvictIfNeeded();
         for (;;) {   // finished decodes -> GPU textures, a few per frame
             Decoded d; { std::lock_guard<std::mutex> l(g_decMutex); if (g_decDone.empty() || g_loadsThisFrame >= 4) break; d = g_decDone.front(); g_decDone.pop_front(); g_decInFlight.erase(d.file); }
@@ -435,6 +499,10 @@ namespace overlay {
 
     static HWND GetSwapChainWindow(IDXGISwapChain* chain) {
         if (!chain) return nullptr;
+        if (g_boundSwapChain.load(std::memory_order_acquire) == chain) {
+            HWND cached = g_boundSwapChainWindow.load(std::memory_order_acquire);
+            if (cached) return cached;
+        }
         IDXGISwapChain1* chain1 = nullptr;
         HWND hwnd = nullptr;
         if (SUCCEEDED(chain->QueryInterface(IID_PPV_ARGS(&chain1))) && chain1) {
@@ -445,6 +513,8 @@ namespace overlay {
             DXGI_SWAP_CHAIN_DESC desc = {};
             if (SUCCEEDED(chain->GetDesc(&desc))) hwnd = desc.OutputWindow;
         }
+        if (g_boundSwapChain.load(std::memory_order_acquire) == chain)
+            g_boundSwapChainWindow.store(hwnd, std::memory_order_release);
         return hwnd;
     }
 
@@ -511,11 +581,31 @@ namespace overlay {
         const char* name;
     };
 
+    enum class HookTargetState { NotInstalled, Matching, Different };
+    static HookTargetState GetHookTargetState(const HookTarget& state, const void* target) {
+        std::lock_guard<std::mutex> hookLock(g_functionHookMutex);
+        if (!state.installed) return HookTargetState::NotInstalled;
+        return state.target == target ? HookTargetState::Matching : HookTargetState::Different;
+    }
+
+    static std::string ModuleNameForAddress(void* address) {
+        if (!address) return "?";
+        HMODULE module = nullptr;
+        char path[MAX_PATH] = {};
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCSTR>(address), &module) ||
+            !GetModuleFileNameA(module, path, MAX_PATH)) return "?";
+        const char* slash = strrchr(path, '\\');
+        return slash ? slash + 1 : path;
+    }
+
     static bool InstallSingleHook(HookTarget& state, void* target, void* detour, void** original, const char* name) {
         if (!target) return false;
+        std::lock_guard<std::mutex> hookLock(g_functionHookMutex);
         if (state.installed) {
             if (state.target == target) return true;
-            core::Log("[overlay] %s target differs from already hooked implementation; ignored", name);
+            core::Log("[overlay] factory_method_target_mismatch=1; method=%s; existing_module=%s; new_module=%s; alternate_factory_hooked=0",
+                      name, ModuleNameForAddress(state.target).c_str(), ModuleNameForAddress(target).c_str());
             return false;
         }
         MH_STATUS create = MH_CreateHook(target, detour, original);
@@ -537,10 +627,12 @@ namespace overlay {
     }
 
     static bool InstallHookGroup(const std::vector<HookRequest>& requests) {
+        std::lock_guard<std::mutex> hookLock(g_functionHookMutex);
         for (const HookRequest& r : requests) {
             if (!r.target) return false;
             if (r.state->installed && r.state->target != r.target) {
-                core::Log("[overlay] %s target differs from already hooked swapchain implementation; ignored", r.name);
+                core::Log("[overlay] swap_chain_method_target_mismatch=1; method=%s; existing_module=%s; new_module=%s; alternate_swap_chain_hooked=0",
+                          r.name, ModuleNameForAddress(r.state->target).c_str(), ModuleNameForAddress(r.target).c_str());
                 return false;
             }
         }
@@ -586,31 +678,59 @@ namespace overlay {
     static HRESULT STDMETHODCALLTYPE hkResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags);
     static HRESULT STDMETHODCALLTYPE hkResizeBuffers1(IDXGISwapChain3* sc, UINT n, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                       const UINT* nodeMasks, IUnknown* const* presentQueues);
+    static HRESULT STDMETHODCALLTYPE hkSetColorSpace1(IDXGISwapChain3* sc, DXGI_COLOR_SPACE_TYPE colorSpace);
 
     static bool InstallRealSwapChainHooks(IDXGISwapChain* chain) {
-        if (!chain) return false;
+        if (!chain || !IsReadableRange(chain, sizeof(void*))) return false;
         std::lock_guard<std::mutex> lock(g_swapChainHookMutex);
-        void** vt = *reinterpret_cast<void***>(chain);
-        if (!vt) return false;
 
         IDXGISwapChain1* chain1 = nullptr;
         IDXGISwapChain3* chain3 = nullptr;
         chain->QueryInterface(IID_PPV_ARGS(&chain1));
         chain->QueryInterface(IID_PPV_ARGS(&chain3));
 
-        std::vector<HookRequest> requests;
-        requests.push_back({ &g_presentHookTarget, vt[8], (void*)&hkPresent, (void**)&oPresent, "Present" });
-        requests.push_back({ &g_resizeHookTarget, vt[13], (void*)&hkResizeBuffers, (void**)&oResizeBuffers, "ResizeBuffers" });
-        if (chain1) {
-            void** vt1 = *reinterpret_cast<void***>(chain1);
-            if (vt1 && vt1[22]) requests.push_back({ &g_present1HookTarget, vt1[22], (void*)&hkPresent1, (void**)&oPresent1, "Present1" });
+        void* presentTarget = ComVtableSlot(chain, 8);
+        void* resizeTarget = ComVtableSlot(chain, 13);
+        void* present1Target = ComVtableSlot(chain1, 22);
+        void* colorSpaceTarget = ComVtableSlot(chain3, 38);
+        void* resize1Target = ComVtableSlot(chain3, 39);
+
+        const HookTargetState presentState = GetHookTargetState(g_presentHookTarget, presentTarget);
+        if (presentState == HookTargetState::Different) {
+            core::Log("[overlay] swap_chain_present_target_mismatch=1; existing_module=%s; new_module=%s; alternate_swap_chain_hooked=0",
+                      ModuleNameForAddress(g_presentHookTarget.target).c_str(), ModuleNameForAddress(presentTarget).c_str());
+            ReleaseCom(chain3);
+            ReleaseCom(chain1);
+            return false;
         }
-        if (chain3) {
-            void** vt3 = *reinterpret_cast<void***>(chain3);
-            if (vt3 && vt3[39]) requests.push_back({ &g_resize1HookTarget, vt3[39], (void*)&hkResizeBuffers1, (void**)&oResizeBuffers1, "ResizeBuffers1" });
+        if (presentState == HookTargetState::Matching) {
+            const bool allTargetsMatch =
+                GetHookTargetState(g_resizeHookTarget, resizeTarget) == HookTargetState::Matching &&
+                (!present1Target || GetHookTargetState(g_present1HookTarget, present1Target) == HookTargetState::Matching) &&
+                (!resize1Target || GetHookTargetState(g_resize1HookTarget, resize1Target) == HookTargetState::Matching) &&
+                (!colorSpaceTarget || GetHookTargetState(g_colorSpaceHookTarget, colorSpaceTarget) == HookTargetState::Matching);
+            ReleaseCom(chain3);
+            ReleaseCom(chain1);
+            if (!allTargetsMatch) core::Log("[overlay] swap_chain_method_target_mismatch=1; alternate_swap_chain_hooked=0");
+            return allTargetsMatch;
         }
 
+        std::vector<HookRequest> requests;
+        requests.push_back({ &g_presentHookTarget, presentTarget, (void*)&hkPresent, (void**)&oPresent, "Present" });
+        requests.push_back({ &g_resizeHookTarget, resizeTarget, (void*)&hkResizeBuffers, (void**)&oResizeBuffers, "ResizeBuffers" });
+        if (present1Target) requests.push_back({ &g_present1HookTarget, present1Target, (void*)&hkPresent1, (void**)&oPresent1, "Present1" });
+        if (colorSpaceTarget) requests.push_back({ &g_colorSpaceHookTarget, colorSpaceTarget, (void*)&hkSetColorSpace1, (void**)&oSetColorSpace1, "SetColorSpace1" });
+        if (resize1Target) requests.push_back({ &g_resize1HookTarget, resize1Target, (void*)&hkResizeBuffers1, (void**)&oResizeBuffers1, "ResizeBuffers1" });
+
         const bool ok = InstallHookGroup(requests);
+        if (ok) {
+            uint32_t mask = 0x01u | 0x04u;
+            if (present1Target) mask |= 0x02u;
+            if (resize1Target) mask |= 0x08u;
+            if (colorSpaceTarget) mask |= 0x10u;
+            g_swapChainMethodHookMask.store(mask, std::memory_order_release);
+            g_presentHookReady.store(1, std::memory_order_release);
+        }
         ReleaseCom(chain3);
         ReleaseCom(chain1);
         return ok;
@@ -684,13 +804,6 @@ namespace overlay {
         IDXGISwapChain* nativeChain = TryUnwrapStreamlineNativeInterface(appChain);
         IDXGISwapChain* hookChain = nativeChain ? nativeChain : appChain;
         const bool nativeChainAlias = nativeChain && nativeChain != appChain;
-        if (!outputWindow) outputWindow = GetSwapChainWindow(hookChain);
-        const HWND gameWindow = RefreshGameWindow(outputWindow);
-        if (!gameWindow || !outputWindow || outputWindow != gameWindow) {
-            queue->Release();
-            ReleaseCom(nativeChain);
-            return false;
-        }
         if (!QueueMatchesSwapChainDevice(hookChain, queue)) {
             core::Log("[overlay] captured swapchain and DIRECT queue belong to different D3D12 devices; ignored");
             queue->Release();
@@ -717,11 +830,14 @@ namespace overlay {
                     destination = &captured;
                     break;
                 }
-                if (!destination && !captured.appIdentity && !captured.nativeIdentity && !captured.hookIdentity)
+                if (!destination && !captured.appSwapChain && !captured.nativeSwapChain && !captured.hookSwapChain)
                     destination = &captured;
             }
             if (!destination) destination = &g_capturedQueues[g_nextCapturedQueue++ % g_capturedQueues.size()];
             ReleaseCaptured(*destination);
+            destination->appSwapChain = appChain;
+            destination->nativeSwapChain = nativeChain;
+            destination->hookSwapChain = hookChain;
             destination->appIdentity = appIdentity;
             destination->nativeIdentity = nativeIdentity;
             destination->hookIdentity = hookIdentity;
@@ -795,7 +911,10 @@ namespace overlay {
             return false;
         }
         if (queue != g_queue) {
-            if (g_ready && g_queue) WaitIdle();
+            if (g_ready && g_queue && !RendererGpuIdleNoWait()) {
+                queue->Release();
+                return false;
+            }
             ReleaseCom(g_queue);
             g_queue = queue;
             core::Log("[overlay] presentation queue selected %p", (void*)g_queue);
@@ -817,12 +936,12 @@ namespace overlay {
 
         std::unique_lock<std::mutex> renderLock(g_renderMutex, std::try_to_lock);
         if (!renderLock.owns_lock()) return;
-        if (!SelectPresentQueue(baseChain)) return;
 
         IDXGISwapChain3* sc = nullptr;
         if (FAILED(baseChain->QueryInterface(IID_PPV_ARGS(&sc))) || !sc) return;
 
         if (!g_ready) {
+            if (!SelectPresentQueue(baseChain)) { sc->Release(); return; }
             if (Init(sc)) g_ready = true;
             else {
                 g_failed = true;
@@ -833,12 +952,29 @@ namespace overlay {
         } else {
             const uintptr_t identity = CanonicalComIdentityToken(sc);
             const bool replaced = identity != g_swapChainIdentity;
-            const bool resized = g_rebuildPending.exchange(false, std::memory_order_acq_rel);
-            if ((replaced || resized) && !RebindRenderer(sc, true)) {
+            PresentRendererResizeState lifecycle = g_rendererResizeState.load(std::memory_order_acquire);
+            if (lifecycle == PresentRendererResizeState::ReleaseForRetry) {
+                sc->Release();
+                return;
+            }
+            const bool rebind = replaced || lifecycle == PresentRendererResizeState::RebindAfterSuccess;
+            if (rebind && !RendererGpuIdleNoWait()) {
+                sc->Release();
+                return;
+            }
+            if (rebind && !SelectPresentQueue(baseChain)) {
+                sc->Release();
+                return;
+            }
+            if (rebind && !RebindRenderer(sc, true)) {
                 g_disabled = true;
                 core::Log("[overlay] renderer rebind after swapchain change failed; overlay disabled");
                 sc->Release();
                 return;
+            }
+            if (rebind) {
+                g_rendererResizeState.store(PresentRendererResizeState::Idle, std::memory_order_release);
+                g_resizeNonblockingReleases.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
@@ -895,40 +1031,84 @@ namespace overlay {
     }
 
     static bool BeginResize(IDXGISwapChain* chain) {
-        if (!g_ready || !chain || CanonicalComIdentityToken(chain) != g_swapChainIdentity) return false;
+        if (!chain || g_presentHookReady.load(std::memory_order_acquire) == 0) return false;
         const HWND gameWindow = g_gameWindow.load(std::memory_order_acquire);
         if (!gameWindow || GetSwapChainWindow(chain) != gameWindow) return false;
         g_resizeInProgress.fetch_add(1, std::memory_order_acq_rel);
+        g_resizeCallbacks.fetch_add(1, std::memory_order_relaxed);
+        g_rendererResizeState.store(PresentRendererResizeState::ReleaseForRetry, std::memory_order_release);
         return true;
     }
 
-    static void FinishResize(bool tracked, HRESULT hr) {
-        if (!tracked) return;
-        if (SUCCEEDED(hr)) g_rebuildPending.store(true, std::memory_order_release);
-        g_resizeInProgress.fetch_sub(1, std::memory_order_acq_rel);
+    static void FinishResize(bool tracked) {
+        if (tracked) g_resizeInProgress.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    static bool IsRetryableResizeFailure(HRESULT hr) {
+        return hr == DXGI_ERROR_INVALID_CALL || hr == DXGI_ERROR_WAS_STILL_DRAWING;
+    }
+
+    static bool TryReleaseRendererBeforeResize(IDXGISwapChain* chain) {
+        std::unique_lock<std::mutex> lock(g_renderMutex, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        if (!g_ready || CanonicalComIdentityToken(chain) != g_swapChainIdentity) return true;
+        // WB deliberately holds no persistent swap-chain backbuffer references.
+        // Match CrimsonRoute's nonblocking contract: never wait in Resize; the
+        // renderer is retired/rebound by the following Present once its fence is idle.
+        return RendererGpuIdleNoWait();
     }
 
     static HRESULT STDMETHODCALLTYPE hkResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
         const bool tracked = BeginResize(sc);
+        if (tracked) (void)TryReleaseRendererBeforeResize(sc);
         const HRESULT hr = oResizeBuffers ? oResizeBuffers(sc, n, w, h, fmt, flags) : E_FAIL;
         if (tracked) {
-            if (FAILED(hr)) core::Log("[overlay] game's ResizeBuffers failed: 0x%08x", (unsigned)hr);
-            else core::Log("[overlay] ResizeBuffers succeeded; renderer rebind deferred to next Present");
+            g_rendererResizeState.store(
+                SUCCEEDED(hr) ? PresentRendererResizeState::RebindAfterSuccess :
+                (IsRetryableResizeFailure(hr) ? PresentRendererResizeState::ReleaseForRetry : PresentRendererResizeState::Idle),
+                std::memory_order_release);
+            core::Log("[overlay] ResizeBuffers result=0x%08x; state=%s", (unsigned)hr,
+                SUCCEEDED(hr) ? "rebind_after_success" : (IsRetryableResizeFailure(hr) ? "release_for_retry" : "idle"));
         }
-        FinishResize(tracked, hr);
+        FinishResize(tracked);
         return hr;
     }
 
     static HRESULT STDMETHODCALLTYPE hkResizeBuffers1(IDXGISwapChain3* sc, UINT n, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                       const UINT* nodeMasks, IUnknown* const* presentQueues) {
         const bool tracked = BeginResize(sc);
+        if (tracked) (void)TryReleaseRendererBeforeResize(sc);
         const HRESULT hr = oResizeBuffers1 ? oResizeBuffers1(sc, n, w, h, fmt, flags, nodeMasks, presentQueues) : E_FAIL;
         if (SUCCEEDED(hr) && presentQueues && n) CaptureResizePresentQueues(sc, n, presentQueues);
         if (tracked) {
-            if (FAILED(hr)) core::Log("[overlay] game's ResizeBuffers1 failed: 0x%08x", (unsigned)hr);
-            else core::Log("[overlay] ResizeBuffers1 succeeded; renderer rebind deferred to next Present");
+            g_rendererResizeState.store(
+                SUCCEEDED(hr) ? PresentRendererResizeState::RebindAfterSuccess :
+                (IsRetryableResizeFailure(hr) ? PresentRendererResizeState::ReleaseForRetry : PresentRendererResizeState::Idle),
+                std::memory_order_release);
+            core::Log("[overlay] ResizeBuffers1 result=0x%08x; state=%s", (unsigned)hr,
+                SUCCEEDED(hr) ? "rebind_after_success" : (IsRetryableResizeFailure(hr) ? "release_for_retry" : "idle"));
         }
-        FinishResize(tracked, hr);
+        FinishResize(tracked);
+        return hr;
+    }
+
+    static HRESULT STDMETHODCALLTYPE hkSetColorSpace1(IDXGISwapChain3* sc, DXGI_COLOR_SPACE_TYPE colorSpace) {
+        const HRESULT hr = oSetColorSpace1 ? oSetColorSpace1(sc, colorSpace) : E_FAIL;
+        if (sc) {
+            if (SUCCEEDED(hr) && IsSupportedPresentColorSpace(colorSpace)) {
+                g_colorSpaceHintSwapChain.store(sc, std::memory_order_release);
+                g_colorSpaceHint.store((int)colorSpace, std::memory_order_release);
+                g_colorSpaceHintValid.store(1, std::memory_order_release);
+            } else if (FAILED(hr)) {
+                g_colorSpaceHintValid.store(
+                    g_colorSpaceHintSwapChain.load(std::memory_order_acquire) == sc ? 1 : 0,
+                    std::memory_order_release);
+            } else {
+                g_colorSpaceHintValid.store(0, std::memory_order_release);
+            }
+            if (SUCCEEDED(hr) && g_boundSwapChain.load(std::memory_order_acquire) == sc)
+                g_rendererResizeState.store(PresentRendererResizeState::RebindAfterSuccess, std::memory_order_release);
+        }
         return hr;
     }
 
@@ -968,22 +1148,27 @@ namespace overlay {
         created->QueryInterface(IID_PPV_ARGS(&factory2));
         int installed = 0;
         if (factory) {
-            void** vt = *reinterpret_cast<void***>(factory);
-            if (vt && InstallSingleHook(g_factoryHookTargets[0], vt[10], (void*)&hkCreateSwapChain,
+            void* target = ComVtableSlot(factory, 10);
+            if (target && InstallSingleHook(g_factoryHookTargets[0], target, (void*)&hkCreateSwapChain,
                                         (void**)&oCreateSwapChain, "CreateSwapChain")) installed++;
         }
         if (factory2) {
-            void** vt = *reinterpret_cast<void***>(factory2);
-            if (vt && InstallSingleHook(g_factoryHookTargets[1], vt[15], (void*)&hkCreateSwapChainForHwnd,
+            void* targetHwnd = ComVtableSlot(factory2, 15);
+            void* targetCore = ComVtableSlot(factory2, 16);
+            void* targetComposition = ComVtableSlot(factory2, 24);
+            if (targetHwnd && InstallSingleHook(g_factoryHookTargets[1], targetHwnd, (void*)&hkCreateSwapChainForHwnd,
                                         (void**)&oCreateSwapChainForHwnd, "CreateSwapChainForHwnd")) installed++;
-            if (vt && InstallSingleHook(g_factoryHookTargets[2], vt[16], (void*)&hkCreateSwapChainForCoreWindow,
+            if (targetCore && InstallSingleHook(g_factoryHookTargets[2], targetCore, (void*)&hkCreateSwapChainForCoreWindow,
                                         (void**)&oCreateSwapChainForCoreWindow, "CreateSwapChainForCoreWindow")) installed++;
-            if (vt && InstallSingleHook(g_factoryHookTargets[3], vt[24], (void*)&hkCreateSwapChainForComposition,
+            if (targetComposition && InstallSingleHook(g_factoryHookTargets[3], targetComposition, (void*)&hkCreateSwapChainForComposition,
                                         (void**)&oCreateSwapChainForComposition, "CreateSwapChainForComposition")) installed++;
         }
         ReleaseCom(factory2);
         ReleaseCom(factory);
-        if (installed) core::Log("[overlay] %s returned factory captured (%d methods ready)", provider, installed);
+        uint32_t mask = 0;
+        for (int i = 0; i < 4; ++i) if (g_factoryHookTargets[i].installed) mask |= (1u << i);
+        g_factoryMethodHookMask.store(mask, std::memory_order_release);
+        if (installed) core::Log("[overlay] %s returned factory captured (%d methods ready, mask=0x%02x)", provider, installed, mask);
         return installed;
     }
 
@@ -1021,10 +1206,12 @@ namespace overlay {
         return hr;
     }
 
-    static bool HookExport(HMODULE module, const char* symbol, void* detour, void** original) {
+    static bool HookExport(HookTarget& state, HMODULE module, const char* symbol, void* detour, void** original) {
         if (!module) return false;
         void* target = reinterpret_cast<void*>(GetProcAddress(module, symbol));
         if (!target) return false;
+        std::lock_guard<std::mutex> hookLock(g_functionHookMutex);
+        if (state.installed) return state.target == target;
         MH_STATUS create = MH_CreateHook(target, detour, original);
         if (create != MH_OK) return false;
         MH_STATUS enable = MH_EnableHook(target);
@@ -1033,6 +1220,8 @@ namespace overlay {
             if (original) *original = nullptr;
             return false;
         }
+        state.target = target;
+        state.installed = true;
         return true;
     }
 
@@ -1044,19 +1233,25 @@ namespace overlay {
             return;
         }
 
+        int dxgiExports = 0;
+        if (HookExport(g_dxgiExportHookTargets[0], dxgi, "CreateDXGIFactory", (void*)&hkCreateDXGIFactory, (void**)&oCreateDXGIFactory)) dxgiExports++;
+        if (HookExport(g_dxgiExportHookTargets[1], dxgi, "CreateDXGIFactory1", (void*)&hkCreateDXGIFactory1, (void**)&oCreateDXGIFactory1)) dxgiExports++;
+        if (HookExport(g_dxgiExportHookTargets[2], dxgi, "CreateDXGIFactory2", (void*)&hkCreateDXGIFactory2, (void**)&oCreateDXGIFactory2)) dxgiExports++;
+        uint32_t dxgiMask = 0;
+        for (int i = 0; i < 3; ++i) if (g_dxgiExportHookTargets[i].installed) dxgiMask |= (1u << i);
+        g_dxgiExportHookMask.store(dxgiMask, std::memory_order_release);
+
         int streamlineExports = 0;
         HMODULE sl = GetModuleHandleW(L"sl.interposer.dll");
         if (sl) {
-            if (HookExport(sl, "CreateDXGIFactory", (void*)&hkStreamlineCreateDXGIFactory, (void**)&oStreamlineCreateDXGIFactory)) streamlineExports++;
-            if (HookExport(sl, "CreateDXGIFactory1", (void*)&hkStreamlineCreateDXGIFactory1, (void**)&oStreamlineCreateDXGIFactory1)) streamlineExports++;
-            if (HookExport(sl, "CreateDXGIFactory2", (void*)&hkStreamlineCreateDXGIFactory2, (void**)&oStreamlineCreateDXGIFactory2)) streamlineExports++;
+            if (HookExport(g_streamlineExportHookTargets[0], sl, "CreateDXGIFactory", (void*)&hkStreamlineCreateDXGIFactory, (void**)&oStreamlineCreateDXGIFactory)) streamlineExports++;
+            if (HookExport(g_streamlineExportHookTargets[1], sl, "CreateDXGIFactory1", (void*)&hkStreamlineCreateDXGIFactory1, (void**)&oStreamlineCreateDXGIFactory1)) streamlineExports++;
+            if (HookExport(g_streamlineExportHookTargets[2], sl, "CreateDXGIFactory2", (void*)&hkStreamlineCreateDXGIFactory2, (void**)&oStreamlineCreateDXGIFactory2)) streamlineExports++;
         }
-        g_streamlineFactoryExportsHooked = streamlineExports != 0;
-
-        int dxgiExports = 0;
-        if (HookExport(dxgi, "CreateDXGIFactory", (void*)&hkCreateDXGIFactory, (void**)&oCreateDXGIFactory)) dxgiExports++;
-        if (HookExport(dxgi, "CreateDXGIFactory1", (void*)&hkCreateDXGIFactory1, (void**)&oCreateDXGIFactory1)) dxgiExports++;
-        if (HookExport(dxgi, "CreateDXGIFactory2", (void*)&hkCreateDXGIFactory2, (void**)&oCreateDXGIFactory2)) dxgiExports++;
+        uint32_t streamlineMask = 0;
+        for (int i = 0; i < 3; ++i) if (g_streamlineExportHookTargets[i].installed) streamlineMask |= (1u << i);
+        g_streamlineExportHookMask.store(streamlineMask, std::memory_order_release);
+        g_streamlineFactoryExportsHooked = streamlineMask != 0;
 
         IDXGIFactory2* probe = nullptr;
         HRESULT hr = E_FAIL;
@@ -1066,16 +1261,17 @@ namespace overlay {
             else if (oStreamlineCreateDXGIFactory2) hr = oStreamlineCreateDXGIFactory2(0, IID_PPV_ARGS(&probe));
             else if (oStreamlineCreateDXGIFactory) hr = oStreamlineCreateDXGIFactory(IID_PPV_ARGS(&probe));
         } else {
-            if (oCreateDXGIFactory1) hr = oCreateDXGIFactory1(IID_PPV_ARGS(&probe));
-            else if (oCreateDXGIFactory2) hr = oCreateDXGIFactory2(0, IID_PPV_ARGS(&probe));
-            else if (oCreateDXGIFactory) hr = oCreateDXGIFactory(IID_PPV_ARGS(&probe));
+            hr = CreateDXGIFactory1(IID_PPV_ARGS(&probe));
         }
+        g_factoryImportHookMask.store(dxgiMask | (streamlineMask ? 0x08u : 0u), std::memory_order_release);
+        g_factoryProbeResult.store(hr, std::memory_order_release);
         if (SUCCEEDED(hr) && probe) {
             HookReturnedFactory(probe, provider);
             probe->Release();
         }
 
-        core::Log("[overlay] CrimsonRoute-style DXGI capture ready: DXGI %d/3, Streamline %d/3; waiting for game D3D12 swapchain",
-                  dxgiExports, streamlineExports);
+        core::Log("[overlay] CrimsonRoute DXGI capture ready: dxgi_export_mask=0x%02x streamline_export_mask=0x%02x factory_import_mask=0x%02x factory_method_mask=0x%02x probe_hr=0x%08x; waiting for game D3D12 swapchain",
+                  dxgiMask, streamlineMask, g_factoryImportHookMask.load(std::memory_order_acquire),
+                  g_factoryMethodHookMask.load(std::memory_order_acquire), (unsigned)hr);
     }
 }

@@ -97,7 +97,9 @@ den Weg blockieren; das Log nennt dann den fehlenden Hook, alles andere läuft w
 
 Der Tab **NPCs** listet alle rund 7.250 Figuren des Spiels (Menschen, Goblins, Tiere, Reittiere, Monster, Bosse) mit ihrem
 Spielnamen in deiner Sprache, dem internen Namen und dem Schlüssel. Suche und Kategorie grenzen die Liste ein, **SPAWN** (oder
-ein Doppelklick) setzt die Figur mit dem eingestellten Abstand vor dich, mit "count" auch mehrere nebeneinander. Die Liste
+ein Doppelklick) setzt die Figur mit dem eingestellten Abstand vor dich. Mit "count" können bis zu 100.000 Figuren erzeugt werden;
+als Formation stehen **Line**, **Matrix** und **Circle** mit einstellbarem Abstand bzw. Radius zur Verfügung. Der Spawn-Abstand
+kann auch für weit entfernte Gruppen direkt eingegeben werden. Die Liste
 liest die Mod zur Laufzeit aus deinem installierten Spiel, es wird nichts davon mitgeliefert.
 
 Die Figuren entstehen über die Spawn-Anfrage des Spiels selbst und sind danach ganz normale Bewohner der Welt: Sie laufen,
@@ -105,7 +107,7 @@ kämpfen, fliehen und verschwinden nach den Regeln des Spiels. Feindliche Figure
 Szenenliste, lassen sich nicht verschieben oder rückgängig machen und werden nicht in Projekten gespeichert.
 
 Der NPC-Browser funktioniert auch im Dock. Dort wird die Trefferliste automatisch als kompakte Kachelansicht gezeigt; Suche,
-Kategorie, Abstand, Anzahl und SPAWN bleiben verfügbar.
+Kategorie, Abstand, Anzahl, Formation und SPAWN bleiben verfügbar.
 
 Nach dem Laden eines Spielstands zeigt der Tab "walk a few steps first", bis du dich kurz bewegt hast: Die Anfrage braucht
 die Server-Figur deines Charakters, und die liefert das Spiel beim Laufen. Ein Spiel-Update kann den Weg blockieren; dann sagt

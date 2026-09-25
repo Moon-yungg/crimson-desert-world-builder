@@ -23,8 +23,9 @@ licenses require.
   format used by `thumbgen.cpp` and `scripts/parse_parc.py` was ported from it; the offline scripts import it directly.
 - **CDMW** (MIT) - Copyright (c) 2026 Ratrider. The `.pam` static mesh layouts in `thumbgen.cpp` and
   `scripts/render_thumbs.py` were ported from its mesh parser.
-- **CrimsonRoute** - the player transform layout and the overlay's DXGI/Streamline interception and swap-chain lifecycle were adapted from the adjacent
-  CrimsonRoute implementation. CrimsonRoute-specific map/route rendering, D3D11/HDR paths, diagnostics, and runtime-management code are not bundled here.
+- **CrimsonRoute** - the player transform layout and the overlay's DXGI/Streamline factory interception, swap-chain capture and
+  Present/Resize/SetColorSpace lifecycle are ported from the adjacent CrimsonRoute implementation. CrimsonRoute-specific map/route rendering,
+  D3D11 renderer, HDR compositor, diagnostics, and unrelated runtime-management code are not bundled; World Builder keeps its own ImGui editor renderer.
 - **CrimsonWeather** by **Nostyxx** - https://github.com/Nostyxx/CrimsonWeather. Its public reverse-engineering
   work was used as a technical reference for the optional visual time-of-day and weather bridge in
   `asi/cdmodkit/environment.cpp` (environment/time layout, visual-time freeze concept, and composed weather-table

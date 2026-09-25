@@ -1274,8 +1274,10 @@ namespace editor {
     // They become ordinary actors of the world (AI, combat, own despawn rules), so they are not scene objects: no moving, undo
     // or project saving. The list is read from the installed game at runtime (thumbgen::Characters), names in the UI language.
     static char g_npcFilter[128] = ""; static int g_npcCat = 0, g_npcSel = -1, g_npcCount = 1; static float g_npcDist = 5.0f;
+    static int g_npcFormation = 0; static float g_npcSpacing = 1.5f, g_npcRadius = 8.0f;
     static std::vector<int> g_npcRows; static std::string g_npcKey;
     static const char* kNpcCats[] = { "all", "people", "animals and mounts", "monsters", "bosses", "other" };
+    static const char* kNpcFormations[] = { "Line", "Matrix", "Circle" };
     static int NpcCategory(const std::string& n) {   // from the internal name's first token: NHM_ = human male, NGW_ = goblin female, ...
         const std::string t = n.substr(0, n.find('_'));
         if (t == "Animal" || t == "Riding" || t == "NatureCreature") return 2;
@@ -1364,7 +1366,7 @@ namespace editor {
             std::stable_sort(g_npcRows.begin(), g_npcRows.end(), [&](int a, int b) { const auto& x = (*chars)[a]; const auto& y = (*chars)[b]; if (x.name.empty() != y.name.empty()) return !x.name.empty(); return (x.name.empty() ? x.internal : x.name) < (y.name.empty() ? y.internal : y.name); });
         }
         ImGui::TextDisabled(T("%d characters"), (int)g_npcRows.size());
-        const float detailsH = (compact ? 170.0f : 118.0f) * ui;
+        const float detailsH = (compact ? 220.0f : 156.0f) * ui;
         float listH = ImGui::GetContentRegionAvail().y - detailsH - ImGui::GetStyle().ItemSpacing.y; if (listH < 80 * ui) listH = 80 * ui;
         const bool useCards = compact || g_npcCards;
         if (useCards) DrawNpcCards(*chars, listH, ui, havePos && st == 2);
@@ -1404,14 +1406,42 @@ namespace editor {
             }
             ImGui::BeginGroup();
             ImGui::Text("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str()); ImGui::SameLine(); ImGui::TextDisabled("  %s   ID %u", c.internal.c_str(), c.key);
-            ImGui::SetNextItemWidth(compact ? 100 * ui : 140 * ui); ImGui::SliderFloat(T("distance"), &g_npcDist, 1.0f, 30.0f, "%.0f m"); SameLineOrWrap(compact, 90 * ui);
+            ImGui::SetNextItemWidth(compact ? 120 * ui : 150 * ui); ImGui::DragFloat(T("distance"), &g_npcDist, 1.0f, 1.0f, 100000.0f, "%.0f m"); g_npcDist = std::clamp(g_npcDist, 1.0f, 100000.0f); SameLineOrWrap(compact, 90 * ui);
             ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, 100000);
+            SameLineOrWrap(compact, 130 * ui);
+            ImGui::TextDisabled("%s", T("formation")); ImGui::SameLine(); ImGui::SetNextItemWidth(120 * ui); ComboT("##npcformation", &g_npcFormation, kNpcFormations, 3);
+            SameLineOrWrap(compact, 130 * ui);
+            ImGui::SetNextItemWidth(120 * ui);
+            if (g_npcFormation == 2) {
+                ImGui::DragFloat(T("radius"), &g_npcRadius, 0.25f, 0.5f, 100000.0f, "%.1f m");
+                g_npcRadius = std::clamp(g_npcRadius, 0.5f, 100000.0f);
+            } else {
+                ImGui::DragFloat(T("spacing"), &g_npcSpacing, 0.1f, 0.25f, 1000.0f, "%.1f m");
+                g_npcSpacing = std::clamp(g_npcSpacing, 0.25f, 1000.0f);
+            }
             ImGui::BeginDisabled(!havePos || st != 2);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
             if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS "   SPAWN   "), ImVec2(150 * ui, 0))) {
-                for (int k = 0; k < g_npcCount; k++) {   // side by side across the view direction, 1.5 m apart, centred
-                    const float side = (k - (g_npcCount - 1) * 0.5f) * 1.5f;
-                    Vec3 at = { g_lastPlayer.x + g_fx * g_npcDist + g_fz * side, g_lastPlayer.y, g_lastPlayer.z + g_fz * g_npcDist - g_fx * side };
+                const float cx = g_lastPlayer.x + g_fx * g_npcDist;
+                const float cz = g_lastPlayer.z + g_fz * g_npcDist;
+                const float rx = g_fz, rz = -g_fx;   // right vector in the XZ plane
+                const int cols = std::max(1, (int)ceilf(sqrtf((float)g_npcCount)));
+                const int rows = std::max(1, (g_npcCount + cols - 1) / cols);
+                for (int k = 0; k < g_npcCount; k++) {
+                    float side = 0.0f, depth = 0.0f;
+                    if (g_npcFormation == 0) {   // line: centred across the view direction
+                        side = (k - (g_npcCount - 1) * 0.5f) * g_npcSpacing;
+                    } else if (g_npcFormation == 1) {   // matrix: square-ish grid centred on the requested distance
+                        const int row = k / cols, col = k % cols;
+                        const int rowCount = std::min(cols, g_npcCount - row * cols);
+                        side = (col - (rowCount - 1) * 0.5f) * g_npcSpacing;
+                        depth = (row - (rows - 1) * 0.5f) * g_npcSpacing;
+                    } else {   // circle: evenly distributed around the requested centre
+                        const float a = g_npcCount > 1 ? (6.28318530718f * k / (float)g_npcCount) : 0.0f;
+                        side = cosf(a) * g_npcRadius;
+                        depth = sinf(a) * g_npcRadius;
+                    }
+                    Vec3 at = { cx + rx * side + g_fx * depth, g_lastPlayer.y, cz + rz * side + g_fz * depth };
                     core::SpawnNpc(c.key, at);
                 }
                 Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str());
