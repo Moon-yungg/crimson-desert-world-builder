@@ -1405,7 +1405,7 @@ namespace editor {
             ImGui::BeginGroup();
             ImGui::Text("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str()); ImGui::SameLine(); ImGui::TextDisabled("  %s   ID %u", c.internal.c_str(), c.key);
             ImGui::SetNextItemWidth(compact ? 100 * ui : 140 * ui); ImGui::SliderFloat(T("distance"), &g_npcDist, 1.0f, 30.0f, "%.0f m"); SameLineOrWrap(compact, 90 * ui);
-            ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, 20);
+            ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, 100000);
             ImGui::BeginDisabled(!havePos || st != 2);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
             if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS "   SPAWN   "), ImVec2(150 * ui, 0))) {
