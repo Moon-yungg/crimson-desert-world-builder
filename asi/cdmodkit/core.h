@@ -107,6 +107,8 @@ namespace core {
     void SetFreeCam(bool on);                   // the editor's camera mode (key_mode) switches it; also POST /api/freecam
     bool FreeCamPose(Vec3* pos, Vec3* fwd);     // current free camera position and view direction (false while off)
     bool FreeCamBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd);   // full frame of the free camera (false while off)
+    void FreeCamFocus(Vec3 target, float radius); // move/look at a target; queued until the free camera finishes initializing
+    void FreeCamViewPreset(int preset);          // 1 level, 2 straight down, 3 straight up; position is unchanged
     void FreeCamDolly(float meters);            // move along the view (mouse wheel)
     void FreeCamTurn(float dyaw, float dpitch);  // degrees, as the mouse would (tests without a mouse)
     extern volatile bool g_fcHoldMove;          // editor: no key movement now (context menu open, a field being edited)

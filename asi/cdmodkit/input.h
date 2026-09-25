@@ -1,6 +1,7 @@
 // Window subclass + virtual cursor for the overlay (adapted from master-looter / Trinity, MIT).
 #pragma once
 #include <windows.h>
+#include <string>
 struct ImGuiIO;
 namespace input {
     void Init(HWND hwnd);
@@ -18,4 +19,5 @@ namespace input {
     void SetFreeCam(bool on);      // free-fly camera: WASD/QE/Shift/Ctrl/Space and the look mouse go to World Builder
     bool FreeCamLooking();         // the mouse currently turns the free camera (menu closed, or right button held over the world)
     void TakeLookDelta(float* dx, float* dy);   // raw mouse movement collected for the free camera since the last call   // keys that belong to World Builder while an object is carried
+    std::string ImeComposition();  // current IME pre-edit/composition text (e.g. pinyin), UTF-8; empty when not composing
 }

@@ -6,6 +6,8 @@
 #include <MinHook.h>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
+#include <imm.h>
+#include <string>
 #include <vector>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -27,6 +29,7 @@ namespace input {
     // menu open) go to World Builder instead of the game; the mouse deltas are collected for the camera's turn
     static volatile bool g_freeCam = false; static volatile bool g_rmb = false;
     static float g_lookDx = 0, g_lookDy = 0;
+    static std::string g_imeComposition;
     static bool FreeCamLookingNow() { return g_freeCam && (!core::g_menuOpen || (g_rmb && !core::g_uiMouseOverUi)); }
 
     static void Lock() { EnterCriticalSection(&g_cs); }
@@ -232,6 +235,27 @@ namespace input {
             || m == WM_IME_NOTIFY || m == WM_IME_SETCONTEXT || m == WM_IME_REQUEST || m == WM_IME_CONTROL || m == WM_IME_SELECT
             || m == WM_IME_KEYDOWN || m == WM_IME_KEYUP;
     }
+    static std::string WideToUtf8(const wchar_t* s, int n) {
+        if (!s || n <= 0) return {};
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, s, n, nullptr, 0, nullptr, nullptr); if (bytes <= 0) return {};
+        std::string out((size_t)bytes, '\0'); WideCharToMultiByte(CP_UTF8, 0, s, n, out.data(), bytes, nullptr, nullptr); return out;
+    }
+    static void TrackImeComposition(HWND hwnd, UINT msg, LPARAM lParam) {
+        if (msg == WM_IME_STARTCOMPOSITION) { Lock(); g_imeComposition.clear(); Unlock(); return; }
+        if (msg == WM_IME_ENDCOMPOSITION) { Lock(); g_imeComposition.clear(); Unlock(); return; }
+        if (msg != WM_IME_COMPOSITION) return;
+        std::string next;
+        if (!(lParam & GCS_RESULTSTR) && (lParam & GCS_COMPSTR)) {
+            HIMC himc = ImmGetContext(hwnd);
+            if (himc) {
+                const LONG bytes = ImmGetCompositionStringW(himc, GCS_COMPSTR, nullptr, 0);
+                if (bytes > 0 && bytes < 64 * 1024) { std::vector<wchar_t> w((size_t)bytes / sizeof(wchar_t)); if (ImmGetCompositionStringW(himc, GCS_COMPSTR, w.data(), (DWORD)bytes) == bytes) next = WideToUtf8(w.data(), (int)w.size()); }
+                ImmReleaseContext(hwnd, himc);
+            }
+        }
+        Lock(); g_imeComposition = std::move(next); Unlock();
+    }
+    std::string ImeComposition() { Lock(); std::string s = g_imeComposition; Unlock(); return s; }
     // While the menu is open the game keeps running and stays controllable: the mouse belongs to the menu only while the
     // cursor is over a World Builder window (core::g_uiWantsMouse), the keyboard only while a text field is active (g_uiWantsKeyboard).
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -262,6 +286,7 @@ namespace input {
         if (core::g_menuOpen) {
             const bool mouseToUi = core::g_uiWantsMouse, keysToUi = core::g_uiWantsKeyboard;
             if (core::g_uiTextInput && IsIme(msg)) {
+                TrackImeComposition(hwnd, msg, lParam);
                 // The game owns the real HWND and may consume IME composition messages. Give them to DefWindowProc instead;
                 // it drives the native composition/candidate window and emits WM_CHAR for committed UTF-16 text, which the
                 // normal ImGui Win32 path below consumes. ImGui's default Win32 IME callback positions the candidate window.

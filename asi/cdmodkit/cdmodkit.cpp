@@ -1865,6 +1865,8 @@ static volatile bool g_fcOn = false; static volatile bool g_fcInit = false;
 static float g_fcPos[3] = {}, g_fcYaw = 0, g_fcPitch = 0, g_fcRightSign = 1, g_fcUpSign = 1;
 static LARGE_INTEGER g_fcLast = {};
 static volatile float g_fcDollyPending = 0;   // mouse-wheel metres from the render thread, applied by the game-thread step
+static volatile bool g_fcFocusPending = false; static float g_fcFocusTarget[3] = {}; static float g_fcFocusRadius = 1.0f;
+static volatile int g_fcViewPresetPending = -1;
 // camera scene object vs. view: S = V * C and p_so = p_view + V * d, both measured on the first free frame and kept
 static float g_fcC[9] = {}, g_fcD[3] = {}; static volatile bool g_fcRel = false;
 static void QToM(const float* q, float* m) {   // columns = rotated basis (same as CameraBasis), m[col*3+row]
@@ -1893,9 +1895,26 @@ static void FcStep() {
     float dt = (float)(now.QuadPart - g_fcLast.QuadPart) / (float)freq.QuadPart; g_fcLast = now; if (dt < 0 || dt > 0.1f) dt = 0.1f;
     float dx = 0, dy = 0; input::TakeLookDelta(&dx, &dy);
     g_fcYaw += dx * g_fcSens; g_fcPitch -= dy * g_fcSens;
+    const int viewPreset = g_fcViewPresetPending; g_fcViewPresetPending = -1;
+    if (viewPreset == 1) g_fcPitch = 0.0f;
+    else if (viewPreset == 2) g_fcPitch = -89.0f;
+    else if (viewPreset == 3) g_fcPitch = 89.0f;
     if (g_fcPitch > 89.0f) g_fcPitch = 89.0f; if (g_fcPitch < -89.0f) g_fcPitch = -89.0f;
     if (g_fcYaw > 180.0f) g_fcYaw -= 360.0f; if (g_fcYaw < -180.0f) g_fcYaw += 360.0f;
     float r[3], u[3], f[3]; FcBasis(r, u, f);
+    if (g_fcFocusPending) {
+        const float tx = g_fcFocusTarget[0], ty = g_fcFocusTarget[1], tz = g_fcFocusTarget[2];
+        float dx = tx - g_fcPos[0], dy = ty - g_fcPos[1], dz = tz - g_fcPos[2];
+        float l = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (l < 0.01f) { dx = f[0]; dy = f[1]; dz = f[2]; l = 1.0f; }
+        dx /= l; dy /= l; dz /= l;
+        g_fcYaw = atan2f(dx, dz) * 180.0f / 3.14159265f;
+        g_fcPitch = asinf(std::max(-1.0f, std::min(1.0f, dy))) * 180.0f / 3.14159265f;
+        const float dist = std::max(3.0f, std::min(120.0f, std::max(1.0f, g_fcFocusRadius) * 2.6f));
+        g_fcPos[0] = tx - dx * dist; g_fcPos[1] = ty - dy * dist; g_fcPos[2] = tz - dz * dist;
+        g_fcFocusPending = false;
+        FcBasis(r, u, f);
+    }
     { const float d = g_fcDollyPending; g_fcDollyPending = 0; if (d != 0 && std::isfinite(d)) for (int i = 0; i < 3; i++) g_fcPos[i] += f[i] * d; }
     // editor shortcuts (Ctrl+Z, Ctrl+D ...) must not fly the camera: no movement while Ctrl is held with a shortcut letter
     const bool ctrl = input::ScanDown(0x1D, false) || input::ScanDown(0x1D, true);
@@ -1984,7 +2003,7 @@ bool FreeCamActive() { return g_fcOn; }
 void SetFreeCam(bool on) {
     if (on && !FreeCamAvailable()) { Log("[freecam] not available in this game build (see the log)"); return; }
     if (on == g_fcOn) return;
-    g_fcInit = false; g_fcRel = false; g_fcSoSeen = false; g_fcDollyPending = 0; if (!on) g_fcSceneObj = 0; input::SetFreeCam(on); g_fcOn = on;
+    g_fcInit = false; g_fcRel = false; g_fcSoSeen = false; g_fcDollyPending = 0; g_fcFocusPending = false; g_fcViewPresetPending = -1; if (!on) g_fcSceneObj = 0; input::SetFreeCam(on); g_fcOn = on;
     Log("[freecam] %s", on ? "requested" : "off");
 }
 bool FreeCamBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd) {
@@ -1997,6 +2016,12 @@ void FreeCamDolly(float meters) {   // mouse wheel: along the view, applied by F
     if (!g_fcOn || !g_fcInit || !std::isfinite(meters)) return;
     g_fcDollyPending = g_fcDollyPending + meters;
 }
+void FreeCamFocus(Vec3 target, float radius) {
+    if (!std::isfinite(target.x) || !std::isfinite(target.y) || !std::isfinite(target.z)) return;
+    g_fcFocusTarget[0] = target.x; g_fcFocusTarget[1] = target.y; g_fcFocusTarget[2] = target.z;
+    g_fcFocusRadius = std::isfinite(radius) ? std::max(0.25f, radius) : 1.0f; g_fcFocusPending = true;
+}
+void FreeCamViewPreset(int preset) { if (preset >= 1 && preset <= 3) g_fcViewPresetPending = preset; }
 void FreeCamTurn(float dyaw, float dpitch) { g_fcYaw += dyaw; g_fcPitch += dpitch; }   // tests without a mouse
 bool FreeCamPose(Vec3* pos, Vec3* fwd) {
     if (!g_fcOn || !g_fcInit) return false;

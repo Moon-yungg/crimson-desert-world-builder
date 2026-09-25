@@ -14,4 +14,4 @@ cl /nologo /std:c++17 /utf-8 /O2 /W3 /EHa /MT /DNDEBUG /D_CRT_SECURE_NO_WARNINGS
    cdmodkit.cpp http_api.cpp diag.cpp overlay.cpp input.cpp editor.cpp thumbgen.cpp heap.cpp icons.cpp i18n.cpp ^
    %IM%\imgui.cpp %IM%\imgui_draw.cpp %IM%\imgui_tables.cpp %IM%\imgui_widgets.cpp %IM%\backends\imgui_impl_dx12.cpp %IM%\backends\imgui_impl_win32.cpp ^
    %MH%\src\buffer.c %MH%\src\hook.c %MH%\src\trampoline.c %MH%\src\hde\hde64.c ^
-   build\cdmodkit.res user32.lib comdlg32.lib shell32.lib d3d12.lib dxgi.lib d3dcompiler.lib ws2_32.lib /link /OUT:build\cdmodkit.asi
+   build\cdmodkit.res user32.lib imm32.lib comdlg32.lib shell32.lib d3d12.lib dxgi.lib d3dcompiler.lib ws2_32.lib /link /OUT:build\cdmodkit.asi
