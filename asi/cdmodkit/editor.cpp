@@ -113,6 +113,7 @@ namespace editor {
     static int g_mainTab = 0, g_compactPage = 0; static bool g_selectMainTab = false;
     static bool  g_showSpawnOpts = false, g_showMass = false; static int g_hoverUid = 0;
     static bool  g_cardView = false; static float g_cardSize = 96.0f;   // browser: tile view instead of the list (same matches / filters)
+    static int   g_browserDragPrefab = -1;   // browser row/card being dragged out into the game view
     static std::set<std::string> g_tagFilter;
     static std::vector<int> g_matches; static std::string g_lastKey;
     static float g_off[3] = { 0.0f, 0.0f, 0.0f };
@@ -197,7 +198,7 @@ namespace editor {
     void Toggle() {
         if (g_open && g_cameraMode) StopCameraMode();
         g_open = !g_open; g_playMode = false;
-        if (!g_open) { g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear(); g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0; }
+        if (!g_open) { g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear(); g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0; g_browserDragPrefab = -1; }
         ImGui::GetIO().ClearInputKeys();
         if (!g_open && g_previewShown) { core::PreviewClear(); g_previewShown = false; }
     }
@@ -468,6 +469,21 @@ namespace editor {
         Vec3 d = { c.right.x * nx + c.up.x * ny + c.fwd.x, c.right.y * nx + c.up.y * ny + c.fwd.y, c.right.z * nx + c.up.z * ny + c.fwd.z };
         const float l = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z); return { d.x / l, d.y / l, d.z / l };
     }
+    // Keep every gizmo handle reachable even for very large prefabs. In world units the gizmo may be proportional to the object,
+    // but on screen it is capped by both a useful pixel size and the distance from its center to the nearest viewport edge.
+    static float GizmoScreenSize(const CamFrame& c, const Vec3& center, float radius) {
+        float wanted = std::max(1.0f, radius * 0.8f);
+        if (!c.ok || c.h <= 1.0f || c.f <= 0.01f) return wanted;
+        const Vec3 d = { center.x - c.pos.x, center.y - c.pos.y, center.z - c.pos.z };
+        const float depth = d.x * c.fwd.x + d.y * c.fwd.y + d.z * c.fwd.z;
+        if (depth <= 0.05f) return std::min(wanted, 1.0f);
+        ImVec2 sc; if (!WorldToScreen(c, center, &sc)) return std::min(wanted, std::max(0.25f, depth * 0.08f));
+        const float edge = std::min(std::min(sc.x, c.w - sc.x), std::min(sc.y, c.h - sc.y));
+        const float maxPx = std::max(12.0f, std::min(120.0f, edge - 12.0f));
+        const float worldPerPx = (2.0f * depth) / (c.h * c.f);
+        const float cap = std::max(0.18f, (maxPx / 1.25f) * worldPerPx);   // scale cubes sit at 1.25 * size
+        return std::min(wanted, cap);
+    }
     static float SegDist(ImVec2 p, ImVec2 a, ImVec2 b) { float vx = b.x - a.x, vy = b.y - a.y, l2 = vx * vx + vy * vy; float t = l2 > 0 ? ((p.x - a.x) * vx + (p.y - a.y) * vy) / l2 : 0; t = std::max(0.0f, std::min(1.0f, t)); float dx = a.x + vx * t - p.x, dy = a.y + vy * t - p.y; return sqrtf(dx * dx + dy * dy); }
     // parameter t of the point on the line (o + a*t) closest to the ray (ro + rd*s)
     static float LineRayParam(const Vec3& o, const Vec3& a, const Vec3& ro, const Vec3& rd) {
@@ -737,7 +753,7 @@ namespace editor {
         if (fetch && havePos) P.center = InFront(P.radius, P.center.y - g_lastPlayer.y);
         if (gizmoMouse) {   // gizmo dragging with the virtual cursor (the game does not see the mouse while this is on)
             ImGuiIO& io = ImGui::GetIO(); CamFrame cf = CurrentCam();
-            const float gsize = std::max(1.0f, P.radius * 0.8f);
+            const float gsize = GizmoScreenSize(cf, P.center, P.radius);
             const float objYaw = P.m.size() == 1 ? WrapYaw(P.m[0].rot0.yaw + P.yaw) : P.yaw, objPitch = P.m.size() == 1 ? WrapYaw(P.m[0].rot0.pitch + P.pitch) : P.pitch;
             GizmoGeo g = GizmoAt(cf, P.center, objYaw, objPitch, gsize);
             if (cf.ok && g.ok) {
@@ -1071,6 +1087,9 @@ namespace editor {
         if (g_colls.empty()) ImGui::TextDisabled(T("no collections yet (left pane)"));
         ImGui::EndPopup();
     }
+    static void ArmBrowserDrag(int prefab, bool blocked = false) {
+        if (!blocked && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) g_browserDragPrefab = prefab;
+    }
     // tile view: one card per match with the preview image, the name below, star = favorite; click selects, double-click spawns, right-click = menu
     static void StartPlaceNew(const PosInfo& p, bool havePos);
     static void DrawCards(const PosInfo& p, bool havePos, float listH, float ui, int forceCols = 0, float tilePx = 0) {
@@ -1104,6 +1123,7 @@ namespace editor {
                 const ImVec2 m = ImGui::GetIO().MousePos; const bool onStar = m.x >= star0.x && m.x < star1.x && m.y >= star0.y && m.y < star1.y;
                 if (ImGui::IsItemClicked(0)) { if (onStar) core::ToggleFavorite(i); else g_selPrefab = i; }
                 if (hov && !onStar && ImGui::IsMouseDoubleClicked(0) && havePos) { g_selPrefab = i; StartPlaceNew(p, havePos); }
+                { const ImVec2 cp = ImGui::GetIO().MouseClickedPos[ImGuiMouseButton_Left]; const bool beganOnStar = cp.x >= star0.x && cp.x < star1.x && cp.y >= star0.y && cp.y < star1.y; ArmBrowserDrag(i, beganOnStar); }
                 PrefabContextMenu(i, pi, "cardctx");
                 dl->AddRectFilled(p0, p1, sel ? ImGui::GetColorU32(ImGuiCol_Header) : hov ? ImGui::GetColorU32(ImGuiCol_FrameBgHovered) : ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
                 if (sel) dl->AddRect(p0, p1, ImGui::GetColorU32(ImGuiCol_HeaderActive), 4.0f, 0, 2.0f);
@@ -1373,6 +1393,7 @@ namespace editor {
                     g_selPrefab = i;
                     if (ImGui::IsMouseDoubleClicked(0) && havePos) StartPlaceNew(p, havePos);
                 }
+                ArmBrowserDrag(i);
                 PrefabContextMenu(i, pi, "rowctx");
                 if (row.head == 2) ImGui::Unindent(18.0f);
                 ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", pi.name.c_str());
@@ -1636,12 +1657,10 @@ namespace editor {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("rotation step for Rotate - / Rotate +"));
         ImGui::BeginDisabled(g_undo.empty()); if (ImGui::SmallButton(T("Undo"))) Undo(); ImGui::EndDisabled(); SameLineOrWrap(compact, 45);
         ImGui::BeginDisabled(g_redo.empty()); if (ImGui::SmallButton(T("Redo"))) Redo(); ImGui::EndDisabled();
-        if (compact) ImGui::TextWrapped(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+D duplicate   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select"));
-        else { ImGui::SameLine(); ImGui::TextDisabled(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+D duplicate   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select")); }
         const float ui = ImGui::GetFontSize() / 17.0f;
         const float availY = ImGui::GetContentRegionAvail().y;
         const bool hasSelection = !g_sel.empty() && Find(list, g_primary);
-        const float footer = compact ? (hasSelection ? (g_sel.size() == 1 ? 210.0f : 85.0f) : 28.0f) * ui : 150.0f * ui;
+        const float footer = compact ? (hasSelection ? (g_sel.size() == 1 ? 238.0f : 113.0f) : 56.0f) * ui : 178.0f * ui;
         const float listH = compact ? std::max(180.0f * ui, std::max(availY * 0.48f, availY - footer)) : std::max(100.0f, availY - footer);
         if (g_sceneCards) DrawSceneCards(list, p, havePos, listH, ui);
         else {
@@ -1698,7 +1717,13 @@ namespace editor {
         // drop uids that no longer exist
         for (auto it = g_sel.begin(); it != g_sel.end(); ) { if (!Find(list, *it)) it = g_sel.erase(it); else ++it; }
         const SpawnedObj* prim = Find(list, g_primary);
-        if (g_sel.empty() || !prim) { ImGui::TextDisabled(T("select an object to edit it (Ctrl+click adds, Shift+click selects a range)")); return; }
+        if (g_sel.empty() || !prim) {
+            ImGui::TextDisabled(T("select an object to edit it (Ctrl+click adds, Shift+click selects a range)"));
+            ImGui::Separator();
+            if (compact) ImGui::TextWrapped(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+D duplicate   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select"));
+            else ImGui::TextDisabled(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+D duplicate   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select"));
+            return;
+        }
         ImGui::Separator();
         if (g_sel.size() == 1) {
             const auto& o = *prim;
@@ -1760,6 +1785,9 @@ namespace editor {
         SameLineOrWrap(compact, 120); if (ImGui::Button(T("Remove duplicates"))) { const int n = SelectDuplicates(); if (n) DeleteSel(); else Note(T("no duplicates found")); }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("deletes every object that sits exactly on an identical one (same prefab, position, rotation, scale),\ne.g. after a project was loaded twice. The earlier copy stays. Ctrl+Z brings them back."));
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("drops the entries from the list without touching the world"));
+        ImGui::Separator();
+        if (compact) ImGui::TextWrapped(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+D duplicate   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select"));
+        else ImGui::TextDisabled(T("Ctrl+Z/Y undo/redo   Ctrl+C/V copy/paste   Ctrl+D duplicate   Ctrl+G group   Ctrl+A all   Del delete   Ctrl/Shift+click multi-select"));
     }
 
     static void DrawProject() {
@@ -1948,9 +1976,11 @@ namespace editor {
         (void)p; (void)havePos;
         g_hoverUid = 0;
         ImGuiIO& io = ImGui::GetIO();
+        if (g_browserDragPrefab >= 0) return;   // a browser drag owns LMB until it is dropped or cancelled
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
         const bool addSelect = g_cameraMode ? ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) : io.KeyCtrl;
         const bool addBox = g_cameraMode ? (((GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT)) & 0x8000) != 0) : (io.KeyCtrl || io.KeyShift);
+        const bool placing = g_place.active;
         if (g_playMode) return;
         auto list = core::Spawned();
         if (g_rightGesture) {
@@ -1960,7 +1990,10 @@ namespace editor {
             }
             if (ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
                 if (!g_rightMoved && g_rightUid) {
-                    if (!g_sel.count(g_rightUid)) SelectUid(g_rightUid, false, list);
+                    if (IsCarried(g_rightUid)) {   // opening the menu on the active gizmo must not drop the object
+                        g_sel.clear(); for (const auto& m : g_place.m) g_sel.insert(m.uid);
+                        g_primary = g_lastClicked = g_rightUid; g_editUid = 0;
+                    } else if (!g_sel.count(g_rightUid)) SelectUid(g_rightUid, false, list);
                     g_worldPopupRequested = true; g_worldPopupPos = io.MousePos;
                 }
                 g_rightGesture = g_rightMoved = false; g_rightUid = 0;
@@ -1971,6 +2004,9 @@ namespace editor {
         // as soon as the click happens in world space; object picking below only fills in its context target.
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             g_rightGesture = true; g_rightMoved = false; g_rightStart = io.MousePos; g_rightUid = 0;
+            if (placing && !g_place.m.empty()) {
+                g_rightUid = IsCarried(g_primary) ? g_primary : g_place.m.front().uid;   // gizmo/current carried set is the default context target
+            }
         }
         CamFrame cf = CurrentCam();
         if (!cf.ok) {
@@ -1981,7 +2017,6 @@ namespace editor {
             UpdateBoxSelection(cf, list, io);
             if (g_boxSelecting || overUi) return;
         }
-        const bool placing = g_place.active;
         if (placing && (g_place.hover || g_place.drag)) return;   // upstream gizmo keeps first priority
 
         float bestDepth = 1e30f; int best = 0;
@@ -1993,7 +2028,7 @@ namespace editor {
         }
         g_hoverUid = best;
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-            g_rightUid = best;
+            if (best) g_rightUid = best;   // otherwise keep the carried gizmo as the context target
             return;
         }
         if (!best) {
@@ -2009,6 +2044,55 @@ namespace editor {
             StartGrab({ best }, false, ShortName(Find(list, best)->prefab)); return;
         }
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { SelectUid(best, addSelect, list); g_editUid = 0; }
+    }
+    static bool BrowserDropPoint(const core::PrefabInfo& pi, ImVec2 mouse, Vec3* center, bool* onGroundPlane) {
+        CamFrame cf = CurrentCam(); if (!cf.ok) return false;
+        const Vec3 rd = MouseRay(cf, mouse);
+        PosInfo pp{}; const bool havePlayer = core::PlayerPosInfo(&pp);
+        bool plane = false; Vec3 hit{};
+        if (havePlayer && fabsf(rd.y) > 1e-4f) {
+            const float t = (pp.world.y - cf.pos.y) / rd.y;
+            if (t > 0.25f && t < 500.0f) { hit = { cf.pos.x + rd.x * t, pp.world.y, cf.pos.z + rd.z * t }; plane = true; }
+        }
+        if (!plane) {
+            const float extent = std::max(pi.sx, std::max(pi.sy, pi.sz)) * g_spawnScale;
+            const float dist = std::max(5.0f, std::min(80.0f, 6.0f + extent * 0.75f));
+            hit = { cf.pos.x + rd.x * dist, cf.pos.y + rd.y * dist, cf.pos.z + rd.z * dist };
+        } else if (pi.sy > 0.0f) {
+            hit.y += pi.sy * g_spawnScale * 0.5f;   // cursor marks the surface; placement center is the box center
+        }
+        *center = hit; if (onGroundPlane) *onGroundPlane = plane; return true;
+    }
+    static void ProcessBrowserDrag() {
+        if (g_browserDragPrefab < 0) return;
+        const auto& idx = core::PrefabIndex();
+        if (g_browserDragPrefab >= (int)idx.size()) { g_browserDragPrefab = -1; return; }
+        ImGuiIO& io = ImGui::GetIO(); const auto& pi = idx[g_browserDragPrefab];
+        if (!io.MouseDown[ImGuiMouseButton_Left] && !ImGui::IsMouseReleased(ImGuiMouseButton_Left)) { g_browserDragPrefab = -1; return; }
+        const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
+        Vec3 center{}; bool groundPlane = false; const bool projected = BrowserDropPoint(pi, io.MousePos, &center, &groundPlane);
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        const std::string shown = ShownName(pi);
+        dl->AddText({ io.MousePos.x + 16.0f, io.MousePos.y + 14.0f }, IM_COL32(255, 220, 150, 255), shown.c_str());
+        if (!overUi && projected) {
+            ImVec2 s; CamFrame cf = CurrentCam();
+            if (WorldToScreen(cf, center, &s)) { dl->AddCircle(s, 11.0f, IM_COL32(255, 190, 90, 255), 24, 2.0f); dl->AddCircleFilled(s, 3.0f, IM_COL32(255, 230, 180, 255)); }
+        }
+        if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left)) return;
+        const int prefab = g_browserDragPrefab; g_browserDragPrefab = -1;
+        if (overUi || !projected || !core::GameThreadReady() || IsAppearance(pi)) return;
+        g_selPrefab = prefab;
+        if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
+        Vec3 at = center;
+        if (pi.hasCenter) {
+            const float t = g_spawnYaw * 3.14159265f / 180.0f, cs = cosf(t), sn = sinf(t);
+            at.x -= g_spawnScale * (cs * pi.cx + sn * pi.cz); at.z -= g_spawnScale * (-sn * pi.cx + cs * pi.cz); at.y -= g_spawnScale * pi.cy;
+        }
+        const int uid = core::SpawnAt(pi.path, at, Rot{ g_spawnYaw }, g_spawnScale);
+        if (uid) {
+            StartGrab({ uid }, true, ShownName(pi));
+            if (groundPlane && g_place.active && core::GroundProbeReady()) StartGroundSnap(g_place);
+        }
     }
     static void DrawWorldContextPopup(bool havePos) {
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
@@ -2028,24 +2112,25 @@ namespace editor {
             bool hasGroup = false;
             const auto list = core::Spawned();
             for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (o && !o->hidden && o->group > 0) { hasGroup = true; break; } }
+            auto settlePlacement = []() { if (g_place.active) DropCarried(); };
             ImGui::BeginDisabled(!hasSel);
             if (ImGui::MenuItem(T("Grab"))) StartGrab(SelUids(), false, g_sel.size() == 1 ? "object" : "selection");
-            if (ImGui::MenuItem(T("To ground"))) SnapSelToGround();
-            if (ImGui::MenuItem(T("Duplicate"))) { CopySel(); Paste(havePos); }
-            if (ImGui::MenuItem(T("Group selection"))) GroupSel(true);
-            if (ImGui::MenuItem(T("Ungroup"), nullptr, false, hasGroup)) GroupSel(false);
+            if (ImGui::MenuItem(T("To ground"))) { settlePlacement(); SnapSelToGround(); }
+            if (ImGui::MenuItem(T("Duplicate"))) { settlePlacement(); CopySel(); Paste(havePos); }
+            if (ImGui::MenuItem(T("Group selection"))) { settlePlacement(); GroupSel(true); }
+            if (ImGui::MenuItem(T("Ungroup"), nullptr, false, hasGroup)) { settlePlacement(); GroupSel(false); }
             if (ImGui::BeginMenu(T("Rotate"))) {
-                if (ImGui::MenuItem(T("Rotate left"))) RotateSel(-g_rotationStep);
-                if (ImGui::MenuItem(T("Rotate right"))) RotateSel(g_rotationStep);
+                if (ImGui::MenuItem(T("Rotate left"))) { settlePlacement(); RotateSel(-g_rotationStep); }
+                if (ImGui::MenuItem(T("Rotate right"))) { settlePlacement(); RotateSel(g_rotationStep); }
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu(T("Align to primary"))) {
-                if (ImGui::MenuItem(T("X"))) AlignSel(0);
-                if (ImGui::MenuItem(T("Y"))) AlignSel(1);
-                if (ImGui::MenuItem(T("Z"))) AlignSel(2);
+                if (ImGui::MenuItem(T("X"))) { settlePlacement(); AlignSel(0); }
+                if (ImGui::MenuItem(T("Y"))) { settlePlacement(); AlignSel(1); }
+                if (ImGui::MenuItem(T("Z"))) { settlePlacement(); AlignSel(2); }
                 ImGui::EndMenu();
             }
-            if (ImGui::MenuItem(T("Delete"))) DeleteSel();
+            if (ImGui::MenuItem(T("Delete"))) { settlePlacement(); DeleteSel(); }
             ImGui::EndDisabled();
             ImGui::EndPopup();
         }
@@ -2091,6 +2176,7 @@ namespace editor {
             const int gp = core::GimmickPending();
             if (gp > 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), core::GimmickTemplateReady() ? T("%d interactive object(s) spawning...") : T("%d interactive object(s) waiting for a spawn template: walk a few meters"), gp);
             DrawScene(p, havePos, true);
+            ProcessBrowserDrag();
             ImGui::End();
             if (g_playMode) ImGui::PopStyleVar();
             return;
@@ -2139,6 +2225,7 @@ namespace editor {
             if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS "   PLACE   "), ImVec2(-1, 0))) StartPlaceNew(p, havePos);
             ImGui::PopStyleColor(2); ImGui::EndDisabled();
         } else { ImGui::TextDisabled(T("pick a card, then PLACE")); ImGui::Dummy(ImVec2(0, ImGui::GetFrameHeight())); }
+        ProcessBrowserDrag();
         ImGui::End();
         if (g_playMode) ImGui::PopStyleVar();
     }
@@ -2208,8 +2295,8 @@ namespace editor {
         PlaceTick(p, havePos);                 // runs with the menu closed as well
         PumpSnapJobs();
         if (g_place.active) DrawPlaceHud();
-        if (g_place.active && (g_gizmo || MouseMode())) { const bool one = g_place.m.size() == 1;
-            DrawGizmo(g_place.center, one ? WrapYaw(g_place.m[0].rot0.yaw + g_place.yaw) : g_place.yaw, one ? WrapYaw(g_place.m[0].rot0.pitch + g_place.pitch) : g_place.pitch, std::max(1.0f, g_place.radius * 0.8f), g_place.drag ? g_place.drag : g_place.hover); }
+        if (g_place.active && (g_gizmo || MouseMode())) { const bool one = g_place.m.size() == 1; const CamFrame cf = CurrentCam();
+            DrawGizmo(g_place.center, one ? WrapYaw(g_place.m[0].rot0.yaw + g_place.yaw) : g_place.yaw, one ? WrapYaw(g_place.m[0].rot0.pitch + g_place.pitch) : g_place.pitch, GizmoScreenSize(cf, g_place.center, g_place.radius), g_place.drag ? g_place.drag : g_place.hover); }
         if (g_place.active && !g_open) ImGui::GetIO().MouseDrawCursor = g_place.mouse;
         DrawCalibrationMarker(p, havePos);
         if (!g_open) { if (g_cameraMode) StopCameraMode(); return; }
@@ -2414,6 +2501,7 @@ namespace editor {
             ImGui::EndTabBar();
             if (g_selectMainTab) g_selectMainTab = false;
         }
+        ProcessBrowserDrag();
         ImGui::End();
         if (g_playMode) ImGui::PopStyleVar();
         CameraTick();

@@ -7,6 +7,7 @@ python ..\..\scripts\pack_index.py || exit /b 1
 rc /nologo /fo build\cdmodkit.res cdmodkit.rc || exit /b 1
 set MH=..\..\tools\minhook
 set IM=..\..\tools\imgui
+python ..\..\scripts\patch_minhook.py "%MH%\src\trampoline.c" || exit /b 1
 cl /nologo /std:c++17 /utf-8 /O2 /W3 /EHa /MT /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DIMGUI_DISABLE_OBSOLETE_FUNCTIONS=0 /DIMGUI_USER_CONFIG=\"cd_imconfig.h\" ^
    /I. /I%MH%\include /I%IM% /I%IM%\backends /Fo:build\ /LD ^
    cdmodkit.cpp http_api.cpp diag.cpp overlay.cpp input.cpp editor.cpp thumbgen.cpp heap.cpp icons.cpp i18n.cpp ^

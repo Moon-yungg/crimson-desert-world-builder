@@ -11,6 +11,7 @@ if not exist build mkdir build
 python ..\..\scripts\pack_index.py || exit /b 1
 set MH=..\..\tools\minhook
 set IM=..\..\tools\imgui
+python ..\..\scripts\patch_minhook.py "%MH%\src\trampoline.c" || exit /b 1
 set CXXFLAGS=-std=c++17 -O2 -w -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DMINGW_HAS_SECURE_API=1 -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS=0 -DIMGUI_USER_CONFIG=\"cd_imconfig.h\" -I. -I%MH%\include -I%IM% -I%IM%\backends
 %WINDRES% -O coff -o build\cdmodkit_res.o cdmodkit.rc || exit /b 1
 %GCC% -O2 -w -c -I%MH%\include -I%MH%\src %MH%\src\buffer.c -o build\mh_buffer.o || exit /b 1
