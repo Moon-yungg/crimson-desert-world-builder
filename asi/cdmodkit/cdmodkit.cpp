@@ -611,8 +611,10 @@ static int LogFault(EXCEPTION_POINTERS* ep) {
 }
 static void RunJobGuarded(std::function<void()>* job) { CDK_GUARD_BEGIN (*job)(); CDK_GUARD_FAIL EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); CDK_GUARD_END }
 static void AutoloadTick();
+static void CheckReplayWatchdog();   // gimmick replay watchdog (below): the game thread keeps running when the server thread is stuck
 static void PumpJobs() {
     g_pumpTicks++; g_gameThread = GetCurrentThreadId();
+    if ((g_pumpTicks & 31) == 0) CheckReplayWatchdog();
     if (g_trace) TraceTick();
     if ((g_pumpTicks & 15) == 0) AutoloadTick();
     std::function<void()> job;
@@ -1430,14 +1432,44 @@ static void ReplayGimmickBody() {
     if (g.s6) { uint32_t u[4]; memcpy(u, g.s6, 16); Log("[gimmick] level replay: origin uuid at s6 %08x %08x %08x %08x cleared", u[0], u[1], u[2], u[3]); memset(g.s6, 0, 16); }
     RunSpawnSteps(c, g, "level replay");
 }
-static bool FindTemplateCapture(GimmickCapture& out, const std::vector<int>* avoid = nullptr) {   // newest level streaming spawn, else newest housing placement, else any other non-drop spawn with a path
+// Which capture serves as the template. A user's log showed the game's server thread never returning from a replay whose
+// template the game had captured 57 ms earlier (its own spawn was apparently still in progress), after seven good replays
+// from an older capture. So: the capture whose last replay succeeded is used again as long as it is in the ring; otherwise a
+// settled one (at least kTemplateSettleMs old: the newest of those, level streaming before housing before any other); a
+// younger one only when there is nothing else (right after loading a save), and then the oldest of them.
+static volatile int g_goodTemplateId = 0;
+static volatile DWORD g_replayWatchTick = 0; static volatile bool g_replayWatchLogged = false;   // the replay in progress (0 = none)
+static char g_replayWatchPrefab[256] = {}; static int g_replayWatchTemplate = 0; static DWORD g_replayWatchAge = 0; static Vec3 g_replayWatchPos{};
+static void CheckReplayWatchdog() {
+    const DWORD t0 = g_replayWatchTick;
+    if (!t0 || g_replayWatchLogged || GetTickCount() - t0 < 5000) return;
+    g_replayWatchLogged = true;
+    Log("[gimmick] WATCHDOG: the replay of %s at (%.1f %.1f %.1f) with template %d (captured %lu ms before) has not returned for 5 s: "
+        "the game's server thread is stuck inside it. Interactive objects, NPC spawns and the game's own world spawns stop until the "
+        "game is restarted. Please report this log.", g_replayWatchPrefab, g_replayWatchPos.x, g_replayWatchPos.y, g_replayWatchPos.z,
+        g_replayWatchTemplate, (unsigned long)g_replayWatchAge);
+}
+static const DWORD kTemplateSettleMs = 2000;
+static bool FindTemplateCapture(GimmickCapture& out, const std::vector<int>* avoid = nullptr) {
     std::lock_guard<std::mutex> l(g_gringMutex);
-    for (uintptr_t want : { g_callerLevel, g_callerHousing, (uintptr_t)0 }) {
-        int best = -1; DWORD bestWhen = 0;
-        for (int k = 0; k < kGimmickRing; k++) { const GimmickCapture& c = g_gring[k]; if (!c.valid || !c.ownerPath[0] || c.caller == g_callerDrop) continue; if (want && c.caller != want) continue;
-            if (avoid && std::find(avoid->begin(), avoid->end(), c.id) != avoid->end()) continue;
-            if (best < 0 || (DWORD)(c.when - bestWhen) < 0x80000000u) { best = k; bestWhen = c.when; } }
-        if (best >= 0) { out = g_gring[best]; return true; }
+    auto usable = [&](const GimmickCapture& c) {
+        return c.valid && c.ownerPath[0] && c.caller != g_callerDrop && !(avoid && std::find(avoid->begin(), avoid->end(), c.id) != avoid->end());
+    };
+    if (const int good = g_goodTemplateId)
+        for (int k = 0; k < kGimmickRing; k++) if (g_gring[k].id == good && usable(g_gring[k])) { out = g_gring[k]; return true; }
+    const DWORD now = GetTickCount();
+    for (int pass = 0; pass < 2; pass++) {   // 0: settled only, newest first; 1: young ones, oldest first
+        for (uintptr_t want : { g_callerLevel, g_callerHousing, (uintptr_t)0 }) {
+            int best = -1; DWORD bestWhen = 0;
+            for (int k = 0; k < kGimmickRing; k++) {
+                const GimmickCapture& c = g_gring[k]; if (!usable(c) || (want && c.caller != want)) continue;
+                const bool settled = now - c.when >= kTemplateSettleMs;
+                if (settled != (pass == 0)) continue;
+                const bool newer = (DWORD)(c.when - bestWhen) < 0x80000000u;
+                if (best < 0 || (pass == 0 ? newer : !newer)) { best = k; bestWhen = c.when; }
+            }
+            if (best >= 0) { out = g_gring[best]; return true; }
+        }
     }
     return false;
 }
@@ -1475,16 +1507,21 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     char saved[256]; memcpy(saved, g_replayPrefab, sizeof saved); strncpy_s(g_replayPrefab, r.prefab.c_str(), _TRUNCATE);
     float xf[12]; MakeTransform(xf, r.pos, r.rot, r.scale, false); memcpy(g_replayQuat, xf + 3, 16); g_replayScale = r.scale; g_replayUseRot = true;
     g_gimmickReplayId = t.id; g_gimmickReplayAt = r.pos;
+    strncpy_s(g_replayWatchPrefab, r.prefab.c_str(), _TRUNCATE); g_replayWatchTemplate = t.id; g_replayWatchAge = GetTickCount() - t.when; g_replayWatchPos = r.pos;
+    g_replayWatchLogged = false; g_replayWatchTick = GetTickCount();
     ReplayGimmick();
+    g_replayWatchTick = 0;
     g_replayUseRot = false; memcpy(g_replayPrefab, saved, sizeof saved);
     const uintptr_t so = g_replayResultSo, actor = g_replayResultActor;
     if (so) {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid);
         if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].standin) { if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); return; }   // deleted or picked up while spawning
         g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale;
+        if (g_goodTemplateId != t.id) { g_goodTemplateId = t.id; Log("[gimmick] capture %d is the proven template now", t.id); }
         Log("[gimmick] object %d spawned through the game: %s (scene object %p, actor %p)", r.uid, r.prefab.c_str(), (void*)so, (void*)actor);
     } else {
         r.triedTemplates.push_back(t.id);
+        if (g_goodTemplateId == t.id) g_goodTemplateId = 0;   // the proven template failed: the next object searches a new one
         // A refusal can depend on the template (captures change as the player moves), so a few different ones are tried; a
         // prefab the game keeps refusing becomes a plain object instead of being retried forever.
         const bool giveUp = r.triedTemplates.size() >= kGimmickMaxTries;
