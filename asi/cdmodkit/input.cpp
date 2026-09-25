@@ -227,12 +227,18 @@ namespace input {
         return false;
     }
     static bool IsKeyboard(UINT m) { return m == WM_KEYDOWN || m == WM_KEYUP || m == WM_SYSKEYDOWN || m == WM_SYSKEYUP || m == WM_CHAR || m == WM_SYSCHAR; }
-
+    static bool IsIme(UINT m) {
+        return m == WM_IME_STARTCOMPOSITION || m == WM_IME_ENDCOMPOSITION || m == WM_IME_COMPOSITION || m == WM_IME_CHAR
+            || m == WM_IME_NOTIFY || m == WM_IME_SETCONTEXT || m == WM_IME_REQUEST || m == WM_IME_CONTROL || m == WM_IME_SELECT
+            || m == WM_IME_KEYDOWN || m == WM_IME_KEYUP;
+    }
     // While the menu is open the game keeps running and stays controllable: the mouse belongs to the menu only while the
     // cursor is over a World Builder window (core::g_uiWantsMouse), the keyboard only while a text field is active (g_uiWantsKeyboard).
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (IsKeyboard(msg)) TrackKey(msg, lParam);
         if (msg == WM_KILLFOCUS || (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE)) { memset(g_scanDown, 0, sizeof g_scanDown); g_rmb = false; }
+        // Keep the platform backend's keyboard code page in sync even when the game's WndProc would otherwise consume the change.
+        if (core::g_menuOpen && msg == WM_INPUTLANGCHANGE) ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
         if (g_freeCam) {
             if (msg == WM_INPUT) {
                 const int take = FreeCamRaw(reinterpret_cast<HRAWINPUT>(lParam));
@@ -255,6 +261,12 @@ namespace input {
         }
         if (core::g_menuOpen) {
             const bool mouseToUi = core::g_uiWantsMouse, keysToUi = core::g_uiWantsKeyboard;
+            if (core::g_uiTextInput && IsIme(msg)) {
+                // The game owns the real HWND and may consume IME composition messages. Give them to DefWindowProc instead;
+                // it drives the native composition/candidate window and emits WM_CHAR for committed UTF-16 text, which the
+                // normal ImGui Win32 path below consumes. ImGui's default Win32 IME callback positions the candidate window.
+                return DefWindowProcW(hwnd, msg, wParam, lParam);
+            }
             if (msg == WM_INPUT) {
                 OnRawInput(reinterpret_cast<HRAWINPUT>(lParam));        // the virtual cursor always follows the mouse
                 if (mouseToUi) return DefWindowProcW(hwnd, msg, wParam, lParam);   // the game does not look around while we use the menu

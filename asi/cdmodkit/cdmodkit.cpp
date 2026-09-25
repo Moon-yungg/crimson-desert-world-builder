@@ -1217,13 +1217,13 @@ static void LogSpawnTransforms(const char* what, uintptr_t save, uintptr_t s8, u
 }
 // ---- interactive objects: the editor's gimmick prefabs spawned through the game's own spawn path -----------------------------
 // SpawnAt queues them here; the ServerField tick (slot 9, server thread) spawns one per tick from the newest usable capture
-// (a level streaming spawn, else a housing placement) with the prefab, position, rotation and scale swapped in. On failure the
-// object falls back to a plain client object. Moves remove + respawn (final only), deletes remove the actor.
-struct GimmickReq { int uid; std::string prefab; Vec3 pos; Rot rot; float scale; };
+// (a level streaming spawn, else a housing placement) with the prefab, position, rotation and scale swapped in. A refused replay
+// keeps a plain client stand-in visible while newer/different captures are retried. Moves remove + respawn (final only), deletes remove the actor.
+struct GimmickReq { int uid; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; };
 static std::deque<GimmickReq> g_gimmickQueue; static std::mutex g_gimmickQueueMutex;
 static std::deque<std::function<void()>> g_serverJobs; static std::mutex g_serverJobsMutex;
 static void RunOnServerTick(std::function<void()> f) { std::lock_guard<std::mutex> l(g_serverJobsMutex); g_serverJobs.push_back(std::move(f)); }
-static void EnqueueGimmick(int uid, const std::string& prefab, Vec3 pos, Rot rot, float scale) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back({ uid, prefab, pos, rot, scale }); }
+static void EnqueueGimmick(int uid, const std::string& prefab, Vec3 pos, Rot rot, float scale) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back({ uid, prefab, pos, rot, scale, {} }); }
 int GimmickPending() { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); return (int)g_gimmickQueue.size(); }
 static bool MoveGimmick(size_t idx, Vec3 pos, Rot rot, float scale, bool final) {
     // While an interactive object is dragged it cannot follow the mouse (a server object only moves by remove + respawn), so
@@ -1428,11 +1428,13 @@ static void ReplayGimmickBody() {
     if (g.s6) { uint32_t u[4]; memcpy(u, g.s6, 16); Log("[gimmick] level replay: origin uuid at s6 %08x %08x %08x %08x cleared", u[0], u[1], u[2], u[3]); memset(g.s6, 0, 16); }
     RunSpawnSteps(c, g, "level replay");
 }
-static bool FindTemplateCapture(GimmickCapture& out) {   // newest level streaming spawn, else newest housing placement, else any other non-drop spawn with a path
+static bool FindTemplateCapture(GimmickCapture& out, const std::vector<int>* avoid = nullptr) {   // newest level streaming spawn, else newest housing placement, else any other non-drop spawn with a path
     std::lock_guard<std::mutex> l(g_gringMutex);
     for (uintptr_t want : { g_callerLevel, g_callerHousing, (uintptr_t)0 }) {
         int best = -1; DWORD bestWhen = 0;
-        for (int k = 0; k < kGimmickRing; k++) { const GimmickCapture& c = g_gring[k]; if (!c.valid || !c.ownerPath[0] || c.caller == g_callerDrop) continue; if (want && c.caller != want) continue; if (best < 0 || (DWORD)(c.when - bestWhen) < 0x80000000u) { best = k; bestWhen = c.when; } }
+        for (int k = 0; k < kGimmickRing; k++) { const GimmickCapture& c = g_gring[k]; if (!c.valid || !c.ownerPath[0] || c.caller == g_callerDrop) continue; if (want && c.caller != want) continue;
+            if (avoid && std::find(avoid->begin(), avoid->end(), c.id) != avoid->end()) continue;
+            if (best < 0 || (DWORD)(c.when - bestWhen) < 0x80000000u) { best = k; bestWhen = c.when; } }
         if (best >= 0) { out = g_gring[best]; return true; }
     }
     return false;
@@ -1445,9 +1447,19 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     GimmickReq r; size_t pending = 0;
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty()) return; r = g_gimmickQueue.front(); pending = g_gimmickQueue.size(); }
     GimmickCapture t;
-    if (!FindTemplateCapture(t)) { static DWORD lastLog = 0; if (GetTickCount() - lastLog > 15000) { lastLog = GetTickCount(); Log("[gimmick] %zu interactive object%s waiting for a spawn template (the game spawns one when you walk)", pending, pending == 1 ? "" : "s"); } return; }
+    if (!FindTemplateCapture(t, r.triedTemplates.empty() ? nullptr : &r.triedTemplates)) {
+        static DWORD lastLog = 0; if (GetTickCount() - lastLog > 15000) { lastLog = GetTickCount();
+            Log(r.triedTemplates.empty() ? "[gimmick] %zu interactive object%s waiting for a spawn template (the game spawns one when you walk)" : "[gimmick] %zu interactive object%s waiting for a fresh spawn template after a replay was refused", pending, pending == 1 ? "" : "s"); }
+        if (!r.triedTemplates.empty()) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); } }
+        return;
+    }
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.pop_front(); }
-    { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].standin) return; }   // deleted or being dragged meanwhile
+    uintptr_t waitingStandin = 0;
+    { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return;
+      // A stand-in plus a queue entry means a previous server replay failed and left a visible client placeholder. Active dragging
+      // removes the queue entry, so it never reaches this path. Retire the placeholder before retrying the interactive spawn.
+      if (g_reg[(size_t)i].standin) { waitingStandin = g_reg[(size_t)i].obj; g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].standin = false; } }
+    if (waitingStandin && GameThreadReady()) RunOnGameThread([waitingStandin]() { DoRemove(waitingStandin); });
     char saved[256]; memcpy(saved, g_replayPrefab, sizeof saved); strncpy_s(g_replayPrefab, r.prefab.c_str(), _TRUNCATE);
     float xf[12]; MakeTransform(xf, r.pos, r.rot, r.scale, false); memcpy(g_replayQuat, xf + 3, 16); g_replayScale = r.scale; g_replayUseRot = true;
     g_gimmickReplayId = t.id; g_gimmickReplayAt = r.pos;
@@ -1460,9 +1472,13 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
         g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale;
         Log("[gimmick] object %d spawned through the game: %s (scene object %p, actor %p)", r.uid, r.prefab.c_str(), (void*)so, (void*)actor);
     } else {
-        Log("[gimmick] object %d: the game's spawn path refused %s, placing it as a plain object instead", r.uid, r.prefab.c_str());
-        { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i >= 0) g_reg[(size_t)i].gimmick = false; }
+        r.triedTemplates.push_back(t.id);
+        Log("[gimmick] object %d: replay with template %d was refused; keeping a plain stand-in and waiting for another/fresh template (tried %zu)", r.uid, t.id, r.triedTemplates.size());
+        // A refusal can be template-dependent: captures are refreshed as the player moves and the game creates other gimmicks.
+        // Never permanently demote an interactive prefab because one (or several) transient replay contexts rejected it.
+        { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return; g_reg[(size_t)i].standin = true; g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].actor = 0; }
         if (GameThreadReady()) RunOnGameThread([r]() { DoSpawn(r.prefab, r.pos, r.rot, r.scale, r.uid); });
+        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); }
     }
 }
 static void* __fastcall HookGimmickSpawn(void* param, void* out, void* mgr, void* owner, void* s5, void* s6, void* s7, void* s8, void* s9, void* s10, void* s11, void* s12) {

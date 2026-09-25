@@ -1,5 +1,6 @@
 """Validate the shipped UI translation resource and its printf placeholders."""
 from pathlib import Path
+import ast
 import re
 import sys
 
@@ -11,6 +12,81 @@ LANGUAGE_NAMES = [
     "Korean", "Japanese", "Spanish", "Portuguese (Brazil)", "Russian", "Turkish",
 ]
 PRINTF = re.compile(r"%(?!%)(?:[-+#0 ]*(?:\d+|\*)?(?:\.(?:\d+|\*))?(?:hh|h|ll|l|I64|I32|z|t|j|L)?[diuoxXfFeEgGaAcspn])")
+CPP_STRING = r'"(?:\\.|[^"\\])*"'
+TRANSLATE_CALL = re.compile(r'\bT(?:Stable)?\(\s*(?:ICON_[A-Z0-9_]+\s*)?(' + CPP_STRING + r')\s*\)')
+
+
+def strip_cpp_comments(source: str) -> str:
+    """Remove C/C++ comments without touching comment markers inside string literals."""
+    out = []
+    i = 0
+    quote = None
+    while i < len(source):
+        c = source[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and i + 1 < len(source):
+                i += 1
+                out.append(source[i])
+            elif c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ('"', "'"):
+            quote = c
+            out.append(c)
+            i += 1
+            continue
+        if source.startswith("//", i):
+            nl = source.find("\n", i + 2)
+            if nl < 0:
+                break
+            out.append("\n")
+            i = nl + 1
+            continue
+        if source.startswith("/*", i):
+            end = source.find("*/", i + 2)
+            i = len(source) if end < 0 else end + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def visible_key(text: str) -> str:
+    # Mirrors i18n::StripVisibleKey for source literals. Icon macros are outside the captured literal.
+    text = text.strip(" \t")
+    return text.split("##", 1)[0]
+
+
+def unescape_pack(value: str) -> str:
+    out = []
+    i = 0
+    while i < len(value):
+        if value[i] == "\\" and i + 1 < len(value):
+            n = value[i + 1]
+            if n == "n": out.append("\n"); i += 2; continue
+            if n == "r": out.append("\r"); i += 2; continue
+            if n == "t": out.append("\t"); i += 2; continue
+            if n == "\\": out.append("\\"); i += 2; continue
+        out.append(value[i])
+        i += 1
+    return "".join(out)
+
+
+def source_translation_keys() -> set[str]:
+    keys = set()
+    for path in (ROOT / "asi" / "cdmodkit").glob("*.cpp"):
+        source = strip_cpp_comments(path.read_text(encoding="utf-8"))
+        for match in TRANSLATE_CALL.finditer(source):
+            try:
+                text = ast.literal_eval(match.group(1))
+            except (SyntaxError, ValueError):
+                continue
+            key = visible_key(text)
+            if key:
+                keys.add(key)
+    return keys
 
 
 def main() -> int:
@@ -48,7 +124,11 @@ def main() -> int:
     missing_names = [name for name in LANGUAGE_NAMES if name not in seen]
     if missing_names:
         raise ValueError(f"missing localized language names: {missing_names}")
-    print(f"Locale pack OK: {count} entries, {len(EXPECTED)} languages, all placeholders match.")
+    runtime_keys = {unescape_pack(key) for key in seen}
+    missing_source = sorted(source_translation_keys() - runtime_keys)
+    if missing_source:
+        raise ValueError("source strings missing from locales.tsv:\n  " + "\n  ".join(repr(key) for key in missing_source))
+    print(f"Locale pack OK: {count} entries, {len(EXPECTED)} languages, all placeholders match, all source T() keys present.")
     return 0
 
 

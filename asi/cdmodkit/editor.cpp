@@ -307,7 +307,7 @@ namespace editor {
         g_lastKey = key; g_rowsDirty = false;
         if (!sameMatches) { g_matches.clear();
         std::set<std::string> collSet; if (g_selColl >= 0 && g_selColl < (int)g_colls.size()) for (auto& p : g_colls[g_selColl].paths) collSet.insert(p);
-        std::vector<std::string> words; { std::string w; for (const char* p = g_filter; ; p++) { if (*p == ' ' || *p == 0) { if (!w.empty()) words.push_back(w); w.clear(); if (!*p) break; } else w += (char)tolower(*p); } }
+        std::vector<std::string> words; { std::string w; for (const char* p = g_filter; ; p++) { if (*p == ' ' || *p == 0) { if (!w.empty()) words.push_back(w); w.clear(); if (!*p) break; } else w += (char)tolower((unsigned char)*p); } }
         const auto& idx = core::PrefabIndex();
         for (int i = 0; i < (int)idx.size(); i++) {
             const auto& pi = idx[i];
@@ -319,7 +319,7 @@ namespace editor {
             if (g_selCat > 0 && !InCat(pi.cat, g_selCat)) continue;
             bool ok = true;
             const std::string& gn = ShownName(pi);
-            for (auto& w : words) if (!ContainsCI(pi.path, w) && !ContainsCI(pi.tags, w) && !ContainsCI(gn, w)) { ok = false; break; }
+            for (auto& w : words) if (!ContainsCI(pi.path, w) && !ContainsCI(pi.tags, w) && !ContainsCI(pi.name, w) && !ContainsCI(gn, w)) { ok = false; break; }
             if (!ok) continue;
             for (auto& t : g_tagFilter) if (!HasTag(pi.tags, t)) { ok = false; break; }
             if (!ok) continue;
@@ -942,11 +942,11 @@ namespace editor {
         g_undo.push_back(acts); Note(T("redo"));
     }
     struct ClipItem { std::string prefab; Vec3 rel; Rot rot; float scale; };
-    static std::vector<ClipItem> g_clip; static float g_clipRadius = 1;
+    static std::vector<ClipItem> g_clip; static float g_clipRadius = 1; static Vec3 g_clipCenter{};
     static void CopySel() {
         auto list = core::Spawned(); g_clip.clear(); Vec3 c{ 0, 0, 0 }; int n = 0;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; c.x += o->pos.x; c.y += o->pos.y; c.z += o->pos.z; n++; }
-        if (!n) return; c.x /= n; c.y /= n; c.z /= n; g_clipRadius = 1;
+        if (!n) return; c.x /= n; c.y /= n; c.z /= n; g_clipCenter = c; g_clipRadius = 1;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; g_clip.push_back({ o->prefab, { o->pos.x - c.x, o->pos.y - c.y, o->pos.z - c.z }, o->rot, o->scale });
             float dx = o->pos.x - c.x, dz = o->pos.z - c.z; g_clipRadius = std::max(g_clipRadius, sqrtf(dx * dx + dz * dz) + 1.0f); }
         Note(T("copied %d objects"), (int)g_clip.size());
@@ -961,7 +961,14 @@ namespace editor {
         StartGrab(uids, true, name);
         g_place.radius = std::max(g_place.radius, radius);
     }
-    static void Paste(bool havePos) { if (g_clip.empty() || !havePos) return; SpawnSet(g_clip, InFront(g_clipRadius, 0), g_clipRadius, "pasted"); }
+    static void Paste(bool havePos) {
+        (void)havePos; if (g_clip.empty()) return;
+        // Duplicates belong next to their source, not next to the player/camera. A small view-right offset keeps the copy visible
+        // without destroying a multi-selection's relative layout; placement mode can then move it precisely if desired.
+        const float d = std::max(0.6f, std::min(2.0f, g_clipRadius * 0.35f));
+        const Vec3 at = { g_clipCenter.x + g_fz * d, g_clipCenter.y, g_clipCenter.z - g_fx * d };
+        SpawnSet(g_clip, at, g_clipRadius, "pasted");
+    }
     static void GroupSel(bool group) {
         if (g_sel.empty()) return;
         auto list = core::Spawned(); int gid = group ? core::NewGroupId() : 0; int n = 0; std::vector<Act> acts;
@@ -1202,7 +1209,7 @@ namespace editor {
                 dl->PushClipRect({ p0.x + pad, t1.y }, { p1.x - pad, p1.y }, true);
                 dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), { p0.x + pad, t1.y + 2 }, ImGui::GetColorU32(ImGuiCol_Text), c.name.empty() ? c.internal.c_str() : c.name.c_str(), nullptr, tile);
                 dl->PopClipRect();
-                if (hov) ImGui::SetTooltip("%s\n%s   key %u", c.name.empty() ? "-" : c.name.c_str(), c.internal.c_str(), c.key);
+                if (hov) ImGui::SetTooltip("%s\n%s   %s %u", c.name.empty() ? "-" : c.name.c_str(), c.internal.c_str(), T("key"), c.key);
                 ImGui::PopID();
             }
         }

@@ -3,6 +3,7 @@ rem an MSVC environment that is already set up (CI, a developer command prompt) 
 where cl >nul 2>nul || call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
 cd /d "%~dp0"
 if not exist build mkdir build
+python ..\..\scripts\check_locales.py || exit /b 1
 python ..\..\scripts\pack_index.py || exit /b 1
 rc /nologo /fo build\cdmodkit.res cdmodkit.rc || exit /b 1
 set MH=..\..\tools\minhook
