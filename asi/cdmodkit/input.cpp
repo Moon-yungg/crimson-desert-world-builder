@@ -240,9 +240,15 @@ namespace input {
                 if (core::g_menuOpen) { if (core::g_uiWantsMouse) return DefWindowProcW(hwnd, msg, wParam, lParam); }
                 return CallWindowProc(g_original, hwnd, msg, wParam, lParam);
             }
-            if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_CHAR) && !core::g_uiTextInput && IsFreeCamScan((int)((lParam >> 16) & 0xFF))) return 0;   // key-ups pass: the game must see a key released that it saw pressed
+            if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_CHAR) && !core::g_uiTextInput && IsFreeCamScan((int)((lParam >> 16) & 0xFF))) {
+                // not to the game; the editor still sees Ctrl / Shift (Ctrl-click, shortcuts). Key-ups pass below: the game must see
+                // a key released that it saw pressed
+                if (core::g_menuOpen && msg != WM_CHAR) ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
+                return 0;
+            }
             if (IsMouse(msg) && (!core::g_menuOpen || ((g_rmb || msg == WM_RBUTTONDOWN) && !core::g_uiMouseOverUi))) {
                 if (msg == WM_RBUTTONDOWN) g_rmb = true; else if (msg == WM_RBUTTONUP) g_rmb = false;
+                if (core::g_menuOpen && !g_rawButtons) ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);   // right click / drag in the world: the editor's context menu
                 if (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP || msg == WM_XBUTTONUP) return CallWindowProc(g_original, hwnd, msg, wParam, lParam);
                 return 0;   // no attack / aim while flying
             }

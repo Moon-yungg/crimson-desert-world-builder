@@ -34,8 +34,8 @@ Zum Neuaufbau einfach den Ordner `thumbs` und die Datei `prefab_size.tsv` lösch
 
 - Spielstand laden, dann **Einfg** (Insert) drücken: Fenster "World Builder" erscheint im **Bearbeitungsmodus**. Die Welt läuft
   weiter, aber Maus und Tastatur gehören komplett dem Menü (die Figur reagiert nicht, der Cursor ist sichtbar).
-- **Pos1** (Home) schaltet in den **Spielmodus**: das Fenster bleibt halbtransparent stehen, alle Eingaben gehen ans Spiel.
-  Nochmal Pos1 schaltet zurück, Einfg blendet das Fenster aus. Beide Tasten sind im Tab "Settings" umbelegbar, dort lässt sich auch das Konsolenfenster abschalten
+- **Pos1** (Home) schaltet in den **Kameramodus**: eine frei fliegende Kamera, der Editor bleibt offen (siehe „Freie
+  Kamera“). Nochmal Pos1 schaltet zurück, Einfg blendet das Fenster aus und gibt die Steuerung ans Spiel zurück. Beide Tasten sind im Tab "Settings" umbelegbar, dort lässt sich auch das Konsolenfenster abschalten
   (gespeichert in `bin64\cdmodkit\settings.txt`).
 - **Browser:** Kategorien links (Breite ziehbar), Suche und Tag-Filter oben, Favoriten mit dem Stern. Eintrag anklicken zeigt
   Vorschau, Größe in Metern und Tags. Versatz zum Spieler, Yaw und Scale einstellen, dann "SPAWN" oder Doppelklick.

@@ -47,12 +47,13 @@ namespace editor {
         const ImGuiIO& io = ImGui::GetIO(); const bool active = ImGui::IsItemActive() || io.WantTextInput;
         if (active) { g_numericEditWasActive = true; g_numericEditFocus = false; }
         const bool clickedOutside = ImGui::GetFrameCount() > g_numericEditStartedFrame && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsItemHovered();
-        const bool stableDeactivation = g_numericEditWasActive && ImGui::GetFrameCount() > g_numericEditStartedFrame + 1 && ImGui::IsItemDeactivated();
+        const bool stableDeactivation = g_numericEditWasActive && ImGui::GetFrameCount() > g_numericEditStartedFrame + 1 && ImGui::IsItemDeactivated() && !ImGui::IsItemActive();
         const bool submit = g_numericEditWasActive && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
         if (stableDeactivation || submit || ((g_numericEditFocus || g_numericEditWasActive) && clickedOutside)) {
             const int count = vec3 ? 3 : 1; for (int i = 0; i < count; ++i) value[i] = std::max(min, std::min(max, value[i]));
             g_numericEditEndedId = id; g_numericEditEndedFrame = ImGui::GetFrameCount(); CancelNumericEdit();
         }
+        for (int i = 0; i < (vec3 ? 3 : 1); ++i) value[i] = std::max(min, std::min(max, value[i]));   // a half-typed 0 must not reach the object
         *changed = entered; for (int i = 0; i < (vec3 ? 3 : 1); ++i) *changed |= before[i] != value[i];
         return true;
     }
@@ -80,16 +81,19 @@ namespace editor {
         bool edited = false; NumericEditInput(label, value, min, max, format, vec3, &edited); return edited;
     }
     static bool NumericEditEnded(const char* label) { return g_numericEditEndedFrame == ImGui::GetFrameCount() && g_numericEditEndedId == ImGui::GetID(label); }
+    // the ">" button comes after the slider, so a caller's IsItemDeactivatedAfterEdit() sees the button: the slider's own end
+    // (drag released) is recorded here as an ended edit, and callers check NumericEditEnded() for both ways
+    static void NoteSliderEnd(const char* label) { if (ImGui::IsItemDeactivatedAfterEdit()) { g_numericEditEndedId = ImGui::GetID(label); g_numericEditEndedFrame = ImGui::GetFrameCount(); } }
     static bool SliderFloatEdit(const char* label, float* value, float min, float max, const char* format, ImGuiSliderFlags flags = 0) {
-        const bool changed = ImGui::SliderFloat(label, value, min, max, format, flags);
+        const bool changed = ImGui::SliderFloat(label, value, min, max, format, flags); NoteSliderEnd(label);
         return NumericEditFoldout(label, value, min, max, format, false) || changed;
     }
     static bool DragFloatEdit(const char* label, float* value, float speed, float min, float max, const char* format, ImGuiSliderFlags flags = 0) {
-        const bool changed = ImGui::DragFloat(label, value, speed, min, max, format, flags);
+        const bool changed = ImGui::DragFloat(label, value, speed, min, max, format, flags); NoteSliderEnd(label);
         return NumericEditFoldout(label, value, min, max, format, false) || changed;
     }
     static bool DragFloat3Edit(const char* label, float value[3], float speed, float min, float max, const char* format) {
-        const bool changed = ImGui::DragFloat3(label, value, speed, min, max, format);
+        const bool changed = ImGui::DragFloat3(label, value, speed, min, max, format); NoteSliderEnd(label);
         return NumericEditFoldout(label, value, min, max, format, true) || changed;
     }
     static void SameLineOrWrap(bool compact, float nextWidth = 80.0f, float spacing = -1.0f) {
@@ -176,11 +180,14 @@ namespace editor {
     void TogglePlay() {
         if (!g_open) return;
         if (g_cameraMode) StopCameraMode();
+        g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear(); g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0;
         g_playMode = !g_playMode; ImGui::GetIO().ClearInputKeys();
     }
     void ToggleCameraMode() {
         if (!g_open) return;
         if (g_cameraMode) { StopCameraMode(); return; }
+        if (!core::FreeCamAvailable()) { core::Log("[editor] camera mode: the free camera is not available in this game build"); return; }   // the header button says so too
+        g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear(); g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0;
         g_playMode = false; g_cameraMode = true; g_cameraStartAt = GetTickCount(); g_cameraEverActive = false; memset(g_cameraShortcutDown, 0, sizeof g_cameraShortcutDown);
         input::TakeMouseDelta(nullptr, nullptr);
         input::ClearKeys(); ImGui::GetIO().ClearInputKeys(); core::SetFreeCam(true);
@@ -1695,6 +1702,17 @@ namespace editor {
         ImGui::Separator();
         if (g_sel.size() == 1) {
             const auto& o = *prim;
+            if (g_editUid != o.uid && g_numericEditId != 0) {
+                if (const SpawnedObj* old = Find(list, g_editUid)) {
+                    const Vec3 p1 = { g_edit[0], g_edit[1], g_edit[2] };
+                    if (p1.x != g_editPos0.x || p1.y != g_editPos0.y || p1.z != g_editPos0.z || g_editRot.yaw != g_editRot0.yaw || g_editRot.pitch != g_editRot0.pitch ||
+                        g_editRot.roll != g_editRot0.roll || g_editScale != g_editScale0) {
+                        core::MoveMany({ { old->uid, p1, g_editRot, g_editScale } }, true);
+                        Act a; a.kind = Act::Move; a.uid = old->uid; a.prefab = old->prefab; a.pos0 = g_editPos0; a.rot0 = g_editRot0; a.sc0 = g_editScale0; a.pos1 = p1; a.rot1 = g_editRot; a.sc1 = g_editScale; Push({ a });
+                    }
+                }
+                CancelNumericEdit();
+            }
             if (g_editUid != o.uid) { g_edit[0] = o.pos.x; g_edit[1] = o.pos.y; g_edit[2] = o.pos.z; g_editRot = o.rot; g_editScale = o.scale; g_editPos0 = o.pos; g_editRot0 = o.rot; g_editScale0 = o.scale; g_editUid = o.uid; }
             ImGui::TextDisabled("%s", o.prefab.c_str());
             bool changed = false;
@@ -2063,9 +2081,10 @@ namespace editor {
         const char* dockPages[2] = { ICON_MAGNIFYING_GLASS " Browser", ICON_CUBE " Scene" };
         for (int i = 0; i < 2; ++i) {
             if (i) ImGui::SameLine(0, 4);
-            if (g_compactPage == i) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
+            const bool act = g_compactPage == i;   // decided once: the click below may change the page
+            if (act) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
             if (ImGui::SmallButton(TStable(dockPages[i]))) { g_compactPage = i; g_mainTab = i; }
-            if (g_compactPage == i) ImGui::PopStyleColor();
+            if (act) ImGui::PopStyleColor();
         }
         if (g_compactPage == 1) {
             if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }

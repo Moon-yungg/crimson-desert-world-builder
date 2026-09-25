@@ -14,7 +14,7 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 2. Type a word into the search box, pick a card or a row, press **PLACE** (or double-click).
 3. The object appears in front of your character. Move it with the placement keys (numpad by default) or press Numpad 5 and drag the gizmo. Place the next one, click another object or double-click into the open and it stays where it is (**Enter** works too); **Backspace** cancels while you hold it.
 4. Prefer a small panel? Click **dock**: a narrow side window with search, one to four columns of cards and PLACE. It stays open while you place.
-5. **Home** switches between edit mode (menu takes the input) and play mode (game takes the input, window stays visible). Save your build in the Project tab.
+5. **Home** switches camera mode on and off: a free-flying camera (WASD, right-drag to look, mouse wheel forward) while the editor stays open. **Insert** hides the editor and hands the controls back to the game. Save your build in the Project tab.
 
 ## Features
 
@@ -41,7 +41,7 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 | Key | Action |
 | --- | --- |
 | Insert | show / hide the editor |
-| Home | edit mode (menu takes the input) / play mode (game takes the input) |
+| Home | camera mode on / off (free-flying camera, the editor stays open) |
 | Numpad 8 / 2 | move the object away from you / closer |
 | Numpad 4 / 6 | move it left / right |
 | Numpad 9 / 3 | move it up / down |

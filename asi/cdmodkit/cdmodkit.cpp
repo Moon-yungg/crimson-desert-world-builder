@@ -1848,6 +1848,7 @@ static SetCamPoseFn g_origSetCamPose = nullptr; static uintptr_t kRva_SetCamPose
 static volatile bool g_fcOn = false; static volatile bool g_fcInit = false;
 static float g_fcPos[3] = {}, g_fcYaw = 0, g_fcPitch = 0, g_fcRightSign = 1, g_fcUpSign = 1;
 static LARGE_INTEGER g_fcLast = {};
+static volatile float g_fcDollyPending = 0;   // mouse-wheel metres from the render thread, applied by the game-thread step
 // camera scene object vs. view: S = V * C and p_so = p_view + V * d, both measured on the first free frame and kept
 static float g_fcC[9] = {}, g_fcD[3] = {}; static volatile bool g_fcRel = false;
 static void QToM(const float* q, float* m) {   // columns = rotated basis (same as CameraBasis), m[col*3+row]
@@ -1879,6 +1880,7 @@ static void FcStep() {
     if (g_fcPitch > 89.0f) g_fcPitch = 89.0f; if (g_fcPitch < -89.0f) g_fcPitch = -89.0f;
     if (g_fcYaw > 180.0f) g_fcYaw -= 360.0f; if (g_fcYaw < -180.0f) g_fcYaw += 360.0f;
     float r[3], u[3], f[3]; FcBasis(r, u, f);
+    { const float d = g_fcDollyPending; g_fcDollyPending = 0; if (d != 0 && std::isfinite(d)) for (int i = 0; i < 3; i++) g_fcPos[i] += f[i] * d; }
     // editor shortcuts (Ctrl+Z, Ctrl+D ...) must not fly the camera: no movement while Ctrl is held with a shortcut letter
     const bool ctrl = input::ScanDown(0x1D, false) || input::ScanDown(0x1D, true);
     const bool ctrlCommand = ctrl && (input::ScanDown(0x2C, false) || input::ScanDown(0x15, false) || input::ScanDown(0x2E, false) || input::ScanDown(0x2D, false) ||
@@ -1966,7 +1968,7 @@ bool FreeCamActive() { return g_fcOn; }
 void SetFreeCam(bool on) {
     if (on && !FreeCamAvailable()) { Log("[freecam] not available in this game build (see the log)"); return; }
     if (on == g_fcOn) return;
-    g_fcInit = false; g_fcRel = false; g_fcSoSeen = false; if (!on) g_fcSceneObj = 0; input::SetFreeCam(on); g_fcOn = on;
+    g_fcInit = false; g_fcRel = false; g_fcSoSeen = false; g_fcDollyPending = 0; if (!on) g_fcSceneObj = 0; input::SetFreeCam(on); g_fcOn = on;
     Log("[freecam] %s", on ? "requested" : "off");
 }
 bool FreeCamBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd) {
@@ -1975,9 +1977,9 @@ bool FreeCamBasis(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd) {
     if (pos) *pos = { g_fcPos[0], g_fcPos[1], g_fcPos[2] }; if (right) *right = { r[0], r[1], r[2] }; if (up) *up = { u[0], u[1], u[2] }; if (fwd) *fwd = { f[0], f[1], f[2] };
     return true;
 }
-void FreeCamDolly(float meters) {   // mouse wheel: along the view
+void FreeCamDolly(float meters) {   // mouse wheel: along the view, applied by FcStep on the game thread
     if (!g_fcOn || !g_fcInit || !std::isfinite(meters)) return;
-    float r[3], u[3], f[3]; FcBasis(r, u, f); for (int i = 0; i < 3; i++) g_fcPos[i] += f[i] * meters;
+    g_fcDollyPending = g_fcDollyPending + meters;
 }
 void FreeCamTurn(float dyaw, float dpitch) { g_fcYaw += dyaw; g_fcPitch += dpitch; }   // tests without a mouse
 bool FreeCamPose(Vec3* pos, Vec3* fwd) {
