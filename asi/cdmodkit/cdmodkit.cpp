@@ -1221,6 +1221,7 @@ static void LogSpawnTransforms(const char* what, uintptr_t save, uintptr_t s8, u
 // (a level streaming spawn, else a housing placement) with the prefab, position, rotation and scale swapped in. A refused replay
 // keeps a plain client stand-in visible while newer/different captures are retried. Moves remove + respawn (final only), deletes remove the actor.
 struct GimmickReq { int uid; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; };
+static const size_t kGimmickMaxTries = 3;   // refusals with different templates before an interactive prefab becomes a plain object
 static std::deque<GimmickReq> g_gimmickQueue; static std::mutex g_gimmickQueueMutex;
 static std::deque<std::function<void()>> g_serverJobs; static std::mutex g_serverJobsMutex;
 static void RunOnServerTick(std::function<void()> f) { std::lock_guard<std::mutex> l(g_serverJobsMutex); g_serverJobs.push_back(std::move(f)); }
@@ -1454,6 +1455,16 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
         if (!r.triedTemplates.empty()) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); } }
         return;
     }
+    // A refused replay queued a plain stand-in on the game thread. Until it exists, a retry would spawn a second stand-in whose
+    // registration overwrites the first one (left in the world, no longer selectable or deletable): wait for it.
+    bool standinPending = false;
+    { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid);
+      standinPending = i >= 0 && !g_reg[(size_t)i].hidden && g_reg[(size_t)i].standin && !g_reg[(size_t)i].obj && !r.triedTemplates.empty(); }
+    if (standinPending) {
+        std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
+        if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); }
+        return;
+    }
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.pop_front(); }
     uintptr_t waitingStandin = 0;
     { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return;
@@ -1474,12 +1485,15 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
         Log("[gimmick] object %d spawned through the game: %s (scene object %p, actor %p)", r.uid, r.prefab.c_str(), (void*)so, (void*)actor);
     } else {
         r.triedTemplates.push_back(t.id);
-        Log("[gimmick] object %d: replay with template %d was refused; keeping a plain stand-in and waiting for another/fresh template (tried %zu)", r.uid, t.id, r.triedTemplates.size());
-        // A refusal can be template-dependent: captures are refreshed as the player moves and the game creates other gimmicks.
-        // Never permanently demote an interactive prefab because one (or several) transient replay contexts rejected it.
-        { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return; g_reg[(size_t)i].standin = true; g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].actor = 0; }
+        // A refusal can depend on the template (captures change as the player moves), so a few different ones are tried; a
+        // prefab the game keeps refusing becomes a plain object instead of being retried forever.
+        const bool giveUp = r.triedTemplates.size() >= kGimmickMaxTries;
+        if (giveUp) Log("[gimmick] object %d: %s refused with %zu different templates, placing it as a plain object", r.uid, r.prefab.c_str(), r.triedTemplates.size());
+        else Log("[gimmick] object %d: replay with template %d was refused; a plain stand-in waits for another template (try %zu of %d)", r.uid, t.id, r.triedTemplates.size(), kGimmickMaxTries);
+        { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return;
+          SpawnedObj& e = g_reg[(size_t)i]; e.standin = !giveUp; e.obj = 0; e.actor = 0; if (giveUp) e.gimmick = false; }
         if (GameThreadReady()) RunOnGameThread([r]() { DoSpawn(r.prefab, r.pos, r.rot, r.scale, r.uid); });
-        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); }
+        if (!giveUp) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); }
     }
 }
 static void* __fastcall HookGimmickSpawn(void* param, void* out, void* mgr, void* owner, void* s5, void* s6, void* s7, void* s8, void* s9, void* s10, void* s11, void* s12) {

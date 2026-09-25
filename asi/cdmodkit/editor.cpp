@@ -249,7 +249,7 @@ namespace editor {
     void Toggle() {
         if (g_open && g_cameraMode) StopCameraMode();
         g_open = !g_open; g_playMode = false;
-        if (!g_open) { g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear(); g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0; g_browserDragPrefab = -1; }
+        if (!g_open) { g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear(); g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0; g_browserDragPrefab = -1; g_browserDropJobs.clear(); }
         ImGui::GetIO().ClearInputKeys();
         if (!g_open && g_previewShown) { core::PreviewClear(); g_previewShown = false; }
     }
@@ -470,7 +470,10 @@ namespace editor {
         if (IsAppearance(pi)) { Note(T("these appearances can only be previewed; living characters are spawned from the NPCs tab")); return; }
         Vec3 at = SpawnSpot(pi, g_spawnYaw, g_spawnScale);
         int committedUid = g_previewShown ? core::PreviewCommit() : 0;
-        if (committedUid) { g_previewShown = false; g_previewSuppressed = true; std::vector<Act> acts; RecordSpawn(acts, committedUid, pi.path, at, Rot{ g_spawnYaw }, g_spawnScale, 0); Push(std::move(acts)); Note(T("placed %s"), ShownName(pi).c_str()); }
+        if (committedUid) {
+            Vec3 cpos = at; Rot crot{ g_spawnYaw }; float cscale = g_spawnScale;
+            { const auto list = core::Spawned(); if (const SpawnedObj* o = Find(list, committedUid)) { cpos = o->pos; crot = o->rot; cscale = o->scale; } }
+            g_previewShown = false; g_previewSuppressed = true; std::vector<Act> acts; RecordSpawn(acts, committedUid, pi.path, cpos, crot, cscale, 0); Push(std::move(acts)); Note(T("placed %s"), ShownName(pi).c_str()); }
         else { int uid = core::SpawnAt(pi.path, at, Rot{ g_spawnYaw }, g_spawnScale); std::vector<Act> acts; RecordSpawn(acts, uid, pi.path, at, Rot{ g_spawnYaw }, g_spawnScale, 0); Push(std::move(acts)); Note(T("spawn %s"), ShownName(pi).c_str()); }
         g_recent.erase(std::remove(g_recent.begin(), g_recent.end(), g_selPrefab), g_recent.end());
         g_recent.insert(g_recent.begin(), g_selPrefab); if (g_recent.size() > 12) g_recent.pop_back();
@@ -890,6 +893,7 @@ namespace editor {
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; const Vec3 bc = BboxCenter(*o); const float dx = bc.x - c.x, dy = bc.y - c.y, dz = bc.z - c.z; radius = std::max(radius, sqrtf(dx * dx + dy * dy + dz * dz) + ObjectRadius(*o)); }
         if (!g_cameraMode) ToggleCameraMode();
         if (!g_cameraMode) return false;
+        g_cameraViewMode = 0;   // the focus sets its own direction
         core::FreeCamFocus(c, radius); return true;
     }
     struct SelectionUnit { int key = 0; std::vector<const SpawnedObj*> objects; Vec3 center{}; };
@@ -1370,7 +1374,7 @@ namespace editor {
                 dl->PushClipRect({ p0.x + pad, t1.y }, { p1.x - pad, p1.y }, true);
                 dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), { p0.x + pad, t1.y + 2 }, ImGui::GetColorU32(ImGuiCol_Text), c.name.empty() ? c.internal.c_str() : c.name.c_str(), nullptr, tile);
                 dl->PopClipRect();
-                if (hov) ImGui::SetTooltip("%s\n%s   %s %u", c.name.empty() ? "-" : c.name.c_str(), c.internal.c_str(), T("key"), c.key);
+                if (hov) ImGui::SetTooltip("%s\n%s   %s %u", c.name.empty() ? "-" : c.name.c_str(), c.internal.c_str(), T("ID"), c.key);
                 ImGui::PopID();
             }
         }
@@ -1414,7 +1418,7 @@ namespace editor {
         else if (ImGui::BeginTable("npcs", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable, ImVec2(0, listH))) {
             ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch, 3);
             ImGui::TableSetupColumn(T("internal name"), ImGuiTableColumnFlags_WidthStretch, 4);
-            ImGui::TableSetupColumn(T("key"), ImGuiTableColumnFlags_WidthFixed, 70 * ui);
+            ImGui::TableSetupColumn(T("ID"), ImGuiTableColumnFlags_WidthFixed, 70 * ui);
             ImGui::TableSetupScrollFreeze(0, 1); ImGui::TableHeadersRow();
             ImGuiListClipper clip; clip.Begin((int)g_npcRows.size());
             while (clip.Step()) for (int r = clip.DisplayStart; r < clip.DisplayEnd; r++) {
@@ -1446,7 +1450,7 @@ namespace editor {
                 ImGui::SameLine();
             }
             ImGui::BeginGroup();
-            ImGui::Text("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str()); ImGui::SameLine(); ImGui::TextDisabled("  %s   key %u", c.internal.c_str(), c.key);
+            ImGui::Text("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str()); ImGui::SameLine(); ImGui::TextDisabled("  %s   ID %u", c.internal.c_str(), c.key);
             ImGui::SetNextItemWidth(140 * ui); ImGui::SliderFloat(T("distance"), &g_npcDist, 1.0f, 30.0f, "%.0f m"); ImGui::SameLine();
             ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, 20);
             ImGui::BeginDisabled(!havePos || st != 2);
@@ -1660,9 +1664,14 @@ namespace editor {
 
     static bool g_sceneCards = false; static std::set<int> g_closedGroups;
     static ImU32 GroupColor(int gid, int alpha) { const float h = fmodf(gid * 0.61803f, 1.0f); ImVec4 c = ImColor::HSV(h, 0.55f, 0.85f); return IM_COL32((int)(c.x * 255), (int)(c.y * 255), (int)(c.z * 255), alpha); }
-    static void SceneObjectContext(const SpawnedObj& o, const std::vector<SpawnedObj>& list, bool havePos, const char* id) {
+    // members: the rows of a group header; its menu acts on the whole group even when "select groups" is off
+    static void SceneObjectContext(const SpawnedObj& o, const std::vector<SpawnedObj>& list, bool havePos, const char* id, const std::vector<int>* members = nullptr) {
         if (!ImGui::BeginPopupContextItem(id)) return;
-        if (!g_sel.count(o.uid)) SelectUid(o.uid, false, list);   // grouped members select their group by default
+        if (members && !members->empty()) {
+            bool all = true; for (int m : *members) if (!g_sel.count(list[(size_t)m].uid)) { all = false; break; }
+            if (!all) { if (g_place.active) DropCarried(); g_sel.clear(); for (int m : *members) if (!list[(size_t)m].hidden) g_sel.insert(list[(size_t)m].uid); g_primary = o.uid; }
+        }
+        else if (!g_sel.count(o.uid)) SelectUid(o.uid, false, list);   // grouped members select their group by default
         ImGui::BeginDisabled(!core::FreeCamAvailable());
         if (ImGui::MenuItem(T("Focus"))) FocusSelection();
         ImGui::EndDisabled();
@@ -1863,7 +1872,7 @@ namespace editor {
                     char glbl[64]; snprintf(glbl, sizeof glbl, T("Group %d  (%d objects)##gs%d"), gid, (int)mem.size(), gid);
                     if (ImGui::Selectable(glbl, allSel, ImGuiSelectableFlags_SpanAllColumns)) { ImGuiIO& io = ImGui::GetIO(); if (!io.KeyCtrl) g_sel.clear(); for (int m : mem) { if (allSel && io.KeyCtrl) g_sel.erase(list[m].uid); else g_sel.insert(list[m].uid); } g_primary = list[mem[0]].uid; g_lastClicked = g_primary; g_editUid = 0; }
                     ImGui::PushID(gid);
-                    SceneObjectContext(list[mem[0]], list, havePos, "groupctx");
+                    SceneObjectContext(list[mem[0]], list, havePos, "groupctx", &mem);
                     ImGui::PopID();
                     ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%d", gid);
                     continue;
@@ -2282,7 +2291,6 @@ namespace editor {
         }
     }
     static void ProcessBrowserDrag() {
-        PumpBrowserDropJobs();
         if (g_browserDragPrefab < 0) return;
         const auto& idx = core::PrefabIndex();
         if (g_browserDragPrefab >= (int)idx.size()) { g_browserDragPrefab = -1; return; }
@@ -2383,9 +2391,10 @@ namespace editor {
         if (ImGui::SmallButton(T(ICON_LIST " full editor"))) { g_compact = false; g_mainTab = g_compactPage; g_selectMainTab = true; }
         ImGui::SameLine();
         ImGui::BeginDisabled(!core::FreeCamAvailable());
-        if (g_cameraMode) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f));
-        if (ImGui::SmallButton(T(g_cameraMode ? ICON_EYE " flying" : ICON_EYE " free camera"))) ToggleCameraMode();
-        if (g_cameraMode) ImGui::PopStyleColor();
+        const bool flying = g_cameraMode;   // decided once: the click below toggles it
+        if (flying) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f));
+        if (ImGui::SmallButton(T(flying ? ICON_EYE " flying" : ICON_EYE " free camera"))) ToggleCameraMode();
+        if (flying) ImGui::PopStyleColor();
         ImGui::EndDisabled();
         ImGui::SameLine(0, 3); DrawCameraViewTool();
         ImGui::TextDisabled(T("%s = %s   %s = hide"), core::KeyName(core::g_keyMode), T(g_cameraMode ? "exit camera" : (g_playMode ? "edit" : "camera")), core::KeyName(core::g_keyToggle));
@@ -2521,6 +2530,7 @@ namespace editor {
         TrackFacing(p, havePos);
         PlaceTick(p, havePos);                 // runs with the menu closed as well
         PumpSnapJobs();
+        PumpBrowserDropJobs();                 // a drop whose ground probe returns after the window was hidden still spawns
         if (g_place.active) DrawPlaceHud();
         if (g_place.active && (g_gizmo || MouseMode())) { const bool one = g_place.m.size() == 1; const CamFrame cf = CurrentCam();
             DrawGizmo(g_place.center, one ? WrapYaw(g_place.m[0].rot0.yaw + g_place.yaw) : g_place.yaw, one ? WrapYaw(g_place.m[0].rot0.pitch + g_place.pitch) : g_place.pitch, GizmoScreenSize(cf, g_place.center, g_place.radius), g_place.drag ? g_place.drag : g_place.hover); }
