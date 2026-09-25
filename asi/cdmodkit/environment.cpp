@@ -94,6 +94,7 @@ static std::atomic<float> g_windMultiplier{ 1.0f };
 
 static long long __fastcall HookWeatherCompose(long long weatherState, float dt);
 static void __fastcall HookWeatherTick(long long self, float dt);
+static uintptr_t ResolveWeatherTick(bool& is201);
 
 static float Clamp(float v, float lo, float hi) {
     return std::max(lo, std::min(hi, v));
@@ -257,6 +258,29 @@ static bool ReadFloat(uintptr_t address, float& value) {
 }
 
 static bool ResolveEnvManagerGlobal() {
+    // Current 2.01 / game build 1.0.0.2976: WeatherTick itself contains the
+    // authoritative environment-manager global load. Prefer that relationship
+    // over the older standalone signatures below; it is also what current
+    // CrimsonWeather uses for this build.
+    bool is201 = false;
+    const uintptr_t tick = ResolveWeatherTick(is201);
+    if (tick) {
+        const uintptr_t site = tick + (is201 ? 0x0B8 : 0x0B4);
+        uint8_t load[3] = {};
+        if (ReadBytes(site, load, sizeof(load)) && load[0] == 0x48 && load[1] == 0x8B && load[2] == 0x0D) {
+            const uintptr_t global = RipTarget7(site);
+            uintptr_t probe = 0;
+            if (global && ReadBytes(global, &probe, sizeof(probe))) {
+                g_envManagerGlobal = reinterpret_cast<uintptr_t*>(global);
+                g_envGetEntityVt = is201 ? 0x60 : 0x40;
+                Log("[environment] environment manager from weather tick at rva 0x%llx (get-entity vt 0x%llx)",
+                    static_cast<unsigned long long>(global - g_base),
+                    static_cast<unsigned long long>(g_envGetEntityVt));
+                return true;
+            }
+        }
+    }
+
     // Exact variants observed across the same game family. Keeping them narrow
     // makes this optional feature fail closed after a patch instead of guessing.
     struct EnvPattern { const char* pattern; ptrdiff_t getEntityVt; };
