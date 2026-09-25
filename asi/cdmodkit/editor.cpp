@@ -134,6 +134,8 @@ namespace editor {
     static bool  g_showSpawnOpts = false, g_showMass = false; static int g_hoverUid = 0;
     static bool  g_cardView = false; static float g_cardSize = 96.0f;   // browser: tile view instead of the list (same matches / filters)
     static int   g_browserDragPrefab = -1;   // browser row/card being dragged out into the game view
+    struct BrowserDropJob { int prefab = -1, ticket = 0; Vec3 center{}; float yaw = 0, scale = 1; };
+    static std::vector<BrowserDropJob> g_browserDropJobs;   // ground is probed before spawning, so a new object's own collision cannot be mistaken for the surface
     static std::set<std::string> g_tagFilter;
     static std::vector<int> g_matches; static std::string g_lastKey;
     static float g_off[3] = { 0.0f, 0.0f, 0.0f };
@@ -172,8 +174,24 @@ namespace editor {
 
     // ---- undo / redo ----
     struct Act { enum Kind { Spawn, Move, Delete, SetGroup } kind; int uid; std::string prefab; Vec3 pos0{}, pos1{}; Rot rot0, rot1; float sc0 = 1, sc1 = 1; int group = 0, group1 = 0; int proj = 0; };   // group/group1: old/new group for undoable grouping; proj keeps deleted objects in their project
-    static std::vector<std::vector<Act>> g_undo, g_redo;
-    static void Push(std::vector<Act> acts) { if (acts.empty()) return; g_undo.push_back(std::move(acts)); if (g_undo.size() > 100) g_undo.erase(g_undo.begin()); g_redo.clear(); }
+    struct HistoryEntry { unsigned long long serial = 0; std::vector<Act> acts; };
+    static constexpr size_t kHistoryLimit = 200;
+    static unsigned long long g_historySerial = 0;
+    static std::vector<HistoryEntry> g_undo, g_redo;
+    static bool ActChanged(const Act& a) {
+        if (a.kind == Act::Spawn || a.kind == Act::Delete) return true;
+        if (a.kind == Act::SetGroup) return a.group != a.group1;
+        return fabsf(a.pos1.x - a.pos0.x) > 0.0001f || fabsf(a.pos1.y - a.pos0.y) > 0.0001f || fabsf(a.pos1.z - a.pos0.z) > 0.0001f ||
+               fabsf(a.rot1.yaw - a.rot0.yaw) > 0.0001f || fabsf(a.rot1.pitch - a.rot0.pitch) > 0.0001f || fabsf(a.rot1.roll - a.rot0.roll) > 0.0001f ||
+               fabsf(a.sc1 - a.sc0) > 0.0001f;
+    }
+    static void Push(std::vector<Act> acts) {
+        acts.erase(std::remove_if(acts.begin(), acts.end(), [](const Act& a) { return !ActChanged(a); }), acts.end());
+        if (acts.empty()) return;
+        g_undo.push_back({ ++g_historySerial, std::move(acts) });
+        if (g_undo.size() > kHistoryLimit) g_undo.erase(g_undo.begin());
+        g_redo.clear();
+    }
 
     // ---- placement mode: one or many objects carried as a rigid set around a center; keys move/rotate/scale the set ----
     struct Member { int uid; std::string prefab; Vec3 rel{}; Rot rot0; float scale0 = 1; Vec3 origPos{}; Rot origRot; float origScale = 1; };
@@ -451,8 +469,9 @@ namespace editor {
         const auto& pi = core::PrefabIndex()[g_selPrefab];
         if (IsAppearance(pi)) { Note(T("these appearances can only be previewed; living characters are spawned from the NPCs tab")); return; }
         Vec3 at = SpawnSpot(pi, g_spawnYaw, g_spawnScale);
-        if (g_previewShown && core::PreviewCommit()) { g_previewShown = false; g_previewSuppressed = true; Note(T("placed %s"), ShownName(pi).c_str()); }
-        else { int uid = core::SpawnAt(pi.path, at, Rot{ g_spawnYaw }, g_spawnScale); std::vector<Act> acts; RecordSpawn(acts, uid, pi.path, at, Rot{ g_spawnYaw }, g_spawnScale, 0); Push(acts); Note(T("spawn %s"), ShownName(pi).c_str()); }
+        int committedUid = g_previewShown ? core::PreviewCommit() : 0;
+        if (committedUid) { g_previewShown = false; g_previewSuppressed = true; std::vector<Act> acts; RecordSpawn(acts, committedUid, pi.path, at, Rot{ g_spawnYaw }, g_spawnScale, 0); Push(std::move(acts)); Note(T("placed %s"), ShownName(pi).c_str()); }
+        else { int uid = core::SpawnAt(pi.path, at, Rot{ g_spawnYaw }, g_spawnScale); std::vector<Act> acts; RecordSpawn(acts, uid, pi.path, at, Rot{ g_spawnYaw }, g_spawnScale, 0); Push(std::move(acts)); Note(T("spawn %s"), ShownName(pi).c_str()); }
         g_recent.erase(std::remove(g_recent.begin(), g_recent.end(), g_selPrefab), g_recent.end());
         g_recent.insert(g_recent.begin(), g_selPrefab); if (g_recent.size() > 12) g_recent.pop_back();
     }
@@ -967,7 +986,7 @@ namespace editor {
     }
     static void RemapUid(int from, int to) {
         if (!from || !to || from == to) return;
-        for (auto* stack : { &g_undo, &g_redo }) for (auto& batch : *stack) for (auto& a : batch) if (a.uid == from) a.uid = to;
+        for (auto* stack : { &g_undo, &g_redo }) for (auto& entry : *stack) for (auto& a : entry.acts) if (a.uid == from) a.uid = to;
         if (g_sel.erase(from)) g_sel.insert(to);
         if (g_primary == from) g_primary = to;
         if (g_lastClicked == from) g_lastClicked = to;
@@ -979,7 +998,8 @@ namespace editor {
     }
     static void Undo() {
         if (g_undo.empty()) return;
-        std::vector<Act> acts = g_undo.back(); g_undo.pop_back();
+        HistoryEntry entry = std::move(g_undo.back()); g_undo.pop_back();
+        std::vector<Act>& acts = entry.acts;
         std::vector<core::MoveReq> moves;
         for (auto& a : acts) {
             if (a.kind == Act::Spawn) { core::HideUid(a.uid); RemoveSelectionUid(a.uid); }
@@ -988,11 +1008,12 @@ namespace editor {
             else moves.push_back({ a.uid, a.pos0, a.rot0, a.sc0 });
         }
         if (!moves.empty()) core::MoveMany(moves, true);
-        g_redo.push_back(acts); Note(T("undo"));
+        g_redo.push_back(std::move(entry)); Note(T("undo"));
     }
     static void Redo() {
         if (g_redo.empty()) return;
-        std::vector<Act> acts = g_redo.back(); g_redo.pop_back();
+        HistoryEntry entry = std::move(g_redo.back()); g_redo.pop_back();
+        std::vector<Act>& acts = entry.acts;
         std::vector<core::MoveReq> moves;
         for (auto& a : acts) {
             if (a.kind == Act::Spawn) { const int oldUid = a.uid, nu = core::SpawnAt(a.prefab, a.pos1, a.rot1, a.sc1, a.group, a.proj); if (nu) { a.uid = nu; RemapUid(oldUid, nu); g_sel.insert(nu); g_primary = nu; } }
@@ -1001,7 +1022,72 @@ namespace editor {
             else moves.push_back({ a.uid, a.pos1, a.rot1, a.sc1 });
         }
         if (!moves.empty()) core::MoveMany(moves, true);
-        g_undo.push_back(acts); Note(T("redo"));
+        g_undo.push_back(std::move(entry)); Note(T("redo"));
+    }
+    static const char* HistoryActionName(const HistoryEntry& entry) {
+        if (entry.acts.empty()) return "";
+        const Act::Kind k = entry.acts[0].kind;
+        for (const auto& a : entry.acts) if (a.kind != k) return T("Grab / move");
+        if (k == Act::Spawn) return T("SPAWN");
+        if (k == Act::Delete) return T("Delete");
+        if (k == Act::SetGroup) return T("Group");
+        bool pos = false, rot = false, scale = false;
+        for (const auto& a : entry.acts) {
+            pos |= fabsf(a.pos1.x - a.pos0.x) > 0.0001f || fabsf(a.pos1.y - a.pos0.y) > 0.0001f || fabsf(a.pos1.z - a.pos0.z) > 0.0001f;
+            rot |= fabsf(a.rot1.yaw - a.rot0.yaw) > 0.0001f || fabsf(a.rot1.pitch - a.rot0.pitch) > 0.0001f || fabsf(a.rot1.roll - a.rot0.roll) > 0.0001f;
+            scale |= fabsf(a.sc1 - a.sc0) > 0.0001f;
+        }
+        if (scale && !pos && !rot) return T("scale");
+        if (rot && !pos && !scale) return T("Rotate");
+        return T("Grab / move");
+    }
+    static void DrawHistoryAct(const Act& a) {
+        const std::string name = a.prefab.empty() ? std::string() : ShortName(a.prefab);
+        if (name.empty()) ImGui::Text("#%d", a.uid); else ImGui::Text("#%d  %s", a.uid, name.c_str());
+        ImGui::Indent();
+        auto drawPos = [&](Vec3 p0, Vec3 p1, bool arrow) {
+            if (arrow) ImGui::Text("%s: %.2f, %.2f, %.2f  ->  %.2f, %.2f, %.2f", T("position"), p0.x, p0.y, p0.z, p1.x, p1.y, p1.z);
+            else ImGui::Text("%s: %.2f, %.2f, %.2f", T("position"), p1.x, p1.y, p1.z);
+        };
+        auto drawRot = [&](Rot r0, Rot r1, bool arrow) {
+            if (arrow) ImGui::Text("%s: %.1f / %.1f / %.1f  ->  %.1f / %.1f / %.1f", T("Rotate"), r0.yaw, r0.pitch, r0.roll, r1.yaw, r1.pitch, r1.roll);
+            else ImGui::Text("%s: %.1f / %.1f / %.1f", T("Rotate"), r1.yaw, r1.pitch, r1.roll);
+        };
+        if (a.kind == Act::Move) {
+            if (fabsf(a.pos1.x - a.pos0.x) > 0.0001f || fabsf(a.pos1.y - a.pos0.y) > 0.0001f || fabsf(a.pos1.z - a.pos0.z) > 0.0001f) drawPos(a.pos0, a.pos1, true);
+            if (fabsf(a.rot1.yaw - a.rot0.yaw) > 0.0001f || fabsf(a.rot1.pitch - a.rot0.pitch) > 0.0001f || fabsf(a.rot1.roll - a.rot0.roll) > 0.0001f) drawRot(a.rot0, a.rot1, true);
+            if (fabsf(a.sc1 - a.sc0) > 0.0001f) ImGui::Text("%s: %.3f  ->  %.3f", T("scale"), a.sc0, a.sc1);
+        } else if (a.kind == Act::SetGroup) {
+            ImGui::Text("%s: %d  ->  %d", T("Group"), a.group, a.group1);
+        } else {
+            const bool spawn = a.kind == Act::Spawn; const Vec3 p = spawn ? a.pos1 : a.pos0; const Rot r = spawn ? a.rot1 : a.rot0; const float sc = spawn ? a.sc1 : a.sc0;
+            drawPos({}, p, false); drawRot({}, r, false); ImGui::Text("%s: %.3f", T("scale"), sc);
+            if (a.group) ImGui::Text("%s: %d", T("Group"), a.group);
+        }
+        ImGui::Unindent();
+    }
+    static void DrawHistory() {
+        ImGui::BeginDisabled(g_undo.empty()); if (ImGui::Button(T("Undo"))) Undo(); ImGui::EndDisabled(); ImGui::SameLine();
+        ImGui::BeginDisabled(g_redo.empty()); if (ImGui::Button(T("Redo"))) Redo(); ImGui::EndDisabled(); ImGui::SameLine();
+        ImGui::TextDisabled("%s %d / %d    %s %d", T("Undo"), (int)g_undo.size(), (int)kHistoryLimit, T("Redo"), (int)g_redo.size());
+        ImGui::Separator();
+        struct View { const HistoryEntry* entry; bool redo; };
+        std::vector<View> view; view.reserve(g_undo.size() + g_redo.size());
+        for (const auto& e : g_undo) view.push_back({ &e, false });
+        for (const auto& e : g_redo) view.push_back({ &e, true });
+        std::sort(view.begin(), view.end(), [](const View& a, const View& b) { return a.entry->serial > b.entry->serial; });
+        ImGui::BeginChild("history_list", ImVec2(0, 0), ImGuiChildFlags_Borders);
+        if (view.empty()) ImGui::TextDisabled("-");
+        for (const View& v : view) {
+            const HistoryEntry& e = *v.entry; ImGui::PushID((int)(e.serial & 0x7fffffff));
+            char label[256]; snprintf(label, sizeof label, "#%llu   %s   %s   (%d)", e.serial, T(v.redo ? "Redo" : "Undo"), HistoryActionName(e), (int)e.acts.size());
+            if (ImGui::TreeNodeEx("##history", ImGuiTreeNodeFlags_SpanAvailWidth, "%s", label)) {
+                for (const auto& a : e.acts) DrawHistoryAct(a);
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
     }
     struct ClipItem { std::string prefab; Vec3 rel; Rot rot; float scale; };
     static std::vector<ClipItem> g_clip; static float g_clipRadius = 1; static Vec3 g_clipCenter{};
@@ -2162,12 +2248,41 @@ namespace editor {
             const float extent = std::max(pi.sx, std::max(pi.sy, pi.sz)) * g_spawnScale;
             const float dist = std::max(5.0f, std::min(80.0f, 6.0f + extent * 0.75f));
             hit = { cf.pos.x + rd.x * dist, cf.pos.y + rd.y * dist, cf.pos.z + rd.z * dist };
-        } else if (pi.sy > 0.0f) {
+        } else if (pi.hasCenter && pi.sy > 0.0f) {
             hit.y += pi.sy * g_spawnScale * 0.5f;   // cursor marks the surface; placement center is the box center
         }
         *center = hit; if (onGroundPlane) *onGroundPlane = plane; return true;
     }
+    static void SpawnBrowserDrop(int prefab, Vec3 center, float yaw, float scale) {
+        const auto& idx = core::PrefabIndex(); if (prefab < 0 || prefab >= (int)idx.size()) return;
+        const auto& pi = idx[prefab]; g_selPrefab = prefab;
+        if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
+        Vec3 at = center;
+        if (pi.hasCenter) {
+            const float t = yaw * 3.14159265f / 180.0f, cs = cosf(t), sn = sinf(t);
+            at.x -= scale * (cs * pi.cx + sn * pi.cz); at.z -= scale * (-sn * pi.cx + cs * pi.cz); at.y -= scale * pi.cy;
+        }
+        const int uid = core::SpawnAt(pi.path, at, Rot{ yaw }, scale);
+        if (uid) StartGrab({ uid }, true, ShownName(pi));
+    }
+    static void PumpBrowserDropJobs() {
+        const auto& idx = core::PrefabIndex();
+        for (size_t i = 0; i < g_browserDropJobs.size(); ) {
+            BrowserDropJob& j = g_browserDropJobs[i]; core::GroundHit gh;
+            if (!core::GroundResult(j.ticket, &gh)) { ++i; continue; }
+            Vec3 center = j.center;
+            if (j.prefab >= 0 && j.prefab < (int)idx.size() && gh.hit) {
+                const auto& pi = idx[j.prefab]; const float groundY = gh.centerY - core::g_probeRadius;
+                // BrowserDropPoint stores a bbox center when bounds are known.  Put its lowest point exactly on the
+                // physical surface; the prefab pivot is recovered by SpawnBrowserDrop afterwards.
+                center.y = groundY + (pi.hasCenter ? std::max(0.0f, pi.sy) * j.scale * 0.5f : 0.0f);
+            }
+            SpawnBrowserDrop(j.prefab, center, j.yaw, j.scale);
+            g_browserDropJobs.erase(g_browserDropJobs.begin() + i);
+        }
+    }
     static void ProcessBrowserDrag() {
+        PumpBrowserDropJobs();
         if (g_browserDragPrefab < 0) return;
         const auto& idx = core::PrefabIndex();
         if (g_browserDragPrefab >= (int)idx.size()) { g_browserDragPrefab = -1; return; }
@@ -2185,18 +2300,17 @@ namespace editor {
         if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left)) return;
         const int prefab = g_browserDragPrefab; g_browserDragPrefab = -1;
         if (overUi || !projected || !core::GameThreadReady() || IsAppearance(pi)) return;
-        g_selPrefab = prefab;
-        if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
-        Vec3 at = center;
-        if (pi.hasCenter) {
-            const float t = g_spawnYaw * 3.14159265f / 180.0f, cs = cosf(t), sn = sinf(t);
-            at.x -= g_spawnScale * (cs * pi.cx + sn * pi.cz); at.z -= g_spawnScale * (-sn * pi.cx + cs * pi.cz); at.y -= g_spawnScale * pi.cy;
+        if (groundPlane && core::GroundProbeReady()) {
+            const float startY = center.y + 150.0f;
+            const int ticket = core::GroundProbe({ center.x, startY, center.z }, 400.0f);
+            if (ticket) {
+                g_browserDropJobs.push_back({ prefab, ticket, center, g_spawnYaw, g_spawnScale });
+                return;
+            }
         }
-        const int uid = core::SpawnAt(pi.path, at, Rot{ g_spawnYaw }, g_spawnScale);
-        if (uid) {
-            StartGrab({ uid }, true, ShownName(pi));
-            if (groundPlane && g_place.active && core::GroundProbeReady()) StartGroundSnap(g_place);
-        }
+        // Physics may not be ready immediately after loading.  The fallback still places the measured bbox bottom on
+        // the player-height plane; unlike the old path it does not spawn first and then cast through its own collision.
+        SpawnBrowserDrop(prefab, center, g_spawnYaw, g_spawnScale);
     }
     static void DrawWorldContextPopup(bool havePos) {
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
@@ -2475,6 +2589,7 @@ namespace editor {
             if (ImGui::BeginTabItem(TStable(ICON_LOCATION_DOT " NPCs"))) { DrawNpcs(p, havePos); ImGui::EndTabItem(); }
             const ImGuiTabItemFlags sceneFlags = g_selectMainTab && g_mainTab == 1 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
             if (ImGui::BeginTabItem(TStable(ICON_CUBE " Scene"), nullptr, sceneFlags)) { g_mainTab = 1; { const int gp = core::GimmickPending(); if (gp > 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), core::GimmickTemplateReady() ? T("%d interactive object(s) spawning...") : T("%d interactive object(s) waiting for a spawn template: walk a few meters"), gp); } DrawScene(p, havePos); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem(TStable(ICON_CLOCK_ROTATE_LEFT " History"))) { g_mainTab = 6; DrawHistory(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(TStable(ICON_FLOPPY_DISK " Project"))) { g_mainTab = 2; DrawProject(); ImGui::EndTabItem(); }
             static const bool s_showTravel = false;   // hidden until the game's own teleport path is found
             if (s_showTravel && ImGui::BeginTabItem(TStable(ICON_LOCATION_CROSSHAIRS " Travel"))) { g_mainTab = 3; DrawTravel(p, havePos); ImGui::EndTabItem(); }

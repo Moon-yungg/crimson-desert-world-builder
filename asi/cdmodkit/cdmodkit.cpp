@@ -787,13 +787,14 @@ void PreviewSet(const std::string& prefab, Vec3 pos, float yawDeg, float scale, 
         g_prev.obj = obj; g_prev.prefab = prefab; g_prev.pos = pos; g_prev.yaw = yawDeg; g_prev.scale = scale; g_prev.pending = false;
     });
 }
-bool PreviewCommit() {
+int PreviewCommit() {
     std::lock_guard<std::mutex> l(g_prevMutex);
-    if (!g_prev.obj) return false;
-    { std::lock_guard<std::mutex> r(g_regMutex); g_reg.push_back({ g_prev.obj, g_prev.prefab, g_prev.pos, Rot{ g_prev.yaw }, g_prev.scale, false, GetTickCount(), Rot{ g_prev.yaw }, g_prev.scale, g_nextUid++, 0 }); }
+    if (!g_prev.obj) return 0;
+    int uid = 0;
+    { std::lock_guard<std::mutex> r(g_regMutex); uid = g_nextUid++; g_reg.push_back({ g_prev.obj, g_prev.prefab, g_prev.pos, Rot{ g_prev.yaw }, g_prev.scale, false, GetTickCount(), Rot{ g_prev.yaw }, g_prev.scale, uid, 0 }); }
     Log("preview committed: %s at (%.2f %.2f %.2f)", g_prev.prefab.c_str(), g_prev.pos.x, g_prev.pos.y, g_prev.pos.z);
     g_prev.obj = 0; g_prev.prefab.clear();
-    return true;
+    return uid;
 }
 
 // ---- projects (save / load / autoload) ----

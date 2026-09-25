@@ -145,7 +145,7 @@ namespace core {
     // Live preview: one temporary object that follows the browser selection; Commit turns it into a permanent object.
     void PreviewSet(const std::string& prefab, Vec3 world, float yawDeg, float scale, bool recreate = false);   // recreate: always remove + spawn
     void PreviewClear();
-    bool PreviewCommit();          // registers the preview object as spawned (no new spawn needed); false if none
+    int  PreviewCommit();          // registers the preview object as spawned (no new spawn needed); returns uid (0 = none)
     bool PreviewActive();
     bool PreviewPending();         // a PreviewSet job is still queued (commit only once it ran)
 
