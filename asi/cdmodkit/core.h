@@ -46,6 +46,7 @@ namespace core {
     bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11, int rank);
     bool RenderCameraNative();                // the last RenderCamera() answer came from the renderer's camera object (no copy guessing, rank ignored)
     void FindRenderCamera();
+    void ResearchGimmickSpawn(uint32_t gimmickKey, Vec3 world, float yawDeg, float scale, int reason);   // research: template-free spawn through the game's save-data builder
     void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object                  // (re)starts the background scan; RenderCamera() does this itself when it has nothing
     int  RenderCameraBlocks();                // how many copies are currently tracked (0 = falling back to the camera object + fov setting)
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)

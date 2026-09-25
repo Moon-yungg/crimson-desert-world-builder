@@ -22,6 +22,7 @@ namespace thumbgen {
     int  Done();                                    // prefabs with a rendered image
     void WantNamesLanguage(const std::string& id);   // UI language id; the worker loads the in-game names for it
     std::shared_ptr<const std::unordered_map<std::string, std::string>> GameNames();   // prefab path -> in-game name (gimmicks), null until loaded
+    uint32_t GimmickKey(const std::string& prefab);   // gimmickinfo row key of an interactive prefab (0: unknown or not loaded yet)
     std::shared_ptr<const std::vector<CharInfo>> Characters();   // all characters of characterinfo (NPC spawn list), null until loaded
     bool PassProgress(int* done, int* total);       // re-render pass of existing images (after a renderer fix): active, how far
     int  Failed();                                  // prefabs without usable geometry

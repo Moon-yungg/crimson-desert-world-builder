@@ -206,3 +206,13 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Args: (camera, float rot[16], float pos[3], float a[3], float tilePos[3], float eye[3], p7). rot = view rotation, right/up/forward as columns (m0,m4,m8 = right; m2,m6,m10 = forward). pos = world position -> camera+0xC8. tilePos = the same position relative to its world tile -> camera+0xEC. eye is always (0,0,0): the view translation is camera-relative. a -> +0xE0 (seen as (nan, 0, nan)). Tail-calls camera vtable +0x50.
 - Free camera = hook it for the renderer camera only and pass our own rot / pos / tilePos (tile offset = game pos - game tilePos, applied to ours); keep eye and a. Passing a world eye or an unchanged tilePos shears the whole image.
 - The world streams around the character, not the camera: far flights show coarse LODs.
+
+## Template-free gimmick spawn (v0.94, build 1.0.0.2976)
+- The game's "gimmick from save data" builder, rva 0x278d440, unique 60-byte signature (ResolveGimmickFromSave): `bool fn(ServerField* field, FieldGimmickSaveData* save, u32 a, u32 b, u8 reason2, ScopeAttacher<CommonActor>* out)`. Server tick only.
+- field = first argument of the ServerField slot-9 tick (the VtThunk with C==2, N==9 that also drains the server jobs).
+- save record (0x400 zeroed is enough): +0x1C0 gimmickinfo row key (dword; looked up in a global hash table), +0x25C reason byte, +0x28 flags, +0x4C uuid (16 bytes), +0x220 reason hash. Callers pass reason2 6 or 8 (read only when b != 0).
+- out = a ScopeAttacher<CommonActor> (RTTI `.?AV?$ScopeAttacher@VCommonActor@pa@@@pa@@`): +0 vtable, +8 actor, +0x10 attached flag; vtable slot 0x10 = reset / detach. Without it the builder faults (rva 0x278d6e3). We detach afterwards; the actor stays in the field.
+- Flow: builds a CreateServerActorDesc_InstantGimmick (ctor thunk 0x27a4880), runs the spawn prepare 0x278f490 (our HookGimmickSpawn) with a default transform block (scale3, quat4 +0xC, pos3 +0x1C: 1 / identity / 0), commits (desc vfunc +0x20), field create (field vfunc +0x88). The prepare hook swaps in our transform.
+- gimmickinfo row key per prefab: the first "/...prefab" string in the row (thumbgen LoadGimmickKeys, 13,941 keys). E.g. gimmick_ladder_01 = 8150001, gimmick_lamp_standtorch_03_on = 5080001.
+- Works right after loading, no captured template. The template replay stays as the fallback when the key is unknown or the builder fails.
+- TrocTrCharacterPresetSpawnGimmickByCheatReq is a dead end: its worker is stubbed in release.

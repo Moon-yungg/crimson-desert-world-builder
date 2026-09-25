@@ -23,3 +23,9 @@ Changed
   and gizmo and outlines follow it. The game treats it as its real camera, so the world stays visible while you turn. Speed
   and mouse sensitivity are in Settings. The world keeps loading around your character, so very distant flights show
   coarser detail.
+
+Fixed
+- Interactive objects (doors, ladders, torches, chests ...) are now created directly from the game's own gimmick table:
+  no captured template needed, so they appear right after loading a save without walking first, and the invisible
+  objects some players saw are gone. The old template method remains as a fallback; it now prefers a template that has
+  already worked, uses fresh templates only once they are 2 s old, and a watchdog logs a replay that hangs.

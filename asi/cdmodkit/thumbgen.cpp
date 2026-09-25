@@ -1081,6 +1081,30 @@ static bool RowDirectory(const std::vector<uint8_t>& h, const std::vector<uint8_
     }
     return false;
 }
+// prefab path -> gimmickinfo row key: what the game's "gimmick from save data" builder takes (template-free interactive spawns)
+static std::shared_ptr<const std::unordered_map<std::string, uint32_t>> g_gimmickKeys;   // atomic_load/store
+static bool LoadGimmickKeys() {
+    std::vector<uint8_t> hd, bd;
+    if (!GetFile("gamedata/binarystaticinfo__/bin/gimmickinfo.staticinfoheader", hd) || !GetFile("gamedata/binarystaticinfo__/bin/gimmickinfo.staticinfobody", bd)) {
+        static int s_logged = 0; if (s_logged++ < 3) Log("[gimmick] gimmickinfo not readable yet, retrying"); return false;
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> rows; if (!RowDirectory(hd, bd, rows)) { Log("[gimmick] gimmickinfo: row directory not recognised, template-free spawns off"); return true; }   // format changed: do not retry
+    auto keys = std::make_shared<std::unordered_map<std::string, uint32_t>>();
+    for (size_t r = 0; r < rows.size(); r++) {
+        const size_t off = rows[r].second, end = r + 1 < rows.size() ? rows[r + 1].second : bd.size();
+        for (size_t i = off; i + 4 <= end;) {   // the first prefab path string in the row
+            const uint32_t n = rd32(bd.data() + i);
+            if (n >= 8 && n <= 400 && i + 4 + n <= end && bd[i + 4] == '/') {
+                std::string v((const char*)bd.data() + i + 4, n);
+                if (EndsWith(v, ".prefab") && v.find_first_of(std::string("\0\r\n", 3)) == std::string::npos) { keys->emplace(v, rows[r].first); break; }
+            }
+            i++;
+        }
+    }
+    Log("[gimmick] %zu gimmick prefabs have a gimmickinfo key (template-free spawns)", keys->size());
+    std::atomic_store(&g_gimmickKeys, std::shared_ptr<const std::unordered_map<std::string, uint32_t>>(keys));
+    return true;
+}
 static bool LoadGameNames(const std::string& lang) {
     std::vector<uint8_t> hd, bd, pal;
     if (!GetFile("gamedata/binarystaticinfo__/bin/gimmickinfo.staticinfoheader", hd) || !GetFile("gamedata/binarystaticinfo__/bin/gimmickinfo.staticinfobody", bd)) return false;
@@ -1423,6 +1447,8 @@ static DWORD WINAPI Worker(LPVOID) {
     std::deque<std::string> retry;   // background prefabs that hit a read error, tried again once the pass reaches the end
     std::unordered_map<std::string, int> retries; int errStreak = 0, streaksLogged = 0;
     for (;;) {
+        { static bool s_keys = false; static DWORD s_keysTry = 0;   // until it works: the packs may not be readable yet this early
+          if (!s_keys && GetTickCount() - s_keysTry > 5000) { s_keysTry = GetTickCount(); const bool e = g_readError; s_keys = LoadGimmickKeys(); g_readError = e; } }
         {   // in-game names for the browser: (re)loaded when the UI language differs from the loaded one
             std::string want; { std::lock_guard<std::mutex> l(g_mu); want = g_namesWanted; }
             if (!want.empty() && want != g_namesLoaded) { g_namesLoaded = want; const bool e = g_readError; LoadGameNames(want); LoadCharacters(want); g_readError = e; }
@@ -1532,6 +1558,7 @@ int Done() { return g_done; }
 void WantNamesLanguage(const std::string& id) { std::lock_guard<std::mutex> l(g_mu); g_namesWanted = id; }
 std::shared_ptr<const std::unordered_map<std::string, std::string>> GameNames() { return std::atomic_load(&g_names); }
 std::shared_ptr<const std::vector<CharInfo>> Characters() { return std::atomic_load(&g_chars); }
+uint32_t GimmickKey(const std::string& prefab) { auto m = std::atomic_load(&g_gimmickKeys); if (!m) return 0; auto it = m->find(prefab); return it == m->end() ? 0 : it->second; }
 bool PassProgress(int* done, int* total) { std::lock_guard<std::mutex> l(g_mu); if (done) *done = (int)g_passDone.size(); if (total) *total = g_passTotal; return g_passActive; }
 int Failed() { return g_failed; }
 int Total() { return g_total; }

@@ -1222,7 +1222,7 @@ static void LogSpawnTransforms(const char* what, uintptr_t save, uintptr_t s8, u
 // SpawnAt queues them here; the ServerField tick (slot 9, server thread) spawns one per tick from the newest usable capture
 // (a level streaming spawn, else a housing placement) with the prefab, position, rotation and scale swapped in. A refused replay
 // keeps a plain client stand-in visible while newer/different captures are retried. Moves remove + respawn (final only), deletes remove the actor.
-struct GimmickReq { int uid; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; };
+struct GimmickReq { int uid; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; bool noDirect = false; };
 static const size_t kGimmickMaxTries = 3;   // refusals with different templates before an interactive prefab becomes a plain object
 static std::deque<GimmickReq> g_gimmickQueue; static std::mutex g_gimmickQueueMutex;
 static std::deque<std::function<void()>> g_serverJobs; static std::mutex g_serverJobsMutex;
@@ -1477,9 +1477,32 @@ bool GimmickTemplateReady() { GimmickCapture c; return FindTemplateCapture(c); }
 static void ProcessServerJobs() {
     for (;;) { std::function<void()> job; { std::lock_guard<std::mutex> l(g_serverJobsMutex); if (g_serverJobs.empty()) return; job = std::move(g_serverJobs.front()); g_serverJobs.pop_front(); } job(); }
 }
+static uintptr_t kRva_GimmickFromSave = 0, g_scopeAttacherVt = 0;
+static volatile uintptr_t g_serverFieldObj = 0;   // the ServerField whose slot 9 tick runs our server jobs
+static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uintptr_t* soOut, uintptr_t* actOut, int reason);   // below
 static void ProcessGimmickQueue() {   // server thread, one object per tick
     GimmickReq r; size_t pending = 0;
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty()) return; r = g_gimmickQueue.front(); pending = g_gimmickQueue.size(); }
+    // Template-free first: the game's own "gimmick from save data" builder with the prefab's gimmickinfo key. It needs no captured
+    // spawn (works right after loading, no walking) and none of the replay's patching; the template replay stays as the fallback.
+    if (const uint32_t gkey = !r.noDirect && kRva_GimmickFromSave && g_serverFieldObj ? thumbgen::GimmickKey(r.prefab) : 0) {
+        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid) return; g_gimmickQueue.pop_front(); }
+        uintptr_t standin = 0;
+        { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return;
+          if (g_reg[(size_t)i].standin) { standin = g_reg[(size_t)i].obj; g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].standin = false; } }
+        if (standin && GameThreadReady()) RunOnGameThread([standin]() { DoRemove(standin); });
+        strncpy_s(g_replayWatchPrefab, r.prefab.c_str(), _TRUNCATE);
+        uintptr_t so = 0, actor = 0;
+        if (DirectGimmickSpawn(gkey, r.pos, r.rot, r.scale, &so, &actor, 0)) {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid);
+            if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].standin) { if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); return; }   // deleted or picked up while spawning
+            g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale;
+            Log("[gimmick] object %d spawned directly (no template): %s key %u (scene object %p, actor %p)", r.uid, r.prefab.c_str(), gkey, (void*)so, (void*)actor);
+            return;
+        }
+        Log("[gimmick] object %d: direct spawn of %s failed, the template replay takes over", r.uid, r.prefab.c_str());
+        r.noDirect = true; std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); return;
+    }
     GimmickCapture t;
     if (!FindTemplateCapture(t, r.triedTemplates.empty() ? nullptr : &r.triedTemplates)) {
         static DWORD lastLog = 0; if (GetTickCount() - lastLog > 15000) { lastLog = GetTickCount();
@@ -1533,8 +1556,81 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
         if (!giveUp) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); }
     }
 }
+// ---- template-free gimmick spawn (research) ----
+// The game's own "gimmick from save data" builder: bool fn(ServerField* field, FieldGimmickSaveData* save, u32 a, u32 b, u8 reason2,
+// ScopeAttacher<CommonActor>* out). The callers pass reason2 6 or 8 (only read when b != 0) and a stack ScopeAttacher that receives
+// the created actor (out+8 actor, +0x10 attached flag); its slot 0x10 is the reset / detach the builder itself calls first. It looks
+// save+0x1C0 (gimmickinfo row key) up in the gimmick table, builds a CreateServerActorDesc_InstantGimmick (reason byte save+0x25C,
+// flags save+0x28, uuid save+0x4C, reason hash save+0x220), runs the spawn prepare (0x278f490 in 2976, our HookGimmickSpawn) with a
+// default transform block (scale 1, identity rotation, position 0), commits the desc and hands it to ServerField slot 17 (field
+// create). Called with our own save record, the prepare hook swaps in position / rotation / scale: no captured template needed.
+static uintptr_t FindVtableByName(const char* mangled);   // RTTI lookup (below)
+static volatile bool g_directArmed = false; static DWORD g_directThread = 0; static float g_directXf[10] = {};   // scale3 quat4 pos3
+static void ResolveGimmickFromSave() {
+    int n = 0;
+    const uintptr_t f = FindPatternCount("48 89 5C 24 08 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8D AC 24 B0 FA FF FF 48 81 EC 50 06 00 00 41 8B F1 45 8B F0 4C 8B FA 4C 8B E1 44 8B 92 C0 01 00 00", &n);
+    if (!f || n != 1) { Log("[gimmick] save-data builder: %d matches, template-free spawn off", n); return; }
+    g_scopeAttacherVt = FindVtableByName(".?AV?$ScopeAttacher@VCommonActor@pa@@@pa@@");
+    if (!g_scopeAttacherVt) { Log("[gimmick] ScopeAttacher<CommonActor> vtable not found, template-free spawn off"); return; }
+    kRva_GimmickFromSave = f - g_base; Log("resolved %-20s rva 0x%llx (via signature), result holder vtable rva 0x%llx", "gimmick from save", (unsigned long long)kRva_GimmickFromSave, (unsigned long long)(g_scopeAttacherVt - g_base));
+}
+static bool CallGimmickFromSave(void* field, uint8_t* save, void* holder, bool* ok) {   // guarded: a wrong record must not take the game down
+    typedef bool (__fastcall* Fn)(void*, void*, uint32_t, uint32_t, uint8_t, void*);
+    CDK_GUARD_BEGIN *ok = ((Fn)(g_base + kRva_GimmickFromSave))(field, save, 0, 0, 8, holder); return true;
+    CDK_GUARD_FAIL { EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); } return false;
+    CDK_GUARD_END
+    return false;
+}
+// Server thread. True with the new scene object and actor when the game built the interactive object.
+static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uintptr_t* soOut, uintptr_t* actOut, int reason) {
+    *soOut = *actOut = 0;
+    void* field = (void*)g_serverFieldObj;
+    if (!kRva_GimmickFromSave || !field) return false;
+    alignas(16) static uint8_t save[0x400]; memset(save, 0, sizeof save);
+    memcpy(save + 0x1C0, &key, 4); save[0x25C] = (uint8_t)reason;
+    float xf[12]; MakeTransform(xf, pos, rot, scale, false);
+    memcpy(g_directXf, xf, 40); memcpy(save + 0x1CC, xf, 40);   // the record's own transform too (the builder does not read it)
+    g_directThread = GetCurrentThreadId(); g_directArmed = true;
+    g_lastActorCreated_ = 0; g_replayActor = 0; g_replayActorCount = 0; g_replayCtorActor = 0; g_replayResultSo = 0; g_replayResultActor = 0; g_replayInnerSo = 0;
+    g_inGimmickReplay = true; g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount();
+    const LONG before = g_soCreated_;
+    g_replayWatchTemplate = 0; g_replayWatchAge = 0; g_replayWatchPos = pos; g_replayWatchLogged = false; g_replayWatchTick = GetTickCount();
+    alignas(16) uintptr_t holder[8] = { g_scopeAttacherVt };   // ScopeAttacher<CommonActor>: vtable, actor, flags ...
+    bool ok = false; const bool ran = CallGimmickFromSave(field, save, holder, &ok);
+    g_replayWatchTick = 0; g_inGimmickReplay = false; const bool hookSaw = !g_directArmed; g_directArmed = false;
+    const uintptr_t heldActor = holder[1]; const uint8_t attached = (uint8_t)(holder[2] & 0xFF);
+    if (ran && attached) {   // let go of the attachment the builder handed us (its own detach); the actor stays in the field
+        typedef void (__fastcall* ResetFn)(void*); ResetFn reset = nullptr;
+        if (ReadPtr(g_scopeAttacherVt + 0x10, (uintptr_t*)&reset) && InImage((uintptr_t)reset)) { CDK_GUARD_BEGIN reset(holder); CDK_GUARD_FAIL Log("[gimmick] direct: detach faulted"); CDK_GUARD_END }
+    }
+    const uintptr_t so = g_replayInnerSo ? g_replayInnerSo : (g_soCreated_ != before ? g_lastSoCreated_ : 0);
+    const uintptr_t act = heldActor ? heldActor : (so ? PickReplayActor(so) : 0);
+    if (!ran || !ok || !hookSaw || !so) {
+        Log("[gimmick] direct spawn of key %u at (%.2f %.2f %.2f) failed: %s, builder %s, prepare hook %s, scene object %p",
+            key, pos.x, pos.y, pos.z, ran ? "returned" : "FAULTED", ok ? "true" : "false", hookSaw ? "reached" : "NOT reached", (void*)so);
+        return false;
+    }
+    *soOut = so; *actOut = act; return true;
+}
+void ResearchGimmickSpawn(uint32_t key, Vec3 pos, float yawDeg, float scale, int reason) {
+    if (!kRva_GimmickFromSave) { Log("[gimmick] direct: builder not resolved"); return; }
+    RunOnServerTick([key, pos, yawDeg, scale, reason]() {
+        strncpy_s(g_replayWatchPrefab, "research spawn", _TRUNCATE);
+        uintptr_t so = 0, act = 0; const bool ok = DirectGimmickSpawn(key, pos, Rot{ yawDeg }, scale, &so, &act, reason);
+        Log("[gimmick] research spawn key %u reason %d: %s, scene object %p (%s), actor %p (%s)", key, reason, ok ? "ok" : "failed",
+            (void*)so, so && RttiName(so) ? RttiName(so) : "-", (void*)act, act && RttiName(act) ? RttiName(act) : "-");
+    });
+}
+
 static void* __fastcall HookGimmickSpawn(void* param, void* out, void* mgr, void* owner, void* s5, void* s6, void* s7, void* s8, void* s9, void* s10, void* s11, void* s12) {
     g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount();
+    if (g_directArmed && GetCurrentThreadId() == g_directThread && s8) {   // our template-free spawn: transform block scale3 quat4 pos3
+        g_directArmed = false;
+        float was[10] = {}; ReadBytes((uintptr_t)s8, was, 40);
+        memcpy(s8, g_directXf, 40);
+        Log("[gimmick] direct: prepare transform was scale %.2f quat (%.2f %.2f %.2f %.2f) pos (%.2f %.2f %.2f), now pos (%.2f %.2f %.2f)", was[0], was[3], was[4], was[5], was[6], was[7], was[8], was[9], g_directXf[7], g_directXf[8], g_directXf[9]);
+        return g_origGimmickSpawn(param, out, mgr, owner, s5, s6, s7, s8, s9, s10, s11, s12);
+    }
     CaptureGimmick(param, out, mgr, owner, s5, s6, s7, s8, s9, s10, s11, s12);
     if (!g_trace) {
         void* r0 = g_origGimmickSpawn(param, out, mgr, owner, s5, s6, s7, s8, s9, s10, s11, s12);
@@ -1811,7 +1907,7 @@ template<int C, int N> static void* __fastcall VtThunk(void* a, void* b, void* c
     if (C == 3) { if (g_inGimmickReplay && GetCurrentThreadId() == g_spawnWindowThread) NoteReplayActor((uintptr_t)a, N); if (!g_trace || !g_inGimmickReplay) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); }
     if (C == 2 && N == 9 && g_gimmickReplayArmed) { if (InterlockedCompareExchange(&g_gimmickReplayArmed, 0, 1) == 1) ReplayGimmick(); }
     if (C == 2 && N == 9 && g_removeActorRequest) { const uintptr_t a = (uintptr_t)InterlockedExchangePointer((void* volatile*)&g_removeActorRequest, nullptr); if (a) RemoveSpawnedActor(a); }
-    if (C == 2 && N == 9) { ProcessServerJobs(); ProcessGimmickQueue(); }   // ServerField slot 9 runs ~18x per second on the server thread: armed replays run here, no game spawn needed
+    if (C == 2 && N == 9) { g_serverFieldObj = (uintptr_t)a; ProcessServerJobs(); ProcessGimmickQueue(); }   // ServerField slot 9 runs ~18x per second on the server thread: armed replays run here, no game spawn needed
     if (C == 2) { if (!g_trace) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); const LONG k = InterlockedIncrement(&g_vtCount[N]); g_vtCountThread[N] = GetCurrentThreadId(); if (k > 20) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); }
     const bool log = g_trace && (C == 0 || C == 2 || Watched((uintptr_t)a) || (GetCurrentThreadId() == g_spawnWindowThread && GetTickCount() - g_spawnWindowTick < 500));
     if (!log) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h);
@@ -2855,6 +2951,7 @@ static bool ResolveGame() {
     ResolveActorCtor();              // research: traced only
     ResolveSoServerCreate();         // research: traced only
     ResolveUuidLookup();             // research: traced only
+    ResolveGimmickFromSave();        // research: template-free gimmick spawn
     if (g_probeVtableOverride) { kRva_ProbeCollector = g_probeVtableOverride; Log("[probe] collector vtable overridden by settings.txt: rva 0x%llx", (unsigned long long)kRva_ProbeCollector); }
     return ok;
 }
