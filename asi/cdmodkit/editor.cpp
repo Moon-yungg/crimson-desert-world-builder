@@ -1776,7 +1776,9 @@ namespace editor {
                     ImGui::TableSetColumnIndex(1);
                     char glbl[64]; snprintf(glbl, sizeof glbl, T("Group %d  (%d objects)##gs%d"), gid, (int)mem.size(), gid);
                     if (ImGui::Selectable(glbl, allSel, ImGuiSelectableFlags_SpanAllColumns)) { ImGuiIO& io = ImGui::GetIO(); if (!io.KeyCtrl) g_sel.clear(); for (int m : mem) { if (allSel && io.KeyCtrl) g_sel.erase(list[m].uid); else g_sel.insert(list[m].uid); } g_primary = list[mem[0]].uid; g_lastClicked = g_primary; g_editUid = 0; }
+                    ImGui::PushID(gid);
                     SceneObjectContext(list[mem[0]], list, havePos, "groupctx");
+                    ImGui::PopID();
                     ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%d", gid);
                     continue;
                 }
@@ -1794,7 +1796,12 @@ namespace editor {
                     } else SelectUid(o.uid, io.KeyCtrl, list);
                     g_editUid = 0;
                 }
+                // Each row needs its own popup ID.  Reusing the same explicit
+                // "rowctx" ID makes every visible row append its menu entries
+                // to the one popup that was opened from a grouped child.
+                ImGui::PushID(o.uid);
                 SceneObjectContext(o, list, havePos, "rowctx");
+                ImGui::PopID();
                 if (rw.second) ImGui::Unindent(14.0f);
                 ImGui::TableSetColumnIndex(1);
                 std::string name = ShortName(o.prefab);
