@@ -217,6 +217,15 @@ static std::string Handle(const std::string& method, const std::string& path, co
         float ty = 0, tp = 0; Number(arg, "turnYaw", ty); Number(arg, "turnPitch", tp); if (ty != 0 || tp != 0) core::FreeCamTurn(ty, tp);
         return core::FreeCamActive() ? "{\"on\":true}" : "{\"on\":false}";
     }
+    if (method == "POST" && path == "/api/time") {   // {"hour":18} sets the visual time (keeps running), {"freeze":1} holds it, {"native":1} back to the game clock
+        if (!core::TimeControlAvailable()) { status = 503; return Error("time control not available in this game build (see log)"); }
+        float h = -1, fr = -1, nat = 0; Number(arg, "hour", h); Number(arg, "freeze", fr); Number(arg, "native", nat);
+        if (nat != 0) core::ResetTimeControl();
+        if (fr >= 0) core::SetTimeFrozen(fr != 0);
+        if (h >= 0) core::SetTimeHour(h);
+        float cur = 0; const bool have = core::TimeHour(&cur);
+        return "{\"hour\":" + (have ? std::to_string(cur) : std::string("null")) + ",\"frozen\":" + (core::TimeFrozen() ? "true" : "false") + "}";
+    }
     if (method == "POST" && path == "/api/research/camwatch") {   // research: {"seconds":8} logs the code writing the renderer camera pose
         float sec = 8, mode = 0; Number(arg, "seconds", sec); Number(arg, "mode", mode); core::CamWatch((int)sec, (int)mode); status = 202; return "{\"started\":true}";
     }

@@ -80,7 +80,10 @@ static std::atomic<float> g_timeCurrentHour{ 12.0f };
 static std::atomic<float> g_timeTargetHour{ 12.0f };  // written by the UI thread only, so the game thread cannot race a request
 static std::atomic<bool> g_timeFreeze{ false };
 static std::atomic<bool> g_timeApply{ false };
-static std::atomic<int> g_timeSetHoldTicks{ 0 };
+static std::atomic<bool> g_timeRun{ false };           // a jumped-to time that keeps running (the game snaps a one-off set back to its clock)
+static float g_timeRunHour = 12.0f;                    // game thread: the hour we hold / advance while overriding
+static double g_timeRatePerMs = 1.0 / 360000.0;        // native progression, measured while not overriding (default 1 h per 6 min)
+static float g_rateHour = NAN; static ULONGLONG g_rateTick = 0, g_runTick = 0;
 static long long g_timeEntity = 0;
 static bool g_timeEntityOk = false;
 static bool g_timeDomainHours = true;
@@ -1006,48 +1009,60 @@ void EnvironmentTick() {
         g_timeCurrentValid.store(false, std::memory_order_relaxed);
     }
 
-    const bool frozen = g_timeFreeze.load(std::memory_order_acquire);
-    if (!frozen) {
+    // The visual time follows the game clock every frame, so a one-off set snaps back at once. Setting a time therefore
+    // overrides it until "use native time": frozen holds it, running advances it at the measured native rate.
+    const bool frozen = g_timeFreeze.load(std::memory_order_acquire), run = g_timeRun.load(std::memory_order_acquire);
+    const ULONGLONG now = GetTickCount64();
+    if (!frozen && !run) {
         if (g_timeOverriding) {
             // undo only our own write: if a script replaced our limits since, its values stay
             if (haveLimits && lo == g_timeWritten && hi == g_timeWritten) {
                 WriteBytes(static_cast<uintptr_t>(entity) + g_timeLower, &g_timeNativeLower, sizeof(float));
                 WriteBytes(static_cast<uintptr_t>(entity) + g_timeUpper, &g_timeNativeUpper, sizeof(float));
             }
-            g_timeOverriding = false;
-        }
-        int hold = g_timeSetHoldTicks.load(std::memory_order_acquire);
-        if (hold > 0) {
-            SetTimeRaw(entity, HourToRaw(g_timeTargetHour.load(std::memory_order_relaxed)));
-            g_timeSetHoldTicks.compare_exchange_strong(hold, hold - 1, std::memory_order_relaxed);  // a new UI request wins
+            g_timeOverriding = false; g_rateHour = NAN;
+        } else if (g_timeCurrentValid.load(std::memory_order_relaxed)) {   // native rate over >= 5 s windows
+            if (!std::isfinite(g_rateHour)) { g_rateHour = current; g_rateTick = now; }
+            else if (now - g_rateTick >= 5000) {
+                float dh = current - g_rateHour; if (dh < -12.0f) dh += 24.0f;
+                if (dh > 0.0f && dh < 1.0f) g_timeRatePerMs = dh / (double)(now - g_rateTick);
+                g_rateHour = current; g_rateTick = now;
+            }
         }
         g_timeApply.store(false, std::memory_order_relaxed);
         return;
     }
 
-    const float raw = HourToRaw(g_timeTargetHour.load(std::memory_order_relaxed));
-    bool write = g_timeApply.exchange(false, std::memory_order_relaxed);
+    bool write = false;
+    if (g_timeApply.exchange(false, std::memory_order_acquire)) { g_timeRunHour = NormalizeHour(g_timeTargetHour.load(std::memory_order_relaxed)); write = true; }
     if (!g_timeOverriding) {
-        // capture exactly what the game has right before the freeze starts, on this entity
+        // capture exactly what the game has right before the override starts, on this entity
         g_timeNativeLower = lo;
         g_timeNativeUpper = hi;
         g_timeOverriding = true;
         write = true;
-        Log("[environment] visual-time native limits %.4f..%.4f (%s)", lo, hi, g_timeDomainHours ? "hours" : "normalized");
+        Log("[environment] visual-time override from %.2f h (%s), native limits %.4f..%.4f (%s), native rate %.2f game min per real min",
+            g_timeRunHour, frozen ? "frozen" : "running", lo, hi, g_timeDomainHours ? "hours" : "normalized", g_timeRatePerMs * 3600000.0);
     } else if (haveLimits && (lo != g_timeWritten || hi != g_timeWritten)) {
-        // something else (a script / the game) set the limits while frozen: that is what restore must give back
+        // something else (a script / the game) set the limits while we override: that is what restore must give back
         g_timeNativeLower = lo;
         g_timeNativeUpper = hi;
         write = true;
     }
+    if (!frozen) {   // running: advance at the native pace
+        const ULONGLONG dt = g_runTick ? std::min<ULONGLONG>(now - g_runTick, 1000) : 0;
+        g_timeRunHour = NormalizeHour(g_timeRunHour + (float)(g_timeRatePerMs * dt));
+        write = true;
+    }
+    g_runTick = now;
     if (write) {
-        // limits first: the native setter clamps into [lower, upper], so stale frozen limits would swallow the new time
+        const float raw = HourToRaw(g_timeRunHour);
+        // limits first: the native setter clamps into [lower, upper], so stale limits would swallow the new time
         WriteBytes(static_cast<uintptr_t>(entity) + g_timeLower, &raw, sizeof(raw));
         WriteBytes(static_cast<uintptr_t>(entity) + g_timeUpper, &raw, sizeof(raw));
         g_timeWritten = raw;
         SetTimeRaw(entity, raw);
     }
-    g_timeSetHoldTicks.store(0, std::memory_order_relaxed);
 }
 
 bool TimeControlAvailable() { return g_timeAvailable.load(std::memory_order_relaxed); }
@@ -1057,33 +1072,30 @@ bool TimeHour(float* hour) {
     return true;
 }
 float TimeTargetHour() {
-    // the target only means something while a request is pending or frozen; otherwise the slider follows the game
-    const bool pending = g_timeFreeze.load(std::memory_order_relaxed) || g_timeSetHoldTicks.load(std::memory_order_relaxed) > 0;
-    if (!pending && g_timeCurrentValid.load(std::memory_order_relaxed)) return NormalizeHour(g_timeCurrentHour.load(std::memory_order_relaxed));
+    // a pending request shows its target; otherwise the slider follows the visible time (ours while overriding)
+    if (!g_timeApply.load(std::memory_order_relaxed) && g_timeCurrentValid.load(std::memory_order_relaxed)) return NormalizeHour(g_timeCurrentHour.load(std::memory_order_relaxed));
     return NormalizeHour(g_timeTargetHour.load(std::memory_order_relaxed));
 }
 bool TimeFrozen() { return g_timeFreeze.load(std::memory_order_relaxed); }
 void SetTimeHour(float hour) {
     // target before the flags (release): the game thread reads the flags with acquire and then sees this target
     g_timeTargetHour.store(NormalizeHour(hour), std::memory_order_relaxed);
+    if (!g_timeFreeze.load(std::memory_order_relaxed)) g_timeRun.store(true, std::memory_order_release);
     g_timeApply.store(true, std::memory_order_release);
-    if (!g_timeFreeze.load(std::memory_order_relaxed))
-        g_timeSetHoldTicks.store(8, std::memory_order_release);
 }
 void SetTimeFrozen(bool frozen) {
-    if (frozen && !g_timeFreeze.load(std::memory_order_relaxed) &&
-        g_timeSetHoldTicks.load(std::memory_order_relaxed) <= 0 &&
-        g_timeCurrentValid.load(std::memory_order_relaxed)) {
+    // freeze holds the visible time; unfreezing lets it run on from there (back to the game clock: ResetTimeControl)
+    if (g_timeCurrentValid.load(std::memory_order_relaxed)) {
         g_timeTargetHour.store(g_timeCurrentHour.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        g_timeApply.store(true, std::memory_order_release);
     }
-    g_timeApply.store(frozen, std::memory_order_relaxed);
+    g_timeRun.store(!frozen, std::memory_order_release);
     g_timeFreeze.store(frozen, std::memory_order_release);
-    if (!frozen) g_timeSetHoldTicks.store(0, std::memory_order_relaxed);
 }
 void ResetTimeControl() {
     g_timeFreeze.store(false, std::memory_order_release);
+    g_timeRun.store(false, std::memory_order_release);
     g_timeApply.store(false, std::memory_order_relaxed);
-    g_timeSetHoldTicks.store(0, std::memory_order_relaxed);
 }
 
 bool WeatherControlAvailable() { return g_weatherAvailable.load(std::memory_order_relaxed); }
