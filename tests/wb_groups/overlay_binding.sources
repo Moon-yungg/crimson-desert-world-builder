@@ -1,0 +1,14 @@
+# The fixture includes the real overlay.cpp; the linked production TUs are the ones the fixture does not stub.
+# input.cpp is stubbed too: the host suite drives no real input layer (the overlay only calls Init/MenuOpened/MenuClosed/FeedMouse).
+# The DXGI/MinHook boundary is substituted by the fixture (recording hooks, fake factory/device/chain objects).
+@include tools/imgui
+@include tools/imgui/backends
+@include tools/minhook/include
+asi/cdmodkit/i18n.cpp
+asi/cdmodkit/icons.cpp
+tools/imgui/imgui.cpp
+tools/imgui/imgui_draw.cpp
+tools/imgui/imgui_tables.cpp
+tools/imgui/imgui_widgets.cpp
+tools/imgui/backends/imgui_impl_dx12.cpp
+tools/imgui/backends/imgui_impl_win32.cpp
