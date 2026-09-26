@@ -12,8 +12,8 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 
 1. Press **Insert** in the game world. The editor opens in edit mode: the mouse belongs to the menu, the world keeps running.
 2. Type a word into the search box, pick a card or a row, press **PLACE** (or double-click).
-3. The object appears in front of your character. Move it with the placement keys (numpad by default) or press Numpad 5 and drag the gizmo. Place the next one, click another object or double-click into the open and it stays where it is (**Enter** works too); **Backspace** cancels while you hold it.
-4. Prefer a small panel? Click **dock**: a narrow side window with search, one to four columns of cards and PLACE. It stays open while you place.
+3. The object appears in front of your character with the mouse gizmo active. Drag the arrows, rings, center point or scale handles to position it. Use the placement HUD to Drop, Cancel, level or snap it to the ground; placing/selecting something else or double-clicking into the open also finishes the placement.
+4. Prefer a small panel? Click **dock**: the narrow side window can switch between Browser, Scene, NPCs and Time & Weather, and stays open while you work.
 5. **Home** switches camera mode on and off: a free-flying camera (WASD, right-drag to look, mouse wheel forward) while the editor stays open. **Insert** hides the editor and hands the controls back to the game. Save your build in the Project tab.
 
 ## Features
@@ -21,39 +21,32 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 - **Prefab browser**: category tree, full-text search (words in any order), tag filters, a "meshes only" filter, favorites and your own named collections
 - **List or cards**: the matches as a list or as tiles with the preview image; the dock shows one to four per row, sized to the window
 - **Textured preview images** for every prefab, rendered on your machine with the game's own textures. The mod asks the game's resource loader for the files: no archive code, no keys, nothing extracted, nothing redistributed
-- **Placement mode**: the object stays where it is while you walk around it. Move away / closer, left / right, up / down, rotate about its center, scale, bring it back in front of you
-- **Mouse gizmo**: Numpad 5 hands the mouse to World Builder. Arrows move along the object's axes, the center dot slides over the ground, the green ring turns, the red and blue rings tilt, the cubes scale
-- **Full rotation**: yaw, pitch and roll, with sliders in the Scene tab and a "level" key
-- **Snapping**: grid steps (0.1 to 2 m) and angle steps (5 to 90 degrees), one step per key press
-- **Snap to ground**: one key drops the carried object onto the surface below it, "To ground" in the Scene tab does the same for the selection. Uses the game's own physics probe, so it lands on terrain, floors and other objects alike
+- **Placement mode**: newly placed or grabbed objects are edited directly with the mouse gizmo; the placement HUD provides Drop, Cancel, level, snap and To ground actions
+- **Mouse gizmo**: arrows move along the object's axes, the center dot slides over the ground, the green ring turns, the red and blue rings tilt, and the cubes scale
+- **Full rotation**: yaw, pitch and roll through the gizmo and the Scene tab, with a level action to remove tilt
+- **Snapping**: grid steps (0.1 to 2 m) and angle steps (5 to 90 degrees) apply to gizmo movement and rotation
+- **Snap to ground**: "To ground" on the placement HUD or in the Scene tab drops objects onto the surface below them using the game's own physics probe
 - **Click to select**: in edit mode a click on a placed object selects it, a double-click grabs it. Selected objects are outlined
 - **Scene tab**: every placed object with position and distance; multi-select (Ctrl / Shift + click), groups (Ctrl+G) as collapsible rows, undo / redo (Ctrl+Z / Ctrl+Y), copy / paste with orientation (Ctrl+C / Ctrl+V), duplicate, delete, To ground, Grab, Remove duplicates
+- **Time & Weather**: set the visual time of day, freeze the day/night lighting without pausing gameplay, restore native time progression, and control clear sky, rain, snow, clouds and wind. The controls are also available in the dock
+- **NPC spawning**: spawn one or many NPCs/creatures at a directly entered distance, with counts up to 100,000 and Line, Matrix or Circle formations with adjustable spacing/radius; drag a row or card into the game view to spawn one NPC at the marked drop point; the same controls are available in the narrow NPC dock
 - **Line and circle tools**: N copies in a row or on a ring in front of you, grouped, handed to the placement mode
 - **Projects**: save and load whole builds (absolute world coordinates, groups and tilt included), import .cdproj files shared by others, optional autoload when the game starts (tick as many projects as you like; they are all placed into the same world)
 - **One scene, several projects**: every object knows which project it came from. The scene has a tab per loaded project plus "new" for what you just placed, a star marks unsaved changes, and each project is written back into its own file - so you can build inside a loaded project without having to clear it first
-- **Every key is yours**: the editor hotkeys and all placement keys can be changed in the Settings tab or settings.txt. No numpad? Bind WASD, the arrows or anything else
+- **Simple controls**: only the editor and camera-mode hotkeys are configurable; object placement is handled by the mouse gizmo instead of a separate keyboard control scheme
 - **Modding SDK**: `cdk_spawn`, `cdk_move`, `cdk_remove`, `cdk_player_pos` and friends, callable from any other ASI mod
 - **Interactive objects**: every gimmick prefab (torches, lamps, doors, chests, campfires, levers - 16,591 of them) is spawned through the game's own spawn path and behaves like the real thing: light a torch, open a chest, knock a stand over. Select, drag, rotate, undo and save them like any other object. The game provides the spawn template by itself a few steps after loading
 - **Update-tolerant**: game functions are located by signature and class name at startup. After a game patch the mod either works or disables itself cleanly and tells you why
 
-## Controls (defaults, all rebindable)
+## Controls
 
 | Key | Action |
 | --- | --- |
 | Insert | show / hide the editor |
 | Home | camera mode on / off (free-flying camera, the editor stays open) |
-| Numpad 8 / 2 | move the object away from you / closer |
-| Numpad 4 / 6 | move it left / right |
-| Numpad 9 / 3 | move it up / down |
-| Numpad 7 / 1 | rotate it about its center |
-| Numpad + / - | scale |
-| Shift | fast |
-| Numpad 0 | bring it back in front of you |
-| Numpad . | snapping on / off |
-| Numpad 5 | mouse gizmo on / off |
-| Numpad * | level (remove the tilt) |
-| Numpad / | snap to ground |
-| Enter, placing or selecting something else, double-click into the open / Backspace | done / cancel or put back |
+| Placement HUD | Drop / Cancel / To ground / level / snapping |
+| Mouse gizmo | move / rotate / tilt / scale the carried object or selection |
+| Placing or selecting something else, or double-click into the open | finish the current placement |
 | Scene tab | Ctrl+A select all, Ctrl+G group, Ctrl+Z / Ctrl+Y undo / redo, Ctrl+C / Ctrl+V copy / paste, Delete |
 
 ## Requirements
@@ -94,6 +87,7 @@ If World Builder is useful to you and you want to say thanks, you can buy me a c
 - **dofo7777** for extensive testing, ideas and videos. Many of the placement and input improvements exist because of that feedback.
 - **Shin234** for Master Looter, whose input layer this mod's virtual cursor is adapted from, and for showing the way into this engine.
 - **LiangWood** for tracking down the missing prefab list with DMM, **Alduin1991** for the mounted-coordinates report, and the author of CrimsonRoute for the transform snapshot notes.
+- **Nostyxx** for the open reverse-engineering work in [CrimsonWeather](https://github.com/Nostyxx/CrimsonWeather), which served as a technical reference for World Builder's time-of-day and weather controls.
 - The whole Crimson Desert modding community: the pycrimson and CDMW projects for the archive and mesh format research, and everyone sharing findings in the open.
 
 Third-party code: MinHook (BSD-2), Dear ImGui (MIT), stb_image / stb_image_write (public domain), input layer adapted from Master Looter and Trinity (MIT). No game assets are included.

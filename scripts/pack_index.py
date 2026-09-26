@@ -1,6 +1,6 @@
 # Packs asi/cdmodkit/data/prefabs.tsv into asi/cdmodkit/build/prefabs.lz4 (8-byte header "CDK1" + u32 raw size, then one
-# LZ4 block). The blob is linked into cdmodkit.asi as an RCDATA resource; the plugin writes bin64\cdmodkit\prefabs.tsv from it
-# when the file is missing (mod managers that install only the .asi). Run by build.bat before compiling.
+# LZ4 block). The blob is linked directly into cdmodkit.asi as RCDATA and decoded in memory at runtime; it is never extracted
+# to bin64\cdmodkit. Run by build.bat before compiling.
 import struct, pathlib, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 src = ROOT / "asi" / "cdmodkit" / "data" / "prefabs.tsv"

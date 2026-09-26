@@ -1,16 +1,17 @@
 #define WIN32_LEAN_AND_MEAN
 #include "i18n.h"
+#include "core.h"
 #include <windows.h>
 #include <imgui.h>
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <cstdio>
-#include <fstream>
 #include <map>
 #include <mutex>
 #include <atomic>
 #include <set>
+#include <sstream>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -33,7 +34,7 @@ namespace i18n {
         using PackRow = std::array<std::string, 11>;
         std::unordered_map<std::string, PackRow> g_pack;
         std::vector<unsigned short> g_glyphRanges;
-        // code points of text that does not come from locales.tsv (the game's own item names, read after the atlas was built)
+        // code points of text that does not come from the embedded locale table (the game's own item names, read after the atlas was built)
         std::mutex g_extraMutex; std::set<unsigned short> g_extra, g_inAtlas; std::atomic<bool> g_glyphsDirty{ false };
         std::string g_preference = "auto";
         std::string g_systemLanguage = "en";
@@ -97,7 +98,7 @@ namespace i18n {
                 for (wchar_t c : wide) if ((unsigned int)c >= 0x0100 && (unsigned int)c <= 0xFFFF) codepoints.insert((unsigned short)c);
             };
             for (const auto& row : g_pack) { collect(row.first); for (const std::string& text : row.second) collect(text); }
-            for (const auto& l : kLanguages) if (l.native) collect(l.native);   // the selector needs them even without locales.tsv
+            for (const auto& l : kLanguages) if (l.native) collect(l.native);   // the selector needs them even if the embedded table is unavailable
             { std::lock_guard<std::mutex> lock(g_extraMutex); codepoints.insert(g_extra.begin(), g_extra.end()); g_inAtlas = codepoints; }
             g_glyphRanges.clear();
             g_glyphRanges.push_back(0x0020); g_glyphRanges.push_back(0x00FF);
@@ -133,8 +134,9 @@ namespace i18n {
         }
     }
 
-    static void LoadPack(const std::string& path) {
-        std::ifstream file(path, std::ios::binary);
+    static void LoadPack(const uint8_t* data, size_t size) {
+        if (!data || !size) return;
+        std::istringstream file(std::string(reinterpret_cast<const char*>(data), size));
         std::string line;
         if (!std::getline(file, line)) return;
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -151,11 +153,13 @@ namespace i18n {
             g_pack.emplace(std::move(fields[0]), std::move(row));
         }
     }
-    void Initialize(const std::string& modDir) {
+    void Initialize() {
         if (g_initialized) return;
         g_initialized = true; g_systemLanguage = ResolveSystemLocale();
-        LoadPack(modDir + "\\locales.tsv");
-        BuildGlyphRanges();   // also without locales.tsv: the language selector shows the native names
+        const uint8_t* data = nullptr; size_t size = 0;
+        if (core::EmbeddedResource(core::kResourceLocales, &data, &size)) LoadPack(data, size);
+        else core::Log("[i18n] embedded locale table resource is missing");
+        BuildGlyphRanges();   // also without the resource: the language selector shows the native names
     }
     const char* Translate(const char* source) {
         if (!source) return "";

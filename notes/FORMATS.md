@@ -199,7 +199,7 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Global: unique `48 8B 05 ?? ?? ?? ?? C5 FB 10 B0 C8 00 00 00 8B 98 D0 00 00 00` (rva 0x2D14367 -> global rva 0x6C8CF30) holds the renderer camera.
 - The camera class has NO MSVC RTTI (qword before its vtable rva 0x5D20718 is a function pointer). Recognised by slot 1 + slot 2 fingerprints (see ResolveNativeCamera); slot 2 unchanged since 1.0.0.2658.
 - camera+0x2C8 frame counter, camera+0x428 -> scene constants (0xB00 bytes): +0x20 frame number, +0x30/+0x34 screen w/h (+0x38/+0x3C reciprocals), +0x80 eye, +0x90 forward, +0x3E0 view matrix (columns right/up/forward, row 3 = -R*eye), +0x420 view-relative (same rotation, no translation), +0x4E0 projection (m00 +0x4E0, m11 +0x4F4, +0x50C = 1), +0x860 near, +0xAC0 = 6360000 (earth radius; layout signature).
-- This is the block the old heap scan (diag.cpp RenderCamScanThread) found as one of several copies; through camera+0x428 it is the frame being rendered, so no ranking / camlag is needed. The scan stays as fallback.
+- This is the block the old heap scan (diag.cpp RenderCamScanThread) found as one of several copies; through camera+0x428 it is the frame being rendered, so no ranking / camlag is needed. The old heap-scan fallback was removed once this direct path was proven reliable.
 
 ## Camera pose function / free camera (v0.94, build 1.0.0.2976)
 - Found with the console/API research tool `camwatch` (hardware write breakpoints on renderer camera +0xC8..+0xE0): one writer, once per frame, rva 0x38ED860, signature `48 81 EC 88 00 00 00 C5 FC 10 02 C5 FC 11 41 48 C5 FC 10 4A 20 C5 FA 10 2D ?? ?? ?? ?? 48 8B 84 24 B8 00 00 00`.
