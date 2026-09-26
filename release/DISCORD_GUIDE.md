@@ -87,7 +87,7 @@ für Spiel-Updates und Kompatibilitätsstatus aller Mods.
 > This server is for everyone who mods Crimson Desert or uses mods: help, releases, tools, format research.
 > It started around World Builder (in-game prefab editor), you find everything about it under WORLD BUILDER.
 > Pick your roles in Channels & Roles, read #rules, and post problems in #wb-support or #mod-help as a forum thread.
-> World Builder on Nexus: <Link>   Ko-fi: <Link>
+> World Builder on Nexus: <Link>
 
 **#rules**
 

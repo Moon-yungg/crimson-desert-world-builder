@@ -78,16 +78,12 @@ Join the [Crimson Desert Modding](https://discord.gg/HfkShRJZU) Discord: questio
 
 When something goes wrong, everything is logged in `bin64\cdmodkit\cdmodkit.log`. Post the last 30 lines, especially lines containing "fault", "imgui assert" or "RESOLVE FAILED".
 
-## Support
-
-If World Builder is useful to you and you want to say thanks, you can buy me a coffee: [ko-fi.com/daebak91](https://ko-fi.com/daebak91). Never expected, always appreciated.
-
 ## Credits and thanks
 
 - **dofo7777** for extensive testing, ideas and videos. Many of the placement and input improvements exist because of that feedback.
 - **Shin234** for Master Looter, whose input layer this mod's virtual cursor is adapted from, and for showing the way into this engine.
 - **LiangWood** for tracking down the missing prefab list with DMM, **Alduin1991** for the mounted-coordinates report, and the author of CrimsonRoute for the transform snapshot notes.
-- **Nostyxx** for the open reverse-engineering work in [CrimsonWeather](https://github.com/Nostyxx/CrimsonWeather), which served as a technical reference for World Builder's time-of-day and weather controls.
+- **Nostyxx** for [CrimsonWeather](https://github.com/Nostyxx/CrimsonWeather): thanks for finding the offsets and signatures of the game's time and weather data that World Builder's time-of-day and weather controls build on (no code taken), and the author of **CrimsonRoute** for allowing us to use its overlay capture code.
 - The whole Crimson Desert modding community: the pycrimson and CDMW projects for the archive and mesh format research, and everyone sharing findings in the open.
 
 Third-party code: MinHook (BSD-2), Dear ImGui (MIT), stb_image / stb_image_write (public domain), input layer adapted from Master Looter and Trinity (MIT). No game assets are included.

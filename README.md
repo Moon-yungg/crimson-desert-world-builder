@@ -7,7 +7,6 @@ that load again at the next start. No game files are modified and nothing is wri
 - Downloads and user guide: the Nexus page (link in `release/NEXUS_PAGE.md`) or `release/WorldBuilder-v<version>.zip`
   built from this repository; the user guide is `release/README.md` (German).
 - Discord: **Crimson Desert Modding** - https://discord.gg/HfkShRJZU
-- Support the project: https://ko-fi.com/daebak91
 
 An experimental branch of the work spawns objects through the game's own server spawn path, which makes them
 interactive (a torch placed that way can be lit and put out); see `notes/GIMMICK_SPAWN.md` for the research behind it.

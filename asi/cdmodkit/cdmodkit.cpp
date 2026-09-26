@@ -1520,8 +1520,8 @@ static bool FindTemplateCapture(GimmickCapture& out, const std::vector<int>* avo
     return false;
 }
 bool GimmickTemplateReady() { GimmickCapture c; return FindTemplateCapture(c); }
-static void ProcessServerJobs() {
-    for (;;) { std::function<void()> job; { std::lock_guard<std::mutex> l(g_serverJobsMutex); if (g_serverJobs.empty()) return; job = std::move(g_serverJobs.front()); g_serverJobs.pop_front(); } job(); }
+static void ProcessServerJobs() {   // a bounded number per tick: a batch of hundreds of NPC spawns must not stall the server thread in one tick
+    for (int n = 0; n < 8; n++) { std::function<void()> job; { std::lock_guard<std::mutex> l(g_serverJobsMutex); if (g_serverJobs.empty()) return; job = std::move(g_serverJobs.front()); g_serverJobs.pop_front(); } job(); }
 }
 static uintptr_t kRva_GimmickFromSave = 0, g_scopeAttacherVt = 0;
 static volatile uintptr_t g_serverFieldObj = 0;   // the ServerField whose slot 9 tick runs our server jobs

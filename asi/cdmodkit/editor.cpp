@@ -249,7 +249,9 @@ namespace editor {
         input::ClearKeys(); ImGui::GetIO().ClearInputKeys(); core::SetFreeCam(true);
     }
     bool Placing() { return g_place.active; }
-    bool MouseMode() { return g_place.active && (g_open ? !g_playMode : true); }
+    // Placement is mouse driven (no keyboard scheme): while something is carried the mouse belongs to the gizmo and the HUD, in play
+    // mode too, otherwise Drop / Cancel could not be clicked. Looking around: the editor's free camera (the HUD says how).
+    bool MouseMode() { return g_place.active; }
     static void DrawCameraViewTool() {
         const char* labels[4] = { "F", "H", "D", "U" };
         const float side = ImGui::GetFrameHeight();
@@ -641,6 +643,7 @@ namespace editor {
             ImGui::SameLine(); if (ImGui::Button(T("To ground"))) StartGroundSnap(P);
             ImGui::SameLine(); if (ImGui::Button(T("level"))) { if (P.m.size() == 1) { P.pitch = -P.m[0].rot0.pitch; P.roll = -P.m[0].rot0.roll; } else { P.pitch = P.roll = 0; } P.dirty = P.touched = true; }
             ImGui::SameLine(); ImGui::Checkbox(T("snap"), &g_snap);
+            if (!g_cameraMode) ImGui::TextDisabled(T("To look around: %s opens the editor, %s there switches to the free camera"), core::KeyName(core::g_keyToggle), core::KeyName(core::g_keyMode));
         }
         ImGui::End();
     }
@@ -1286,6 +1289,9 @@ namespace editor {
     // or project saving. The list is read from the installed game at runtime (thumbgen::Characters), names in the UI language.
     static char g_npcFilter[128] = ""; static int g_npcCat = 0, g_npcSel = -1, g_npcCount = 1; static float g_npcDist = 5.0f;
     static int g_npcFormation = 0; static float g_npcSpacing = 1.5f, g_npcRadius = 8.0f;
+    // NPCs only live where the world is streamed in around the character, and every one is a full server actor: a few hundred
+    // within a few hundred metres is what the game copes with (the server jobs are spread over ticks, see ProcessServerJobs).
+    static const int kNpcMaxCount = 500; static const float kNpcMaxDist = 500.0f, kNpcMaxExtent = 200.0f;
     static std::vector<int> g_npcRows; static std::string g_npcKey;
     static const char* kNpcCats[] = { "all", "people", "animals and mounts", "monsters", "bosses", "other" };
     static const char* kNpcFormations[] = { "Line", "Matrix", "Circle" };
@@ -1419,18 +1425,18 @@ namespace editor {
             }
             ImGui::BeginGroup();
             ImGui::Text("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str()); ImGui::SameLine(); ImGui::TextDisabled("  %s   ID %u", c.internal.c_str(), c.key);
-            ImGui::SetNextItemWidth(compact ? 120 * ui : 150 * ui); ImGui::DragFloat(T("distance"), &g_npcDist, 1.0f, 1.0f, 100000.0f, "%.0f m"); g_npcDist = std::clamp(g_npcDist, 1.0f, 100000.0f); SameLineOrWrap(compact, 90 * ui);
-            ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, 100000);
+            ImGui::SetNextItemWidth(compact ? 120 * ui : 150 * ui); ImGui::DragFloat(T("distance"), &g_npcDist, 1.0f, 1.0f, kNpcMaxDist, "%.0f m"); g_npcDist = std::clamp(g_npcDist, 1.0f, kNpcMaxDist); SameLineOrWrap(compact, 90 * ui);
+            ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, kNpcMaxCount);
             SameLineOrWrap(compact, 130 * ui);
             ImGui::TextDisabled("%s", T("formation")); ImGui::SameLine(); ImGui::SetNextItemWidth(120 * ui); ComboT("##npcformation", &g_npcFormation, kNpcFormations, 3);
             SameLineOrWrap(compact, 130 * ui);
             ImGui::SetNextItemWidth(120 * ui);
             if (g_npcFormation == 2) {
-                ImGui::DragFloat(T("radius"), &g_npcRadius, 0.25f, 0.5f, 100000.0f, "%.1f m");
-                g_npcRadius = std::clamp(g_npcRadius, 0.5f, 100000.0f);
+                ImGui::DragFloat(T("radius"), &g_npcRadius, 0.25f, 0.5f, kNpcMaxExtent, "%.1f m");
+                g_npcRadius = std::clamp(g_npcRadius, 0.5f, kNpcMaxExtent);
             } else {
-                ImGui::DragFloat(T("spacing"), &g_npcSpacing, 0.1f, 0.25f, 1000.0f, "%.1f m");
-                g_npcSpacing = std::clamp(g_npcSpacing, 0.25f, 1000.0f);
+                ImGui::DragFloat(T("spacing"), &g_npcSpacing, 0.1f, 0.25f, 50.0f, "%.1f m");
+                g_npcSpacing = std::clamp(g_npcSpacing, 0.25f, 50.0f);
             }
             ImGui::BeginDisabled(!havePos || st != 2);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
@@ -1450,9 +1456,9 @@ namespace editor {
                         side = (col - (rowCount - 1) * 0.5f) * g_npcSpacing;
                         depth = (row - (rows - 1) * 0.5f) * g_npcSpacing;
                     } else {   // circle: evenly distributed around the requested centre
-                        const float a = g_npcCount > 1 ? (6.28318530718f * k / (float)g_npcCount) : 0.0f;
-                        side = cosf(a) * g_npcRadius;
-                        depth = sinf(a) * g_npcRadius;
+                        const float a = 6.28318530718f * k / (float)g_npcCount, r = g_npcCount > 1 ? g_npcRadius : 0.0f;
+                        side = cosf(a) * r;
+                        depth = sinf(a) * r;
                     }
                     Vec3 at = { cx + rx * side + g_fx * depth, g_lastPlayer.y, cz + rz * side + g_fz * depth };
                     core::SpawnNpc(c.key, at);
@@ -2397,14 +2403,15 @@ namespace editor {
         bool plane = false; Vec3 hit{};
         if (havePlayer && fabsf(rd.y) > 1e-5f) {
             const float t = (pp.world.y - cf.pos.y) / rd.y;
-            if (t > 0.25f && t < 100000.0f) {
+            if (t > 0.25f && t < kNpcMaxDist) {
                 hit = { cf.pos.x + rd.x * t, pp.world.y, cf.pos.z + rd.z * t };
                 plane = true;
             }
         }
-        if (!plane) {
-            const float dist = std::clamp(g_npcDist, 1.0f, 100000.0f);
-            hit = { cf.pos.x + rd.x * dist, cf.pos.y + rd.y * dist, cf.pos.z + rd.z * dist };
+        if (!plane) {   // looking at or above the horizon: the chosen distance along the view, at the character's height
+            const float dist = std::clamp(g_npcDist, 1.0f, kNpcMaxDist), h = sqrtf(rd.x * rd.x + rd.z * rd.z);
+            if (havePlayer && h > 1e-3f) { hit = { cf.pos.x + rd.x / h * dist, pp.world.y, cf.pos.z + rd.z / h * dist }; plane = true; }
+            else hit = { cf.pos.x + rd.x * dist, cf.pos.y + rd.y * dist, cf.pos.z + rd.z * dist };
         }
         *at = hit; if (onGroundPlane) *onGroundPlane = plane; return true;
     }

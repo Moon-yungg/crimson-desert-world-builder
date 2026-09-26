@@ -162,13 +162,12 @@ Discord-Server **Crimson Desert Modding**: https://discord.gg/HfkShRJZU
 Alles landet in `bin64\cdmodkit\cdmodkit.log`. Bei einem Absturz die letzten 30 Zeilen davon schicken,
 insbesondere Zeilen mit `[fault]`, `[imgui assert]` oder `RESOLVE FAILED`.
 
-## Unterstützen
-
-Wenn dir World Builder gefällt und du dich bedanken möchtest: https://ko-fi.com/daebak91. Nie erwartet, immer willkommen.
-
 ## Danke
 
 - **dofo7777** für ausgiebiges Testen, Ideen und Videos.
+- **Nostyxx** für [CrimsonWeather](https://github.com/Nostyxx/CrimsonWeather): danke für das Finden der Offsets und Signaturen der
+  Tageszeit- und Wetterdaten, auf denen die Zeit- und Wettersteuerung aufbaut (kein Code übernommen).
+- Dem Autor von **CrimsonRoute** für die Erlaubnis, den Overlay-Capture-Code zu verwenden.
 - **Shin234** für Master Looter (die Eingabeschicht dieser Mod ist daraus abgeleitet) und die ganze Crimson-Desert-Modding-Community,
   insbesondere die Projekte pycrimson und CDMW für die Formatforschung.
 
