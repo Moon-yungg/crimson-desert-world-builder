@@ -9,7 +9,7 @@ knowledge behind it. Public name **World Builder**, technical names stay `cdmodk
 | Path | What |
 | --- | --- |
 | `asi/cdmodkit/` | the plugin (C++17, MSVC, static CRT) |
-| `asi/cdmodkit/data/` | `prefabs.tsv` (48k prefab paths + tags), `settings.txt` defaults |
+| `asi/cdmodkit/data/` | build-time sources for embedded prefab/error-name/locale RCDATA resources, plus `settings.txt` defaults |
 | `scripts/` | build helpers (`make_release.py`, `pack_index.py`) and RE tools (`xref.py`, `disasm.py`, `rtti_*.py`, `peek.py`, `parse_parc.py`) |
 | `notes/FORMATS.md` | **read this first for anything about the game**: RVAs, struct offsets, the spawn recipe, file formats, pitfalls |
 | `notes/rtti_*.txt` | RTTI dumps of the game (class name -> vtable rva) |
@@ -28,9 +28,9 @@ python scripts\make_release.py 0.79     # bumps the version strings, builds, che
 
 - Deploy = copy `asi\cdmodkit\build\cdmodkit.asi` over `<game>\bin64\cdmodkit.asi`. **The game must be closed**, the
   DLL is locked while it runs. Relaunch with `steam://rungameid/3321460`.
-- Data files live in `<game>\bin64\cdmodkit\` (`prefabs.tsv`, `settings.txt`, `thumbs\`, `projects\`, `cdmodkit.log`).
-  `prefabs.tsv` is also linked into the .asi as an LZ4 resource and written out when the file is missing.
-- The release zip ships **no game assets**: only `.asi`, `prefabs.tsv`, `settings.txt`, the SDK header and the docs.
+- Runtime/user files live in `<game>\bin64\cdmodkit\` (`settings.txt`, `thumbs\`, `projects\`, `cdmodkit.log`, caches).
+  The prefab index is LZ4-compressed RCDATA in the ASI; error names and locales are raw RCDATA. None of those three are extracted to disk.
+- The release zip ships **no game assets**: only the `.asi`, `settings.txt`, the SDK header and the docs.
   Thumbnails are rendered on the player's own machine from their own installed game files.
 - One `CHANGELOG_<ver>.txt` per release, tag `v<ver>` on the release commit, commit message `v<ver>: <summary>`.
 - `release/NEXUS_PAGE.md` contains hand edits by the user - patch it in place, never regenerate it wholesale.
@@ -39,10 +39,13 @@ python scripts\make_release.py 0.79     # bumps the version strings, builds, che
 
 - `cdmodkit.cpp` - core: logging, guarded memory reads, player/camera lookup, signature resolution, the
   createSceneObjectFrom hook, the game-thread pump, the spawn registry, projects/autoload, the console,
-  plus the reverse-engineering aids (trace hooks, `ViewScan`, `FovTrace`, `CamTrace`, ray/shape tracing).
-- `overlay.cpp` - D3D12: detours `CreateSwapChainForHwnd`, hooks Present/Present1/ResizeBuffers, draws ImGui into
-  the back buffer, manages the thumbnail textures (decode thread -> upload -> SRV heap).
-- `diag.cpp` - console-only reverse-engineering aids (`viewscan`, `fovtrace`, `camtrace`, `traceio`) behind `core_internal.h`.
+  plus reverse-engineering aids (trace hooks, `FovTrace`, `CamTrace`, ray/shape tracing).
+- `environment.cpp` - optional visual time-of-day and weather bridge: runtime signature resolution, lighting-only time freeze,
+  and composed weather-table overrides. Failures disable only the environment controls.
+- `overlay.cpp` - D3D12: ports CrimsonRoute's current DXGI/Streamline factory interception, swap-chain capture and Present lifecycle
+  (native-interface unwrap, COM/device/queue validation, per-backbuffer presentation queues, Present/Present1, ResizeBuffers/ResizeBuffers1,
+  SetColorSpace1, method-chain validation and retry/rebind state). World Builder keeps its own ImGui/editor/thumbnail drawing layer on top.
+- `diag.cpp` - console-only reverse-engineering aids (`fovtrace`, `camtrace`, `traceio`) behind `core_internal.h`.
 - `editor.cpp` - the whole UI: browser, scene tree, placement mode, line/circle tools, projects, travel, settings.
 - `input.cpp` - window subclass, virtual cursor from raw mouse deltas, scan-code key state.
 - `thumbgen.cpp` - background worker that reads the game's packs through the game's own loader and renders prefab previews.

@@ -154,40 +154,16 @@ namespace input {
         Lock(); g_pendingDx = g_pendingDy = 0; for (auto& b : g_pendingButtons) b[0] = b[1] = 0; g_pendingWheel = 0; Unlock();
     }
 
-    // scan code key state: set on key-down, cleared on key-up (both extended variants: Shift+Numpad flips the flag), on focus loss
-    // and when the placement mode starts/ends. No time-out: Windows auto-repeats only the last pressed key, so a held key may stay silent.
+    // scan code key state for the free camera: set on key-down, cleared on key-up/focus loss and on mode transitions.
+    // No time-out: Windows auto-repeats only the last pressed key, so a held key may stay silent.
     static bool g_scanDown[512] = { false };
     static void TrackKey(UINT msg, LPARAM lParam) {
         const int scan = (int)((lParam >> 16) & 0xFF), ext = (int)((lParam >> 24) & 1);
         if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) g_scanDown[scan | (ext << 8)] = true;
-        else if (msg == WM_KEYUP || msg == WM_SYSKEYUP) {
-            // Shift + numpad: Windows inserts a fake extended Shift-up (E0 2A) around the key; only that variant is cleared for
-            // the shift keys so the real Shift stays 'down'. Other keys clear both variants (the up event may arrive in the other form).
-            if ((scan == 0x2A || scan == 0x36) && ext) g_scanDown[scan | 256] = false;
-            else { g_scanDown[scan] = false; g_scanDown[scan | 256] = false; }
-        }
+        else if (msg == WM_KEYUP || msg == WM_SYSKEYUP) { g_scanDown[scan] = false; g_scanDown[scan | 256] = false; }
     }
     bool ScanDown(int scan, bool ext) { return g_scanDown[(scan & 0xFF) | (ext ? 256 : 0)]; }
     void ClearKeys() { memset(g_scanDown, 0, sizeof g_scanDown); }
-    // Numpad keys share their scan code with the navigation keys (Home = E0 47 = Numpad 7 etc.). The extended variant only counts
-    // while Shift is held, because Shift + numpad arrives as the extended code; a plain Home / End / PgUp / Insert / Delete is ignored.
-    // Numpad Enter (E0 1C) and Numpad / (E0 35) are always extended and always accepted.
-    bool ScanDownAny(int scan) {
-        if (scan == 0x1C || scan == 0x35) return ScanDown(scan, false) || ScanDown(scan, true);
-        const bool shift = ScanDown(0x2A, false) || ScanDown(0x36, false);
-        return ScanDown(scan, false) || (shift && ScanDown(scan, true));
-    }
-    bool VkDown(int vk) {
-        if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) return ScanDown(0x2A, false) || ScanDown(0x36, false);
-        if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) return ScanDown(0x1D, false) || ScanDown(0x1D, true);
-        if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) return ScanDown(0x38, false) || ScanDown(0x38, true);
-        const int scan = (int)MapVirtualKeyA((UINT)vk, MAPVK_VK_TO_VSC); if (!scan) return false;
-        const bool numpad = (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) || vk == VK_DECIMAL || vk == VK_ADD || vk == VK_SUBTRACT || vk == VK_MULTIPLY;
-        const bool ext = vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT || vk == VK_PRIOR || vk == VK_NEXT || vk == VK_HOME || vk == VK_END || vk == VK_INSERT || vk == VK_DELETE || vk == VK_DIVIDE;
-        if (vk == VK_RETURN) return ScanDown(scan, false) || ScanDown(scan, true);   // main Enter or numpad Enter
-        if (numpad) return ScanDownAny(scan);                                         // Shift + numpad arrives as the extended code
-        return ScanDown(scan, ext);
-    }
     static bool IsFreeCamScan(int scan) { return scan == 0x11 || scan == 0x1E || scan == 0x1F || scan == 0x20 || scan == 0x10 || scan == 0x12 || scan == 0x2A || scan == 0x1D || scan == 0x39; }   // W A S D Q E Shift Ctrl Space
     void SetFreeCam(bool on) { g_freeCam = on; Lock(); g_lookDx = g_lookDy = 0; Unlock(); }
     bool FreeCamLooking() { return FreeCamLookingNow(); }
@@ -214,21 +190,7 @@ namespace input {
         if (ri->data.mouse.usButtonFlags & ups) return 0;   // button releases still reach the game (see keys)
         return 1;   // the game's own camera must not turn while flying: its view decides what gets culled
     }
-    static std::vector<int> g_placeVks;
-    void SetPlaceVks(const int* vks, int count) { g_placeVks.assign(vks, vks + count); }
     static bool IsMouse(UINT m) { return m >= WM_MOUSEFIRST && m <= WM_MOUSELAST; }
-    static bool IsPlaceKeyFixed(WPARAM vk) { return vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN || vk == VK_PRIOR || vk == VK_NEXT || vk == VK_ADD || vk == VK_SUBTRACT || vk == VK_RETURN || vk == VK_BACK || vk == VK_DECIMAL || vk == VK_CLEAR || vk == VK_MULTIPLY || vk == VK_DIVIDE || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9); }   // Shift stays with the game (sprint)
-    // keys that belong to World Builder while carrying an object: the bound placement keys (modifiers stay with the game, Shift = sprint)
-    // plus the navigation variants of bound numpad keys (NumLock off / Shift turns Numpad 8 into Up, Numpad . into Delete, ...)
-    static bool IsPlaceKey(WPARAM vk) {
-        if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LSHIFT || vk == VK_RSHIFT || vk == VK_LCONTROL || vk == VK_RCONTROL) return false;
-        if (g_placeVks.empty()) return IsPlaceKeyFixed(vk);
-        for (int k : g_placeVks) if ((WPARAM)k == vk) return true;
-        static const int nav[] = { VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_DELETE, VK_CLEAR };
-        static const int np[]  = { VK_NUMPAD8, VK_NUMPAD2, VK_NUMPAD4, VK_NUMPAD6, VK_NUMPAD9, VK_NUMPAD3, VK_NUMPAD7, VK_NUMPAD1, VK_NUMPAD0, VK_DECIMAL, VK_NUMPAD5 };
-        for (int j = 0; j < 11; j++) if (vk == (WPARAM)nav[j]) for (int k : g_placeVks) if (k == np[j]) return true;
-        return false;
-    }
     static bool IsKeyboard(UINT m) { return m == WM_KEYDOWN || m == WM_KEYUP || m == WM_SYSKEYDOWN || m == WM_SYSKEYUP || m == WM_CHAR || m == WM_SYSCHAR; }
     static bool IsIme(UINT m) {
         return m == WM_IME_STARTCOMPOSITION || m == WM_IME_ENDCOMPOSITION || m == WM_IME_COMPOSITION || m == WM_IME_CHAR
@@ -304,7 +266,6 @@ namespace input {
                 return CallWindowProc(g_original, hwnd, msg, wParam, lParam);
             }
             if (IsKeyboard(msg)) {
-                if (!keysToUi && core::g_placing && IsPlaceKey(wParam)) return 0;   // placement keys belong to World Builder while carrying an object
                 if (keysToUi) {
                     ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
                     if (msg == WM_KEYUP || msg == WM_SYSKEYUP) return CallWindowProc(g_original, hwnd, msg, wParam, lParam);

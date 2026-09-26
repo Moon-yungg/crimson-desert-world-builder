@@ -5,13 +5,13 @@
 
 struct ImFontAtlas;
 
-// UI translations from bin64\cdmodkit\locales.tsv (English text = key, English is the fallback).
+// UI translations are embedded in cdmodkit.asi as RCDATA (English text = key, English is the fallback).
 // UI code marks every translatable string explicitly: T("text"), or TStable("text") for labels whose ImGui ID must not
 // change with the language (tabs, popups, headers). A translated format keeps its printf placeholders (check_locales.py).
 namespace i18n {
     struct LanguageOption { const char* id; const char* name; };
 
-    void Initialize(const std::string& modDir);
+    void Initialize();
     const char* Translate(const char* source);   // leading icons / blanks and a trailing "##id" are kept, not part of the key
     const char* T(const char* english);
     const char* TStable(const char* english);    // "translated###english"

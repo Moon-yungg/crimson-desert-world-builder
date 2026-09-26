@@ -35,8 +35,5 @@ jobs:
           name: cdmodkit-msvc
           path: |
             asi/cdmodkit/build/cdmodkit.asi
-            asi/cdmodkit/data/prefabs.tsv
             asi/cdmodkit/data/settings.txt
-            asi/cdmodkit/data/errnames.txt
-            asi/cdmodkit/data/locales.tsv
 
