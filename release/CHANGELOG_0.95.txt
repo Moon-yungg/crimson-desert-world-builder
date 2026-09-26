@@ -1,7 +1,7 @@
 World Builder 0.95
 
 Added (from dofo7777)
-- Time & Weather tab (also in the dock): set the time of day, freeze the day/night lighting without pausing the game,
+- Time & Weather tab (also in the dock): set the time of day (it keeps running from there), freeze the day/night lighting without pausing the game,
   clear sky, rain, snow, clouds and wind, and restore the game's own values at any time. Every control that cannot find
   its game data after an update switches itself off, the rest keeps working.
 - NPC formations: spawn up to 500 NPCs at once in a line, a grid or a circle, up to 500 m away; drag an NPC from the list
