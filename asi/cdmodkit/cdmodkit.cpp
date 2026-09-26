@@ -1222,7 +1222,7 @@ static void LogSpawnTransforms(const char* what, uintptr_t save, uintptr_t s8, u
 // SpawnAt queues them here; the ServerField tick (slot 9, server thread) spawns one per tick from the newest usable capture
 // (a level streaming spawn, else a housing placement) with the prefab, position, rotation and scale swapped in. A refused replay
 // keeps a plain client stand-in visible while newer/different captures are retried. Moves remove + respawn (final only), deletes remove the actor.
-struct GimmickReq { int uid; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; bool noDirect = false; };
+struct GimmickReq { int uid; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; bool directTried = false; };
 static const size_t kGimmickMaxTries = 3;   // refusals with different templates before an interactive prefab becomes a plain object
 static std::deque<GimmickReq> g_gimmickQueue; static std::mutex g_gimmickQueueMutex;
 static std::deque<std::function<void()>> g_serverJobs; static std::mutex g_serverJobsMutex;
@@ -1440,6 +1440,28 @@ static void ReplayGimmickBody() {
 static volatile int g_goodTemplateId = 0;
 static volatile DWORD g_replayWatchTick = 0; static volatile bool g_replayWatchLogged = false;   // the replay in progress (0 = none)
 static char g_replayWatchPrefab[256] = {}; static int g_replayWatchTemplate = 0; static DWORD g_replayWatchAge = 0; static Vec3 g_replayWatchPos{};
+// Where a stuck server thread waits: suspend it briefly and unwind its stack through the PE unwind table (game frames as rvas).
+static void LogStuckStack(DWORD tid) {
+    if (!tid) return;
+    HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!th) { Log("[gimmick] WATCHDOG: cannot open thread %lu", tid); return; }
+    if (SuspendThread(th) == (DWORD)-1) { CloseHandle(th); return; }
+    CONTEXT ctx = {}; ctx.ContextFlags = CONTEXT_FULL;
+    char line[1024]; int len = 0; line[0] = 0;
+    if (GetThreadContext(th, &ctx)) {
+        for (int i = 0; i < 28 && ctx.Rip; i++) {
+            const uintptr_t pc = ctx.Rip;
+            len += snprintf(line + len, sizeof line - len, InImage(pc) ? " %llx" : " [%llx]", (unsigned long long)(InImage(pc) ? pc - g_base : pc));
+            if (len >= (int)sizeof line - 24) break;
+            DWORD64 imageBase = 0; PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+            if (!fe) { uintptr_t ret = 0; if (!ReadBytes(ctx.Rsp, &ret, 8)) break; ctx.Rip = ret; ctx.Rsp += 8; continue; }   // leaf
+            void* handlerData = nullptr; DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fe, &ctx, &handlerData, &establisher, nullptr);
+        }
+    }
+    ResumeThread(th); CloseHandle(th);
+    Log("[gimmick] WATCHDOG: stuck thread %lu stack (rva, [outside the game]):%s", tid, line);
+}
 static void CheckReplayWatchdog() {
     const DWORD t0 = g_replayWatchTick;
     if (!t0 || g_replayWatchLogged || GetTickCount() - t0 < 5000) return;
@@ -1448,6 +1470,7 @@ static void CheckReplayWatchdog() {
         "the game's server thread is stuck inside it. Interactive objects, NPC spawns and the game's own world spawns stop until the "
         "game is restarted. Please report this log.", g_replayWatchPrefab, g_replayWatchPos.x, g_replayWatchPos.y, g_replayWatchPos.z,
         g_replayWatchTemplate, (unsigned long)g_replayWatchAge);
+    LogStuckStack(g_spawnWindowThread);
 }
 static const DWORD kTemplateSettleMs = 2000;
 static bool FindTemplateCapture(GimmickCapture& out, const std::vector<int>* avoid = nullptr) {
@@ -1479,37 +1502,10 @@ static void ProcessServerJobs() {
 }
 static uintptr_t kRva_GimmickFromSave = 0, g_scopeAttacherVt = 0;
 static volatile uintptr_t g_serverFieldObj = 0;   // the ServerField whose slot 9 tick runs our server jobs
-static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uintptr_t* soOut, uintptr_t* actOut, int reason);   // below
+static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uintptr_t* soOut, uintptr_t* actOut);   // below
 static void ProcessGimmickQueue() {   // server thread, one object per tick
     GimmickReq r; size_t pending = 0;
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty()) return; r = g_gimmickQueue.front(); pending = g_gimmickQueue.size(); }
-    // Template-free first: the game's own "gimmick from save data" builder with the prefab's gimmickinfo key. It needs no captured
-    // spawn (works right after loading, no walking) and none of the replay's patching; the template replay stays as the fallback.
-    if (const uint32_t gkey = !r.noDirect && kRva_GimmickFromSave && g_serverFieldObj ? thumbgen::GimmickKey(r.prefab) : 0) {
-        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid) return; g_gimmickQueue.pop_front(); }
-        uintptr_t standin = 0;
-        { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return;
-          if (g_reg[(size_t)i].standin) { standin = g_reg[(size_t)i].obj; g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].standin = false; } }
-        if (standin && GameThreadReady()) RunOnGameThread([standin]() { DoRemove(standin); });
-        strncpy_s(g_replayWatchPrefab, r.prefab.c_str(), _TRUNCATE);
-        uintptr_t so = 0, actor = 0;
-        if (DirectGimmickSpawn(gkey, r.pos, r.rot, r.scale, &so, &actor, 0)) {
-            std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid);
-            if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].standin) { if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); return; }   // deleted or picked up while spawning
-            g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale;
-            Log("[gimmick] object %d spawned directly (no template): %s key %u (scene object %p, actor %p)", r.uid, r.prefab.c_str(), gkey, (void*)so, (void*)actor);
-            return;
-        }
-        Log("[gimmick] object %d: direct spawn of %s failed, the template replay takes over", r.uid, r.prefab.c_str());
-        r.noDirect = true; std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); return;
-    }
-    GimmickCapture t;
-    if (!FindTemplateCapture(t, r.triedTemplates.empty() ? nullptr : &r.triedTemplates)) {
-        static DWORD lastLog = 0; if (GetTickCount() - lastLog > 15000) { lastLog = GetTickCount();
-            Log(r.triedTemplates.empty() ? "[gimmick] %zu interactive object%s waiting for a spawn template (the game spawns one when you walk)" : "[gimmick] %zu interactive object%s waiting for a fresh spawn template after a replay was refused", pending, pending == 1 ? "" : "s"); }
-        if (!r.triedTemplates.empty()) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); } }
-        return;
-    }
     // A refused replay queued a plain stand-in on the game thread. Until it exists, a retry would spawn a second stand-in whose
     // registration overwrites the first one (left in the world, no longer selectable or deletable): wait for it.
     bool standinPending = false;
@@ -1518,6 +1514,35 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     if (standinPending) {
         std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
         if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); }
+        return;
+    }
+    // Template-free first: the game's own "gimmick from save data" builder with the prefab's gimmickinfo key and the level spawn
+    // reason. It needs no captured spawn (works right after loading, no walking) and none of the replay's patching; the template
+    // replay stays as the fallback when the key is unknown or the builder fails.
+    const bool directWanted = !r.directTried && kRva_GimmickFromSave && g_serverFieldObj;
+    if (const uint32_t gkey = directWanted ? thumbgen::GimmickKey(r.prefab) : 0) {
+        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid) return; g_gimmickQueue.pop_front(); }
+        uintptr_t standin = 0;
+        { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return;
+          if (g_reg[(size_t)i].standin) { standin = g_reg[(size_t)i].obj; g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].standin = false; } }
+        if (standin && GameThreadReady()) RunOnGameThread([standin]() { DoRemove(standin); });
+        strncpy_s(g_replayWatchPrefab, r.prefab.c_str(), _TRUNCATE);
+        uintptr_t so = 0, actor = 0;
+        if (DirectGimmickSpawn(gkey, r.pos, r.rot, r.scale, &so, &actor)) {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid);
+            if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].standin) { if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); return; }   // deleted or picked up while spawning
+            g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale;
+            Log("[gimmick] object %d spawned directly (no template): %s key %u (scene object %p, actor %p)", r.uid, r.prefab.c_str(), gkey, (void*)so, (void*)actor);
+            return;
+        }
+        Log("[gimmick] object %d: direct spawn of %s failed, the template replay takes over", r.uid, r.prefab.c_str());
+        r.directTried = true; std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); return;
+    }
+    GimmickCapture t;
+    if (!FindTemplateCapture(t, r.triedTemplates.empty() ? nullptr : &r.triedTemplates)) {
+        static DWORD lastLog = 0; if (GetTickCount() - lastLog > 15000) { lastLog = GetTickCount();
+            Log(r.triedTemplates.empty() ? "[gimmick] %zu interactive object%s waiting for a spawn template (the game spawns one when you walk)" : "[gimmick] %zu interactive object%s waiting for a fresh spawn template after a replay was refused", pending, pending == 1 ? "" : "s"); }
+        if (!r.triedTemplates.empty()) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); } }
         return;
     }
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.pop_front(); }
@@ -1581,13 +1606,27 @@ static bool CallGimmickFromSave(void* field, uint8_t* save, void* holder, bool* 
     CDK_GUARD_END
     return false;
 }
+// The spawn reason byte (desc+0xA) decides what the gimmick becomes: with 0 a campfire cannot be cooked on and a bed not slept
+// in (boxes and torches work either way); the level spawn passes its own (0x1F in 2976). Read from the level caller's code:
+// "mov r8b, imm8; lea rcx, [rbp-0x40]; call <desc ctor>" shortly before its call of the spawn prepare.
+static int LevelSpawnReason() {
+    static int s_reason = -1; if (s_reason >= 0) return s_reason;
+    int found = -1;
+    if (g_callerLevel) for (uintptr_t a = g_base + g_callerLevel - 0x80; a < g_base + g_callerLevel && found < 0; a++) {
+        uint8_t b[8] = {}; if (!ReadBytes(a, b, 8)) break;
+        if (b[0] == 0x41 && b[1] == 0xB0 && b[3] == 0x48 && b[4] == 0x8D && b[5] == 0x4D && b[7] == 0xE8) found = b[2];
+    }
+    s_reason = found >= 0 ? found : 0x1F;
+    Log("[gimmick] level spawn reason %u (%s)", s_reason, found >= 0 ? "read from the level caller" : "NOT found in the level caller, using 0x1F of build 2976");
+    return s_reason;
+}
 // Server thread. True with the new scene object and actor when the game built the interactive object.
-static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uintptr_t* soOut, uintptr_t* actOut, int reason) {
+static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uintptr_t* soOut, uintptr_t* actOut) {
     *soOut = *actOut = 0;
     void* field = (void*)g_serverFieldObj;
     if (!kRva_GimmickFromSave || !field) return false;
     alignas(16) static uint8_t save[0x400]; memset(save, 0, sizeof save);
-    memcpy(save + 0x1C0, &key, 4); save[0x25C] = (uint8_t)reason;
+    memcpy(save + 0x1C0, &key, 4); save[0x25C] = (uint8_t)LevelSpawnReason();
     float xf[12]; MakeTransform(xf, pos, rot, scale, false);
     memcpy(g_directXf, xf, 40); memcpy(save + 0x1CC, xf, 40);   // the record's own transform too (the builder does not read it)
     g_directThread = GetCurrentThreadId(); g_directArmed = true;
@@ -1612,16 +1651,6 @@ static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uin
     }
     *soOut = so; *actOut = act; return true;
 }
-void ResearchGimmickSpawn(uint32_t key, Vec3 pos, float yawDeg, float scale, int reason) {
-    if (!kRva_GimmickFromSave) { Log("[gimmick] direct: builder not resolved"); return; }
-    RunOnServerTick([key, pos, yawDeg, scale, reason]() {
-        strncpy_s(g_replayWatchPrefab, "research spawn", _TRUNCATE);
-        uintptr_t so = 0, act = 0; const bool ok = DirectGimmickSpawn(key, pos, Rot{ yawDeg }, scale, &so, &act, reason);
-        Log("[gimmick] research spawn key %u reason %d: %s, scene object %p (%s), actor %p (%s)", key, reason, ok ? "ok" : "failed",
-            (void*)so, so && RttiName(so) ? RttiName(so) : "-", (void*)act, act && RttiName(act) ? RttiName(act) : "-");
-    });
-}
-
 static void* __fastcall HookGimmickSpawn(void* param, void* out, void* mgr, void* owner, void* s5, void* s6, void* s7, void* s8, void* s9, void* s10, void* s11, void* s12) {
     g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount();
     if (g_directArmed && GetCurrentThreadId() == g_directThread && s8) {   // our template-free spawn: transform block scale3 quat4 pos3
@@ -1629,7 +1658,8 @@ static void* __fastcall HookGimmickSpawn(void* param, void* out, void* mgr, void
         float was[10] = {}; ReadBytes((uintptr_t)s8, was, 40);
         memcpy(s8, g_directXf, 40);
         Log("[gimmick] direct: prepare transform was scale %.2f quat (%.2f %.2f %.2f %.2f) pos (%.2f %.2f %.2f), now pos (%.2f %.2f %.2f)", was[0], was[3], was[4], was[5], was[6], was[7], was[8], was[9], g_directXf[7], g_directXf[8], g_directXf[9]);
-        return g_origGimmickSpawn(param, out, mgr, owner, s5, s6, s7, s8, s9, s10, s11, s12);
+        void* r = g_origGimmickSpawn(param, out, mgr, owner, s5, s6, s7, s8, s9, s10, s11, s12);
+        return r;
     }
     CaptureGimmick(param, out, mgr, owner, s5, s6, s7, s8, s9, s10, s11, s12);
     if (!g_trace) {

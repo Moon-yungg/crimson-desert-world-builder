@@ -217,12 +217,6 @@ static std::string Handle(const std::string& method, const std::string& path, co
         float ty = 0, tp = 0; Number(arg, "turnYaw", ty); Number(arg, "turnPitch", tp); if (ty != 0 || tp != 0) core::FreeCamTurn(ty, tp);
         return core::FreeCamActive() ? "{\"on\":true}" : "{\"on\":false}";
     }
-    if (method == "POST" && path == "/api/research/gimmickspawn") {   // research: {"key":8150001,"x":..,"y":..,"z":..,"yaw":0,"scale":1,"reason":0}
-        float key = 0, x = 0, y = 0, z = 0, yaw = 0, scale = 1, reason = 0;
-        if (!Number(arg, "key", key, true) || !Number(arg, "x", x, true) || !Number(arg, "y", y, true) || !Number(arg, "z", z, true)) { status = 400; return Error("key and x/y/z required"); }
-        Number(arg, "yaw", yaw); Number(arg, "scale", scale); Number(arg, "reason", reason);
-        core::ResearchGimmickSpawn((uint32_t)key, { x, y, z }, yaw, scale, (int)reason); status = 202; return "{\"queued\":true}";
-    }
     if (method == "POST" && path == "/api/research/camwatch") {   // research: {"seconds":8} logs the code writing the renderer camera pose
         float sec = 8, mode = 0; Number(arg, "seconds", sec); Number(arg, "mode", mode); core::CamWatch((int)sec, (int)mode); status = 202; return "{\"started\":true}";
     }

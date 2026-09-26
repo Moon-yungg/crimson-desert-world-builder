@@ -1,0 +1,7 @@
+World Builder 0.95
+
+Fixed
+- Campfires, cooking stations and beds placed with 0.94 could not be used (no cooking, no sleeping). Interactive objects are
+  now created exactly like the game creates its own world objects, so every station works right after placing, and still
+  without walking first after loading a save.
+- If the game ever gets stuck while creating an interactive object, the log now records where, so it can be fixed.
