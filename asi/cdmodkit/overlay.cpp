@@ -22,6 +22,7 @@ void* CdHeapAlloc(size_t n); void* CdHeapRealloc(void* p, size_t n); void CdHeap
 #include <set>
 #include <deque>
 #include <mutex>
+#include <chrono>
 #include <string>
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -61,21 +62,24 @@ namespace overlay {
     static CreateDXGIFactory_t oStreamlineCreateDXGIFactory = nullptr;
     static CreateDXGIFactory1_t oStreamlineCreateDXGIFactory1 = nullptr;
     static CreateDXGIFactory2_t oStreamlineCreateDXGIFactory2 = nullptr;
-    static FactoryCreateSwapChain_t oCreateSwapChain = nullptr;
-    static FactoryCreateSwapChainForHwnd_t oCreateSwapChainForHwnd = nullptr;
-    static FactoryCreateSwapChainForCoreWindow_t oCreateSwapChainForCoreWindow = nullptr;
-    static FactoryCreateSwapChainForComposition_t oCreateSwapChainForComposition = nullptr;
+    // Factory methods are hooked per provider: Streamline's proxy factory and the real dxgi factory have different method
+    // code, and a game may create its swapchain through either one (the proxy forwards into the real one, both then fire).
+    enum FactoryProvider { kProviderDxgi = 0, kProviderStreamline = 1, kProviderCount = 2 };
+    static const char* const kProviderName[kProviderCount] = { "DXGI", "Streamline" };
+    static FactoryCreateSwapChain_t oCreateSwapChain[kProviderCount] = {};
+    static FactoryCreateSwapChainForHwnd_t oCreateSwapChainForHwnd[kProviderCount] = {};
+    static FactoryCreateSwapChainForCoreWindow_t oCreateSwapChainForCoreWindow[kProviderCount] = {};
+    static FactoryCreateSwapChainForComposition_t oCreateSwapChainForComposition[kProviderCount] = {};
     static Present_t oPresent = nullptr;
     static Present1_t oPresent1 = nullptr;
     static ResizeBuffers_t oResizeBuffers = nullptr;
     static ResizeBuffers1_t oResizeBuffers1 = nullptr;
     static SetColorSpace1_t oSetColorSpace1 = nullptr;
-    static bool g_streamlineFactoryExportsHooked = false;
 
     struct HookTarget { void* target = nullptr; bool installed = false; };
     static HookTarget g_dxgiExportHookTargets[3];
     static HookTarget g_streamlineExportHookTargets[3];
-    static HookTarget g_factoryHookTargets[4];
+    static HookTarget g_factoryHookTargets[kProviderCount][4];
     static HookTarget g_presentHookTarget;
     static HookTarget g_present1HookTarget;
     static HookTarget g_resizeHookTarget;
@@ -95,37 +99,40 @@ namespace overlay {
     constexpr size_t kCapturedSwapChains = 16;
     constexpr size_t kMaximumCapturedPresentQueues = 16;
     struct CapturedD3D12Queue {
+        // identity-only: these are never dereferenced and hold no reference (the game owns the swapchain and may free it
+        // any time); they only mark the slot as used. Matching goes through the canonical IUnknown tokens below.
         IDXGISwapChain* appSwapChain = nullptr;
         IDXGISwapChain* nativeSwapChain = nullptr;
         IDXGISwapChain* hookSwapChain = nullptr;
         uintptr_t appIdentity = 0;
         uintptr_t nativeIdentity = 0;
         uintptr_t hookIdentity = 0;
+        uint64_t generation = 0;          // bumped on every capture: a new swapchain at a freed address still counts as new
         HWND outputWindow = nullptr;
         ID3D12CommandQueue* creationQueue = nullptr;
         std::array<ID3D12CommandQueue*, kMaximumCapturedPresentQueues> presentQueues{};
         UINT presentQueueCount = 0;
-        bool presentQueueOverrideObserved = false;
+        bool presentQueueOverrideObserved = false;   // only true with a validated, non-empty ResizeBuffers1 queue array
     };
     static std::array<CapturedD3D12Queue, kCapturedSwapChains> g_capturedQueues{};
     static size_t g_nextCapturedQueue = 0;
     static std::mutex g_capturedQueueMutex;
-    static std::mutex g_renderMutex;
+    static std::atomic<uint64_t> g_captureGeneration{0};
+    static uint64_t g_boundGeneration = 0;   // generation of the capture the renderer is bound to (render lock)
+    // timed: ResizeBuffers waits for a frame in flight on another thread (frame generation) but must never hang the game
+    static std::timed_mutex g_renderMutex;
     static std::atomic<int> g_resizeInProgress{0};
     enum class PresentRendererResizeState : uint8_t { Idle, ReleaseForRetry, RebindAfterSuccess };
     static std::atomic<PresentRendererResizeState> g_rendererResizeState{PresentRendererResizeState::Idle};
-    static std::atomic<uint64_t> g_resizeCallbacks{0};
-    static std::atomic<uint64_t> g_resizeNonblockingReleases{0};
-    static std::atomic<void*> g_colorSpaceHintSwapChain{nullptr};
-    static std::atomic<int> g_colorSpaceHint{(int)DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
-    static std::atomic<int> g_colorSpaceHintValid{0};
+    static std::atomic<int> g_boundColorSpace{(int)DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
     static std::atomic<HWND> g_gameWindow{nullptr};
+    static std::atomic<bool> g_gameWindowFromSwapChain{false};   // g_gameWindow came from a swapchain's own HWND, not the size heuristic
     static thread_local bool g_insidePresent = false;
 
     static ID3D12CommandQueue* g_queue = nullptr;
     static ID3D12Device* g_device = nullptr;
     static uintptr_t g_swapChainIdentity = 0;
-    static std::atomic<IDXGISwapChain*> g_boundSwapChain{nullptr};
+    static std::atomic<IDXGISwapChain*> g_boundSwapChain{nullptr};   // identity-only (pointer compare), never dereferenced, no reference held
     static std::atomic<HWND> g_boundSwapChainWindow{nullptr};
     static HWND g_hwnd = nullptr;
     static UINT g_bufferCount = 0, g_width = 0, g_height = 0;
@@ -141,7 +148,7 @@ namespace overlay {
     // to and released again inside DrawFrame; the RTV descriptor is rewritten each frame (cheap).
     struct Frame { ID3D12CommandAllocator* alloc = nullptr; D3D12_CPU_DESCRIPTOR_HANDLE rtv = {}; UINT64 fence = 0; };
     static std::vector<Frame> g_frames;
-    static bool g_ready = false, g_failed = false, g_disabled = false;
+    static std::atomic<bool> g_ready{false}, g_failed{false}, g_disabled{false};   // read by every Present thread (frame generation presents from its own)
     static std::atomic<long> g_presents{0};
     static bool g_wasOpen = false;
 
@@ -290,23 +297,18 @@ namespace overlay {
         return true;
     }
 
-    static bool IsSupportedPresentColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace) {
-        return colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ||
-               colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ||
-               colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
-               colorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
-    }
-
     static bool RendererGpuIdleNoWait() {
         if (!g_ready || !g_fence) return true;
         UINT64 pending = 0;
         for (const Frame& frame : g_frames) pending = std::max(pending, frame.fence);
         return !pending || g_fence->GetCompletedValue() >= pending;
     }
-    static void WaitIdle() {
-        if (!g_fence || !g_queue) return;
+    // bounded: returns whether our queue really drained (a hung GPU must not hang the game's Present or ResizeBuffers)
+    static bool WaitIdle(DWORD timeoutMs = 2000) {
+        if (!g_fence || !g_queue) return true;
         g_queue->Signal(g_fence, ++g_fenceValue);
-        if (g_fence->GetCompletedValue() < g_fenceValue) { g_fence->SetEventOnCompletion(g_fenceValue, g_fenceEvent); WaitForSingleObject(g_fenceEvent, 2000); }
+        if (g_fence->GetCompletedValue() < g_fenceValue) { g_fence->SetEventOnCompletion(g_fenceValue, g_fenceEvent); WaitForSingleObject(g_fenceEvent, timeoutMs); }
+        return g_fence->GetCompletedValue() >= g_fenceValue;
     }
 
     // text font + system fonts for other scripts + the plugin's icons; again after in-game names brought new characters
@@ -363,6 +365,7 @@ namespace overlay {
         g_swapChainIdentity = CanonicalComIdentityToken(sc);
         g_boundSwapChain.store(sc, std::memory_order_release);
         g_boundSwapChainWindow.store(g_hwnd, std::memory_order_release);
+        g_boundColorSpace.store((int)DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, std::memory_order_release);
         core::Log("[overlay] ready: %ux%u, %u buffers, format %d, hwnd %p", g_width, g_height, g_bufferCount, (int)g_format, (void*)g_hwnd);
         return true;
     }
@@ -382,7 +385,18 @@ namespace overlay {
         if (restartBackend && !ImGui_ImplDX12_Init(g_device, (int)g_bufferCount, g_format, g_srvHeap,
                 g_srvHeap->GetCPUDescriptorHandleForHeapStart(), g_srvHeap->GetGPUDescriptorHandleForHeapStart())) return false;
         DXGI_SWAP_CHAIN_DESC desc = {};
-        if (SUCCEEDED(sc->GetDesc(&desc)) && desc.OutputWindow) g_hwnd = desc.OutputWindow;
+        if (SUCCEEDED(sc->GetDesc(&desc)) && desc.OutputWindow && desc.OutputWindow != g_hwnd) {
+            // the game recreated its window: the Win32 backend and the input subclass must follow, otherwise the menu draws
+            // but mouse and keys still go to (or are swallowed by) the old window
+            core::Log("[overlay] swapchain window changed %p -> %p; re-attaching ImGui Win32 backend and input", (void*)g_hwnd, (void*)desc.OutputWindow);
+            if (g_wasOpen) input::MenuClosed();
+            input::Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            g_hwnd = desc.OutputWindow;
+            ImGui_ImplWin32_Init(g_hwnd);
+            input::Init(g_hwnd);
+            if (g_wasOpen) input::MenuOpened();
+        }
         g_swapChainIdentity = CanonicalComIdentityToken(sc);
         g_boundSwapChain.store(sc, std::memory_order_release);
         g_boundSwapChainWindow.store(g_hwnd, std::memory_order_release);
@@ -457,9 +471,19 @@ namespace overlay {
         g_drawCount++;
     }
 
+    // Every path that switches the overlay off hands the input back: with the menu open the subclassed window proc swallows
+    // mouse and keys, and with no more frames nothing would ever close the menu again.
+    static void DisableOverlay() {
+        g_disabled = true;
+        if (g_wasOpen) { input::MenuClosed(); g_wasOpen = false; }
+        core::g_menuOpen = false;
+        core::g_uiWantsMouse = false; core::g_uiWantsKeyboard = false;
+        core::g_uiTextInput = false; core::g_uiMouseOverUi = false;
+    }
+
     static void RenderGuarded(IDXGISwapChain3* sc) {
         CDK_GUARD_BEGIN DrawFrame(sc);
-        CDK_GUARD_FAIL g_disabled = true; core::Log("[overlay] exception 0x%08x while drawing; overlay disabled", cdk::GuardCode());
+        CDK_GUARD_FAIL DisableOverlay(); core::Log("[overlay] exception 0x%08x while drawing; overlay disabled", cdk::GuardCode());
         CDK_GUARD_END
     }
 
@@ -525,8 +549,11 @@ namespace overlay {
         GetWindowThreadProcessId(hwnd, &pid);
         if (pid != GetCurrentProcessId() || GetWindow(hwnd, GW_OWNER) != nullptr) return false;
         if (requireVisible && !IsWindowVisible(hwnd)) return false;
+        // WS_EX_LAYERED is not rejected: borderless-fullscreen game windows can carry it, and a real game window must pass
         const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        if (ex & (WS_EX_TOOLWINDOW | WS_EX_LAYERED)) return false;
+        if (ex & WS_EX_TOOLWINDOW) return false;
+        // TransmogOverlay is another Crimson Desert mod's in-process overlay window with its own swapchain; it must never be
+        // taken for the game window (neither by the size fallback nor as a captured swapchain window)
         wchar_t cls[128] = {};
         if (GetClassNameW(hwnd, cls, static_cast<int>(sizeof(cls) / sizeof(cls[0]))) > 0 &&
             (wcscmp(cls, L"ConsoleWindowClass") == 0 || wcscmp(cls, L"TransmogOverlay") == 0)) return false;
@@ -553,12 +580,35 @@ namespace overlay {
     static HWND RefreshGameWindow(HWND hint = nullptr) {
         HWND latest = FindGameWindow();
         if (!latest && IsGameWindowCandidate(hint, false)) latest = hint;
-        if (latest) g_gameWindow.store(latest, std::memory_order_release);
+        if (latest) { g_gameWindow.store(latest, std::memory_order_release); g_gameWindowFromSwapChain.store(false, std::memory_order_release); }
         else {
             HWND cached = g_gameWindow.load(std::memory_order_acquire);
             if (!IsGameWindowCandidate(cached, false)) g_gameWindow.store(nullptr, std::memory_order_release);
         }
         return g_gameWindow.load(std::memory_order_acquire);
+    }
+
+    // The window a swapchain was created for is the best evidence of the game window; the largest-visible-window heuristic
+    // is only the fallback (it can pick a launcher or another mod's window, and then the overlay stayed off silently).
+    static bool AcceptPresentWindow(HWND chainWindow, HWND createdFor) {
+        if (!chainWindow) return false;
+        HWND gameWindow = g_gameWindow.load(std::memory_order_acquire);
+        const bool gameValid = gameWindow && IsWindow(gameWindow);
+        // a window taken from an earlier swapchain is kept while it is visible, so two swapchains cannot flip it every frame
+        if (createdFor == chainWindow && IsGameWindowCandidate(createdFor, false) &&
+            (!gameValid || !g_gameWindowFromSwapChain.load(std::memory_order_acquire) || !IsWindowVisible(gameWindow))) {
+            if (gameWindow != createdFor) core::Log("[overlay] game window %p taken from its swapchain", (void*)createdFor);
+            g_gameWindow.store(createdFor, std::memory_order_release);
+            g_gameWindowFromSwapChain.store(true, std::memory_order_release);
+            return true;
+        }
+        if (!gameValid) gameWindow = RefreshGameWindow(chainWindow);
+        if (gameWindow && chainWindow == gameWindow) return true;
+        static std::atomic<HWND> s_lastIgnored{nullptr};
+        static std::atomic<unsigned> s_ignoredLogs{0};
+        if (s_lastIgnored.exchange(chainWindow, std::memory_order_relaxed) != chainWindow && s_ignoredLogs.fetch_add(1, std::memory_order_relaxed) < 8)
+            core::Log("[overlay] swapchain for window %p ignored by the game-window filter (game window %p)", (void*)chainWindow, (void*)gameWindow);
+        return false;
     }
 
     static bool QueueMatchesSwapChainDevice(IDXGISwapChain* chain, ID3D12CommandQueue* queue) {
@@ -738,13 +788,14 @@ namespace overlay {
 
     static ID3D12CommandQueue* AcquireCapturedQueue(const CapturedD3D12Queue& captured, IDXGISwapChain* chain) {
         ID3D12CommandQueue* queue = captured.creationQueue;
-        if (captured.presentQueueOverrideObserved) {
+        if (captured.presentQueueOverrideObserved && captured.presentQueueCount) {
+            // ResizeBuffers1 bound each back buffer to its own queue: draw on the one of the buffer presented next
             IDXGISwapChain3* chain3 = nullptr;
             if (FAILED(chain->QueryInterface(IID_PPV_ARGS(&chain3))) || !chain3) return nullptr;
             const UINT index = chain3->GetCurrentBackBufferIndex();
             chain3->Release();
-            if (index >= captured.presentQueueCount || index >= captured.presentQueues.size()) return nullptr;
-            queue = captured.presentQueues[index];
+            if (index < captured.presentQueueCount && index < captured.presentQueues.size() && captured.presentQueues[index])
+                queue = captured.presentQueues[index];
         }
         if (!queue || !QueueMatchesSwapChainDevice(chain, queue)) return nullptr;
         queue->AddRef();
@@ -755,8 +806,9 @@ namespace overlay {
         if (!chain) return nullptr;
         const uintptr_t identity = CanonicalComIdentityToken(chain);
         if (!identity) return nullptr;
-        std::unique_lock<std::mutex> lock(g_capturedQueueMutex, std::try_to_lock);
-        if (!lock.owns_lock()) return nullptr;
+        // blocking: this runs every frame with per-buffer queues, a skipped frame there flickers; the lock order is always
+        // render lock -> capture lock and the capture lock is only held for table edits
+        std::lock_guard<std::mutex> lock(g_capturedQueueMutex);
 
         for (const CapturedD3D12Queue& captured : g_capturedQueues) {
             if (captured.appIdentity == identity || captured.nativeIdentity == identity || captured.hookIdentity == identity)
@@ -783,6 +835,21 @@ namespace overlay {
         ReleaseCom(captured.creationQueue);
         for (ID3D12CommandQueue*& queue : captured.presentQueues) ReleaseCom(queue);
         captured = {};
+    }
+
+    struct CapturedInfo { uint64_t generation = 0; HWND window = nullptr; bool perBufferQueues = false; };
+    static bool LookupCaptured(IDXGISwapChain* chain, CapturedInfo& out) {
+        const uintptr_t identity = CanonicalComIdentityToken(chain);
+        if (!identity) return false;
+        std::lock_guard<std::mutex> lock(g_capturedQueueMutex);
+        for (const CapturedD3D12Queue& captured : g_capturedQueues) {
+            if (captured.appIdentity != identity && captured.nativeIdentity != identity && captured.hookIdentity != identity) continue;
+            out.generation = captured.generation;
+            out.window = captured.outputWindow;
+            out.perBufferQueues = captured.presentQueueOverrideObserved && captured.presentQueueCount;
+            return true;
+        }
+        return false;
     }
 
     static bool CapturePresentSwapChain(IUnknown* device, IDXGISwapChain* appChain, HWND outputWindow) {
@@ -841,9 +908,13 @@ namespace overlay {
             destination->appIdentity = appIdentity;
             destination->nativeIdentity = nativeIdentity;
             destination->hookIdentity = hookIdentity;
+            // every capture is a new swapchain: the next Present rebinds even when the COM identity equals the bound one
+            // (the game creates a second swapchain at startup and a freed address is reused), re-pinning the queue (rule 7)
+            destination->generation = g_captureGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
             destination->outputWindow = outputWindow;
             destination->creationQueue = queue;
         }
+        g_boundSwapChainWindow.store(nullptr, std::memory_order_release);   // the cached HWND may belong to a freed chain at this address
 
         core::Log("[overlay] captured game D3D12 swapchain (native chain=%d, native queue=%d, hwnd=%p)",
                   nativeChainAlias ? 1 : 0, nativeQueueAlias ? 1 : 0, (void*)outputWindow);
@@ -851,11 +922,19 @@ namespace overlay {
         return true;
     }
 
-    static void CaptureResizePresentQueues(IDXGISwapChain3* chain, UINT count, IUnknown* const* presentQueues) {
-        if (!chain || !presentQueues || !count) return;
+    // After a successful ResizeBuffers1 (queue array) or plain ResizeBuffers (presentQueues null: back to the creation queue).
+    // An empty or invalid array is "no override": AcquireCapturedQueue then falls back to the creation queue instead of
+    // finding no queue at all, which kept the overlay off for good.
+    static void CaptureResizePresentQueues(IDXGISwapChain* chain, UINT count, IUnknown* const* presentQueues) {
+        if (!chain) return;
+        const bool clearing = !presentQueues;
+        if (!clearing && !count) {   // BufferCount 0 keeps the current count, and the array has one entry per existing buffer
+            DXGI_SWAP_CHAIN_DESC desc = {};
+            if (SUCCEEDED(chain->GetDesc(&desc))) count = desc.BufferCount;
+        }
 
         std::array<ID3D12CommandQueue*, kMaximumCapturedPresentQueues> verified{};
-        bool valid = count <= verified.size();
+        bool valid = !clearing && count && count <= verified.size();
         for (UINT i = 0; valid && i < count; ++i) {
             ID3D12CommandQueue* queue = nullptr;
             if (!presentQueues[i] || FAILED(presentQueues[i]->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) {
@@ -877,15 +956,16 @@ namespace overlay {
         if (!valid) for (ID3D12CommandQueue*& queue : verified) ReleaseCom(queue);
 
         const uintptr_t identity = CanonicalComIdentityToken(chain);
-        bool matched = false;
+        bool matched = false, hadOverride = false;
         {
             std::lock_guard<std::mutex> lock(g_capturedQueueMutex);
             for (CapturedD3D12Queue& captured : g_capturedQueues) {
                 if (captured.appIdentity != identity && captured.nativeIdentity != identity && captured.hookIdentity != identity) continue;
                 matched = true;
+                hadOverride = captured.presentQueueOverrideObserved;
                 for (ID3D12CommandQueue*& queue : captured.presentQueues) ReleaseCom(queue);
                 captured.presentQueueCount = 0;
-                captured.presentQueueOverrideObserved = true;
+                captured.presentQueueOverrideObserved = valid;
                 if (valid) {
                     captured.presentQueueCount = count;
                     for (UINT i = 0; i < count; ++i) {
@@ -897,8 +977,14 @@ namespace overlay {
             }
         }
         for (ID3D12CommandQueue*& queue : verified) ReleaseCom(queue);
-        if (matched) {
-            core::Log("[overlay] ResizeBuffers1 presentation queues %s (%u)", valid ? "validated" : "rejected", valid ? count : 0);
+        if (!matched) return;
+        if (valid) {
+            if (!hadOverride) core::Log("[overlay] ResizeBuffers1 presentation queues validated (%u)", count);
+        } else if (clearing) {
+            if (hadOverride) core::Log("[overlay] ResizeBuffers dropped the per-buffer presentation queues; back to the creation queue");
+        } else {
+            static std::atomic<bool> s_logged{false};
+            if (!s_logged.exchange(true)) core::Log("[overlay] ResizeBuffers1 presentation queues empty or invalid (%u); using the creation queue", count);
         }
     }
 
@@ -911,13 +997,16 @@ namespace overlay {
             return false;
         }
         if (queue != g_queue) {
-            if (g_ready && g_queue && !RendererGpuIdleNoWait()) {
+            // one fence serves every frame slot and the retire list, so its values must complete in order: drain the old
+            // queue before anything is signalled on the new one (free when all back buffers share a queue, the usual case)
+            if (g_ready && g_queue && !RendererGpuIdleNoWait() && !WaitIdle(500)) {
                 queue->Release();
                 return false;
             }
             ReleaseCom(g_queue);
             g_queue = queue;
-            core::Log("[overlay] presentation queue selected %p", (void*)g_queue);
+            static std::atomic<unsigned> switches{0};
+            if (switches.fetch_add(1, std::memory_order_relaxed) < 8) core::Log("[overlay] presentation queue selected %p", (void*)g_queue);
         } else {
             queue->Release();
         }
@@ -929,12 +1018,11 @@ namespace overlay {
         if (g_disabled || g_failed || !baseChain || g_resizeInProgress.load(std::memory_order_acquire) != 0) return;
 
         const HWND chainWindow = GetSwapChainWindow(baseChain);
-        HWND gameWindow = g_gameWindow.load(std::memory_order_acquire);
-        if (!gameWindow || !IsWindow(gameWindow))
-            gameWindow = RefreshGameWindow(chainWindow);
-        if (!gameWindow || chainWindow != gameWindow) return;
+        CapturedInfo info;
+        const bool captured = LookupCaptured(baseChain, info);
+        if (!AcceptPresentWindow(chainWindow, captured ? info.window : nullptr)) return;
 
-        std::unique_lock<std::mutex> renderLock(g_renderMutex, std::try_to_lock);
+        std::unique_lock<std::timed_mutex> renderLock(g_renderMutex, std::try_to_lock);
         if (!renderLock.owns_lock()) return;
 
         IDXGISwapChain3* sc = nullptr;
@@ -942,7 +1030,7 @@ namespace overlay {
 
         if (!g_ready) {
             if (!SelectPresentQueue(baseChain)) { sc->Release(); return; }
-            if (Init(sc)) g_ready = true;
+            if (Init(sc)) { g_ready = true; g_boundGeneration = info.generation; }
             else {
                 g_failed = true;
                 core::Log("[overlay] init failed; overlay disabled");
@@ -951,13 +1039,19 @@ namespace overlay {
             }
         } else {
             const uintptr_t identity = CanonicalComIdentityToken(sc);
-            const bool replaced = identity != g_swapChainIdentity;
+            const bool replaced = identity != g_swapChainIdentity || (captured && info.generation != g_boundGeneration);
             PresentRendererResizeState lifecycle = g_rendererResizeState.load(std::memory_order_acquire);
+            bool retryChanged = false;
             if (lifecycle == PresentRendererResizeState::ReleaseForRetry) {
-                sc->Release();
-                return;
+                // the game's resize failed; if it keeps presenting the unchanged buffers, draw on as before instead of
+                // waiting forever for a resize that may never come; if the buffers did change, rebind to them
+                DXGI_SWAP_CHAIN_DESC desc = {};
+                if (FAILED(sc->GetDesc(&desc))) { sc->Release(); return; }
+                retryChanged = desc.BufferCount != g_bufferCount || desc.BufferDesc.Width != g_width ||
+                               desc.BufferDesc.Height != g_height || desc.BufferDesc.Format != g_format;
+                if (!retryChanged) g_rendererResizeState.store(PresentRendererResizeState::Idle, std::memory_order_release);
             }
-            const bool rebind = replaced || lifecycle == PresentRendererResizeState::RebindAfterSuccess;
+            const bool rebind = replaced || retryChanged || lifecycle == PresentRendererResizeState::RebindAfterSuccess;
             if (rebind && !RendererGpuIdleNoWait()) {
                 sc->Release();
                 return;
@@ -967,14 +1061,14 @@ namespace overlay {
                 return;
             }
             if (rebind && !RebindRenderer(sc, true)) {
-                g_disabled = true;
+                DisableOverlay();
                 core::Log("[overlay] renderer rebind after swapchain change failed; overlay disabled");
                 sc->Release();
                 return;
             }
             if (rebind) {
                 g_rendererResizeState.store(PresentRendererResizeState::Idle, std::memory_order_release);
-                g_resizeNonblockingReleases.fetch_add(1, std::memory_order_relaxed);
+                g_boundGeneration = info.generation;
             }
         }
 
@@ -1006,6 +1100,8 @@ namespace overlay {
             return;
         }
 
+        // per-buffer queues (ResizeBuffers1): our command list must run on the queue of the buffer presented now
+        if (captured && info.perBufferQueues && !SelectPresentQueue(baseChain)) { sc->Release(); return; }
         RenderGuarded(sc);
         sc->Release();
     }
@@ -1035,7 +1131,6 @@ namespace overlay {
         const HWND gameWindow = g_gameWindow.load(std::memory_order_acquire);
         if (!gameWindow || GetSwapChainWindow(chain) != gameWindow) return false;
         g_resizeInProgress.fetch_add(1, std::memory_order_acq_rel);
-        g_resizeCallbacks.fetch_add(1, std::memory_order_relaxed);
         g_rendererResizeState.store(PresentRendererResizeState::ReleaseForRetry, std::memory_order_release);
         return true;
     }
@@ -1048,28 +1143,35 @@ namespace overlay {
         return hr == DXGI_ERROR_INVALID_CALL || hr == DXGI_ERROR_WAS_STILL_DRAWING;
     }
 
-    static bool TryReleaseRendererBeforeResize(IDXGISwapChain* chain) {
-        std::unique_lock<std::mutex> lock(g_renderMutex, std::try_to_lock);
-        if (!lock.owns_lock()) return false;
-        if (!g_ready || CanonicalComIdentityToken(chain) != g_swapChainIdentity) return true;
-        // WB deliberately holds no persistent swap-chain backbuffer references.
-        // Match CrimsonRoute's nonblocking contract: never wait in Resize; the
-        // renderer is retired/rebound by the following Present once its fence is idle.
-        return RendererGpuIdleNoWait();
+    // Called before the original ResizeBuffers(1) and held across it. The render lock keeps a Present on another thread
+    // (frame generation) out of DrawFrame, so no GetBuffer reference of ours exists while DXGI resizes (none is kept between
+    // frames: DrawFrame releases its buffer before returning). Then our last command list, which still names the old back
+    // buffer, must be off the GPU. Both waits are bounded; on a timeout the resize proceeds as it would without the overlay.
+    static void DrainRendererBeforeResize(std::unique_lock<std::timed_mutex>& lock) {
+        if (!lock.try_lock_for(std::chrono::milliseconds(1000))) {
+            core::Log("[overlay] render lock still held after 1 s; resizing without draining the overlay");
+            return;
+        }
+        if (g_ready && !WaitIdle(500)) core::Log("[overlay] overlay GPU work still pending after 500 ms before ResizeBuffers");
+    }
+
+    static void EndResize(HRESULT hr, const char* name) {   // under the render lock (when it was obtained)
+        g_rendererResizeState.store(
+            SUCCEEDED(hr) ? PresentRendererResizeState::RebindAfterSuccess :
+            (IsRetryableResizeFailure(hr) ? PresentRendererResizeState::ReleaseForRetry : PresentRendererResizeState::Idle),
+            std::memory_order_release);
+        core::Log("[overlay] %s result=0x%08x; state=%s", name, (unsigned)hr,
+            SUCCEEDED(hr) ? "rebind_after_success" : (IsRetryableResizeFailure(hr) ? "release_for_retry" : "idle"));
     }
 
     static HRESULT STDMETHODCALLTYPE hkResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
         const bool tracked = BeginResize(sc);
-        if (tracked) (void)TryReleaseRendererBeforeResize(sc);
+        std::unique_lock<std::timed_mutex> lock(g_renderMutex, std::defer_lock);
+        if (tracked) DrainRendererBeforeResize(lock);
         const HRESULT hr = oResizeBuffers ? oResizeBuffers(sc, n, w, h, fmt, flags) : E_FAIL;
-        if (tracked) {
-            g_rendererResizeState.store(
-                SUCCEEDED(hr) ? PresentRendererResizeState::RebindAfterSuccess :
-                (IsRetryableResizeFailure(hr) ? PresentRendererResizeState::ReleaseForRetry : PresentRendererResizeState::Idle),
-                std::memory_order_release);
-            core::Log("[overlay] ResizeBuffers result=0x%08x; state=%s", (unsigned)hr,
-                SUCCEEDED(hr) ? "rebind_after_success" : (IsRetryableResizeFailure(hr) ? "release_for_retry" : "idle"));
-        }
+        if (SUCCEEDED(hr)) CaptureResizePresentQueues(sc, 0, nullptr);   // a plain resize puts every buffer back on the creation queue
+        if (tracked) EndResize(hr, "ResizeBuffers");
+        if (lock.owns_lock()) lock.unlock();
         FinishResize(tracked);
         return hr;
     }
@@ -1077,69 +1179,64 @@ namespace overlay {
     static HRESULT STDMETHODCALLTYPE hkResizeBuffers1(IDXGISwapChain3* sc, UINT n, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                       const UINT* nodeMasks, IUnknown* const* presentQueues) {
         const bool tracked = BeginResize(sc);
-        if (tracked) (void)TryReleaseRendererBeforeResize(sc);
+        std::unique_lock<std::timed_mutex> lock(g_renderMutex, std::defer_lock);
+        if (tracked) DrainRendererBeforeResize(lock);
         const HRESULT hr = oResizeBuffers1 ? oResizeBuffers1(sc, n, w, h, fmt, flags, nodeMasks, presentQueues) : E_FAIL;
-        if (SUCCEEDED(hr) && presentQueues && n) CaptureResizePresentQueues(sc, n, presentQueues);
-        if (tracked) {
-            g_rendererResizeState.store(
-                SUCCEEDED(hr) ? PresentRendererResizeState::RebindAfterSuccess :
-                (IsRetryableResizeFailure(hr) ? PresentRendererResizeState::ReleaseForRetry : PresentRendererResizeState::Idle),
-                std::memory_order_release);
-            core::Log("[overlay] ResizeBuffers1 result=0x%08x; state=%s", (unsigned)hr,
-                SUCCEEDED(hr) ? "rebind_after_success" : (IsRetryableResizeFailure(hr) ? "release_for_retry" : "idle"));
-        }
+        // n == 0 keeps the buffer count and still passes one queue per buffer; a null array is "no override"
+        if (SUCCEEDED(hr)) CaptureResizePresentQueues(sc, n, presentQueues);
+        if (tracked) EndResize(hr, "ResizeBuffers1");
+        if (lock.owns_lock()) lock.unlock();
         FinishResize(tracked);
         return hr;
     }
 
+    // ImGui keeps drawing plain sRGB values into whatever the back buffer is; tone mapping the menu for an HDR color space
+    // is out of scope. The color space does not change the buffers either, so only an actual change triggers a (cheap to
+    // skip, costly to repeat) backend rebind, and a game re-setting the same value every frame or after each resize costs nothing.
     static HRESULT STDMETHODCALLTYPE hkSetColorSpace1(IDXGISwapChain3* sc, DXGI_COLOR_SPACE_TYPE colorSpace) {
         const HRESULT hr = oSetColorSpace1 ? oSetColorSpace1(sc, colorSpace) : E_FAIL;
-        if (sc) {
-            if (SUCCEEDED(hr) && IsSupportedPresentColorSpace(colorSpace)) {
-                g_colorSpaceHintSwapChain.store(sc, std::memory_order_release);
-                g_colorSpaceHint.store((int)colorSpace, std::memory_order_release);
-                g_colorSpaceHintValid.store(1, std::memory_order_release);
-            } else if (FAILED(hr)) {
-                g_colorSpaceHintValid.store(
-                    g_colorSpaceHintSwapChain.load(std::memory_order_acquire) == sc ? 1 : 0,
-                    std::memory_order_release);
-            } else {
-                g_colorSpaceHintValid.store(0, std::memory_order_release);
-            }
-            if (SUCCEEDED(hr) && g_boundSwapChain.load(std::memory_order_acquire) == sc)
-                g_rendererResizeState.store(PresentRendererResizeState::RebindAfterSuccess, std::memory_order_release);
-        }
+        if (sc && SUCCEEDED(hr) && g_boundSwapChain.load(std::memory_order_acquire) == sc &&
+            g_boundColorSpace.exchange((int)colorSpace, std::memory_order_acq_rel) != (int)colorSpace)
+            g_rendererResizeState.store(PresentRendererResizeState::RebindAfterSuccess, std::memory_order_release);
         return hr;
     }
 
-    static HRESULT STDMETHODCALLTYPE hkCreateSwapChain(IDXGIFactory* self, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** pp) {
-        const HRESULT hr = oCreateSwapChain ? oCreateSwapChain(self, device, desc, pp) : E_FAIL;
+    template <int P> static HRESULT STDMETHODCALLTYPE hkCreateSwapChain(IDXGIFactory* self, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** pp) {
+        const HRESULT hr = oCreateSwapChain[P] ? oCreateSwapChain[P](self, device, desc, pp) : E_FAIL;
         if (SUCCEEDED(hr) && pp && *pp) CapturePresentSwapChain(device, *pp, desc ? desc->OutputWindow : nullptr);
         return hr;
     }
 
-    static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForHwnd(IDXGIFactory2* self, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+    template <int P> static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForHwnd(IDXGIFactory2* self, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                                                const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* out, IDXGISwapChain1** pp) {
-        const HRESULT hr = oCreateSwapChainForHwnd ? oCreateSwapChainForHwnd(self, device, hwnd, desc, fs, out, pp) : E_FAIL;
+        const HRESULT hr = oCreateSwapChainForHwnd[P] ? oCreateSwapChainForHwnd[P](self, device, hwnd, desc, fs, out, pp) : E_FAIL;
         if (SUCCEEDED(hr) && pp && *pp) CapturePresentSwapChain(device, *pp, hwnd);
         return hr;
     }
 
-    static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForCoreWindow(IDXGIFactory2* self, IUnknown* device, IUnknown* window,
+    template <int P> static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForCoreWindow(IDXGIFactory2* self, IUnknown* device, IUnknown* window,
                                                                      const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* out, IDXGISwapChain1** pp) {
-        const HRESULT hr = oCreateSwapChainForCoreWindow ? oCreateSwapChainForCoreWindow(self, device, window, desc, out, pp) : E_FAIL;
+        const HRESULT hr = oCreateSwapChainForCoreWindow[P] ? oCreateSwapChainForCoreWindow[P](self, device, window, desc, out, pp) : E_FAIL;
         if (SUCCEEDED(hr) && pp && *pp) CapturePresentSwapChain(device, *pp, nullptr);
         return hr;
     }
 
-    static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForComposition(IDXGIFactory2* self, IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc,
+    template <int P> static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForComposition(IDXGIFactory2* self, IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc,
                                                                       IDXGIOutput* out, IDXGISwapChain1** pp) {
-        const HRESULT hr = oCreateSwapChainForComposition ? oCreateSwapChainForComposition(self, device, desc, out, pp) : E_FAIL;
+        const HRESULT hr = oCreateSwapChainForComposition[P] ? oCreateSwapChainForComposition[P](self, device, desc, out, pp) : E_FAIL;
         if (SUCCEEDED(hr) && pp && *pp) CapturePresentSwapChain(device, *pp, nullptr);
         return hr;
     }
 
-    static int HookReturnedFactory(IUnknown* created, const char* provider) {
+    // Streamline without an active proxy hands out the real dxgi factory, whose methods may already be hooked as the other
+    // provider's; a second MinHook on the same address would fail, and the existing hook already captures that path.
+    static bool HookFactoryMethod(int provider, int slot, void* target, void* detour, void** original, const char* name) {
+        if (!target) return false;
+        if (GetHookTargetState(g_factoryHookTargets[1 - provider][slot], target) == HookTargetState::Matching) return true;
+        return InstallSingleHook(g_factoryHookTargets[provider][slot], target, detour, original, name);
+    }
+
+    template <int P> static int HookReturnedFactory(IUnknown* created) {
         if (!created) return 0;
         std::lock_guard<std::mutex> lock(g_factoryHookMutex);
         IDXGIFactory* factory = nullptr;
@@ -1148,61 +1245,57 @@ namespace overlay {
         created->QueryInterface(IID_PPV_ARGS(&factory2));
         int installed = 0;
         if (factory) {
-            void* target = ComVtableSlot(factory, 10);
-            if (target && InstallSingleHook(g_factoryHookTargets[0], target, (void*)&hkCreateSwapChain,
-                                        (void**)&oCreateSwapChain, "CreateSwapChain")) installed++;
+            if (HookFactoryMethod(P, 0, ComVtableSlot(factory, 10), (void*)&hkCreateSwapChain<P>,
+                                  (void**)&oCreateSwapChain[P], "CreateSwapChain")) installed++;
         }
         if (factory2) {
-            void* targetHwnd = ComVtableSlot(factory2, 15);
-            void* targetCore = ComVtableSlot(factory2, 16);
-            void* targetComposition = ComVtableSlot(factory2, 24);
-            if (targetHwnd && InstallSingleHook(g_factoryHookTargets[1], targetHwnd, (void*)&hkCreateSwapChainForHwnd,
-                                        (void**)&oCreateSwapChainForHwnd, "CreateSwapChainForHwnd")) installed++;
-            if (targetCore && InstallSingleHook(g_factoryHookTargets[2], targetCore, (void*)&hkCreateSwapChainForCoreWindow,
-                                        (void**)&oCreateSwapChainForCoreWindow, "CreateSwapChainForCoreWindow")) installed++;
-            if (targetComposition && InstallSingleHook(g_factoryHookTargets[3], targetComposition, (void*)&hkCreateSwapChainForComposition,
-                                        (void**)&oCreateSwapChainForComposition, "CreateSwapChainForComposition")) installed++;
+            if (HookFactoryMethod(P, 1, ComVtableSlot(factory2, 15), (void*)&hkCreateSwapChainForHwnd<P>,
+                                  (void**)&oCreateSwapChainForHwnd[P], "CreateSwapChainForHwnd")) installed++;
+            if (HookFactoryMethod(P, 2, ComVtableSlot(factory2, 16), (void*)&hkCreateSwapChainForCoreWindow<P>,
+                                  (void**)&oCreateSwapChainForCoreWindow[P], "CreateSwapChainForCoreWindow")) installed++;
+            if (HookFactoryMethod(P, 3, ComVtableSlot(factory2, 24), (void*)&hkCreateSwapChainForComposition<P>,
+                                  (void**)&oCreateSwapChainForComposition[P], "CreateSwapChainForComposition")) installed++;
         }
         ReleaseCom(factory2);
         ReleaseCom(factory);
-        uint32_t mask = 0;
-        for (int i = 0; i < 4; ++i) if (g_factoryHookTargets[i].installed) mask |= (1u << i);
+        uint32_t mask = 0;   // bits 0-3 DXGI methods, 4-7 Streamline methods
+        for (int p = 0; p < kProviderCount; ++p)
+            for (int i = 0; i < 4; ++i) if (g_factoryHookTargets[p][i].installed) mask |= (1u << (p * 4 + i));
         g_factoryMethodHookMask.store(mask, std::memory_order_release);
-        if (installed) core::Log("[overlay] %s returned factory captured (%d methods ready, mask=0x%02x)", provider, installed, mask);
+        if (installed) core::Log("[overlay] %s returned factory captured (%d methods ready, mask=0x%02x)", kProviderName[P], installed, mask);
         return installed;
     }
 
+    // Both providers are always hooked: a game that creates its swapchain through plain dxgi while sl.interposer is loaded
+    // must still be captured, and when the Streamline proxy forwards into the real factory both captures agree.
     static HRESULT WINAPI hkCreateDXGIFactory(REFIID iid, void** out) {
         const HRESULT hr = oCreateDXGIFactory ? oCreateDXGIFactory(iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out && !g_streamlineFactoryExportsHooked)
-            HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "DXGI");
+        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderDxgi>(reinterpret_cast<IUnknown*>(*out));
         return hr;
     }
     static HRESULT WINAPI hkCreateDXGIFactory1(REFIID iid, void** out) {
         const HRESULT hr = oCreateDXGIFactory1 ? oCreateDXGIFactory1(iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out && !g_streamlineFactoryExportsHooked)
-            HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "DXGI");
+        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderDxgi>(reinterpret_cast<IUnknown*>(*out));
         return hr;
     }
     static HRESULT WINAPI hkCreateDXGIFactory2(UINT flags, REFIID iid, void** out) {
         const HRESULT hr = oCreateDXGIFactory2 ? oCreateDXGIFactory2(flags, iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out && !g_streamlineFactoryExportsHooked)
-            HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "DXGI");
+        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderDxgi>(reinterpret_cast<IUnknown*>(*out));
         return hr;
     }
     static HRESULT WINAPI hkStreamlineCreateDXGIFactory(REFIID iid, void** out) {
         const HRESULT hr = oStreamlineCreateDXGIFactory ? oStreamlineCreateDXGIFactory(iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "Streamline");
+        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderStreamline>(reinterpret_cast<IUnknown*>(*out));
         return hr;
     }
     static HRESULT WINAPI hkStreamlineCreateDXGIFactory1(REFIID iid, void** out) {
         const HRESULT hr = oStreamlineCreateDXGIFactory1 ? oStreamlineCreateDXGIFactory1(iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "Streamline");
+        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderStreamline>(reinterpret_cast<IUnknown*>(*out));
         return hr;
     }
     static HRESULT WINAPI hkStreamlineCreateDXGIFactory2(UINT flags, REFIID iid, void** out) {
         const HRESULT hr = oStreamlineCreateDXGIFactory2 ? oStreamlineCreateDXGIFactory2(flags, iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "Streamline");
+        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderStreamline>(reinterpret_cast<IUnknown*>(*out));
         return hr;
     }
 
@@ -1251,26 +1344,23 @@ namespace overlay {
         uint32_t streamlineMask = 0;
         for (int i = 0; i < 3; ++i) if (g_streamlineExportHookTargets[i].installed) streamlineMask |= (1u << i);
         g_streamlineExportHookMask.store(streamlineMask, std::memory_order_release);
-        g_streamlineFactoryExportsHooked = streamlineMask != 0;
 
+        // The probe goes to the real dxgi.dll only: Streamline forbids any call into sl.interposer before the game's slInit,
+        // and this runs on the init thread, possibly before it. Streamline's proxy factory is captured when the game itself
+        // creates it through the hooked exports. The real factory's methods are shared by every real factory, so hooking
+        // them now also covers a factory the game created before these export hooks existed.
         IDXGIFactory2* probe = nullptr;
         HRESULT hr = E_FAIL;
-        const char* provider = g_streamlineFactoryExportsHooked ? "Streamline" : "DXGI";
-        if (g_streamlineFactoryExportsHooked) {
-            if (oStreamlineCreateDXGIFactory1) hr = oStreamlineCreateDXGIFactory1(IID_PPV_ARGS(&probe));
-            else if (oStreamlineCreateDXGIFactory2) hr = oStreamlineCreateDXGIFactory2(0, IID_PPV_ARGS(&probe));
-            else if (oStreamlineCreateDXGIFactory) hr = oStreamlineCreateDXGIFactory(IID_PPV_ARGS(&probe));
-        } else {
-            hr = CreateDXGIFactory1(IID_PPV_ARGS(&probe));
-        }
+        if (oCreateDXGIFactory1) hr = oCreateDXGIFactory1(IID_PPV_ARGS(&probe));   // the original: no detour in between
+        else hr = CreateDXGIFactory1(IID_PPV_ARGS(&probe));
         g_factoryImportHookMask.store(dxgiMask | (streamlineMask ? 0x08u : 0u), std::memory_order_release);
         g_factoryProbeResult.store(hr, std::memory_order_release);
         if (SUCCEEDED(hr) && probe) {
-            HookReturnedFactory(probe, provider);
+            HookReturnedFactory<kProviderDxgi>(probe);
             probe->Release();
         }
 
-        core::Log("[overlay] CrimsonRoute DXGI capture ready: dxgi_export_mask=0x%02x streamline_export_mask=0x%02x factory_import_mask=0x%02x factory_method_mask=0x%02x probe_hr=0x%08x; waiting for game D3D12 swapchain",
+        core::Log("[overlay] World Builder DXGI capture ready: dxgi_export_mask=0x%02x streamline_export_mask=0x%02x factory_import_mask=0x%02x factory_method_mask=0x%02x probe_hr=0x%08x; waiting for game D3D12 swapchain",
                   dxgiMask, streamlineMask, g_factoryImportHookMask.load(std::memory_order_acquire),
                   g_factoryMethodHookMask.load(std::memory_order_acquire), (unsigned)hr);
     }
