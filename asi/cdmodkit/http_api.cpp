@@ -226,6 +226,32 @@ static std::string Handle(const std::string& method, const std::string& path, co
         float cur = 0; const bool have = core::TimeHour(&cur);
         return "{\"hour\":" + (have ? std::to_string(cur) : std::string("null")) + ",\"frozen\":" + (core::TimeFrozen() ? "true" : "false") + "}";
     }
+    if (method == "POST" && (path == "/api/research/read" || path == "/api/research/write")) {   // research: {"addr":"0x..","bytes":64} -> hex; write: {"addr":"0x..","hex":"0000803f"}
+        auto it = arg.find("addr"); if (it == arg.end()) { status = 400; return Error("addr required"); }
+        const uintptr_t a = (uintptr_t)strtoull(it->second.c_str(), nullptr, 0);
+        if (path == "/api/research/read") {
+            float by = 64; Number(arg, "bytes", by); const size_t n = (size_t)std::clamp((int)by, 1, 65536);
+            std::vector<uint8_t> b(n); if (!core::ReadMem(a, b.data(), n)) { status = 409; return Error("unreadable"); }
+            static const char* hx = "0123456789abcdef"; std::string out; out.reserve(n * 2);
+            for (uint8_t c : b) { out += hx[c >> 4]; out += hx[c & 15]; }
+            return "{\"hex\":\"" + out + "\"}";
+        }
+        auto h = arg.find("hex"); if (h == arg.end() || h->second.size() % 2 || h->second.size() > 131072) { status = 400; return Error("hex required"); }
+        std::vector<uint8_t> b(h->second.size() / 2);
+        for (size_t i = 0; i < b.size(); i++) b[i] = (uint8_t)strtoul(h->second.substr(i * 2, 2).c_str(), nullptr, 16);
+        if (!core::WriteMem(a, b.data(), b.size())) { status = 409; return Error("write failed"); }
+        return "{\"written\":" + Int((int)b.size()) + "}";
+    }
+    if (method == "POST" && path == "/api/research/peek") {   // research: {"addr":"0x34b0aceb700","bytes":256,"u16":0}
+        auto it = arg.find("addr"); if (it == arg.end()) { status = 400; return Error("addr required"); }
+        const uintptr_t a = (uintptr_t)strtoull(it->second.c_str(), nullptr, 0); float by = 256, u = 0; Number(arg, "bytes", by); Number(arg, "u16", u);
+        core::ResearchPeek(a, std::clamp((int)by, 8, 8192) & ~7, u != 0); return "{\"done\":true}";
+    }
+    if (method == "POST" && path == "/api/research/vtscan") {   // research: {"class":".?AVhknpHeightFieldShape@@","max":8,"bytes":256}
+        auto it = arg.find("class"); if (it == arg.end() || it->second.size() < 6 || it->second.size() > 200) { status = 400; return Error("class (mangled RTTI name) required"); }
+        float mx = 8, by = 256; Number(arg, "max", mx); Number(arg, "bytes", by);
+        core::ResearchVtScan(it->second, std::clamp((int)mx, 1, 256), std::clamp((int)by, 16, 1024) & ~7); status = 202; return "{\"started\":true}";
+    }
     if (method == "POST" && path == "/api/research/camwatch") {   // research: {"seconds":8} logs the code writing the renderer camera pose
         float sec = 8, mode = 0; Number(arg, "seconds", sec); Number(arg, "mode", mode); core::CamWatch((int)sec, (int)mode); status = 202; return "{\"started\":true}";
     }

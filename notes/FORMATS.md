@@ -221,3 +221,43 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Autoload stress (1200 objects, 800 random cd_gimmick prefabs) runs through on both v0.94 and the fixed build; about a quarter of cd_gimmick prefabs have no gimmickinfo row, the game refuses them (eErrNoInvalidGimmickPrefabPath) and they become plain objects.
 - One user report (v0.94): the builder call for gimmick_attach_airship_02_marni never returned (server thread stuck, queue stopped), not reproducible here. The replay watchdog now also logs the stuck thread's stack (SuspendThread + RtlVirtualUnwind, rvas) to find the spot next time.
 - TrocTrCharacterPresetSpawnGimmickByCheatReq is a dead end: its worker is stubbed in release.
+
+## Terrain (spike 2026-09-27, build 1.0.0.2976)
+- Files: `leveldata/rootlevel/terrain/height16f/terrain_X_Z_height_h.dds` (512x512 L16, 10 mips; tile X/Z centred on X*1024 / Z*1024, 2 m per texel),
+  `heighttable/sector_X_Z.xml` (`_heightOffset`, `_heightRange`: height = offset + v/65535*range, e.g. -10/-4: 494 + v/65535*164),
+  plus normal / color / mask / region / shorelinesdf per tile.
+- Physics is Havok (hknp). Around the player ~25 live `hknpHeightFieldShape` (RTTI, vtable rva 0x530ab48), found by scanning
+  memory for the vtable (research endpoint /api/research/vtscan). Shape: +0x38 / +0x40 are 64-bit RELATIVE offsets (target =
+  field address + value); +0x4C/+0x50 = 64/64, +0x70 scale (2,1,2), +0x80 inverse scale, +0x90 AABB min, +0xA0 AABB max (x,z 0..32).
+  - +0x38 -> game geometry object (vtable rva 0x5D137A8, no usable RTTI): +0x20/+0x24 = 65x65 samples, +0x28 PhysicsMaterialManager,
+    +0x30 shared object, +0x38 -> data object (vtable rva 0x5D138D8) with four arrays of 4225 entries (65x65):
+    +0x18 float heights (world metres), +0x28 material bytes, +0x38 u16 pairs, +0x48 RGBA colours; world-space floats follow at +0x60.
+  - +0x40 -> hknpHeightFieldBoundingVolume (vtable rva 0x530ab28): the min/max tree used to cull queries.
+- The patches do NOT match the DDS tiles exactly (best mean error ~0.3 m over all 8 orientations and offsets), so they are built
+  from another source or the tile numbering differs; their world placement comes from the owning hknp body, not the shape.
+- Experiment: +3 m on all float heights and the shape AABB made the character sink half into the ground (seen in game; /api/player
+  only updates after moving, it still said 610.5). +20 m (AABB then above the
+  character) made the character fall through the world: queries are culled by the shape AABB / bounding-volume tree, and the
+  float array alone is not what collision reads (or the tree must be rebuilt). Render (GPU heightmap) untouched in both cases.
+- Collision DOES read the float array: geometry vtable function 0x39f3390 (a quad query) takes the four corner heights from
+  [data+0x18] (index x*rows + z, clamped) and the material from the byte array [data+0x28] (0 = no ground, 0xFF = hole).
+- Walkable edits work (seen in game): smooth dips in the middle of each patch, edges untouched, and never below the patch's
+  original minimum -> players walk into and out of them. Anything outside the patch's ORIGINAL height range drops the collision
+  (half sinking, then falling through): the owning hknp body's broadphase AABB is not updated by writing the shape. Raising
+  under a standing character also embeds it (heightfields are one-sided). The shape AABB (+0x90) and the bounding-volume tree
+  (base +0x30, quant scale +0x40 / inverse +0x44, rel-array +0x20 of 4 levels 8x8/4x4/2x2/1x1 of u16 min/max pairs) must
+  cover the new heights too.
+- Bounding-volume tree cells are groups of 8 u16: the 4 children's minima, then their 4 maxima (quantized with base/scale);
+  the last level (4 bytes) does not follow that scheme - leave it alone. Opening the three lower levels correctly (0 / 65535 per
+  group) with base, scale and shape AABB unchanged is harmless (tested: nothing happens).
+- Result (seen in game): dips up to 1 m deep, within the patch's original range -> the character sinks in and walks on, no fall.
+  3 m deep -> it stands 2-3 m under the visible ground, then drops after a few steps: a game-side "below the terrain" safety check
+  (not Havok) against another height source, threshold roughly 1-2 m. Editing that height source (and the render texture) is
+  the next step for real terraforming.
+- Pitfall: after a fall the game streams patches out; writing saved addresses then corrupts its heap (one crash). Check the
+  shape vtable and the heights pointer before every write. A rescan after a fall saves already-modified heights as "original".
+- Next steps: find the hknp body of each patch (world placement + broadphase AABB, then a proper AABB update so edits may leave
+  the original range); the render side (GPU height texture) is untouched so far: the ground looks unchanged.
+- Next steps (original list): find what the collision query reads (disassemble the geometry vtable 0x5D137A8 slots / hknpHeightFieldShape
+  getHeight path), rebuild or patch the bounding-volume tree, find the patch's body transform; the render side (GPU height
+  texture) is a separate problem.

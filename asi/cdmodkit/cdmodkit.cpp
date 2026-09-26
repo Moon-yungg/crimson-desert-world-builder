@@ -1927,6 +1927,41 @@ static uintptr_t FindVtableByName(const char* mangled) {
     }
     return 0;
 }
+// Research: every live object of an RTTI class, found by scanning committed private read-write memory for its vtable
+// pointer (background thread, chunked guarded copies). Logs each hit with a dump of its first bytes and pointer fields.
+void ResearchVtScan(const std::string& mangled, int maxHits, int dumpBytes) {
+    const uintptr_t vt = FindVtableByName(mangled.c_str());
+    if (!vt) { Log("[vtscan] %s: no vtable", mangled.c_str()); return; }
+    std::thread([vt, mangled, maxHits, dumpBytes]() {
+        const DWORD t0 = GetTickCount(); int hits = 0; uint64_t scanned = 0;
+        std::vector<uint8_t> buf(1 << 20);
+        MEMORY_BASIC_INFORMATION mbi{}; uintptr_t a = 0x10000;
+        while (hits < maxHits && VirtualQuery((void*)a, &mbi, sizeof mbi) == sizeof mbi) {
+            const uintptr_t base = (uintptr_t)mbi.BaseAddress, end = base + mbi.RegionSize; a = end;
+            if (mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) || (mbi.Protect & PAGE_GUARD)) continue;
+            for (uintptr_t c = base; c < end && hits < maxHits; c += buf.size()) {
+                const size_t n = (size_t)std::min<uintptr_t>(buf.size(), end - c);
+                if (!ReadBytes(c, buf.data(), n)) continue;
+                scanned += n;
+                for (size_t k = 0; k + 8 <= n && hits < maxHits; k += 8) {
+                    uintptr_t v; memcpy(&v, buf.data() + k, 8); if (v != vt) continue;
+                    char tag[48]; snprintf(tag, sizeof tag, "vtscan hit %d", hits); hits++;
+                    DumpDeep(tag, c + k, (unsigned)dumpBytes, (unsigned)(dumpBytes / 8));
+                }
+            }
+        }
+        Log("[vtscan] %s (vtable rva 0x%llx): %d hits in %.1f GB, %lu ms", mangled.c_str(), (unsigned long long)(vt - g_base), hits, scanned / 1e9, GetTickCount() - t0);
+    }).detach();
+}
+bool ReadMem(uintptr_t addr, void* out, size_t n) { return ReadBytes(addr, out, n); }
+bool WriteMem(uintptr_t addr, const void* in, size_t n) { return WriteBytes(addr, in, n); }
+void ResearchPeek(uintptr_t addr, int bytes, bool u16) {   // research: raw memory (guarded), optionally as unsigned 16-bit words
+    if (!u16) { DumpDeep("peek", addr, (unsigned)bytes, (unsigned)std::min(bytes / 8, 32)); return; }
+    std::vector<uint16_t> w((size_t)bytes / 2); if (!ReadBytes(addr, w.data(), w.size() * 2)) { Log("[peek] %p unreadable", (void*)addr); return; }
+    std::string line; char t[16];
+    for (size_t i = 0; i < w.size(); i++) { snprintf(t, sizeof t, "%u ", w[i]); line += t; if (i % 32 == 31) { Log("[peek] %p+%zx: %s", (void*)addr, (i - 31) * 2, line.c_str()); line.clear(); } }
+    if (!line.empty()) Log("[peek] %p: %s", (void*)addr, line.c_str());
+}
 static const int kVtMax = 160; static const int kVtClasses = 5;
 static void* g_vtOrig[kVtClasses][kVtMax] = {}; static const char* g_vtClass[kVtClasses] = { "", "", "", "", "" };
 // class 4 (TrocTrSpawnCharacterCheatReq, a static handler object): slot 2 = execute(handler, &result, packet). Always logged with

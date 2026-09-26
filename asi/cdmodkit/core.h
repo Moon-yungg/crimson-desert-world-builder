@@ -46,6 +46,9 @@ namespace core {
     bool CameraFov(float* deg);                // live vertical field of view read from the camera object (PhotoCamera +0x1DC), false if implausible
     // the view + projection the renderer really uses through the renderer's camera object
     bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11);
+    bool ReadMem(uintptr_t addr, void* out, size_t n); bool WriteMem(uintptr_t addr, const void* in, size_t n);   // research: guarded raw access
+    void ResearchPeek(uintptr_t addr, int bytes, bool u16);   // research: log raw memory
+    void ResearchVtScan(const std::string& mangled, int maxHits, int dumpBytes);   // research: live objects of an RTTI class (logged)
     void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)
     struct GimmickCapInfo { int id; uintptr_t caller; uint32_t k1, k2; Vec3 pos; unsigned long ageMs; char name[96]; char path[200]; };
