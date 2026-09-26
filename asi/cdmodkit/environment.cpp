@@ -11,6 +11,10 @@
 //
 // Important: "Freeze time" below freezes the visual time-of-day / lighting path.
 // It does NOT pause the game simulation, NPCs, physics, combat or quest logic.
+//
+// Every offset, vtable slot and helper used below is derived at startup from the game's own code (the weather tick, the
+// weather-node getters it calls, the time-limit console setters, the time-advance virtual, the weather summary reader).
+// Each control is enabled only when everything it writes through was derived; otherwise it stays off with a log line.
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -31,105 +35,102 @@
 namespace core {
 namespace {
 
-static ptrdiff_t g_envGetEntityVt = 0x60;
-static ptrdiff_t g_envGetTimeVt = 0x178;
-static ptrdiff_t g_entitySetTimeVt = 0x130;
-
-constexpr ptrdiff_t kWeatherWindSpeed = 0x138;
-constexpr ptrdiff_t kWeatherAltitudeWindRatio = 0x158;
-constexpr ptrdiff_t kWeatherSnow = 0x168;
-constexpr ptrdiff_t kWeatherRain = 0x16C;
-constexpr ptrdiff_t kWeatherWindBlendContribution = 0x1A4;
-constexpr ptrdiff_t kAtmosphereCloudAmount = 0xA8;
-constexpr ptrdiff_t kAtmosphereMieAerosolDensity = 0x88;
-constexpr ptrdiff_t kAtmosphereNativeFogSecondary = 0x9C;
-
 using WeatherComposeFn = long long(__fastcall*)(long long weatherState, float dt);
 using WeatherTickFn = void(__fastcall*)(long long self, float dt);
 using ActivateEffectFn = void(__fastcall*)(long long self, int id, long long* slotA, long long* slotB, float v);
 using SetIntensityFn = void(__fastcall*)(long long particleMgr, int handle, float v);
 using EnvGetEntityFn = long long(__fastcall*)(void* envMgr);
-using EnvGetTimeFn = double(__fastcall*)(void* envMgr);
-using EntitySetTimeFn = void(__fastcall*)(long long entity, float value);
+using EntitySetTimeFn = void(__fastcall*)(long long entity, float value, float epsilon);
 
+// --- resolved at install; -1 / 0 = not derived, and every consumer checks that before touching game memory ---
+static uintptr_t g_tick = 0, g_tickEnd = 0;          // weather tick and the end of its (chained) unwind extent
+static uintptr_t g_rainGetter = 0, g_snowGetter = 0, g_windGetter = 0;
+static uintptr_t g_intensityFn = 0, g_activateFn = 0;
 static uintptr_t* g_envManagerGlobal = nullptr;
+static ptrdiff_t g_envGetEntityVt = -1;              // envMgr vtable slot returning the environment entity
+static ptrdiff_t g_entityWeatherState = -1;          // entity field the tick passes to the weather getters
+static ptrdiff_t g_entityParticleMgr = -1;           // entity field the tick passes to SetEffectIntensity
+static ptrdiff_t g_weatherNodeContainer = -1;        // weatherState -> node container
+static constexpr ptrdiff_t kWeatherChildSlot = 0x18; // fixed by the getter signatures (lea rax,[rdx+18h])
+static ptrdiff_t g_weatherAtmosphereSlot = -1;       // container -> atmosphere node
+
+enum WeatherField { FRain, FSnow, FWindSpeed, FWindAltitude, FWindBlend, FCloud, FMie, FFog, FCount };
+static const char* const kFieldName[FCount] = { "rain", "snow", "wind speed", "altitude wind", "wind blend", "cloud", "mie aerosol", "fog" };
+static ptrdiff_t g_fieldOff[FCount] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+static bool FieldIsAtmosphere(int f) { return f == FCloud || f == FMie || f == FFog; }
+
+// weather effect object (the tick's `this`): activation slot pairs and handle array, all read off the tick's own call sites
+static ptrdiff_t g_effectSlotA[9] = { -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+static ptrdiff_t g_effectSlotB[9] = { -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+static ptrdiff_t g_effectHandleBase = -1;
+static unsigned g_effectHandleMask = 0;              // bit n: the tick itself reads handle n before SetEffectIntensity
+static int* g_nullSentinel = nullptr;
+
+// visual time
 static ptrdiff_t g_timeLower = 0;
 static ptrdiff_t g_timeUpper = 0;
-static ptrdiff_t g_timeCurrentA = 0;
-static ptrdiff_t g_timeCurrentB = 0;
+static ptrdiff_t g_timeCurrent = 0;
+static uintptr_t g_timeAddFn = 0;                    // entity virtual "advance time": add to current, tail-call set-time
+static ptrdiff_t g_entitySetTimeVt = -1;
+static float g_timeSetEpsilon = 0.0f;
 
 static std::atomic<bool> g_timeAvailable{ false };
 static std::atomic<bool> g_timeCurrentValid{ false };
 static std::atomic<float> g_timeCurrentHour{ 12.0f };
-static std::atomic<float> g_timeTargetHour{ 12.0f };
+static std::atomic<float> g_timeTargetHour{ 12.0f };  // written by the UI thread only, so the game thread cannot race a request
 static std::atomic<bool> g_timeFreeze{ false };
 static std::atomic<bool> g_timeApply{ false };
 static std::atomic<int> g_timeSetHoldTicks{ 0 };
 static long long g_timeEntity = 0;
-static bool g_timeBaselineValid = false;
+static bool g_timeEntityOk = false;
 static bool g_timeDomainHours = true;
-static float g_timeBaseLower = 0.0f;
-static float g_timeBaseUpper = 24.0f;
-static bool g_timeFreezeApplied = false;
+static bool g_timeOverriding = false;                 // our frozen limits are in the entity
+static float g_timeNativeLower = 0.0f;                // what the game had right before we froze (or what a script set since)
+static float g_timeNativeUpper = 24.0f;
+static float g_timeWritten = 0.0f;                    // the value we last wrote into both limits
 
+// weather
 static WeatherComposeFn g_origWeatherCompose = nullptr;
 static WeatherTickFn g_origWeatherTick = nullptr;
-static ActivateEffectFn g_activateEffect = nullptr;
-static SetIntensityFn g_setIntensity = nullptr;
-static int* g_nullSentinel = nullptr;
 static std::atomic<bool> g_snowEffectsAvailable{ false };
-static ptrdiff_t g_weatherNodeContainer = 0x60;
 static std::atomic<bool> g_weatherAvailable{ false };
+static std::atomic<bool> g_rainAvailable{ false };
+static std::atomic<bool> g_snowTableAvailable{ false };
+static std::atomic<bool> g_windAvailable{ false };
+static std::atomic<bool> g_cloudAvailable{ false };
 static std::atomic<bool> g_weatherClear{ false };
 static std::atomic<bool> g_rainOverride{ false };
 static std::atomic<float> g_rainValue{ 0.0f };
 static std::atomic<bool> g_snowOverride{ false };
 static std::atomic<float> g_snowValue{ 0.0f };
-static bool g_snowWasOverridden = false;
-static int g_snowCleanupTicks = 0;
 static std::atomic<bool> g_cloudOverride{ false };
 static std::atomic<float> g_cloudValue{ 1.0f };
 static std::atomic<bool> g_windOverride{ false };
 static std::atomic<float> g_windMultiplier{ 1.0f };
 
+// per-field override state, touched only inside the compose hook (one game thread)
+struct FieldState { uintptr_t base; float native; float written; bool active; };
+static FieldState g_field[FCount] = {};
+
 static long long __fastcall HookWeatherCompose(long long weatherState, float dt);
 static void __fastcall HookWeatherTick(long long self, float dt);
-static uintptr_t ResolveWeatherTick(bool& is201);
 
 static float Clamp(float v, float lo, float hi) {
     return std::max(lo, std::min(hi, v));
 }
 
-static uintptr_t RipTarget6(uintptr_t instruction) {
-    int32_t disp = 0;
-    if (!ReadBytes(instruction + 2, &disp, sizeof(disp))) return 0;
-    return instruction + 6 + static_cast<intptr_t>(disp);
-}
-
-static uintptr_t CallTarget(uintptr_t instruction) {
-    uint8_t op = 0;
-    int32_t disp = 0;
-    if (!ReadBytes(instruction, &op, 1) || op != 0xE8 ||
-        !ReadBytes(instruction + 1, &disp, sizeof(disp))) return 0;
-    return instruction + 5 + static_cast<intptr_t>(disp);
-}
-
-static uintptr_t FunctionStartOf(uintptr_t address) {
-    if (!g_base || address < g_base) return 0;
+static const RUNTIME_FUNCTION* PdataTable(size_t& count) {
+    count = 0;
+    if (!g_base) return nullptr;
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(g_base);
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(g_base + dos->e_lfanew);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-    auto* table = reinterpret_cast<RUNTIME_FUNCTION*>(g_base + dir.VirtualAddress);
-    const size_t count = dir.Size / sizeof(RUNTIME_FUNCTION);
-    const uintptr_t rva = address - g_base;
-    size_t lo = 0, hi = count;
-    while (lo < hi) {
-        const size_t mid = (lo + hi) / 2;
-        if (table[mid].BeginAddress <= rva) lo = mid + 1; else hi = mid;
-    }
-    if (!lo) return 0;
-    RUNTIME_FUNCTION fn = table[lo - 1];
-    if (!(fn.BeginAddress <= rva && rva < fn.EndAddress)) return 0;
+    count = dir.Size / sizeof(RUNTIME_FUNCTION);
+    return reinterpret_cast<const RUNTIME_FUNCTION*>(g_base + dir.VirtualAddress);
+}
+
+// Root function start of one pdata entry, following UNW_FLAG_CHAININFO (MSVC splits big functions into chained fragments).
+static uintptr_t RootOfEntry(RUNTIME_FUNCTION fn) {
     for (int depth = 0; depth < 16; ++depth) {
 #ifdef __MINGW32__
         const uint32_t unwindRva = fn.UnwindData;
@@ -147,6 +148,37 @@ static uintptr_t FunctionStartOf(uintptr_t address) {
         fn = chained;
     }
     return g_base + fn.BeginAddress;
+}
+
+static size_t PdataIndexOf(uintptr_t address, const RUNTIME_FUNCTION* table, size_t count) {
+    const uintptr_t rva = address - g_base;
+    size_t lo = 0, hi = count;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (table[mid].BeginAddress <= rva) lo = mid + 1; else hi = mid;
+    }
+    if (!lo || !(table[lo - 1].BeginAddress <= rva && rva < table[lo - 1].EndAddress)) return SIZE_MAX;
+    return lo - 1;
+}
+
+static uintptr_t FunctionStartOf(uintptr_t address) {
+    size_t count = 0;
+    const RUNTIME_FUNCTION* table = PdataTable(count);
+    if (!table || address < g_base) return 0;
+    const size_t i = PdataIndexOf(address, table, count);
+    return i == SIZE_MAX ? 0 : RootOfEntry(table[i]);
+}
+
+// End of a function including every chained fragment that directly follows it: the bounded window for code scans.
+static uintptr_t FunctionEndOf(uintptr_t start) {
+    size_t count = 0;
+    const RUNTIME_FUNCTION* table = PdataTable(count);
+    if (!table || start < g_base) return 0;
+    size_t i = PdataIndexOf(start, table, count);
+    if (i == SIZE_MAX || g_base + table[i].BeginAddress != start) return 0;
+    uintptr_t end = g_base + table[i].EndAddress;
+    for (++i; i < count && RootOfEntry(table[i]) == start; ++i) end = g_base + table[i].EndAddress;
+    return end;
 }
 
 static std::vector<uintptr_t> FindDirectCallsites(uintptr_t target, size_t cap = 8) {
@@ -207,6 +239,20 @@ static std::vector<int> ParsePattern(const char* text) {
     return out;
 }
 
+static bool MatchAt(const uint8_t* at, const std::vector<int>& pat) {
+    for (size_t j = 0; j < pat.size(); ++j)
+        if (pat[j] >= 0 && at[j] != static_cast<uint8_t>(pat[j])) return false;
+    return true;
+}
+
+// Pattern check at one address (a call target), through a guarded copy so a bad target cannot fault.
+static bool MatchesAt(uintptr_t address, const char* pattern) {
+    const std::vector<int> pat = ParsePattern(pattern);
+    uint8_t buf[128] = {};
+    if (pat.empty() || pat.size() > sizeof(buf) || !ReadBytes(address, buf, pat.size())) return false;
+    return MatchAt(buf, pat);
+}
+
 static std::vector<uintptr_t> ScanAll(const char* pattern, size_t cap = 32) {
     std::vector<uintptr_t> hits;
     const std::vector<int> pat = ParsePattern(pattern);
@@ -220,13 +266,8 @@ static std::vector<uintptr_t> ScanAll(const char* pattern, size_t cap = 32) {
         const uint8_t* start = reinterpret_cast<const uint8_t*>(g_base + sec[i].VirtualAddress);
         const size_t size = sec[i].Misc.VirtualSize;
         if (size < pat.size()) continue;
-        for (size_t k = 0; k + pat.size() <= size && hits.size() < cap; ++k) {
-            bool ok = true;
-            for (size_t j = 0; j < pat.size(); ++j) {
-                if (pat[j] >= 0 && start[k + j] != static_cast<uint8_t>(pat[j])) { ok = false; break; }
-            }
-            if (ok) hits.push_back(reinterpret_cast<uintptr_t>(start + k));
-        }
+        for (size_t k = 0; k + pat.size() <= size && hits.size() < cap; ++k)
+            if (MatchAt(start + k, pat)) hits.push_back(reinterpret_cast<uintptr_t>(start + k));
     }
     return hits;
 }
@@ -240,10 +281,12 @@ static uintptr_t ScanUnique(const char* pattern, const char* label) {
     return hits[0];
 }
 
-static uintptr_t RipTarget7(uintptr_t instruction) {
-    int32_t disp = 0;
-    if (!ReadBytes(instruction + 3, &disp, sizeof(disp))) return 0;
-    return instruction + 7 + static_cast<intptr_t>(disp);
+static uintptr_t FirstUnique(const char* const* patterns, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        const auto hits = ScanAll(patterns[i], 3);
+        if (hits.size() == 1) return hits[0];
+    }
+    return 0;
 }
 
 static bool ReadPointer(uintptr_t address, uintptr_t& value) {
@@ -257,55 +300,250 @@ static bool ReadFloat(uintptr_t address, float& value) {
     return ReadBytes(address, &value, sizeof(value)) && std::isfinite(value);
 }
 
-static bool ResolveEnvManagerGlobal() {
-    // Current 2.01 / game build 1.0.0.2976: WeatherTick itself contains the
-    // authoritative environment-manager global load. Prefer that relationship
-    // over the older standalone signatures below; it is also what current
-    // CrimsonWeather uses for this build.
-    bool is201 = false;
-    const uintptr_t tick = ResolveWeatherTick(is201);
-    if (tick) {
-        const uintptr_t site = tick + (is201 ? 0x0B8 : 0x0B4);
-        uint8_t load[3] = {};
-        if (ReadBytes(site, load, sizeof(load)) && load[0] == 0x48 && load[1] == 0x8B && load[2] == 0x0D) {
-            const uintptr_t global = RipTarget7(site);
-            uintptr_t probe = 0;
-            if (global && ReadBytes(global, &probe, sizeof(probe))) {
-                g_envManagerGlobal = reinterpret_cast<uintptr_t*>(global);
-                g_envGetEntityVt = is201 ? 0x60 : 0x40;
-                Log("[environment] environment manager from weather tick at rva 0x%llx (get-entity vt 0x%llx)",
-                    static_cast<unsigned long long>(global - g_base),
-                    static_cast<unsigned long long>(g_envGetEntityVt));
-                return true;
-            }
+static int32_t Disp32(const uint8_t* p) { int32_t d = 0; memcpy(&d, p, sizeof(d)); return d; }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Resolution
+// ---------------------------------------------------------------------------------------------------------------------
+
+static uintptr_t ResolveWeatherTick() {
+    static const char* patterns[] = {
+        "40 53 48 81 EC C0 00 00 00 C5 F2 58 81 C8 00 00 00 C5 F8 29 B4 24 B0 00 00 00 C5 78 29 54 24 70",
+        "48 8B C4 53 48 81 EC ?? 00 00 00 C5 F2 58 81 C8 00 00 00",
+        "48 8B C4 53 48 81 EC B0 00 00 00 80 3D",
+    };
+    const uintptr_t tick = FirstUnique(patterns, sizeof(patterns) / sizeof(patterns[0]));
+    if (!tick) { Log("[environment] weather tick not uniquely resolved"); return 0; }
+    const uintptr_t end = FunctionEndOf(tick);
+    if (!end || end <= tick || end - tick > 0x4000) {
+        Log("[environment] weather tick extent not resolved (rva 0x%llx)", static_cast<unsigned long long>(tick - g_base));
+        return 0;
+    }
+    g_tickEnd = end;
+    return tick;
+}
+
+// Node getter shape shared by the rain and snow getters: weatherState->container->child, field at +34.
+static const char* kNodeGetterShape =
+    "48 8B 51 ?? 4C 8B D1 48 85 D2 B9 40 00 00 00 48 8D 42 18 48 0F 44 C1 41 80 7A 31 00 4C 8B 08 4D 8D 81 ?? ?? 00 00";
+// Wind getter: blend at +41, speed at +52, their null-node defaults (field+0x28) at +24 / +15.
+static const char* kWindGetterShape =
+    "48 8B 41 ?? 41 B8 40 00 00 00 48 85 C0 41 B9 ?? ?? 00 00 48 8D 50 18 B8 ?? ?? 00 00 49 0F 44 D0 4C 8B 02 4D 85 C0 "
+    "49 8D 90 ?? ?? 00 00 48 0F 44 D0 49 8D 80 ?? ?? 00 00 49 0F 44 C1";
+
+static bool ResolveRainGetter() {
+    // Only the two exact variants: the old third pattern (7 bytes) was generic enough to hit unrelated code after a patch.
+    static const char* rainPatterns[] = {
+        "48 8B 51 60 4C 8B D1 48 85 D2 B9 40 00 00 00 48 8D 42 18 48 0F 44 C1 41 80 7A 31 00 4C 8B 08 4D 8D 81 6C 01 00 00",
+        "48 8B 51 58 4C 8B D1 48 85 D2 B9 40 00 00 00 48 8D 42 18 48 0F 44 C1 41 80 7A 31 00 4C 8B 08 4D 8D 81 6C 01 00 00",
+    };
+    const uintptr_t getter = FirstUnique(rainPatterns, sizeof(rainPatterns) / sizeof(rainPatterns[0]));
+    if (!getter) { Log("[environment] rain getter not uniquely resolved"); return false; }
+    uint8_t code[38] = {};
+    if (!ReadBytes(getter, code, sizeof(code))) return false;
+    const uint8_t container = code[3];
+    if (container < 0x40 || container > 0x80 || (container & 7)) {
+        Log("[environment] weather container offset rejected: 0x%02x", container);
+        return false;
+    }
+    g_rainGetter = getter;
+    g_weatherNodeContainer = container;
+    g_fieldOff[FRain] = Disp32(code + 34);
+    return true;
+}
+
+// Parses the node getter at `fn` and returns its field, or -1 when the shape / container does not match.
+static ptrdiff_t NodeGetterField(uintptr_t fn) {
+    if (!MatchesAt(fn, kNodeGetterShape)) return -1;
+    uint8_t code[38] = {};
+    if (!ReadBytes(fn, code, sizeof(code)) || code[3] != g_weatherNodeContainer) return -1;
+    const int32_t field = Disp32(code + 34);
+    return field > 0 && field < 0x400 ? field : -1;
+}
+
+// Wind getter: speed and blend from its main path; altitude ratio from the second path after its first ret.
+static bool ParseWindGetter(uintptr_t fn, ptrdiff_t& speed, ptrdiff_t& blend, ptrdiff_t& altitude) {
+    speed = blend = altitude = -1;
+    if (!MatchesAt(fn, kWindGetterShape)) return false;
+    uint8_t code[0x90] = {};
+    if (!ReadBytes(fn, code, sizeof(code)) || code[3] != g_weatherNodeContainer) return false;
+    const int32_t b = Disp32(code + 41), s = Disp32(code + 52);
+    if (Disp32(code + 24) != b + 0x28 || Disp32(code + 15) != s + 0x28) return false;
+    size_t ret = 0;
+    for (size_t i = 60; i < sizeof(code); ++i) if (code[i] == 0xC3) { ret = i; break; }
+    for (size_t i = ret ? ret + 1 : sizeof(code); i + 12 <= sizeof(code); ++i) {
+        // lea rax,[r8+disp32] ; mov edx,disp+0x28 (null-node default)
+        if (code[i] == 0x49 && code[i + 1] == 0x8D && code[i + 2] == 0x80 && code[i + 7] == 0xBA &&
+            Disp32(code + i + 8) == Disp32(code + i + 3) + 0x28) {
+            altitude = Disp32(code + i + 3);
+            break;
         }
+    }
+    speed = s; blend = b;
+    return true;
+}
+
+// Activation helper validation: it compares handle[id] against the shared null sentinel; this also yields both.
+static bool ParseActivate(uintptr_t fn, int*& sentinel, ptrdiff_t& handleBase) {
+    uint8_t code[0x80] = {};
+    if (!ReadBytes(fn, code, sizeof(code))) return false;
+    for (size_t i = 0; i + 13 <= sizeof(code); ++i) {
+        // mov eax,[rip+x] ; cmp [rcx+rbx*4+disp32],eax
+        if (code[i] != 0x8B || code[i + 1] != 0x05 ||
+            code[i + 6] != 0x39 || code[i + 7] != 0x84 || code[i + 8] != 0x99) continue;
+        const int32_t base = Disp32(code + i + 9);
+        if (base < 0x40 || base > 0x400 || (base & 3)) return false;
+        const uintptr_t at = fn + i + 6 + static_cast<intptr_t>(Disp32(code + i + 2));
+        int value = 0;
+        if (!ReadBytes(at, &value, sizeof(value))) return false;
+        sentinel = reinterpret_cast<int*>(at);
+        handleBase = base;
+        return true;
+    }
+    return false;
+}
+
+// Reads the effect id and slot pair the tick loads right before calling the activation helper at `call`.
+static bool ParseActivateSite(const uint8_t* code, size_t call, int& id, ptrdiff_t& slotA, ptrdiff_t& slotB) {
+    id = -1; slotA = slotB = -1;
+    const size_t from = call > 0x28 ? call - 0x28 : 0;
+    for (size_t i = from; i < call; ++i) {
+        const uint8_t* p = code + i;
+        if (i + 4 <= call && p[0] == 0x4C && p[1] == 0x8D && p[2] == 0x4B) slotB = p[3];              // lea r9,[rbx+ib]
+        if (i + 7 <= call && p[0] == 0x4C && p[1] == 0x8D && p[2] == 0x8B) slotB = Disp32(p + 3);      // lea r9,[rbx+id]
+        if (i + 4 <= call && p[0] == 0x4C && p[1] == 0x8D && p[2] == 0x43) slotA = p[3];              // lea r8,[rbx+ib]
+        if (i + 7 <= call && p[0] == 0x4C && p[1] == 0x8D && p[2] == 0x83) slotA = Disp32(p + 3);      // lea r8,[rbx+id]
+        if (i + 2 <= call && p[0] == 0x33 && p[1] == 0xD2) id = 0;                                     // xor edx,edx
+        if (i + 5 <= call && p[0] == 0xBA) { const int32_t v = Disp32(p + 1); if (v >= 0 && v < 9) id = v; } // mov edx,imm
+    }
+    return id >= 0 && slotA > 0 && slotB == slotA + 8 && slotA < 0x400;
+}
+
+// One bounded pass over the weather tick: every relationship is taken from a call whose target was resolved separately.
+static void ScanWeatherTick() {
+    const size_t size = g_tickEnd - g_tick;
+    std::vector<uint8_t> code(size);
+    if (!ReadBytes(g_tick, code.data(), size)) return;
+
+    // 1) env global, get-entity slot and weather-state field: mov rcx,[rip+g]; mov rax,[rcx]; call [rax+s]; mov rcx,[rax+f]; call rain
+    for (size_t k = 20; k + 5 <= size; ++k) {
+        if (code[k] != 0xE8 || g_tick + k + 5 + static_cast<intptr_t>(Disp32(&code[k + 1])) != g_rainGetter) continue;
+        const uint8_t* p = &code[k - 20];
+        if (!(p[0] == 0x48 && p[1] == 0x8B && p[2] == 0x0D && p[7] == 0x48 && p[8] == 0x8B && p[9] == 0x01 &&
+              p[10] == 0xFF && p[11] == 0x50 && p[13] == 0x48 && p[14] == 0x8B && p[15] == 0x88)) continue;
+        const uintptr_t global = g_tick + (k - 20) + 7 + static_cast<intptr_t>(Disp32(p + 3));
+        const ptrdiff_t slot = p[12], state = Disp32(p + 16);
+        if (g_envManagerGlobal && (reinterpret_cast<uintptr_t>(g_envManagerGlobal) != global ||
+                                   slot != g_envGetEntityVt || state != g_entityWeatherState)) {
+            Log("[environment] weather tick loads the environment inconsistently; environment manager rejected");
+            g_envManagerGlobal = nullptr; g_envGetEntityVt = -1; g_entityWeatherState = -1;
+            break;
+        }
+        uintptr_t probe = 0;
+        if (!ReadBytes(global, &probe, sizeof(probe))) break;
+        g_envManagerGlobal = reinterpret_cast<uintptr_t*>(global);
+        g_envGetEntityVt = slot;
+        g_entityWeatherState = state;
     }
 
-    // Exact variants observed across the same game family. Keeping them narrow
-    // makes this optional feature fail closed after a patch instead of guessing.
-    struct EnvPattern { const char* pattern; ptrdiff_t getEntityVt; };
-    static const EnvPattern patterns[] = {
-        { "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 50 60 48 8B 88 E0 0E 00 00", 0x60 },
-        { "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 50 40 48 8B 88 F0 0E 00 00", 0x40 },
-        { "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 50 40 48 8B 88 D8 0E 00 00", 0x40 },
-        { "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 50 40 48 8B 88 E0 0E 00 00", 0x40 },
-    };
-    for (const auto& p : patterns) {
-        const auto hits = ScanAll(p.pattern, 3);
-        if (hits.size() != 1) continue;
-        const uintptr_t global = RipTarget7(hits[0]);
-        uintptr_t probe = 0;
-        if (global && ReadBytes(global, &probe, sizeof(probe))) {
-            g_envManagerGlobal = reinterpret_cast<uintptr_t*>(global);
-            g_envGetEntityVt = p.getEntityVt;
-            Log("[environment] environment manager global resolved at rva 0x%llx (get-entity vt 0x%llx)",
-                static_cast<unsigned long long>(global - g_base),
-                static_cast<unsigned long long>(g_envGetEntityVt));
-            return true;
+    // 2) particle manager field: mov rcx,[rax+f]; call SetEffectIntensity (the signature-resolved one); all sites must agree
+    ptrdiff_t particle = -1;
+    bool particleOk = g_intensityFn != 0;
+    for (size_t k = 7; particleOk && k + 5 <= size; ++k) {
+        if (code[k] != 0xE8 || g_tick + k + 5 + static_cast<intptr_t>(Disp32(&code[k + 1])) != g_intensityFn) continue;
+        const uint8_t* p = &code[k - 7];
+        if (!(p[0] == 0x48 && p[1] == 0x8B && p[2] == 0x88)) { particleOk = false; break; }
+        const ptrdiff_t f = Disp32(p + 3);
+        if (particle >= 0 && particle != f) particleOk = false;
+        particle = f;
+        // the handle the tick passes: mov edx,[rbx+disp32] shortly before; records which handles the layout covers
+        for (size_t i = k > 0x20 ? k - 0x20 : 0; i + 6 <= k; ++i) {
+            if (code[i] != 0x8B || code[i + 1] != 0x93) continue;
+            const int32_t h = Disp32(&code[i + 2]);
+            if (g_effectHandleBase >= 0 && h >= g_effectHandleBase && ((h - g_effectHandleBase) & 3) == 0 &&
+                (h - g_effectHandleBase) / 4 < 9)
+                g_effectHandleMask |= 1u << ((h - g_effectHandleBase) / 4);
         }
     }
-    Log("[environment] environment manager global not resolved");
-    return false;
+    if (particleOk && particle > 0) g_entityParticleMgr = particle;
+
+    // 3) weather getters called on [entity+weatherState]: exactly one other node getter (snow) and one wind getter
+    if (g_entityWeatherState > 0) {
+        uintptr_t snow = 0, wind = 0;
+        bool snowAmbiguous = false, windAmbiguous = false;
+        size_t snowSite = 0;
+        for (size_t k = 7; k + 5 <= size; ++k) {
+            if (code[k] != 0xE8) continue;
+            const uint8_t* p = &code[k - 7];
+            if (!(p[0] == 0x48 && p[1] == 0x8B && p[2] == 0x88 && Disp32(p + 3) == g_entityWeatherState)) continue;
+            const uintptr_t target = g_tick + k + 5 + static_cast<intptr_t>(Disp32(&code[k + 1]));
+            if (target == g_rainGetter) continue;
+            const ptrdiff_t f = NodeGetterField(target);
+            if (f >= 0 && f != g_fieldOff[FRain]) {
+                if (snow && snow != target) snowAmbiguous = true;
+                if (!snow) snowSite = k;
+                snow = target;
+                continue;
+            }
+            ptrdiff_t s, b, a;
+            if (ParseWindGetter(target, s, b, a)) {
+                if (wind && wind != target) windAmbiguous = true;
+                wind = target;
+            }
+        }
+        // snow semantics: the tick starts effect 2 (the snow effect) right after reading this getter
+        bool snowFeedsEffect2 = false;
+        if (snow && !snowAmbiguous && g_activateFn) {
+            for (size_t k = snowSite + 5; k + 5 <= size && k < snowSite + 0x80; ++k) {
+                if (code[k] != 0xE8 || g_tick + k + 5 + static_cast<intptr_t>(Disp32(&code[k + 1])) != g_activateFn) continue;
+                int id; ptrdiff_t a, b;
+                snowFeedsEffect2 = ParseActivateSite(code.data(), k, id, a, b) && id == 2;
+                break;
+            }
+        }
+        if (snow && !snowAmbiguous && snowFeedsEffect2) { g_snowGetter = snow; g_fieldOff[FSnow] = NodeGetterField(snow); }
+        else Log("[environment] snow getter not derived from the weather tick (found=%d ambiguous=%d effect2=%d)",
+                 snow != 0, snowAmbiguous, snowFeedsEffect2);
+        if (wind && !windAmbiguous) {
+            ptrdiff_t s, b, a;
+            ParseWindGetter(wind, s, b, a);
+            g_windGetter = wind;
+            g_fieldOff[FWindSpeed] = s;
+            g_fieldOff[FWindBlend] = b;
+            g_fieldOff[FWindAltitude] = a;  // -1 when the altitude path was not found: that field is then left alone
+        } else {
+            Log("[environment] wind getter not derived from the weather tick (found=%d ambiguous=%d)", wind != 0, windAmbiguous);
+        }
+    }
+}
+
+// Activation helper: the call target in the tick that has the handle/sentinel compare, then its slot pairs per effect id.
+static void ResolveEffectLayout() {
+    const size_t size = g_tickEnd - g_tick;
+    std::vector<uint8_t> code(size);
+    if (!ReadBytes(g_tick, code.data(), size)) return;
+    for (size_t k = 0; k + 5 <= size && !g_activateFn; ++k) {
+        if (code[k] != 0xE8) continue;
+        const uintptr_t target = g_tick + k + 5 + static_cast<intptr_t>(Disp32(&code[k + 1]));
+        if (target == g_intensityFn || target == g_rainGetter || target < g_base) continue;
+        int* sentinel = nullptr; ptrdiff_t base = -1;
+        int id; ptrdiff_t a, b;
+        if (!ParseActivateSite(code.data(), k, id, a, b) || !ParseActivate(target, sentinel, base)) continue;
+        g_activateFn = target; g_nullSentinel = sentinel; g_effectHandleBase = base;
+    }
+    if (!g_activateFn) return;
+    for (size_t k = 0; k + 5 <= size; ++k) {
+        if (code[k] != 0xE8 || g_tick + k + 5 + static_cast<intptr_t>(Disp32(&code[k + 1])) != g_activateFn) continue;
+        int id; ptrdiff_t a, b;
+        if (!ParseActivateSite(code.data(), k, id, a, b)) continue;
+        if (g_effectSlotA[id] >= 0 && (g_effectSlotA[id] != a || g_effectSlotB[id] != b)) {
+            Log("[environment] effect %d has conflicting activation slots; effect layout rejected", id);
+            for (int i = 0; i < 9; ++i) g_effectSlotA[i] = g_effectSlotB[i] = -1;
+            g_activateFn = 0;
+            return;
+        }
+        g_effectSlotA[id] = a; g_effectSlotB[id] = b;
+    }
 }
 
 static bool ExtractTimeStoreOffset(uintptr_t functionLikeHit, ptrdiff_t& out) {
@@ -315,8 +553,7 @@ static bool ExtractTimeStoreOffset(uintptr_t functionLikeHit, ptrdiff_t& out) {
         const bool sse = code[i] == 0xF3 && code[i + 1] == 0x0F && code[i + 2] == 0x11 && code[i + 3] == 0x8B;
         const bool vex = code[i] == 0xC5 && code[i + 1] == 0xFA && code[i + 2] == 0x11 && code[i + 3] == 0x8B;
         if (!sse && !vex) continue;
-        int32_t disp = 0;
-        memcpy(&disp, code + i + 4, sizeof(disp));
+        const int32_t disp = Disp32(code + i + 4);
         if (disp >= 0x200 && disp <= 0x800) {
             out = static_cast<ptrdiff_t>(disp);
             return true;
@@ -325,60 +562,14 @@ static bool ExtractTimeStoreOffset(uintptr_t functionLikeHit, ptrdiff_t& out) {
     return false;
 }
 
-static uintptr_t FirstUnique(const char* const* patterns, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        const auto hits = ScanAll(patterns[i], 3);
-        if (hits.size() == 1) return hits[0];
-    }
-    return 0;
-}
-
-static void ResolveTimeVtableOffsets() {
-    static const char* patterns[] = {
-        "48 8B 49 30 48 8B 01 FF 90 ?? ?? ?? ?? 48 8B 4B 30 0F 28 F0 F3 0F 59 35 ?? ?? ?? ?? 48 8B 01 F3 0F 59 35 ?? ?? ?? ?? FF 50 ?? 0F 28 CE 48 8B C8 48 8B 10",
-        "48 8B 49 30 48 8B 01 FF 90 ?? ?? ?? ?? 48 8B 4B 30 0F 28 F0 48 8B 01 FF 50 ?? 0F 28 CE 48 8B C8 48 8B 10",
-        "48 8B 49 30 48 8B 01 FF 90 ?? ?? ?? ?? 48 8B 4B 30 C5 FA 59 0D ?? ?? ?? ?? C5 F2 59 35 ?? ?? ?? ?? 48 8B 01 FF 50 ?? C5 F8 28 CE 48 8B C8 48 8B 10",
-    };
-    const uintptr_t hit = FirstUnique(patterns, sizeof(patterns) / sizeof(patterns[0]));
-    if (!hit) {
-        Log("[environment] time vtable layout: using defaults entity=0x%llx get=0x%llx set=0x%llx",
-            static_cast<unsigned long long>(g_envGetEntityVt),
-            static_cast<unsigned long long>(g_envGetTimeVt),
-            static_cast<unsigned long long>(g_entitySetTimeVt));
-        return;
-    }
-    const uintptr_t fn = FunctionStartOf(hit);
-    uint8_t code[0x120] = {};
-    if (!fn || !ReadBytes(fn, code, sizeof(code))) return;
-    ptrdiff_t getEntity = 0, getTime = 0, setTime = 0;
-    for (size_t i = 0; i + 6 <= sizeof(code); ++i) {
-        if (!getTime && code[i] == 0xFF && code[i + 1] == 0x90) {
-            int32_t d = 0; memcpy(&d, code + i + 2, sizeof(d));
-            if (d > 0x80 && d < 0x300 && (d % 8) == 0) getTime = d;
-        }
-        if (!setTime && code[i] == 0xFF && (code[i + 1] == 0xA2 || code[i + 1] == 0x92)) {
-            int32_t d = 0; memcpy(&d, code + i + 2, sizeof(d));
-            if (d > 0x80 && d < 0x300 && (d % 8) == 0) setTime = d;
-        }
-    }
-    for (size_t i = 0; i + 3 <= sizeof(code); ++i) {
-        if (code[i] == 0xFF && code[i + 1] == 0x50) {
-            const ptrdiff_t d = static_cast<uint8_t>(code[i + 2]);
-            if (d == g_envGetEntityVt) { getEntity = d; break; }
-        }
-    }
-    if (getEntity == g_envGetEntityVt && getTime && setTime && getTime != setTime) {
-        g_envGetTimeVt = getTime;
-        g_entitySetTimeVt = setTime;
-        Log("[environment] time vtable layout entity=0x%llx get=0x%llx set=0x%llx",
-            static_cast<unsigned long long>(g_envGetEntityVt),
-            static_cast<unsigned long long>(g_envGetTimeVt),
-            static_cast<unsigned long long>(g_entitySetTimeVt));
-    } else {
-        Log("[environment] time vtable derivation rejected; using defaults get=0x%llx set=0x%llx",
-            static_cast<unsigned long long>(g_envGetTimeVt),
-            static_cast<unsigned long long>(g_entitySetTimeVt));
-    }
+// get-entity slot the setter calls (mov rax,[rcx]; call [rax+ib]) must match the one the weather tick uses
+static ptrdiff_t SetterGetEntitySlot(uintptr_t hit) {
+    uint8_t code[0x30] = {};
+    if (!ReadBytes(hit, code, sizeof(code))) return -1;
+    for (size_t i = 0; i + 6 <= sizeof(code); ++i)
+        if (code[i] == 0x48 && code[i + 1] == 0x8B && code[i + 2] == 0x01 && code[i + 3] == 0xFF && code[i + 4] == 0x50)
+            return code[i + 5];
+    return -1;
 }
 
 static bool ResolveTimeLayout() {
@@ -405,120 +596,73 @@ static bool ResolveTimeLayout() {
             static_cast<unsigned long long>(lower), static_cast<unsigned long long>(upper));
         return false;
     }
+    if (SetterGetEntitySlot(lowHit) != g_envGetEntityVt || SetterGetEntitySlot(highHit) != g_envGetEntityVt) {
+        Log("[environment] time-limit setters use get-entity slot 0x%llx/0x%llx, weather tick 0x%llx; time control disabled",
+            static_cast<unsigned long long>(SetterGetEntitySlot(lowHit)), static_cast<unsigned long long>(SetterGetEntitySlot(highHit)),
+            static_cast<unsigned long long>(g_envGetEntityVt));
+        return false;
+    }
+
+    // Entity "advance time" virtual: mov rax,[rcx]; vaddss xmm1,xmm1,[rcx+current]; vmovss xmm2,[rip+eps]; jmp [rax+setTime].
+    // It names both the current-time field and the set-time slot with its (entity, value, epsilon) ABI; no other source
+    // for those exists on build 2976 (the old defaults 0x130/0x178 point at unrelated virtuals there).
+    const uintptr_t add = ScanUnique(
+        "48 8B 01 C5 F2 58 89 ?? ?? 00 00 C5 FA 10 15 ?? ?? ?? ?? 48 FF A0 ?? ?? 00 00", "time advance virtual");
+    uint8_t code[26] = {};
+    if (!add || !ReadBytes(add, code, sizeof(code))) {
+        Log("[environment] time advance virtual not resolved; time control disabled");
+        return false;
+    }
+    const ptrdiff_t current = Disp32(code + 7);
+    const ptrdiff_t setSlot = Disp32(code + 22);
+    float eps = NAN;
+    const uintptr_t epsAt = add + 19 + static_cast<intptr_t>(Disp32(code + 15));
+    if (current != lower - 4 || setSlot <= 0 || setSlot > 0x800 || (setSlot & 7) ||
+        !ReadFloat(epsAt, eps) || eps <= 0.0f || eps >= 1.0f) {
+        Log("[environment] time advance virtual rejected (current=0x%llx lower=0x%llx slot=0x%llx eps=%g); time control disabled",
+            static_cast<unsigned long long>(current), static_cast<unsigned long long>(lower),
+            static_cast<unsigned long long>(setSlot), eps);
+        return false;
+    }
 
     g_timeLower = lower;
     g_timeUpper = upper;
-    g_timeCurrentA = lower - 4;
-    g_timeCurrentB = lower - 8;
-    Log("[environment] visual-time fields lower=0x%llx upper=0x%llx current=0x%llx/0x%llx",
-        static_cast<unsigned long long>(g_timeLower),
-        static_cast<unsigned long long>(g_timeUpper),
-        static_cast<unsigned long long>(g_timeCurrentA),
-        static_cast<unsigned long long>(g_timeCurrentB));
-    ResolveTimeVtableOffsets();
+    g_timeCurrent = current;
+    g_timeAddFn = add;
+    g_entitySetTimeVt = setSlot;
+    g_timeSetEpsilon = eps;
+    Log("[environment] visual-time fields lower=0x%llx upper=0x%llx current=0x%llx, set-time vt 0x%llx (eps %g)",
+        static_cast<unsigned long long>(g_timeLower), static_cast<unsigned long long>(g_timeUpper),
+        static_cast<unsigned long long>(g_timeCurrent), static_cast<unsigned long long>(g_entitySetTimeVt), eps);
     return true;
 }
 
-static uintptr_t ResolveWeatherTick(bool& is201) {
-    is201 = false;
-    const auto current = ScanAll(
-        "40 53 48 81 EC C0 00 00 00 C5 F2 58 81 C8 00 00 00 C5 F8 29 B4 24 B0 00 00 00 C5 78 29 54 24 70", 3);
-    if (current.size() == 1) { is201 = true; return current[0]; }
-    const auto legacyA = ScanAll("48 8B C4 53 48 81 EC ?? 00 00 00 C5 F2 58 81 C8 00 00 00", 3);
-    if (legacyA.size() == 1) return legacyA[0];
-    const auto legacyB = ScanAll("48 8B C4 53 48 81 EC B0 00 00 00 80 3D", 3);
-    if (legacyB.size() == 1) return legacyB[0];
-    Log("[environment] weather tick not uniquely resolved");
-    return 0;
+// Atmosphere fields from the weather summary reader: it reads container->atmosphere, calls the rain and snow getters,
+// then reads cloud (plain), mie aerosol (min/scaled) and the fog term (max with it), each with its null-node default.
+static void ResolveAtmosphere() {
+    const uintptr_t hit = ScanUnique(
+        "48 8B 41 ?? 48 8D 50 ?? 41 B8 ?? 00 00 00 48 85 C0 49 0F 44 D0 48 8B 1A E8 ?? ?? ?? ?? C5 FA 11 45 ?? 49 8B 4B ?? "
+        "E8 ?? ?? ?? ?? C5 FA 11 45 ?? 49 8B 4B ?? E8 ?? ?? ?? ?? C5 FA 11 45 ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 85 DB "
+        "48 0F 44 C1 C5 FA 10 00 C5 FA 11 45 ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 0F 44 C1 C5 FA 10 00 C5 FA 5D 0D ?? ?? ?? ?? "
+        "C5 F2 59 15 ?? ?? ?? ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 0F 44 C1 C5 FA 10 00 C5 FA 5F CA",
+        "weather summary reader");
+    uint8_t code[150] = {};
+    if (!hit || !ReadBytes(hit, code, sizeof(code))) { Log("[environment] atmosphere fields not derived; cloud control disabled"); return; }
+    const uintptr_t call1 = hit + 24 + 5 + static_cast<intptr_t>(Disp32(code + 25));
+    const uintptr_t call2 = hit + 38 + 5 + static_cast<intptr_t>(Disp32(code + 39));
+    const ptrdiff_t slot = code[7];
+    const int32_t cloud = Disp32(code + 65), mie = Disp32(code + 93), fog = Disp32(code + 129);
+    const bool ok = code[3] == g_weatherNodeContainer && Disp32(code + 10) == slot + 0x28 &&
+                    call1 == g_rainGetter && (!g_snowGetter || call2 == g_snowGetter) &&
+                    Disp32(code + 70) == cloud + 0x28 && Disp32(code + 98) == mie + 0x28 && Disp32(code + 134) == fog + 0x28;
+    if (!ok) { Log("[environment] weather summary reader did not validate; cloud control disabled"); return; }
+    g_weatherAtmosphereSlot = slot;
+    g_fieldOff[FCloud] = cloud;
+    g_fieldOff[FMie] = mie;
+    g_fieldOff[FFog] = fog;
 }
 
-static bool ResolveWeatherEffects() {
-    bool is201 = false;
-    const uintptr_t tick = ResolveWeatherTick(is201);
-    if (!tick) return false;
-
-    uintptr_t activate = CallTarget(tick + (is201 ? 0x159 : 0x2AA));
-    uintptr_t intensity = CallTarget(tick + (is201 ? 0x17C : 0x2CC));
-    if (!activate) {
-        const auto hits = ScanAll(
-            "4C 8B DC 49 89 5B 08 49 89 6B 10 49 89 73 18 57 48 83 EC 40 49 8B F1 48 8B F9 49 8B 00 4C 8B 10", 3);
-        if (hits.size() == 1) activate = hits[0];
-    }
-    if (!intensity) {
-        const auto hits = ScanAll("89 54 24 10 53 48 83 EC 30 83 79 0C 00 48 8B D9 C5 F8 29 74 24 20", 3);
-        if (hits.size() == 1) intensity = hits[0];
-    }
-
-    int* sentinel = nullptr;
-    // Prefer deriving the shared null-handle sentinel from the activation helper
-    // itself. Besides finding the pointer, this validates the 0xFC handle-array
-    // layout that SetEffectIntensity relies on.
-    if (activate) {
-        uint8_t code[0x80] = {};
-        if (ReadBytes(activate, code, sizeof(code))) {
-            for (size_t i = 0; i + 13 <= sizeof(code); ++i) {
-                if (code[i] != 0x8B || code[i + 1] != 0x05 ||
-                    code[i + 6] != 0x39 || code[i + 7] != 0x84 || code[i + 8] != 0x99) continue;
-                uint32_t handleOff = 0;
-                memcpy(&handleOff, code + i + 9, sizeof(handleOff));
-                if (handleOff != 0xFC) continue;
-                int32_t disp = 0;
-                memcpy(&disp, code + i + 2, sizeof(disp));
-                const uintptr_t at = activate + i + 6 + static_cast<intptr_t>(disp);
-                int value = 0;
-                if (ReadBytes(at, &value, sizeof(value))) sentinel = reinterpret_cast<int*>(at);
-                break;
-            }
-        }
-    }
-    if (!sentinel) {
-        const auto sentinelHits = ScanAll("8B 05 ?? ?? ?? ?? 48 8B F9 39 01", 3);
-        if (sentinelHits.size() == 1) {
-            const uintptr_t at = RipTarget6(sentinelHits[0]);
-            int value = 0;
-            if (at && ReadBytes(at, &value, sizeof(value))) sentinel = reinterpret_cast<int*>(at);
-        }
-    }
-    if (!activate || !intensity || !sentinel) {
-        Log("[environment] snow effect bridge incomplete (tick=%p activate=%p intensity=%p sentinel=%p)",
-            reinterpret_cast<void*>(tick), reinterpret_cast<void*>(activate),
-            reinterpret_cast<void*>(intensity), reinterpret_cast<void*>(sentinel));
-        return false;
-    }
-
-    g_activateEffect = reinterpret_cast<ActivateEffectFn>(activate);
-    g_setIntensity = reinterpret_cast<SetIntensityFn>(intensity);
-    g_nullSentinel = sentinel;
-    if (!InstallInternalHook(reinterpret_cast<void*>(tick), reinterpret_cast<void*>(&HookWeatherTick),
-                             reinterpret_cast<void**>(&g_origWeatherTick), "environment weather tick")) {
-        g_activateEffect = nullptr; g_setIntensity = nullptr; g_nullSentinel = nullptr;
-        return false;
-    }
-    Log("[environment] snow/particle bridge ready (tick rva 0x%llx)",
-        static_cast<unsigned long long>(tick - g_base));
-    return true;
-}
-
-static bool ResolveWeatherLayout() {
-    uintptr_t rainGetter = 0;
-    static const char* rainPatterns[] = {
-        "48 8B 51 60 4C 8B D1 48 85 D2 B9 40 00 00 00 48 8D 42 18 48 0F 44 C1 41 80 7A 31 00 4C 8B 08 4D 8D 81 6C 01 00 00",
-        "48 8B 51 58 4C 8B D1 48 85 D2 B9 40 00 00 00 48 8D 42 18 48 0F 44 C1 41 80 7A 31 00 4C 8B 08 4D 8D 81 6C 01 00 00",
-        "48 8B 51 50 4C 8B D1",
-    };
-    for (const char* pattern : rainPatterns) {
-        const auto hits = ScanAll(pattern, 3);
-        if (hits.size() == 1) { rainGetter = hits[0]; break; }
-    }
-    if (!rainGetter) Log("[environment] rain getter not uniquely resolved");
-    if (!rainGetter) return false;
-    uint8_t container = 0;
-    if (!ReadBytes(rainGetter + 3, &container, 1) || container < 0x40 || container > 0x80 || (container & 7)) {
-        Log("[environment] weather container offset rejected: 0x%02x", container);
-        return false;
-    }
-    g_weatherNodeContainer = container;
-
+static bool ResolveWeatherCompose() {
     const uintptr_t compositor = ScanUnique(
         "48 8B C4 C5 FA 11 48 10 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 88 48 81 EC",
         "weather compositor");
@@ -554,18 +698,39 @@ static bool ResolveWeatherLayout() {
         Log("[environment] weather compose hook failed");
         return false;
     }
-
-    Log("[environment] weather controls ready (compose rva 0x%llx, compositor rva 0x%llx, container 0x%llx)",
+    Log("[environment] weather compose hooked (compose rva 0x%llx, compositor rva 0x%llx, container 0x%llx)",
         static_cast<unsigned long long>(compose - g_base),
         static_cast<unsigned long long>(compositor - g_base),
         static_cast<unsigned long long>(g_weatherNodeContainer));
     return true;
 }
 
+static bool ResolveWeatherEffects() {
+    if (!g_tick || !g_activateFn || !g_intensityFn || !g_nullSentinel || g_entityParticleMgr < 0 ||
+        !g_envManagerGlobal || g_envGetEntityVt < 0 || g_fieldOff[FSnow] < 0 ||
+        g_effectSlotA[2] < 0 || g_effectSlotA[3] < 0 || !(g_effectHandleMask & 0xCu)) {
+        Log("[environment] snow/particle bridge incomplete (activate=%p intensity=%p sentinel=%p particle=0x%llx slots2/3=%d/%d handles=0x%x); snow particles disabled",
+            reinterpret_cast<void*>(g_activateFn), reinterpret_cast<void*>(g_intensityFn), reinterpret_cast<void*>(g_nullSentinel),
+            static_cast<unsigned long long>(g_entityParticleMgr), g_effectSlotA[2] >= 0, g_effectSlotA[3] >= 0, g_effectHandleMask);
+        return false;
+    }
+    if (!InstallInternalHook(reinterpret_cast<void*>(g_tick), reinterpret_cast<void*>(&HookWeatherTick),
+                             reinterpret_cast<void**>(&g_origWeatherTick), "environment weather tick"))
+        return false;
+    Log("[environment] snow/particle bridge ready (tick rva 0x%llx, activate rva 0x%llx, particle mgr 0x%llx, handles 0x%llx mask 0x%x)",
+        static_cast<unsigned long long>(g_tick - g_base), static_cast<unsigned long long>(g_activateFn - g_base),
+        static_cast<unsigned long long>(g_entityParticleMgr), static_cast<unsigned long long>(g_effectHandleBase), g_effectHandleMask);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Runtime
+// ---------------------------------------------------------------------------------------------------------------------
+
 static bool ResolveTimeContext(uintptr_t& envMgr, long long& entity) {
     envMgr = 0;
     entity = 0;
-    if (!g_envManagerGlobal) return false;
+    if (!g_envManagerGlobal || g_envGetEntityVt < 0) return false;
     if (!ReadPointer(reinterpret_cast<uintptr_t>(g_envManagerGlobal), envMgr)) return false;
 
     uintptr_t vt = 0, fn = 0;
@@ -579,20 +744,14 @@ static bool ResolveTimeContext(uintptr_t& envMgr, long long& entity) {
     return entity != 0;
 }
 
-static bool CaptureTimeBaseline(long long entity) {
-    float lo = NAN, hi = NAN;
-    if (!ReadFloat(static_cast<uintptr_t>(entity) + g_timeLower, lo) ||
-        !ReadFloat(static_cast<uintptr_t>(entity) + g_timeUpper, hi) ||
-        hi <= lo + 0.0001f) {
-        return false;
-    }
-    g_timeBaseLower = lo;
-    g_timeBaseUpper = hi;
-    g_timeDomainHours = hi > 1.5f && hi <= 48.0f;
-    g_timeBaselineValid = true;
-    Log("[environment] visual-time baseline %.4f..%.4f (%s)",
-        lo, hi, g_timeDomainHours ? "hours" : "normalized");
-    return true;
+// The entity must carry the advance-time virtual we derived the set-time slot from, otherwise the slot means nothing.
+static bool EntityHasTimeVirtuals(long long entity) {
+    uintptr_t vt = 0, fn = 0;
+    if (!ReadPointer(static_cast<uintptr_t>(entity), vt)) return false;
+    bool found = false;
+    for (ptrdiff_t slot = 0; slot < 0x800 && !found; slot += 8)
+        found = ReadPointer(vt + slot, fn) && fn == g_timeAddFn;
+    return found && ReadPointer(vt + g_entitySetTimeVt, fn) && ExecutablePointer(fn);
 }
 
 static float RawToHour(float raw) {
@@ -603,28 +762,10 @@ static float HourToRaw(float hour) {
     return g_timeDomainHours ? hour : hour / 24.0f;
 }
 
-static bool ReadCurrentHour(uintptr_t envMgr, long long entity, float& hour) {
-    float a = NAN, b = NAN;
-    const bool haveA = ReadFloat(static_cast<uintptr_t>(entity) + g_timeCurrentA, a);
-    const bool haveB = ReadFloat(static_cast<uintptr_t>(entity) + g_timeCurrentB, b);
-    const float pad = (g_timeBaseUpper - g_timeBaseLower) * 0.05f + 0.05f;
-    const auto inRange = [&](float v) {
-        return std::isfinite(v) && v >= g_timeBaseLower - pad && v <= g_timeBaseUpper + pad;
-    };
-    if (haveA && inRange(a)) { hour = RawToHour(a); return true; }
-    if (haveB && inRange(b)) { hour = RawToHour(b); return true; }
-
-    uintptr_t vt = 0, fn = 0;
-    if (!ReadPointer(envMgr, vt) || !ReadPointer(vt + g_envGetTimeVt, fn) || !ExecutablePointer(fn)) return false;
-    auto getTime = reinterpret_cast<EnvGetTimeFn>(fn);
-    double raw = NAN;
-    CDK_GUARD_BEGIN
-        raw = getTime(reinterpret_cast<void*>(envMgr));
-    CDK_GUARD_FAIL
-        raw = NAN;
-    CDK_GUARD_END
-    if (!std::isfinite(raw)) return false;
-    hour = RawToHour(static_cast<float>(raw));
+static bool ReadCurrentHour(long long entity, float& hour) {
+    float raw = NAN;
+    if (!ReadFloat(static_cast<uintptr_t>(entity) + g_timeCurrent, raw)) return false;
+    hour = RawToHour(raw);
     return true;
 }
 
@@ -632,19 +773,43 @@ static bool SetTimeRaw(long long entity, float raw) {
     uintptr_t vt = 0, fn = 0;
     if (!ReadPointer(static_cast<uintptr_t>(entity), vt) || !ReadPointer(vt + g_entitySetTimeVt, fn) || !ExecutablePointer(fn)) return false;
     auto setTime = reinterpret_cast<EntitySetTimeFn>(fn);
+    const float eps = g_timeSetEpsilon;
     bool ok = true;
     CDK_GUARD_BEGIN
-        setTime(entity, raw);
+        setTime(entity, raw, eps);
     CDK_GUARD_FAIL
         ok = false;
     CDK_GUARD_END
     return ok;
 }
 
-static void RestoreTimeLimits(long long entity) {
-    if (!g_timeBaselineValid || !entity) return;
-    WriteBytes(static_cast<uintptr_t>(entity) + g_timeLower, &g_timeBaseLower, sizeof(float));
-    WriteBytes(static_cast<uintptr_t>(entity) + g_timeUpper, &g_timeBaseUpper, sizeof(float));
+// Weather table fields: the native value is kept apart from what we write, so a multiplier cannot compound when the
+// table is not rebuilt, and releasing an override puts back the game's value unless the game already replaced ours.
+static bool FieldNative(int f, uintptr_t base, float& native) {
+    FieldState& s = g_field[f];
+    float cur = NAN;
+    if (g_fieldOff[f] < 0 || !base || !ReadFloat(base + g_fieldOff[f], cur)) return false;
+    if (!s.active || s.base != base || cur != s.written) { s.native = cur; s.base = base; }
+    native = s.native;
+    return true;
+}
+static void FieldWrite(int f, float v) {
+    FieldState& s = g_field[f];
+    if (!std::isfinite(v) || !WriteBytes(s.base + g_fieldOff[f], &v, sizeof(v))) return;
+    s.written = v;
+    s.active = true;
+}
+static void FieldSet(int f, uintptr_t base, float v) {
+    float native = 0.0f;
+    if (FieldNative(f, base, native)) FieldWrite(f, v);
+}
+static void FieldRelease(int f, uintptr_t base) {
+    FieldState& s = g_field[f];
+    if (!s.active) return;
+    s.active = false;
+    float cur = NAN;
+    if (s.base == base && base && ReadFloat(base + g_fieldOff[f], cur) && cur == s.written)
+        WriteBytes(base + g_fieldOff[f], &s.native, sizeof(s.native));
 }
 
 static long long __fastcall HookWeatherCompose(long long weatherState, float dt) {
@@ -656,46 +821,37 @@ static long long __fastcall HookWeatherCompose(long long weatherState, float dt)
     const bool snowOn = g_snowOverride.load(std::memory_order_relaxed);
     const bool cloudOn = g_cloudOverride.load(std::memory_order_relaxed);
     const bool windOn = g_windOverride.load(std::memory_order_relaxed);
-    if (!clear && !rainOn && !snowOn && !cloudOn && !windOn) return result;
+    bool anyActive = false;
+    for (const FieldState& s : g_field) anyActive |= s.active;
+    if (!clear && !rainOn && !snowOn && !cloudOn && !windOn && !anyActive) return result;
 
     uintptr_t parent = 0, child = 0, atmosphere = 0;
     if (!ReadPointer(static_cast<uintptr_t>(weatherState) + g_weatherNodeContainer, parent) ||
-        !ReadPointer(parent + 0x18, child)) {
+        !ReadPointer(parent + kWeatherChildSlot, child)) {
         return result;
     }
-    ReadPointer(parent + 0x20, atmosphere); // atmosphere is optional for rain/snow/wind
+    if (g_weatherAtmosphereSlot >= 0) ReadPointer(parent + g_weatherAtmosphereSlot, atmosphere);
 
+    bool want[FCount] = {};
+    float value[FCount] = {};
     if (clear) {
-        const float zero = 0.0f;
-        WriteBytes(child + kWeatherRain, &zero, sizeof(zero));
-        WriteBytes(child + kWeatherSnow, &zero, sizeof(zero));
-        if (atmosphere) {
-            WriteBytes(atmosphere + kAtmosphereCloudAmount, &zero, sizeof(zero));
-            WriteBytes(atmosphere + kAtmosphereMieAerosolDensity, &zero, sizeof(zero));
-            WriteBytes(atmosphere + kAtmosphereNativeFogSecondary, &zero, sizeof(zero));
-        }
+        for (int f : { FRain, FSnow, FCloud, FMie, FFog }) { want[f] = true; value[f] = 0.0f; }
     } else {
-        if (rainOn) {
-            const float v = Clamp(g_rainValue.load(std::memory_order_relaxed), 0.0f, 1.0f);
-            WriteBytes(child + kWeatherRain, &v, sizeof(v));
-        }
-        if (snowOn) {
-            const float v = Clamp(g_snowValue.load(std::memory_order_relaxed), 0.0f, 1.0f);
-            WriteBytes(child + kWeatherSnow, &v, sizeof(v));
-        }
-        if (cloudOn && atmosphere) {
-            const float v = Clamp(g_cloudValue.load(std::memory_order_relaxed), 0.0f, 3.0f);
-            WriteBytes(atmosphere + kAtmosphereCloudAmount, &v, sizeof(v));
-        }
+        if (rainOn) { want[FRain] = true; value[FRain] = Clamp(g_rainValue.load(std::memory_order_relaxed), 0.0f, 1.0f); }
+        if (snowOn) { want[FSnow] = true; value[FSnow] = Clamp(g_snowValue.load(std::memory_order_relaxed), 0.0f, 1.0f); }
+        if (cloudOn) { want[FCloud] = true; value[FCloud] = Clamp(g_cloudValue.load(std::memory_order_relaxed), 0.0f, 3.0f); }
     }
-
-    if (windOn) {
-        const float mul = Clamp(g_windMultiplier.load(std::memory_order_relaxed), 0.0f, 3.0f);
-        for (ptrdiff_t off : { kWeatherWindSpeed, kWeatherAltitudeWindRatio, kWeatherWindBlendContribution }) {
+    const float mul = Clamp(g_windMultiplier.load(std::memory_order_relaxed), 0.0f, 3.0f);
+    for (int f = 0; f < FCount; ++f) {
+        const uintptr_t base = FieldIsAtmosphere(f) ? atmosphere : child;
+        const bool isWind = f == FWindSpeed || f == FWindAltitude || f == FWindBlend;
+        if (isWind && windOn) {
             float native = 0.0f;
-            if (!ReadFloat(child + off, native)) continue;
-            const float v = native * mul;
-            if (std::isfinite(v)) WriteBytes(child + off, &v, sizeof(v));
+            if (FieldNative(f, base, native)) FieldWrite(f, native * mul);
+        } else if (want[f]) {
+            FieldSet(f, base, value[f]);
+        } else {
+            FieldRelease(f, base);
         }
     }
     return result;
@@ -706,48 +862,48 @@ static bool WeatherParticleContext(long long& particleMgr, int& nullSentinel) {
     nullSentinel = 0;
     uintptr_t envMgr = 0;
     long long entity = 0;
-    if (!ResolveTimeContext(envMgr, entity) || !entity || !g_nullSentinel) return false;
+    if (g_entityParticleMgr < 0 || !ResolveTimeContext(envMgr, entity) || !entity || !g_nullSentinel) return false;
     uintptr_t p = 0;
-    if (!ReadPointer(static_cast<uintptr_t>(entity) + 0xEE8, p))
-        ReadPointer(static_cast<uintptr_t>(entity) + 0xEE0, p);
-    if (!p || !ReadBytes(reinterpret_cast<uintptr_t>(g_nullSentinel), &nullSentinel, sizeof(nullSentinel))) return false;
+    if (!ReadPointer(static_cast<uintptr_t>(entity) + g_entityParticleMgr, p)) return false;
+    if (!ReadBytes(reinterpret_cast<uintptr_t>(g_nullSentinel), &nullSentinel, sizeof(nullSentinel))) return false;
     particleMgr = static_cast<long long>(p);
     return true;
 }
 
 static void SetEffectIntensity(long long self, int effect, int nullSentinel, long long particleMgr, float value, bool activate) {
-    static constexpr int ids[9] = { 0,1,2,3,4,5,6,7,8 };
-    static constexpr ptrdiff_t slotA[9] = { 0x18,0x28,0x48,0x58,0x68,0x88,0x98,0xA8,0xB8 };
-    static constexpr ptrdiff_t slotB[9] = { 0x20,0x30,0x50,0x60,0x70,0x90,0xA0,0xB0,0xC0 };
-    if (effect < 0 || effect >= 9 || !g_setIntensity) return;
+    if (effect < 0 || effect >= 9 || !g_intensityFn || g_effectHandleBase < 0 || !(g_effectHandleMask & (1u << effect))) return;
+    const uintptr_t handleAt = static_cast<uintptr_t>(self) + g_effectHandleBase + effect * 4;
     int handle = nullSentinel;
-    if (!ReadBytes(static_cast<uintptr_t>(self) + 0xFC + effect * 4, &handle, sizeof(handle))) return;
-    if (activate && value > 0.001f && handle == nullSentinel && g_activateEffect) {
+    if (!ReadBytes(handleAt, &handle, sizeof(handle))) return;
+    if (activate && value > 0.001f && handle == nullSentinel && g_activateFn && g_effectSlotA[effect] >= 0) {
+        auto activateFn = reinterpret_cast<ActivateEffectFn>(g_activateFn);
         bool ok = true;
         CDK_GUARD_BEGIN
-            g_activateEffect(self, ids[effect], reinterpret_cast<long long*>(self + slotA[effect]),
-                             reinterpret_cast<long long*>(self + slotB[effect]), 1.0f);
+            activateFn(self, effect, reinterpret_cast<long long*>(self + g_effectSlotA[effect]),
+                       reinterpret_cast<long long*>(self + g_effectSlotB[effect]), 1.0f);
         CDK_GUARD_FAIL
             ok = false;
         CDK_GUARD_END
-        if (!ok || !ReadBytes(static_cast<uintptr_t>(self) + 0xFC + effect * 4, &handle, sizeof(handle))) return;
+        if (!ok || !ReadBytes(handleAt, &handle, sizeof(handle))) return;
     }
     if (handle == nullSentinel) return;
+    auto setIntensity = reinterpret_cast<SetIntensityFn>(g_intensityFn);
     CDK_GUARD_BEGIN
-        g_setIntensity(particleMgr, handle, Clamp(value, 0.0f, 1.0f));
+        setIntensity(particleMgr, handle, Clamp(value, 0.0f, 1.0f));
     CDK_GUARD_FAIL
     CDK_GUARD_END
 }
 
 static void __fastcall HookWeatherTick(long long self, float dt) {
     if (!g_origWeatherTick) return;
+    // The native tick runs first and drives every effect from the (possibly overridden) table, including releasing the
+    // snow effects when the native snow value is low. So once an override ends, the game's own state is already back
+    // this very tick; nothing is forced afterwards.
     g_origWeatherTick(self, dt);
 
     const bool clear = g_weatherClear.load(std::memory_order_relaxed);
     const bool snowOn = g_snowOverride.load(std::memory_order_relaxed);
-    if (g_snowWasOverridden && !snowOn) g_snowCleanupTicks = 30;
-    g_snowWasOverridden = snowOn;
-    if (!clear && !snowOn && g_snowCleanupTicks <= 0) return;
+    if (!clear && !snowOn) return;
 
     long long particleMgr = 0;
     int nullSentinel = 0;
@@ -761,13 +917,6 @@ static void __fastcall HookWeatherTick(long long self, float dt) {
         return;
     }
 
-    if (!snowOn) {
-        SetEffectIntensity(self, 2, nullSentinel, particleMgr, 0.0f, false);
-        SetEffectIntensity(self, 3, nullSentinel, particleMgr, 0.0f, false);
-        if (g_snowCleanupTicks > 0) --g_snowCleanupTicks;
-        return;
-    }
-
     const float snow = Clamp(g_snowValue.load(std::memory_order_relaxed), 0.0f, 1.0f);
     SetEffectIntensity(self, 2, nullSentinel, particleMgr, snow, snow > 0.01f);
     SetEffectIntensity(self, 3, nullSentinel, particleMgr, snow, snow > 0.30f);
@@ -776,17 +925,43 @@ static void __fastcall HookWeatherTick(long long self, float dt) {
 } // namespace
 
 void EnvironmentInstall() {
-    const bool env = ResolveEnvManagerGlobal();
-    const bool timeLayout = env && ResolveTimeLayout();
+    g_tick = ResolveWeatherTick();
+    const bool rain = ResolveRainGetter();
+    const auto intensityHits = ScanAll("89 54 24 10 53 48 83 EC 30 83 79 0C 00 48 8B D9 C5 F8 29 74 24 20", 3);
+    if (intensityHits.size() == 1) g_intensityFn = intensityHits[0];
+    else Log("[environment] effect intensity setter: %zu signature matches", intensityHits.size());
+    if (g_tick && rain) {
+        ResolveEffectLayout();   // first: the snow-getter check and the handle mask use the activation helper
+        ScanWeatherTick();
+    }
+    if (!g_envManagerGlobal) Log("[environment] environment manager not derived from the weather tick");
+    else Log("[environment] environment manager rva 0x%llx, get-entity vt 0x%llx, weather state 0x%llx, particle mgr 0x%llx",
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_envManagerGlobal) - g_base),
+             static_cast<unsigned long long>(g_envGetEntityVt), static_cast<unsigned long long>(g_entityWeatherState),
+             static_cast<unsigned long long>(g_entityParticleMgr));
+
+    const bool timeLayout = g_envManagerGlobal && ResolveTimeLayout();
     g_timeAvailable.store(timeLayout, std::memory_order_relaxed);
     if (timeLayout) Log("[environment] visual-time controls ready");
     else Log("[environment] visual-time controls unavailable (optional)");
 
-    g_weatherAvailable.store(ResolveWeatherLayout(), std::memory_order_relaxed);
-    if (g_weatherAvailable.load(std::memory_order_relaxed))
-        g_snowEffectsAvailable.store(ResolveWeatherEffects(), std::memory_order_relaxed);
-    if (!g_weatherAvailable.load(std::memory_order_relaxed))
+    if (rain) ResolveAtmosphere();
+    const bool compose = rain && ResolveWeatherCompose();
+    g_rainAvailable.store(compose && g_fieldOff[FRain] >= 0, std::memory_order_relaxed);
+    g_snowTableAvailable.store(compose && g_fieldOff[FSnow] >= 0, std::memory_order_relaxed);
+    g_windAvailable.store(compose && g_fieldOff[FWindSpeed] >= 0 && g_fieldOff[FWindBlend] >= 0, std::memory_order_relaxed);
+    g_cloudAvailable.store(compose && g_fieldOff[FCloud] >= 0, std::memory_order_relaxed);
+    g_weatherAvailable.store(compose, std::memory_order_relaxed);
+    if (compose) {
+        for (int f = 0; f < FCount; ++f) {
+            if (g_fieldOff[f] >= 0) Log("[environment] weather field %s at 0x%llx", kFieldName[f], static_cast<unsigned long long>(g_fieldOff[f]));
+            else Log("[environment] weather field %s not derived; left untouched", kFieldName[f]);
+        }
+        g_snowEffectsAvailable.store(g_snowTableAvailable.load(std::memory_order_relaxed) && ResolveWeatherEffects(),
+                                     std::memory_order_relaxed);
+    } else {
         Log("[environment] weather controls unavailable (optional)");
+    }
 }
 
 void EnvironmentTick() {
@@ -800,47 +975,78 @@ void EnvironmentTick() {
     }
 
     if (entity != g_timeEntity) {
+        // World change: the old entity may be gone, so its limits are neither restored nor reused. A running freeze
+        // re-captures the native limits on the new entity below.
         g_timeEntity = entity;
-        g_timeBaselineValid = false;
-        g_timeFreezeApplied = false;
+        g_timeOverriding = false;
+        g_timeEntityOk = EntityHasTimeVirtuals(entity);
+        if (!g_timeEntityOk) Log("[environment] environment entity %p lacks the derived time virtuals; time control idle", reinterpret_cast<void*>(entity));
     }
-    if (!g_timeBaselineValid && !CaptureTimeBaseline(entity)) {
+    if (!g_timeEntityOk) {
         g_timeCurrentValid.store(false, std::memory_order_relaxed);
         return;
     }
 
+    float lo = NAN, hi = NAN;
+    const bool haveLimits = ReadFloat(static_cast<uintptr_t>(entity) + g_timeLower, lo) &&
+                            ReadFloat(static_cast<uintptr_t>(entity) + g_timeUpper, hi);
+    if (!g_timeOverriding) {
+        if (!haveLimits || hi <= lo + 0.0001f) {
+            g_timeCurrentValid.store(false, std::memory_order_relaxed);
+            return;
+        }
+        g_timeDomainHours = hi > 1.5f && hi <= 48.0f;
+    }
+
     float current = 0.0f;
-    if (ReadCurrentHour(envMgr, entity, current)) {
+    if (ReadCurrentHour(entity, current)) {
         g_timeCurrentHour.store(current, std::memory_order_relaxed);
         g_timeCurrentValid.store(true, std::memory_order_relaxed);
-        if (!g_timeFreeze.load(std::memory_order_relaxed) && g_timeSetHoldTicks.load(std::memory_order_relaxed) <= 0)
-            g_timeTargetHour.store(current, std::memory_order_relaxed);
     } else {
         g_timeCurrentValid.store(false, std::memory_order_relaxed);
     }
 
-    const bool frozen = g_timeFreeze.load(std::memory_order_relaxed);
+    const bool frozen = g_timeFreeze.load(std::memory_order_acquire);
     if (!frozen) {
-        if (g_timeFreezeApplied) {
-            RestoreTimeLimits(entity);
-            g_timeFreezeApplied = false;
+        if (g_timeOverriding) {
+            // undo only our own write: if a script replaced our limits since, its values stay
+            if (haveLimits && lo == g_timeWritten && hi == g_timeWritten) {
+                WriteBytes(static_cast<uintptr_t>(entity) + g_timeLower, &g_timeNativeLower, sizeof(float));
+                WriteBytes(static_cast<uintptr_t>(entity) + g_timeUpper, &g_timeNativeUpper, sizeof(float));
+            }
+            g_timeOverriding = false;
         }
-        int hold = g_timeSetHoldTicks.load(std::memory_order_relaxed);
+        int hold = g_timeSetHoldTicks.load(std::memory_order_acquire);
         if (hold > 0) {
-            const float raw = HourToRaw(g_timeTargetHour.load(std::memory_order_relaxed));
-            SetTimeRaw(entity, raw);
-            g_timeSetHoldTicks.store(hold - 1, std::memory_order_relaxed);
+            SetTimeRaw(entity, HourToRaw(g_timeTargetHour.load(std::memory_order_relaxed)));
+            g_timeSetHoldTicks.compare_exchange_strong(hold, hold - 1, std::memory_order_relaxed);  // a new UI request wins
         }
         g_timeApply.store(false, std::memory_order_relaxed);
         return;
     }
 
     const float raw = HourToRaw(g_timeTargetHour.load(std::memory_order_relaxed));
-    if (!g_timeFreezeApplied || g_timeApply.exchange(false, std::memory_order_relaxed))
+    bool write = g_timeApply.exchange(false, std::memory_order_relaxed);
+    if (!g_timeOverriding) {
+        // capture exactly what the game has right before the freeze starts, on this entity
+        g_timeNativeLower = lo;
+        g_timeNativeUpper = hi;
+        g_timeOverriding = true;
+        write = true;
+        Log("[environment] visual-time native limits %.4f..%.4f (%s)", lo, hi, g_timeDomainHours ? "hours" : "normalized");
+    } else if (haveLimits && (lo != g_timeWritten || hi != g_timeWritten)) {
+        // something else (a script / the game) set the limits while frozen: that is what restore must give back
+        g_timeNativeLower = lo;
+        g_timeNativeUpper = hi;
+        write = true;
+    }
+    if (write) {
+        // limits first: the native setter clamps into [lower, upper], so stale frozen limits would swallow the new time
+        WriteBytes(static_cast<uintptr_t>(entity) + g_timeLower, &raw, sizeof(raw));
+        WriteBytes(static_cast<uintptr_t>(entity) + g_timeUpper, &raw, sizeof(raw));
+        g_timeWritten = raw;
         SetTimeRaw(entity, raw);
-    WriteBytes(static_cast<uintptr_t>(entity) + g_timeLower, &raw, sizeof(raw));
-    WriteBytes(static_cast<uintptr_t>(entity) + g_timeUpper, &raw, sizeof(raw));
-    g_timeFreezeApplied = true;
+    }
     g_timeSetHoldTicks.store(0, std::memory_order_relaxed);
 }
 
@@ -850,13 +1056,19 @@ bool TimeHour(float* hour) {
     *hour = g_timeCurrentHour.load(std::memory_order_relaxed);
     return true;
 }
-float TimeTargetHour() { return NormalizeHour(g_timeTargetHour.load(std::memory_order_relaxed)); }
+float TimeTargetHour() {
+    // the target only means something while a request is pending or frozen; otherwise the slider follows the game
+    const bool pending = g_timeFreeze.load(std::memory_order_relaxed) || g_timeSetHoldTicks.load(std::memory_order_relaxed) > 0;
+    if (!pending && g_timeCurrentValid.load(std::memory_order_relaxed)) return NormalizeHour(g_timeCurrentHour.load(std::memory_order_relaxed));
+    return NormalizeHour(g_timeTargetHour.load(std::memory_order_relaxed));
+}
 bool TimeFrozen() { return g_timeFreeze.load(std::memory_order_relaxed); }
 void SetTimeHour(float hour) {
+    // target before the flags (release): the game thread reads the flags with acquire and then sees this target
     g_timeTargetHour.store(NormalizeHour(hour), std::memory_order_relaxed);
-    g_timeApply.store(true, std::memory_order_relaxed);
+    g_timeApply.store(true, std::memory_order_release);
     if (!g_timeFreeze.load(std::memory_order_relaxed))
-        g_timeSetHoldTicks.store(8, std::memory_order_relaxed);
+        g_timeSetHoldTicks.store(8, std::memory_order_release);
 }
 void SetTimeFrozen(bool frozen) {
     if (frozen && !g_timeFreeze.load(std::memory_order_relaxed) &&
@@ -864,20 +1076,23 @@ void SetTimeFrozen(bool frozen) {
         g_timeCurrentValid.load(std::memory_order_relaxed)) {
         g_timeTargetHour.store(g_timeCurrentHour.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
-    g_timeFreeze.store(frozen, std::memory_order_relaxed);
     g_timeApply.store(frozen, std::memory_order_relaxed);
+    g_timeFreeze.store(frozen, std::memory_order_release);
     if (!frozen) g_timeSetHoldTicks.store(0, std::memory_order_relaxed);
 }
 void ResetTimeControl() {
-    g_timeFreeze.store(false, std::memory_order_relaxed);
+    g_timeFreeze.store(false, std::memory_order_release);
     g_timeApply.store(false, std::memory_order_relaxed);
     g_timeSetHoldTicks.store(0, std::memory_order_relaxed);
 }
 
 bool WeatherControlAvailable() { return g_weatherAvailable.load(std::memory_order_relaxed); }
+bool WeatherRainAvailable() { return g_rainAvailable.load(std::memory_order_relaxed); }
+bool WeatherCloudAvailable() { return g_cloudAvailable.load(std::memory_order_relaxed); }
+bool WeatherWindAvailable() { return g_windAvailable.load(std::memory_order_relaxed); }
 bool WeatherSnowEffectsAvailable() { return g_snowEffectsAvailable.load(std::memory_order_relaxed); }
 bool WeatherClearSky() { return g_weatherClear.load(std::memory_order_relaxed); }
-void SetWeatherClearSky(bool enabled) { g_weatherClear.store(enabled, std::memory_order_relaxed); }
+void SetWeatherClearSky(bool enabled) { g_weatherClear.store(enabled && WeatherControlAvailable(), std::memory_order_relaxed); }
 bool WeatherRainOverride(float* value) {
     if (value) *value = g_rainValue.load(std::memory_order_relaxed);
     return g_rainOverride.load(std::memory_order_relaxed);
@@ -896,19 +1111,19 @@ bool WeatherWindOverride(float* multiplier) {
 }
 void SetWeatherRainOverride(bool enabled, float value) {
     g_rainValue.store(Clamp(value, 0.0f, 1.0f), std::memory_order_relaxed);
-    g_rainOverride.store(enabled, std::memory_order_relaxed);
+    g_rainOverride.store(enabled && WeatherRainAvailable(), std::memory_order_relaxed);
 }
 void SetWeatherSnowOverride(bool enabled, float value) {
     g_snowValue.store(Clamp(value, 0.0f, 1.0f), std::memory_order_relaxed);
-    g_snowOverride.store(enabled, std::memory_order_relaxed);
+    g_snowOverride.store(enabled && WeatherSnowEffectsAvailable(), std::memory_order_relaxed);
 }
 void SetWeatherCloudOverride(bool enabled, float value) {
     g_cloudValue.store(Clamp(value, 0.0f, 3.0f), std::memory_order_relaxed);
-    g_cloudOverride.store(enabled, std::memory_order_relaxed);
+    g_cloudOverride.store(enabled && WeatherCloudAvailable(), std::memory_order_relaxed);
 }
 void SetWeatherWindOverride(bool enabled, float multiplier) {
     g_windMultiplier.store(Clamp(multiplier, 0.0f, 3.0f), std::memory_order_relaxed);
-    g_windOverride.store(enabled, std::memory_order_relaxed);
+    g_windOverride.store(enabled && WeatherWindAvailable(), std::memory_order_relaxed);
 }
 void ResetWeatherControl() {
     g_weatherClear.store(false, std::memory_order_relaxed);

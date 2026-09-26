@@ -118,14 +118,17 @@ namespace core {
     // return false and the editor disables only that part of the UI.
     bool TimeControlAvailable();
     bool TimeHour(float* hour);                 // current visual time of day, 0..24
-    float TimeTargetHour();                     // last hour requested by World Builder
+    float TimeTargetHour();                     // hour requested by World Builder while frozen / pending, else the current hour
     bool TimeFrozen();                          // freezes visual time / lighting, not gameplay
     void SetTimeHour(float hour);               // jump visual time; native progression continues unless frozen
     void SetTimeFrozen(bool frozen);
     void ResetTimeControl();                    // restore the game's native time limits / progression
 
     bool WeatherControlAvailable();
-    bool WeatherSnowEffectsAvailable();          // snow particles can be started/stopped, not just the table value
+    bool WeatherRainAvailable();                // each control is on only when every field it writes was derived from game code
+    bool WeatherCloudAvailable();
+    bool WeatherWindAvailable();
+    bool WeatherSnowEffectsAvailable();          // snow table field and particle bridge both derived
     bool WeatherClearSky();
     void SetWeatherClearSky(bool enabled);
     bool WeatherRainOverride(float* value);     // value 0..1; return true when override is active
