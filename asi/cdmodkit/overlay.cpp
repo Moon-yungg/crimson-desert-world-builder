@@ -62,24 +62,23 @@ namespace overlay {
     static CreateDXGIFactory_t oStreamlineCreateDXGIFactory = nullptr;
     static CreateDXGIFactory1_t oStreamlineCreateDXGIFactory1 = nullptr;
     static CreateDXGIFactory2_t oStreamlineCreateDXGIFactory2 = nullptr;
-    // Factory methods are hooked per provider: Streamline's proxy factory and the real dxgi factory have different method
-    // code, and a game may create its swapchain through either one (the proxy forwards into the real one, both then fire).
-    enum FactoryProvider { kProviderDxgi = 0, kProviderStreamline = 1, kProviderCount = 2 };
-    static const char* const kProviderName[kProviderCount] = { "DXGI", "Streamline" };
-    static FactoryCreateSwapChain_t oCreateSwapChain[kProviderCount] = {};
-    static FactoryCreateSwapChainForHwnd_t oCreateSwapChainForHwnd[kProviderCount] = {};
-    static FactoryCreateSwapChainForCoreWindow_t oCreateSwapChainForCoreWindow[kProviderCount] = {};
-    static FactoryCreateSwapChainForComposition_t oCreateSwapChainForComposition[kProviderCount] = {};
+    static FactoryCreateSwapChain_t oCreateSwapChain = nullptr;
+    static FactoryCreateSwapChainForHwnd_t oCreateSwapChainForHwnd = nullptr;
+    static FactoryCreateSwapChainForCoreWindow_t oCreateSwapChainForCoreWindow = nullptr;
+    static FactoryCreateSwapChainForComposition_t oCreateSwapChainForComposition = nullptr;
     static Present_t oPresent = nullptr;
     static Present1_t oPresent1 = nullptr;
     static ResizeBuffers_t oResizeBuffers = nullptr;
     static ResizeBuffers1_t oResizeBuffers1 = nullptr;
     static SetColorSpace1_t oSetColorSpace1 = nullptr;
+    // One set of factory method hooks only, first wins (InstallSingleHook logs the other provider as a mismatch): hooking
+    // Streamline's proxy methods on top of the real ones captured the chain twice and the game died with ACCESS_DENIED.
+    static bool g_streamlineFactoryExportsHooked = false;
 
     struct HookTarget { void* target = nullptr; bool installed = false; };
     static HookTarget g_dxgiExportHookTargets[3];
     static HookTarget g_streamlineExportHookTargets[3];
-    static HookTarget g_factoryHookTargets[kProviderCount][4];
+    static HookTarget g_factoryHookTargets[4];
     static HookTarget g_presentHookTarget;
     static HookTarget g_present1HookTarget;
     static HookTarget g_resizeHookTarget;
@@ -1201,101 +1200,104 @@ namespace overlay {
         return hr;
     }
 
-    template <int P> static HRESULT STDMETHODCALLTYPE hkCreateSwapChain(IDXGIFactory* self, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** pp) {
-        const HRESULT hr = oCreateSwapChain[P] ? oCreateSwapChain[P](self, device, desc, pp) : E_FAIL;
+    static HRESULT STDMETHODCALLTYPE hkCreateSwapChain(IDXGIFactory* self, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** pp) {
+        const HRESULT hr = oCreateSwapChain ? oCreateSwapChain(self, device, desc, pp) : E_FAIL;
         if (SUCCEEDED(hr) && pp && *pp) CapturePresentSwapChain(device, *pp, desc ? desc->OutputWindow : nullptr);
         return hr;
     }
 
-    template <int P> static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForHwnd(IDXGIFactory2* self, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+    static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForHwnd(IDXGIFactory2* self, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                                                const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* out, IDXGISwapChain1** pp) {
-        const HRESULT hr = oCreateSwapChainForHwnd[P] ? oCreateSwapChainForHwnd[P](self, device, hwnd, desc, fs, out, pp) : E_FAIL;
+        const HRESULT hr = oCreateSwapChainForHwnd ? oCreateSwapChainForHwnd(self, device, hwnd, desc, fs, out, pp) : E_FAIL;
         if (SUCCEEDED(hr) && pp && *pp) CapturePresentSwapChain(device, *pp, hwnd);
         return hr;
     }
 
-    template <int P> static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForCoreWindow(IDXGIFactory2* self, IUnknown* device, IUnknown* window,
+    static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForCoreWindow(IDXGIFactory2* self, IUnknown* device, IUnknown* window,
                                                                      const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* out, IDXGISwapChain1** pp) {
-        const HRESULT hr = oCreateSwapChainForCoreWindow[P] ? oCreateSwapChainForCoreWindow[P](self, device, window, desc, out, pp) : E_FAIL;
+        const HRESULT hr = oCreateSwapChainForCoreWindow ? oCreateSwapChainForCoreWindow(self, device, window, desc, out, pp) : E_FAIL;
         if (SUCCEEDED(hr) && pp && *pp) CapturePresentSwapChain(device, *pp, nullptr);
         return hr;
     }
 
-    template <int P> static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForComposition(IDXGIFactory2* self, IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc,
+    static HRESULT STDMETHODCALLTYPE hkCreateSwapChainForComposition(IDXGIFactory2* self, IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc,
                                                                       IDXGIOutput* out, IDXGISwapChain1** pp) {
-        const HRESULT hr = oCreateSwapChainForComposition[P] ? oCreateSwapChainForComposition[P](self, device, desc, out, pp) : E_FAIL;
+        const HRESULT hr = oCreateSwapChainForComposition ? oCreateSwapChainForComposition(self, device, desc, out, pp) : E_FAIL;
         if (SUCCEEDED(hr) && pp && *pp) CapturePresentSwapChain(device, *pp, nullptr);
         return hr;
     }
 
-    // Streamline without an active proxy hands out the real dxgi factory, whose methods may already be hooked as the other
-    // provider's; a second MinHook on the same address would fail, and the existing hook already captures that path.
-    static bool HookFactoryMethod(int provider, int slot, void* target, void* detour, void** original, const char* name) {
-        if (!target) return false;
-        if (GetHookTargetState(g_factoryHookTargets[1 - provider][slot], target) == HookTargetState::Matching) return true;
-        return InstallSingleHook(g_factoryHookTargets[provider][slot], target, detour, original, name);
-    }
-
-    template <int P> static int HookReturnedFactory(IUnknown* created) {
+    static int HookReturnedFactory(IUnknown* created, const char* provider) {
         if (!created) return 0;
         std::lock_guard<std::mutex> lock(g_factoryHookMutex);
+        // the game creates dozens of factories; one pass per distinct vtable gives the same result and keeps the log short
+        static std::set<void*> s_seenVtables;
+        void* vtable = IsReadableRange(created, sizeof(void*)) ? *reinterpret_cast<void**>(created) : nullptr;
+        if (vtable && !s_seenVtables.insert(vtable).second) return 0;
         IDXGIFactory* factory = nullptr;
         IDXGIFactory2* factory2 = nullptr;
         created->QueryInterface(IID_PPV_ARGS(&factory));
         created->QueryInterface(IID_PPV_ARGS(&factory2));
         int installed = 0;
         if (factory) {
-            if (HookFactoryMethod(P, 0, ComVtableSlot(factory, 10), (void*)&hkCreateSwapChain<P>,
-                                  (void**)&oCreateSwapChain[P], "CreateSwapChain")) installed++;
+            void* target = ComVtableSlot(factory, 10);
+            if (target && InstallSingleHook(g_factoryHookTargets[0], target, (void*)&hkCreateSwapChain,
+                                        (void**)&oCreateSwapChain, "CreateSwapChain")) installed++;
         }
         if (factory2) {
-            if (HookFactoryMethod(P, 1, ComVtableSlot(factory2, 15), (void*)&hkCreateSwapChainForHwnd<P>,
-                                  (void**)&oCreateSwapChainForHwnd[P], "CreateSwapChainForHwnd")) installed++;
-            if (HookFactoryMethod(P, 2, ComVtableSlot(factory2, 16), (void*)&hkCreateSwapChainForCoreWindow<P>,
-                                  (void**)&oCreateSwapChainForCoreWindow[P], "CreateSwapChainForCoreWindow")) installed++;
-            if (HookFactoryMethod(P, 3, ComVtableSlot(factory2, 24), (void*)&hkCreateSwapChainForComposition<P>,
-                                  (void**)&oCreateSwapChainForComposition[P], "CreateSwapChainForComposition")) installed++;
+            void* targetHwnd = ComVtableSlot(factory2, 15);
+            void* targetCore = ComVtableSlot(factory2, 16);
+            void* targetComposition = ComVtableSlot(factory2, 24);
+            if (targetHwnd && InstallSingleHook(g_factoryHookTargets[1], targetHwnd, (void*)&hkCreateSwapChainForHwnd,
+                                        (void**)&oCreateSwapChainForHwnd, "CreateSwapChainForHwnd")) installed++;
+            if (targetCore && InstallSingleHook(g_factoryHookTargets[2], targetCore, (void*)&hkCreateSwapChainForCoreWindow,
+                                        (void**)&oCreateSwapChainForCoreWindow, "CreateSwapChainForCoreWindow")) installed++;
+            if (targetComposition && InstallSingleHook(g_factoryHookTargets[3], targetComposition, (void*)&hkCreateSwapChainForComposition,
+                                        (void**)&oCreateSwapChainForComposition, "CreateSwapChainForComposition")) installed++;
         }
         ReleaseCom(factory2);
         ReleaseCom(factory);
-        uint32_t mask = 0;   // bits 0-3 DXGI methods, 4-7 Streamline methods
-        for (int p = 0; p < kProviderCount; ++p)
-            for (int i = 0; i < 4; ++i) if (g_factoryHookTargets[p][i].installed) mask |= (1u << (p * 4 + i));
+        uint32_t mask = 0;
+        for (int i = 0; i < 4; ++i) if (g_factoryHookTargets[i].installed) mask |= (1u << i);
         g_factoryMethodHookMask.store(mask, std::memory_order_release);
-        if (installed) core::Log("[overlay] %s returned factory captured (%d methods ready, mask=0x%02x)", kProviderName[P], installed, mask);
+        if (installed) core::Log("[overlay] %s returned factory captured (%d methods ready, mask=0x%02x)", provider, installed, mask);
         return installed;
     }
 
-    // Both providers are always hooked: a game that creates its swapchain through plain dxgi while sl.interposer is loaded
-    // must still be captured, and when the Streamline proxy forwards into the real factory both captures agree.
+    // With Streamline's exports hooked, factories from the real dxgi.dll are left alone (the contributor's tested behaviour);
+    // the install-time probe below has already hooked the real factory methods, which the proxy forwards into, so a game
+    // creating its swapchain through plain dxgi is captured as well.
     static HRESULT WINAPI hkCreateDXGIFactory(REFIID iid, void** out) {
         const HRESULT hr = oCreateDXGIFactory ? oCreateDXGIFactory(iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderDxgi>(reinterpret_cast<IUnknown*>(*out));
+        if (SUCCEEDED(hr) && out && *out && !g_streamlineFactoryExportsHooked)
+            HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "DXGI");
         return hr;
     }
     static HRESULT WINAPI hkCreateDXGIFactory1(REFIID iid, void** out) {
         const HRESULT hr = oCreateDXGIFactory1 ? oCreateDXGIFactory1(iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderDxgi>(reinterpret_cast<IUnknown*>(*out));
+        if (SUCCEEDED(hr) && out && *out && !g_streamlineFactoryExportsHooked)
+            HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "DXGI");
         return hr;
     }
     static HRESULT WINAPI hkCreateDXGIFactory2(UINT flags, REFIID iid, void** out) {
         const HRESULT hr = oCreateDXGIFactory2 ? oCreateDXGIFactory2(flags, iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderDxgi>(reinterpret_cast<IUnknown*>(*out));
+        if (SUCCEEDED(hr) && out && *out && !g_streamlineFactoryExportsHooked)
+            HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "DXGI");
         return hr;
     }
     static HRESULT WINAPI hkStreamlineCreateDXGIFactory(REFIID iid, void** out) {
         const HRESULT hr = oStreamlineCreateDXGIFactory ? oStreamlineCreateDXGIFactory(iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderStreamline>(reinterpret_cast<IUnknown*>(*out));
+        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "Streamline");
         return hr;
     }
     static HRESULT WINAPI hkStreamlineCreateDXGIFactory1(REFIID iid, void** out) {
         const HRESULT hr = oStreamlineCreateDXGIFactory1 ? oStreamlineCreateDXGIFactory1(iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderStreamline>(reinterpret_cast<IUnknown*>(*out));
+        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "Streamline");
         return hr;
     }
     static HRESULT WINAPI hkStreamlineCreateDXGIFactory2(UINT flags, REFIID iid, void** out) {
         const HRESULT hr = oStreamlineCreateDXGIFactory2 ? oStreamlineCreateDXGIFactory2(flags, iid, out) : E_FAIL;
-        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory<kProviderStreamline>(reinterpret_cast<IUnknown*>(*out));
+        if (SUCCEEDED(hr) && out && *out) HookReturnedFactory(reinterpret_cast<IUnknown*>(*out), "Streamline");
         return hr;
     }
 
@@ -1344,11 +1346,12 @@ namespace overlay {
         uint32_t streamlineMask = 0;
         for (int i = 0; i < 3; ++i) if (g_streamlineExportHookTargets[i].installed) streamlineMask |= (1u << i);
         g_streamlineExportHookMask.store(streamlineMask, std::memory_order_release);
+        g_streamlineFactoryExportsHooked = streamlineMask != 0;
 
         // The probe goes to the real dxgi.dll only: Streamline forbids any call into sl.interposer before the game's slInit,
-        // and this runs on the init thread, possibly before it. Streamline's proxy factory is captured when the game itself
-        // creates it through the hooked exports. The real factory's methods are shared by every real factory, so hooking
-        // them now also covers a factory the game created before these export hooks existed.
+        // and this runs on the init thread, possibly before it. It hooks the real factory methods first (the state the
+        // contributor's Streamline probe produced before slInit, where it still returned a real factory); the proxy's own
+        // methods are then refused as a mismatch, so a chain is captured once, from the call the proxy forwards.
         IDXGIFactory2* probe = nullptr;
         HRESULT hr = E_FAIL;
         if (oCreateDXGIFactory1) hr = oCreateDXGIFactory1(IID_PPV_ARGS(&probe));   // the original: no detour in between
@@ -1356,7 +1359,7 @@ namespace overlay {
         g_factoryImportHookMask.store(dxgiMask | (streamlineMask ? 0x08u : 0u), std::memory_order_release);
         g_factoryProbeResult.store(hr, std::memory_order_release);
         if (SUCCEEDED(hr) && probe) {
-            HookReturnedFactory<kProviderDxgi>(probe);
+            HookReturnedFactory(probe, "DXGI");
             probe->Release();
         }
 
