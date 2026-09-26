@@ -1524,9 +1524,18 @@ namespace editor {
         float cloud = 1.0f; bool cloudOn = core::WeatherCloudOverride(&cloud);
         float wind = 1.0f; bool windOn = core::WeatherWindOverride(&wind);
 
+        // a control whose fields were not derived for this build stays disabled; the log names the missing piece
+        const auto unavailableTip = [](bool available) {
+            if (!available && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", T("This control is not available in this game build (see the log)."));
+        };
         ImGui::BeginDisabled(clear);
+        const bool rainAvail = core::WeatherRainAvailable();
+        ImGui::BeginDisabled(!rainAvail);
         if (ImGui::Checkbox(T("override rain"), &rainOn)) core::SetWeatherRainOverride(rainOn, rain);
+        unavailableTip(rainAvail);
         if (rainOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("rain intensity"), &rain, 0.0f, 1.0f, "%.2f")) core::SetWeatherRainOverride(true, rain); }
+        ImGui::EndDisabled();
         const bool snowEffects = core::WeatherSnowEffectsAvailable();
         ImGui::BeginDisabled(!snowEffects);
         if (ImGui::Checkbox(T("override snow"), &snowOn)) core::SetWeatherSnowOverride(snowOn, snow);
@@ -1534,12 +1543,20 @@ namespace editor {
             ImGui::SetTooltip("%s", T("Snow particle control is not available in this game build."));
         if (snowOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("snow intensity"), &snow, 0.0f, 1.0f, "%.2f")) core::SetWeatherSnowOverride(true, snow); }
         ImGui::EndDisabled();
+        const bool cloudAvail = core::WeatherCloudAvailable();
+        ImGui::BeginDisabled(!cloudAvail);
         if (ImGui::Checkbox(T("override clouds"), &cloudOn)) core::SetWeatherCloudOverride(cloudOn, cloud);
+        unavailableTip(cloudAvail);
         if (cloudOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("cloud amount"), &cloud, 0.0f, 3.0f, "%.2f")) core::SetWeatherCloudOverride(true, cloud); }
         ImGui::EndDisabled();
+        ImGui::EndDisabled();
 
+        const bool windAvail = core::WeatherWindAvailable();
+        ImGui::BeginDisabled(!windAvail);
         if (ImGui::Checkbox(T("override wind"), &windOn)) core::SetWeatherWindOverride(windOn, wind);
+        unavailableTip(windAvail);
         if (windOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("wind multiplier"), &wind, 0.0f, 3.0f, "x%.2f")) core::SetWeatherWindOverride(true, wind); }
+        ImGui::EndDisabled();
 
         if (ImGui::Button(T("use native weather"))) core::ResetWeatherControl();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Disable every World Builder weather override and return control to the game."));
