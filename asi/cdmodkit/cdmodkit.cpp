@@ -9,6 +9,7 @@
 #include <mutex>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <map>
 #include <set>
 #include <algorithm>
@@ -49,6 +50,20 @@ void Log(const char* fmt, ...) {
     if (g_console) { printf("%s\n", line); fflush(stdout); }
 }
 std::string ModDir() { return g_modDir; }
+bool EmbeddedResource(int resourceId, const uint8_t** data, size_t* size) {
+    if (data) *data = nullptr;
+    if (size) *size = 0;
+    if (!g_self || resourceId <= 0) return false;
+    HRSRC r = FindResourceA(g_self, MAKEINTRESOURCEA(resourceId), RT_RCDATA);
+    if (!r) return false;
+    HGLOBAL h = LoadResource(g_self, r);
+    const void* p = h ? LockResource(h) : nullptr;
+    const DWORD n = SizeofResource(g_self, r);
+    if (!p || !n) return false;
+    if (data) *data = static_cast<const uint8_t*>(p);
+    if (size) *size = static_cast<size_t>(n);
+    return true;
+}
 
 static std::string DirOf(HMODULE m) {
     char buf[MAX_PATH]; GetModuleFileNameA(m, buf, MAX_PATH);
@@ -703,37 +718,32 @@ static int CatFor(const std::string& path) {   // "/object/cd_gimmick/breakable/
     }
     return node;
 }
-// prefabs.tsv is linked into the plugin as a resource (scripts/pack_index.py -> cdmodkit.rc): written out when the file is
-// missing next to the plugin, which happens with mod managers that install only the .asi.
-static void EnsurePrefabIndexFile() {
-    const std::string path = g_modDir + "\\prefabs.tsv";
-    if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
-    HRSRC r = FindResourceA(g_self, MAKEINTRESOURCEA(101), RT_RCDATA); if (!r) { Log("prefabs.tsv missing and no embedded copy"); return; }
-    HGLOBAL h = LoadResource(g_self, r); const uint8_t* p = h ? (const uint8_t*)LockResource(h) : nullptr; const DWORD n = SizeofResource(g_self, r);
-    if (!p || n < 8 || memcmp(p, "CDK1", 4) != 0) { Log("embedded prefab index unreadable"); return; }
-    uint32_t raw = 0; memcpy(&raw, p + 4, 4);
-    std::vector<uint8_t> out;
-    if (!thumbgen::Lz4Decode(p + 8, n - 8, out, raw)) { Log("embedded prefab index: decode failed"); return; }
-    FILE* f = fopen(path.c_str(), "wb"); if (!f) { Log("cannot write %s", path.c_str()); return; }
-    fwrite(out.data(), 1, out.size(), f); fclose(f);
-    Log("prefabs.tsv was missing: written from the embedded copy (%u bytes) -> %s", raw, path.c_str());
-}
 static void LoadPrefabs() {
-    EnsurePrefabIndexFile();
     g_cats.push_back({ "all", -1, {}, {}, 0 });
-    std::ifstream f(g_modDir + "\\prefabs.tsv"); bool tsv = f.good();
-    if (!tsv) f.open(g_modDir + "\\prefabs.txt");
+    const uint8_t* packed = nullptr; size_t packedSize = 0;
+    std::vector<uint8_t> decoded;
+    std::string prefabText;
+    if (!EmbeddedResource(kResourcePrefabs, &packed, &packedSize) || packedSize < 8 || memcmp(packed, "CDK1", 4) != 0) {
+        Log("WARNING: embedded prefab index resource is missing or unreadable");
+    } else {
+        uint32_t rawSize = 0; memcpy(&rawSize, packed + 4, sizeof rawSize);
+        if (!thumbgen::Lz4Decode(packed + 8, packedSize - 8, decoded, rawSize)) {
+            Log("WARNING: embedded prefab index LZ4 decode failed");
+        } else {
+            prefabText.assign(reinterpret_cast<const char*>(decoded.data()), decoded.size());
+            decoded.clear(); decoded.shrink_to_fit();
+        }
+    }
+    std::istringstream f(std::move(prefabText));
     std::string line; std::map<std::string, int> tagc;
     while (std::getline(f, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         PrefabInfo pi{}; pi.meshes = pi.children = 0;
-        if (tsv) {
-            std::vector<std::string> col; size_t s = 0;
-            while (true) { size_t t = line.find('\t', s); col.push_back(line.substr(s, t == std::string::npos ? std::string::npos : t - s)); if (t == std::string::npos) break; s = t + 1; }
-            if (col.size() < 5) continue;
-            pi.path = col[0]; pi.tags = col[1]; pi.meshes = atoi(col[2].c_str()); pi.children = atoi(col[3].c_str()); pi.mesh = col[4];
-        } else { pi.path = line.rfind("/bin__/") != std::string::npos ? line : line; size_t b = pi.path.find("/bin__/"); if (b != std::string::npos) pi.path.erase(b, 6); }
+        std::vector<std::string> col; size_t s = 0;
+        while (true) { size_t t = line.find('\t', s); col.push_back(line.substr(s, t == std::string::npos ? std::string::npos : t - s)); if (t == std::string::npos) break; s = t + 1; }
+        if (col.size() < 5) continue;
+        pi.path = col[0]; pi.tags = col[1]; pi.meshes = atoi(col[2].c_str()); pi.children = atoi(col[3].c_str()); pi.mesh = col[4];
         pi.name = DisplayName(pi.path);
         pi.cat = CatFor(pi.path);
         int idx = (int)g_index.size();
@@ -758,8 +768,8 @@ static void LoadPrefabs() {
     // favorites
     std::ifstream ff(FavPath()); auto& byPath = g_byPath;
     while (std::getline(ff, line)) { while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back(); auto it = byPath.find(line); if (it != byPath.end()) g_favs.push_back(it->second); }
-    Log("prefab index: %zu entries (%s), %zu categories, %zu tags, %zu favorites", g_index.size(), tsv ? "tsv" : "txt", g_cats.size(), g_tagCounts.size(), g_favs.size());
-    if (g_index.empty()) Log("WARNING: no prefabs loaded. Expected %s\\prefabs.tsv (shipped in the zip as bin64\\cdmodkit\\prefabs.tsv). Mod managers such as DMM install only the .asi: copy the cdmodkit folder from the zip into bin64 by hand.", g_modDir.c_str());
+    Log("prefab index: %zu entries (embedded RCDATA/LZ4), %zu categories, %zu tags, %zu favorites", g_index.size(), g_cats.size(), g_tagCounts.size(), g_favs.size());
+    if (g_index.empty()) Log("WARNING: embedded prefab index is empty or unavailable");
 }
 
 // ---- live preview ----
@@ -1195,12 +1205,25 @@ static __forceinline void CaptureGimmick(void* param, void* out, void* mgr, void
     }
 }
 static void FindStringsForHash(uint32_t code);
-// error codes of the server spawn path are hashed names (the same lookup3 the spawn reasons use); bin64\cdmodkit\errnames.txt
-// lists every eErr* name found in the exe, so a code can be turned back into its name
+// Error codes of the server spawn path are hashed names (the same lookup3 the spawn reasons use). The eErr* name list is
+// linked into the ASI as RCDATA so decoding never depends on a sidecar file.
 static std::string DecodeErr(uint32_t code) {
     if (!code || !g_gameHash) return code ? "?" : "ok";
     static std::vector<std::string> names; static bool loaded = false;
-    if (!loaded) { loaded = true; FILE* f = fopen((g_modDir + "\\errnames.txt").c_str(), "r"); if (f) { char line[256]; while (fgets(line, sizeof line, f)) { std::string n = line; while (!n.empty() && (n.back() == '\n' || n.back() == '\r')) n.pop_back(); if (!n.empty()) names.push_back(n); } fclose(f); } }
+    if (!loaded) {
+        loaded = true;
+        const uint8_t* data = nullptr; size_t size = 0;
+        if (EmbeddedResource(kResourceErrNames, &data, &size)) {
+            std::istringstream in(std::string(reinterpret_cast<const char*>(data), size));
+            std::string n;
+            while (std::getline(in, n)) {
+                while (!n.empty() && (n.back() == '\n' || n.back() == '\r')) n.pop_back();
+                if (!n.empty()) names.push_back(std::move(n));
+            }
+        } else {
+            Log("[gimmick] embedded error-name table resource is missing");
+        }
+    }
     for (const auto& n : names) {
         if (g_gameHash(n.c_str(), n.size()) == code) return n;
         if (n.size() > 6 && g_gameHash(n.c_str() + 6, n.size() - 6) == code) return n;   // without the eErrNo prefix

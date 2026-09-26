@@ -14,8 +14,10 @@ im Log steht `RESOLVE FAILED`, und nichts wird gehookt.
    die enthaltene `dinput8.dll` nach `bin64\winmm.dll` kopieren (umbenennen).
 2. Aus diesem Zip nach `<Spiel>\bin64\` kopieren:
    - `cdmodkit.asi`
-   - Ordner `cdmodkit\` (enthält `prefabs.tsv`, `locales.tsv` und `settings.txt`; bei einem Update kannst du deine eigene `settings.txt` behalten)
+   - `cdmodkit\settings.txt` (bei einem Update kannst du deine eigene `settings.txt` behalten)
 3. Spiel normal über Steam starten. Das Log liegt in `bin64\cdmodkit\cdmodkit.log`; ein Konsolenfenster gibt es nur mit `console=1` in der `settings.txt`.
+
+Prefab-Index, Fehlernamen und Übersetzungen sind direkt in `cdmodkit.asi` eingebettet und werden nicht als separate Dateien installiert oder erzeugt.
 
 Die Oberflächensprache lässt sich im Tab **Settings** unter **Language** ändern. Es gibt Englisch, vereinfachtes und traditionelles Chinesisch, Deutsch, Französisch, Koreanisch, Japanisch, Spanisch, brasilianisches Portugiesisch, Russisch und Türkisch sowie die automatische Erkennung der Systemsprache. Die Namen in der Auswahlliste werden in der jeweils gewählten Oberflächensprache angezeigt.
 
@@ -99,7 +101,8 @@ Der Tab **NPCs** listet alle rund 7.250 Figuren des Spiels (Menschen, Goblins, T
 Spielnamen in deiner Sprache, dem internen Namen und dem Schlüssel. Suche und Kategorie grenzen die Liste ein, **SPAWN** (oder
 ein Doppelklick) setzt die Figur mit dem eingestellten Abstand vor dich. Mit "count" können bis zu 100.000 Figuren erzeugt werden;
 als Formation stehen **Line**, **Matrix** und **Circle** mit einstellbarem Abstand bzw. Radius zur Verfügung. Der Spawn-Abstand
-kann auch für weit entfernte Gruppen direkt eingegeben werden. Die Liste
+kann auch für weit entfernte Gruppen direkt eingegeben werden. Eine Figur kann außerdem aus der Liste oder Kachelansicht direkt
+in die Spielwelt gezogen werden; beim Loslassen wird ein einzelner NPC am markierten Bodenpunkt erzeugt. Die Liste
 liest die Mod zur Laufzeit aus deinem installierten Spiel, es wird nichts davon mitgeliefert.
 
 Die Figuren entstehen über die Spawn-Anfrage des Spiels selbst und sind danach ganz normale Bewohner der Welt: Sie laufen,
@@ -108,6 +111,9 @@ Szenenliste, lassen sich nicht verschieben oder rückgängig machen und werden n
 
 Der NPC-Browser funktioniert auch im Dock. Dort wird die Trefferliste automatisch als kompakte Kachelansicht gezeigt; Suche,
 Kategorie, Abstand, Anzahl, Formation und SPAWN bleiben verfügbar.
+
+Beim Schließen des World-Builder-Fensters – per Hotkey oder über das X in der Titelleiste – wird ein aktiver Freikamera-/Flugmodus
+sofort beendet und die Steuerung vollständig an das Spiel zurückgegeben.
 
 Nach dem Laden eines Spielstands zeigt der Tab "walk a few steps first", bis du dich kurz bewegt hast: Die Anfrage braucht
 die Server-Figur deines Charakters, und die liefert das Spiel beim Laufen. Ein Spiel-Update kann den Weg blockieren; dann sagt

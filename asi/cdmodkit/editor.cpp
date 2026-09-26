@@ -140,6 +140,9 @@ namespace editor {
     static int   g_browserDragPrefab = -1;   // browser row/card being dragged out into the game view
     struct BrowserDropJob { int prefab = -1, ticket = 0; Vec3 center{}; float yaw = 0, scale = 1; };
     static std::vector<BrowserDropJob> g_browserDropJobs;   // ground is probed before spawning, so a new object's own collision cannot be mistaken for the surface
+    static int   g_npcDragIndex = -1;        // character row/card being dragged out into the game view
+    struct NpcDropJob { uint32_t key = 0; int ticket = 0; Vec3 at{}; };
+    static std::vector<NpcDropJob> g_npcDropJobs;
     static std::set<std::string> g_tagFilter;
     static std::vector<int> g_matches; static std::string g_lastKey;
     static float g_off[3] = { 0.0f, 0.0f, 0.0f };
@@ -212,11 +215,21 @@ namespace editor {
         int groundTicket = 0, groundIter = 0; float groundBottom = 0, groundTop = 0, groundStartY = 0;   // snap to ground in flight (see GroundStep)
     };
     static Place g_place;
-    static void StopCameraMode() {
-        if (!g_cameraMode) return;
+    static void StopCameraMode(bool forceFreeCamOff = false) {
+        if (!g_cameraMode && !(forceFreeCamOff && core::FreeCamActive())) return;
         g_cameraMode = false; g_cameraViewMode = 0; g_cameraStartAt = 0; g_cameraEverActive = false; memset(g_cameraShortcutDown, 0, sizeof g_cameraShortcutDown);
         g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0;
         core::SetFreeCam(false); core::g_fcHoldMove = false; input::ClearKeys(); ImGui::GetIO().ClearInputKeys();
+    }
+    static void FinishCloseEditor() {
+        StopCameraMode(true);
+        g_playMode = false;
+        g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear();
+        g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0;
+        g_browserDragPrefab = -1; g_browserDropJobs.clear();
+        g_npcDragIndex = -1; g_npcDropJobs.clear();
+        ImGui::GetIO().ClearInputKeys();
+        if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
     }
     bool IsOpen() { return g_open; }
     bool PlayMode() { return g_playMode; }
@@ -250,11 +263,9 @@ namespace editor {
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", T("camera view: F free, H level, D straight down, U straight up; click to cycle"));
     }
     void Toggle() {
-        if (g_open && g_cameraMode) StopCameraMode();
-        g_open = !g_open; g_playMode = false;
-        if (!g_open) { g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear(); g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0; g_browserDragPrefab = -1; g_browserDropJobs.clear(); }
-        ImGui::GetIO().ClearInputKeys();
-        if (!g_open && g_previewShown) { core::PreviewClear(); g_previewShown = false; }
+        g_open = !g_open;
+        if (!g_open) FinishCloseEditor();
+        else { g_playMode = false; ImGui::GetIO().ClearInputKeys(); }
     }
 
     void ApplyStyle(float scale) {
@@ -1313,6 +1324,7 @@ namespace editor {
                 const bool hov = ImGui::IsItemHovered(), sel = g_npcSel == i;
                 if (ImGui::IsItemClicked(0)) g_npcSel = i;
                 if (hov && ImGui::IsMouseDoubleClicked(0) && canSpawn) { g_npcSel = i; SpawnNpcInFront(c); }
+                if (canSpawn && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) g_npcDragIndex = i;
                 dl->AddRectFilled(p0, p1, sel ? ImGui::GetColorU32(ImGuiCol_Header) : hov ? ImGui::GetColorU32(ImGuiCol_FrameBgHovered) : ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
                 if (sel) dl->AddRect(p0, p1, ImGui::GetColorU32(ImGuiCol_HeaderActive), 4.0f, 0, 2.0f);
                 ImTextureID tex = c.app.empty() ? ImTextureID{} : overlay::Thumb(core::ThumbFile(c.app));
@@ -1383,6 +1395,7 @@ namespace editor {
                     g_npcSel = i;
                     if (ImGui::IsMouseDoubleClicked(0) && havePos && st == 2) SpawnNpcInFront(c);
                 }
+                if (havePos && st == 2 && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) g_npcDragIndex = i;
                 ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", c.internal.c_str());
                 ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%u", c.key);
                 ImGui::PopID();
@@ -1582,7 +1595,7 @@ namespace editor {
         ImGui::TextDisabled(T("%d results%s"), (int)g_matches.size(), g_matches.size() >= 5000 ? T(" (first 5000)") : "");
         if (idx.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 120, 100, 255));
-            ImGui::TextWrapped(T("No prefab list loaded: %s\\prefabs.tsv is missing. Mod managers such as DMM install only the .asi: copy the 'cdmodkit' folder from the zip into bin64 by hand (next to cdmodkit.asi) and restart the game."), core::ModDir().c_str());
+            ImGui::TextWrapped(T("Prefab list not found: the browser and the search stay empty."));
             ImGui::PopStyleColor();
         } else if (g_matches.empty()) {
             ImGui::TextDisabled(T("nothing matches: fewer words, another category, or turn off 'favorites' / 'meshes only' / the tag filters ('clear' resets all)."));
@@ -2231,7 +2244,7 @@ namespace editor {
         (void)p; (void)havePos;
         g_hoverUid = 0;
         ImGuiIO& io = ImGui::GetIO();
-        if (g_browserDragPrefab >= 0) return;   // a browser drag owns LMB until it is dropped or cancelled
+        if (g_browserDragPrefab >= 0 || g_npcDragIndex >= 0) return;   // a browser/NPC drag owns LMB until it is dropped or cancelled
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
         const bool addSelect = g_cameraMode ? ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) : io.KeyCtrl;
         const bool addBox = g_cameraMode ? (((GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT)) & 0x8000) != 0) : (io.KeyCtrl || io.KeyShift);
@@ -2377,6 +2390,59 @@ namespace editor {
         // the player-height plane; unlike the old path it does not spawn first and then cast through its own collision.
         SpawnBrowserDrop(prefab, center, g_spawnYaw, g_spawnScale);
     }
+    static bool NpcDropPoint(ImVec2 mouse, Vec3* at, bool* onGroundPlane) {
+        CamFrame cf = CurrentCam(); if (!cf.ok) return false;
+        const Vec3 rd = MouseRay(cf, mouse);
+        PosInfo pp{}; const bool havePlayer = core::PlayerPosInfo(&pp);
+        bool plane = false; Vec3 hit{};
+        if (havePlayer && fabsf(rd.y) > 1e-5f) {
+            const float t = (pp.world.y - cf.pos.y) / rd.y;
+            if (t > 0.25f && t < 100000.0f) {
+                hit = { cf.pos.x + rd.x * t, pp.world.y, cf.pos.z + rd.z * t };
+                plane = true;
+            }
+        }
+        if (!plane) {
+            const float dist = std::clamp(g_npcDist, 1.0f, 100000.0f);
+            hit = { cf.pos.x + rd.x * dist, cf.pos.y + rd.y * dist, cf.pos.z + rd.z * dist };
+        }
+        *at = hit; if (onGroundPlane) *onGroundPlane = plane; return true;
+    }
+    static void PumpNpcDropJobs() {
+        for (size_t i = 0; i < g_npcDropJobs.size();) {
+            NpcDropJob& j = g_npcDropJobs[i]; core::GroundHit gh;
+            if (!core::GroundResult(j.ticket, &gh)) { ++i; continue; }
+            Vec3 at = j.at;
+            if (gh.hit) at.y = gh.centerY - core::g_probeRadius;
+            core::SpawnNpc(j.key, at);
+            g_npcDropJobs.erase(g_npcDropJobs.begin() + i);
+        }
+    }
+    static void ProcessNpcDrag() {
+        if (g_npcDragIndex < 0) return;
+        const auto chars = thumbgen::Characters();
+        if (!chars || g_npcDragIndex >= (int)chars->size()) { g_npcDragIndex = -1; return; }
+        ImGuiIO& io = ImGui::GetIO(); const auto& c = (*chars)[g_npcDragIndex];
+        if (!io.MouseDown[ImGuiMouseButton_Left] && !ImGui::IsMouseReleased(ImGuiMouseButton_Left)) { g_npcDragIndex = -1; return; }
+        const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
+        Vec3 at{}; bool groundPlane = false; const bool projected = NpcDropPoint(io.MousePos, &at, &groundPlane);
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        const char* shown = c.name.empty() ? c.internal.c_str() : c.name.c_str();
+        dl->AddText({ io.MousePos.x + 16.0f, io.MousePos.y + 14.0f }, IM_COL32(255, 220, 150, 255), shown);
+        if (!overUi && projected) {
+            ImVec2 s; CamFrame cf = CurrentCam();
+            if (WorldToScreen(cf, at, &s)) { dl->AddCircle(s, 11.0f, IM_COL32(255, 190, 90, 255), 24, 2.0f); dl->AddCircleFilled(s, 3.0f, IM_COL32(255, 230, 180, 255)); }
+        }
+        if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left)) return;
+        const uint32_t key = c.key; g_npcDragIndex = -1;
+        if (overUi || !projected || core::NpcState() != 2) return;
+        if (groundPlane && core::GroundProbeReady()) {
+            const float startY = at.y + 150.0f;
+            const int ticket = core::GroundProbe({ at.x, startY, at.z }, 400.0f);
+            if (ticket) { g_npcDropJobs.push_back({ key, ticket, at }); return; }
+        }
+        core::SpawnNpc(key, at);
+    }
     static void DrawWorldContextPopup(bool havePos) {
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(1, 1), ImGuiCond_Always);
@@ -2440,10 +2506,12 @@ namespace editor {
         ImGuiIO& io = ImGui::GetIO(); const float ui = ImGui::GetFontSize() / 17.0f;
         ImGui::SetNextWindowSize(ImVec2(300.0f * ui, io.DisplaySize.y - 80.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 320.0f * ui, 40.0f), ImGuiCond_FirstUseEver);
-        if (g_playMode) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.45f);
+        const bool playAlpha = g_playMode;
+        if (playAlpha) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.45f);
         char title[160]; snprintf(title, sizeof title, T("World Builder [%s]###cdmodkit_dock"), T(g_cameraMode ? "CAMERA" : (g_playMode ? "PLAY" : "EDIT")));
-        const bool began = ImGui::Begin(title, &g_open, g_playMode ? ImGuiWindowFlags_NoInputs : 0);
-        if (!began) { ImGui::End(); if (g_playMode) ImGui::PopStyleVar(); return; }
+        const bool began = ImGui::Begin(title, &g_open, playAlpha ? ImGuiWindowFlags_NoInputs : 0);
+        if (!g_open) { ImGui::End(); if (playAlpha) ImGui::PopStyleVar(); FinishCloseEditor(); return; }
+        if (!began) { ImGui::End(); if (playAlpha) ImGui::PopStyleVar(); return; }
         HandleHotkeys(havePos);
         if (ImGui::SmallButton(T(ICON_LIST " full editor"))) { g_compact = false; g_mainTab = g_compactPage; g_selectMainTab = true; }
         ImGui::SameLine();
@@ -2476,21 +2544,22 @@ namespace editor {
             DrawScene(p, havePos, true);
             ProcessBrowserDrag();
             ImGui::End();
-            if (g_playMode) ImGui::PopStyleVar();
+            if (playAlpha) ImGui::PopStyleVar();
             return;
         }
         if (g_compactPage == TabNpcs) {
             if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
             DrawNpcs(p, havePos, true);
+            ProcessNpcDrag();
             ImGui::End();
-            if (g_playMode) ImGui::PopStyleVar();
+            if (playAlpha) ImGui::PopStyleVar();
             return;
         }
         if (g_compactPage == TabEnvironment) {
             if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
             DrawEnvironment(true);
             ImGui::End();
-            if (g_playMode) ImGui::PopStyleVar();
+            if (playAlpha) ImGui::PopStyleVar();
             return;
         }
         ImGui::SetNextItemWidth(-1); InputTextI18n("##dockfilter", T("search  (words in any order)"), g_filter, sizeof g_filter);
@@ -2539,7 +2608,7 @@ namespace editor {
         } else { ImGui::TextDisabled(T("pick a card, then PLACE")); ImGui::Dummy(ImVec2(0, ImGui::GetFrameHeight())); }
         ProcessBrowserDrag();
         ImGui::End();
-        if (g_playMode) ImGui::PopStyleVar();
+        if (playAlpha) ImGui::PopStyleVar();
     }
     static void CameraTick() {
         float dx = 0, dy = 0; input::TakeMouseDelta(&dx, &dy);   // always consume: entering camera mode must never replay old motion
@@ -2608,6 +2677,7 @@ namespace editor {
         PlaceTick();                           // runs with the menu closed as well
         PumpSnapJobs();
         PumpBrowserDropJobs();                 // a drop whose ground probe returns after the window was hidden still spawns
+        PumpNpcDropJobs();
         if (g_place.active) DrawPlaceHud();
         if (g_place.active && (g_gizmo || MouseMode())) { const bool one = g_place.m.size() == 1; const CamFrame cf = CurrentCam();
             DrawGizmo(g_place.center, one ? WrapYaw(g_place.m[0].rot0.yaw + g_place.yaw) : g_place.yaw, one ? WrapYaw(g_place.m[0].rot0.pitch + g_place.pitch) : g_place.pitch, GizmoScreenSize(cf, g_place.center, g_place.radius), g_place.drag ? g_place.drag : g_place.hover); }
@@ -2626,10 +2696,12 @@ namespace editor {
             ImGui::SetNextWindowSize(want, ImGuiCond_FirstUseEver);
             ImGui::SetNextWindowPos(ImVec2(30, 30), ImGuiCond_FirstUseEver);
         }
-        if (g_playMode) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.45f);
+        const bool playAlpha = g_playMode;
+        if (playAlpha) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.45f);
         char title[240]; snprintf(title, sizeof title, T("World Builder v%s [%s] %s = %s, %s = hide###cdmodkit"), kEditorVersion, T(g_cameraMode ? "CAMERA MODE" : (g_playMode ? "PLAY MODE" : "EDIT MODE")), core::KeyName(core::g_keyMode), T(g_cameraMode ? "exit camera mode" : (g_playMode ? "back to editing" : "camera mode")), core::KeyName(core::g_keyToggle));
-        const bool began = ImGui::Begin(title, &g_open, g_playMode ? ImGuiWindowFlags_NoInputs : 0);
-        if (!began) { ImGui::End(); if (g_playMode) ImGui::PopStyleVar(); CameraTick(); return; }
+        const bool began = ImGui::Begin(title, &g_open, playAlpha ? ImGuiWindowFlags_NoInputs : 0);
+        if (!g_open) { ImGui::End(); if (playAlpha) ImGui::PopStyleVar(); FinishCloseEditor(); return; }
+        if (!began) { ImGui::End(); if (playAlpha) ImGui::PopStyleVar(); CameraTick(); return; }
         HandleHotkeys(havePos);
         if (!core::BuildOk()) {
             ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), T("Game functions not resolved: %s"), core::BuildMessage()[0] ? core::BuildMessage() : "verification pending");
@@ -2638,10 +2710,8 @@ namespace editor {
         }
         if (core::PrefabIndex().empty()) {
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.45f, 0.12f, 0.10f, 0.85f));
-            ImGui::BeginChild("noindex", ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 4.2f), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+            ImGui::BeginChild("noindex", ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 2.2f), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
             ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1), T(ICON_XMARK "  Prefab list not found: the browser and the search stay empty."));
-            ImGui::TextWrapped(T("Expected file: %s\\prefabs.tsv. It is part of the download (bin64\\cdmodkit\\prefabs.tsv). Mod managers such as DMM install only cdmodkit.asi and skip this folder."), core::ModDir().c_str());
-            ImGui::TextWrapped(T("Fix: open the World Builder zip, copy the folder 'cdmodkit' from its bin64 folder into <game>\\bin64\\ next to cdmodkit.asi, then restart the game."));
             ImGui::EndChild(); ImGui::PopStyleColor();
         }
         if (ImGui::SmallButton(T(ICON_COPY " dock"))) {
@@ -2816,8 +2886,9 @@ namespace editor {
             if (g_selectMainTab) g_selectMainTab = false;
         }
         ProcessBrowserDrag();
+        ProcessNpcDrag();
         ImGui::End();
-        if (g_playMode) ImGui::PopStyleVar();
+        if (playAlpha) ImGui::PopStyleVar();
         CameraTick();
     }
 }

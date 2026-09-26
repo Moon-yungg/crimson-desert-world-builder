@@ -5,6 +5,7 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -18,6 +19,9 @@ struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float 
                                                        // proj: which project the object belongs to (0 = placed by hand, not part of a saved project yet)
 
 namespace core {
+    constexpr int kResourcePrefabs = 101;
+    constexpr int kResourceErrNames = 102;
+    constexpr int kResourceLocales = 103;
     extern uintptr_t g_base;
     extern bool      g_menuOpen;      // set by the editor UI
     extern bool      g_uiWantsMouse;  // cursor is over a World Builder window (ImGui WantCaptureMouse), updated every frame
@@ -25,6 +29,7 @@ namespace core {
 
     void Log(const char* fmt, ...);
     std::string ModDir();             // bin64\cdmodkit
+    bool EmbeddedResource(int resourceId, const uint8_t** data, size_t* size);   // RCDATA linked into cdmodkit.asi
 
     bool ReadBytes(uintptr_t a, void* out, size_t n);
     bool WriteBytes(uintptr_t a, const void* src, size_t n);
@@ -143,7 +148,7 @@ namespace core {
     // length > 0: only [offset, offset+length) of the entry as stored (partial textures keep their LZ4 blocks); storedTotal = its full stored size
     bool GameReadFileRange(const std::string& packPath, std::vector<uint8_t>& out, uint32_t offset, uint32_t length, uint32_t* storedTotal = nullptr, bool* notFound = nullptr);
 
-    // Prefab index (bin64\cdmodkit\prefabs.tsv, fallback prefabs.txt): logical path, display name, category tree, tags
+    // Prefab index (embedded RCDATA, LZ4-compressed at build time): logical path, display name, category tree, tags
     struct PrefabInfo { std::string path, name, tags, mesh; int cat = 0; int meshes = 0, children = 0;
                         float sx = 0, sy = 0, sz = 0;                 // bounding box in m (0 = unknown)
                         float cx = 0, cy = 0, cz = 0; bool hasCenter = false; };   // bounding box center relative to the prefab pivot

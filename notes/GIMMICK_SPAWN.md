@@ -23,7 +23,7 @@ Goal: spawn torches / doors that really work (game interaction). Status: not rea
   gimmick key), s9 static.
 - After prepare the caller: reason hash -> param+0x3F8 and save+0x220; `desc->vtable[4](desc, &int)` (commit); then
   `ServerField->vtable[17](field, &int, &{&desc,1}, 0)` (create). Result int: 0 = ok, else a hashed error name
-  (`bin64\cdmodkit\errnames.txt` + the game's hash decode it; the mod logs the name).
+  (the embedded error-name table + the game's hash decode it; the mod logs the name).
 - FieldGimmickSaveData layout (reflection setters): +0x28 fieldGimmickSaveDataKey, +0x30 fieldSaveDataReason, +0x4C
   levelOriginSceneObjectUuid (16), +0x60 item, +0x1C0 gimmickInfoKey (u16), +0x1CC transform, +0x1F4 originSpawnTransform,
   +0x220 spawnReason hash.

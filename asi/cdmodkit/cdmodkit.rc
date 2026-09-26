@@ -1,2 +1,5 @@
-// Embedded prefab index (see scripts/pack_index.py): written to bin64\cdmodkit\prefabs.tsv on start when the file is missing.
+// Runtime data lives entirely inside cdmodkit.asi.
+// 101 stays a single LZ4-compressed prefab blob; 102/103 are raw text resources.
 101 RCDATA "build/prefabs.lz4"
+102 RCDATA "data/errnames.txt"
+103 RCDATA "data/locales.tsv"

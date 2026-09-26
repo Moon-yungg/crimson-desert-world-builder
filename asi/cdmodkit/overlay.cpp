@@ -353,7 +353,7 @@ namespace overlay {
         core::Log("[overlay] init: style");
         editor::ApplyStyle(scale);
         core::Log("[overlay] init: locales");
-        i18n::Initialize(core::ModDir());
+        i18n::Initialize();
         core::Log("[overlay] init: fonts (language %s)", i18n::Preference());
         g_fontScale = scale; BuildFonts(true);
         core::Log("[overlay] init: backends (atlas %dx%d)", io.Fonts->TexWidth, io.Fonts->TexHeight);
