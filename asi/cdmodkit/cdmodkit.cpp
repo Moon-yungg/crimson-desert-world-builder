@@ -1542,7 +1542,10 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     // Template-free first: the game's own "gimmick from save data" builder with the prefab's gimmickinfo key and the level spawn
     // reason. It needs no captured spawn (works right after loading, no walking) and none of the replay's patching; the template
     // replay stays as the fallback when the key is unknown or the builder fails.
-    const bool directWanted = !r.directTried && kRva_GimmickFromSave && g_serverFieldObj;
+    // Attach gimmicks (airship parts etc.) go through the template: near the player the builder's field create waited forever on
+    // a lock while attaching gimmick_attach_airship_02_marni (user log, stuck stack ...278d6d3 -> 2af9d17 -> ... -> 1851084 wait).
+    const bool attachPart = r.prefab.find("/attach/") != std::string::npos;
+    const bool directWanted = !r.directTried && !attachPart && kRva_GimmickFromSave && g_serverFieldObj;
     if (const uint32_t gkey = directWanted ? thumbgen::GimmickKey(r.prefab) : 0) {
         { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid) return; g_gimmickQueue.pop_front(); }
         uintptr_t standin = 0;
@@ -1961,6 +1964,29 @@ void ResearchPeek(uintptr_t addr, int bytes, bool u16) {   // research: raw memo
     std::string line; char t[16];
     for (size_t i = 0; i < w.size(); i++) { snprintf(t, sizeof t, "%u ", w[i]); line += t; if (i % 32 == 31) { Log("[peek] %p+%zx: %s", (void*)addr, (i - 31) * 2, line.c_str()); line.clear(); } }
     if (!line.empty()) Log("[peek] %p: %s", (void*)addr, line.c_str());
+}
+// Research: every occurrence of a byte pattern in committed private read-write memory (background thread, logged).
+void ResearchFind(const std::vector<uint8_t>& pat, int maxHits) {
+    if (pat.size() < 4) return;
+    std::thread([pat, maxHits]() {
+        const DWORD t0 = GetTickCount(); int hits = 0; uint64_t scanned = 0;
+        std::vector<uint8_t> buf((1 << 20) + pat.size());
+        MEMORY_BASIC_INFORMATION mbi{}; uintptr_t a = 0x10000;
+        while (hits < maxHits && VirtualQuery((void*)a, &mbi, sizeof mbi) == sizeof mbi) {
+            const uintptr_t base = (uintptr_t)mbi.BaseAddress, end = base + mbi.RegionSize; a = end;
+            if (mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) || (mbi.Protect & PAGE_GUARD)) continue;
+            for (uintptr_t c = base; c < end && hits < maxHits; c += (1 << 20)) {
+                const size_t n = (size_t)std::min<uintptr_t>(buf.size(), end - c);
+                if (n < pat.size() || !ReadBytes(c, buf.data(), n)) continue;
+                scanned += n;
+                for (size_t k = 0; k + pat.size() <= n && hits < maxHits; k += 2) {
+                    if (buf[k] != pat[0] || memcmp(buf.data() + k, pat.data(), pat.size()) != 0) continue;
+                    Log("[find] hit %d at %p (region %p, size %zx)", hits, (void*)(c + k), (void*)base, (size_t)mbi.RegionSize); hits++;
+                }
+            }
+        }
+        Log("[find] %zu-byte pattern: %d hits in %.1f GB, %lu ms", pat.size(), hits, scanned / 1e9, GetTickCount() - t0);
+    }).detach();
 }
 static const int kVtMax = 160; static const int kVtClasses = 5;
 static void* g_vtOrig[kVtClasses][kVtMax] = {}; static const char* g_vtClass[kVtClasses] = { "", "", "", "", "" };

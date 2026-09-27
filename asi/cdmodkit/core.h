@@ -48,6 +48,7 @@ namespace core {
     bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11);
     bool ReadMem(uintptr_t addr, void* out, size_t n); bool WriteMem(uintptr_t addr, const void* in, size_t n);   // research: guarded raw access
     void ResearchPeek(uintptr_t addr, int bytes, bool u16);   // research: log raw memory
+    void ResearchFind(const std::vector<uint8_t>& pat, int maxHits);   // research: byte pattern search (logged)
     void ResearchVtScan(const std::string& mangled, int maxHits, int dumpBytes);   // research: live objects of an RTTI class (logged)
     void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)

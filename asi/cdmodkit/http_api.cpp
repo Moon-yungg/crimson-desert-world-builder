@@ -247,6 +247,12 @@ static std::string Handle(const std::string& method, const std::string& path, co
         const uintptr_t a = (uintptr_t)strtoull(it->second.c_str(), nullptr, 0); float by = 256, u = 0; Number(arg, "bytes", by); Number(arg, "u16", u);
         core::ResearchPeek(a, std::clamp((int)by, 8, 8192) & ~7, u != 0); return "{\"done\":true}";
     }
+    if (method == "POST" && path == "/api/research/find") {   // research: {"hex":"8c9c4c9c...","max":16}
+        auto it = arg.find("hex"); if (it == arg.end() || it->second.size() < 8 || it->second.size() % 2 || it->second.size() > 512) { status = 400; return Error("hex (4..256 bytes) required"); }
+        std::vector<uint8_t> pat(it->second.size() / 2);
+        for (size_t i = 0; i < pat.size(); i++) pat[i] = (uint8_t)strtoul(it->second.substr(i * 2, 2).c_str(), nullptr, 16);
+        float mx = 16; Number(arg, "max", mx); core::ResearchFind(pat, std::clamp((int)mx, 1, 256)); status = 202; return "{\"started\":true}";
+    }
     if (method == "POST" && path == "/api/research/vtscan") {   // research: {"class":".?AVhknpHeightFieldShape@@","max":8,"bytes":256}
         auto it = arg.find("class"); if (it == arg.end() || it->second.size() < 6 || it->second.size() > 200) { status = 400; return Error("class (mangled RTTI name) required"); }
         float mx = 8, by = 256; Number(arg, "max", mx); Number(arg, "bytes", by);
