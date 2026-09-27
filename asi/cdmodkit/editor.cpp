@@ -2858,7 +2858,9 @@ namespace editor {
     static Vec3 g_brushAt{}; static bool g_brushHave = false; static float g_brushY = 0; static bool g_brushYSet = false;
     static int g_brushTicket = 0; static DWORD g_brushProbeTick = 0, g_brushHitTick = 0; static bool g_brushLastHit = false; static float g_brushLastHitY = 0;
     static bool g_brushPainting = false; static size_t g_brushHistoryMark = 0; static Vec3 g_brushLast{}; static float g_brushAx = 0, g_brushAz = 0;
-    static bool TerrainTabShown() { return g_open && !g_compact && g_mainTab == TabTerrain; }
+    static bool TerrainTabShown() {
+        return g_open && (g_compact ? g_compactPage == TabTerrain : g_mainTab == TabTerrain);
+    }
     static bool g_shapePreview = false;   // with live editing the real ground changes at once; the preview is for builds without it
     struct ShapeGrid { int gen = -1; float x0 = 0, z0 = 0; int nx = 0, nz = 0; std::vector<float> orig, edit; };
     static ShapeGrid g_shape;
@@ -2984,17 +2986,25 @@ namespace editor {
             ImVec2 c; if (WorldToScreen(cf, g_brushAt, &c)) dl->AddCircleFilled(c, 3.0f, col);
         }
     }
-    static void DrawTerrain(const PosInfo& p, bool havePos) {
+    static void DrawTerrain(const PosInfo& p, bool havePos, bool compact = false) {
         if (!core::TerrainAvailable()) { ImGui::TextWrapped(T("Terrain editing is not available in this game build: %s"), core::TerrainStatus().c_str()); return; }
         core::TravelPrepare();
-        ImGui::Checkbox(T("Brush active (left mouse paints in the world)"), &g_brushOn); ImGui::SameLine();
+        const float ui = ImGui::GetFontSize() / 17.0f;
+        ImGui::Checkbox(T("Brush active (left mouse paints in the world)"), &g_brushOn);
+        if (!compact) ImGui::SameLine();
         ImGui::Checkbox(T("Shape preview"), &g_shapePreview);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("The ground as it will be after Apply, as a shaded surface: orange tint = higher, blue tint = lower than now."));
-        ImGui::RadioButton(T("Raise"), &g_brushMode, BrushRaise); ImGui::SameLine();
-        ImGui::RadioButton(T("Lower"), &g_brushMode, BrushLower); ImGui::SameLine();
-        ImGui::RadioButton(T("Flatten"), &g_brushMode, BrushFlatten);
-        ImGui::SetNextItemWidth(260); ImGui::SliderFloat(T("radius (m)"), &g_brushRadius, 2.0f, 60.0f, "%.1f");
-        ImGui::SetNextItemWidth(260);
+        if (compact) {
+            static const char* modes[] = { "Raise", "Lower", "Flatten" };
+            ImGui::SetNextItemWidth(-1);
+            ComboT("##terrain_mode", &g_brushMode, modes, 3);
+        } else {
+            ImGui::RadioButton(T("Raise"), &g_brushMode, BrushRaise); ImGui::SameLine();
+            ImGui::RadioButton(T("Lower"), &g_brushMode, BrushLower); ImGui::SameLine();
+            ImGui::RadioButton(T("Flatten"), &g_brushMode, BrushFlatten);
+        }
+        ImGui::SetNextItemWidth(compact ? -1.0f : 260.0f * ui); ImGui::SliderFloat(T("radius (m)"), &g_brushRadius, 2.0f, 60.0f, "%.1f");
+        ImGui::SetNextItemWidth(compact ? -1.0f : 260.0f * ui);
         if (g_brushMode == BrushFlatten) ImGui::SliderFloat(T("strength"), &g_brushFlat, 0.05f, 1.0f, "%.2f");
         else ImGui::SliderFloat(T("height per stroke (m)"), &g_brushAmount, 0.05f, 5.0f, "%.2f");
         ImGui::TextDisabled(g_brushMode == BrushFlatten ? T("Flatten pulls the ground toward the height where the drag started.") : T("Dragging paints a stroke every 40 percent of the radius; strokes add up."));
@@ -3002,6 +3012,9 @@ namespace editor {
         ImGui::Text(T("%d strokes"), (int)strokes.size()); ImGui::SameLine();
         ImGui::BeginDisabled(g_undo.empty());
         if (ImGui::SmallButton(T("Undo"))) Undo();
+        ImGui::EndDisabled(); ImGui::SameLine();
+        ImGui::BeginDisabled(g_redo.empty());
+        if (ImGui::SmallButton(T("Redo"))) Redo();
         ImGui::EndDisabled(); ImGui::SameLine();
         ImGui::BeginDisabled(strokes.empty());
         if (ImGui::SmallButton(T("Clear all"))) { Act a{}; a.kind = Act::TerrainClear; a.terrain = strokes; core::TerrainClear(); Push({ std::move(a) }); }
@@ -3012,9 +3025,11 @@ namespace editor {
         else if (core::TerrainNeedsApply()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Not applied yet: the shaded surface shows the new shape."));
         else ImGui::TextDisabled(T("The ground shows every stroke."));
         ImGui::BeginDisabled(!st.empty() || !havePos || !core::TravelAvailable() || strokes.empty() && !core::TerrainNeedsApply());
-        if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Apply (two loading screens)"))) { if (core::TerrainApply(p.world)) Note(T("applying the terrain: fast travel away and back")); }
+        if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Apply (two loading screens)"), compact ? ImVec2(-1, 0) : ImVec2(0, 0))) { if (core::TerrainApply(p.world)) Note(T("applying the terrain: fast travel away and back")); }
         ImGui::EndDisabled();
-        ImGui::TextWrapped(T("Strokes change the ground and its collision right away. Apply (a fast travel 5 km away and back, about half a minute) is only needed when a stroke could not be shown live. Strokes are saved with the project and are there right away when the project is autoloaded."));
+        if (!compact || ImGui::CollapsingHeader(TStable("Terrain help"))) {
+            ImGui::TextWrapped(T("Strokes change the ground and its collision right away. Apply (a fast travel 5 km away and back, about half a minute) is only needed when a stroke could not be shown live. Strokes are saved with the project and are there right away when the project is autoloaded."));
+        }
         ImGui::TextDisabled(T("travel: %s"), core::TravelStatus().c_str());
     }
 
@@ -3273,8 +3288,10 @@ namespace editor {
             { TabNpcs, ICON_LOCATION_DOT " NPCs" },
             { TabProject, ICON_FLOPPY_DISK " Project" },
             { TabEnvironment, ICON_CLOCK_ROTATE_LEFT " Time & Weather" },
+            { TabTerrain, ICON_CUBE " Terrain" },
         };
         for (int i = 0; i < (int)(sizeof(dockPages) / sizeof(dockPages[0])); ++i) {
+            if (dockPages[i].id == TabTerrain && !core::TerrainAvailable()) continue;
             if (i && i != 2 && i != 4) ImGui::SameLine(0, 4);
             const bool act = g_compactPage == dockPages[i].id;   // decided once: the click below may change the page
             if (act) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
@@ -3309,6 +3326,13 @@ namespace editor {
         if (g_compactPage == TabEnvironment) {
             if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
             DrawEnvironment(true);
+            ImGui::End();
+            if (playAlpha) ImGui::PopStyleVar();
+            return;
+        }
+        if (g_compactPage == TabTerrain) {
+            if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
+            DrawTerrain(p, havePos, true);
             ImGui::End();
             if (playAlpha) ImGui::PopStyleVar();
             return;
@@ -3475,13 +3499,16 @@ namespace editor {
             ImGui::EndChild(); ImGui::PopStyleColor();
         }
         if (ImGui::SmallButton(T(ICON_COPY " dock"))) {
-            g_compactPage = (g_mainTab == TabScene || g_mainTab == TabNpcs || g_mainTab == TabEnvironment) ? g_mainTab : TabBrowser;
+            g_compactPage = (g_mainTab == TabScene || g_mainTab == TabNpcs || g_mainTab == TabProject ||
+                             g_mainTab == TabEnvironment || g_mainTab == TabTerrain) ? g_mainTab : TabBrowser;
             g_compact = true;
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T(
             g_mainTab == TabScene ? "narrow side window: Scene with the same editing controls" :
             g_mainTab == TabNpcs ? "narrow side window: NPC browser and spawning" :
+            g_mainTab == TabProject ? "narrow side window: project management" :
             g_mainTab == TabEnvironment ? "narrow side window: time and weather controls" :
+            g_mainTab == TabTerrain ? "narrow side window: terrain brush and apply controls" :
             "narrow side window: search, cards and PLACE"));
         ImGui::SameLine();
         {   // free-fly camera
