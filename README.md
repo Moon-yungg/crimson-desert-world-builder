@@ -1,8 +1,8 @@
 # World Builder - in-game world editor for Crimson Desert
 
-An ASI plugin that adds a live prefab editor to Crimson Desert: browse the 48,000+ prefabs the game ships, place them in
-front of your character, move, rotate, scale and group them with hotkeys or a mouse gizmo, and save builds as projects
-that load again at the next start. No game files are modified and nothing is written into the game's own save data.
+An ASI plugin that adds a live world editor to Crimson Desert: browse the 48,000+ prefabs the game ships, place and transform
+objects, spawn and manage NPCs with batch AI/behavior controls, group/annotate scene entities, and save builds as projects that
+load again at the next start. No game files are modified and nothing is written into the game's own save data.
 
 - Downloads and user guide: the Nexus page (link in `release/NEXUS_PAGE.md`) or `release/WorldBuilder-v<version>.zip`
   built from this repository; the user guide is `release/README.md` (German).

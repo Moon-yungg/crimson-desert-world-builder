@@ -99,18 +99,24 @@ den Weg blockieren; das Log nennt dann den fehlenden Hook, alles andere läuft w
 
 Der Tab **NPCs** listet alle rund 7.250 Figuren des Spiels (Menschen, Goblins, Tiere, Reittiere, Monster, Bosse) mit ihrem
 Spielnamen in deiner Sprache, dem internen Namen und dem Schlüssel. Suche und Kategorie grenzen die Liste ein, **SPAWN** (oder
-ein Doppelklick) setzt die Figur mit dem eingestellten Abstand vor dich. Mit "count" können bis zu 100.000 Figuren erzeugt werden;
+ein Doppelklick) setzt die Figur mit dem eingestellten Abstand vor dich. Mit "count" können bis zu 500 Figuren pro Vorgang erzeugt werden;
 als Formation stehen **Line**, **Matrix** und **Circle** mit einstellbarem Abstand bzw. Radius zur Verfügung. Der Spawn-Abstand
 kann auch für weit entfernte Gruppen direkt eingegeben werden. Eine Figur kann außerdem aus der Liste oder Kachelansicht direkt
 in die Spielwelt gezogen werden; beim Loslassen wird ein einzelner NPC am markierten Bodenpunkt erzeugt. Die Liste
 liest die Mod zur Laufzeit aus deinem installierten Spiel, es wird nichts davon mitgeliefert.
 
-Die Figuren entstehen über die Spawn-Anfrage des Spiels selbst und sind danach ganz normale Bewohner der Welt: Sie laufen,
-kämpfen, fliehen und verschwinden nach den Regeln des Spiels. Feindliche Figuren greifen an. Deshalb stehen sie nicht in der
-Szenenliste, lassen sich nicht verschieben oder rückgängig machen und werden nicht in Projekten gespeichert.
+Die Figuren entstehen weiterhin über die Spawn-Anfrage des Spiels selbst, werden vom World Builder aber als **verwaltete NPCs**
+registriert. Schon beim Erzeugen kannst du normale KI oder **Hold / AI paused** wählen. Danach lassen sich NPCs per Ctrl/Shift
+mehrfach auswählen oder komplett markieren und gemeinsam bewegen, löschen, gruppieren, benennen, mit Notizen versehen sowie
+in der KI ein-/ausschalten bzw. zwischen normalem Verhalten und Hold wechseln. Dieselben verwalteten NPCs erscheinen auch im
+**Scene**-Tab; ihre Änderungen laufen durch Undo/Redo.
+
+Verwaltete NPCs werden zusammen mit dem Projekt gespeichert: Position, KI-Zustand, Verhalten, Gruppe, eigener Name und Notiz
+werden beim Laden wiederhergestellt. Ist die Server-Figur des Spielers nach einem Ladebildschirm noch nicht bekannt, bleibt der
+NPC kurz als "pending" eingetragen und wird automatisch erzeugt, sobald das Spiel wieder eine gültige Server-Session liefert.
 
 Der NPC-Browser funktioniert auch im Dock. Dort wird die Trefferliste automatisch als kompakte Kachelansicht gezeigt; Suche,
-Kategorie, Abstand, Anzahl, Formation und SPAWN bleiben verfügbar.
+Kategorie, Abstand, Anzahl, Formation, KI beim Spawn und SPAWN bleiben verfügbar.
 
 Beim Schließen des World-Builder-Fensters – per Hotkey oder über das X in der Titelleiste – wird ein aktiver Freikamera-/Flugmodus
 sofort beendet und die Steuerung vollständig an das Spiel zurückgegeben.

@@ -141,7 +141,7 @@ namespace editor {
     struct BrowserDropJob { int prefab = -1, ticket = 0; Vec3 center{}; float yaw = 0, scale = 1; };
     static std::vector<BrowserDropJob> g_browserDropJobs;   // ground is probed before spawning, so a new object's own collision cannot be mistaken for the surface
     static int   g_npcDragIndex = -1;        // character row/card being dragged out into the game view
-    struct NpcDropJob { uint32_t key = 0; int ticket = 0; Vec3 at{}; int count = 1, formation = 0; float spacing = 1.5f, radius = 8.0f, fx = 0, fz = 1; };
+    struct NpcDropJob { uint32_t key = 0; int ticket = 0; Vec3 at{}; int count = 1, formation = 0; float spacing = 1.5f, radius = 8.0f, fx = 0, fz = 1; bool ai = true; int behavior = 0; };
     static std::vector<NpcDropJob> g_npcDropJobs;
     static std::set<std::string> g_tagFilter;
     static std::vector<int> g_matches; static std::string g_lastKey;
@@ -162,6 +162,10 @@ namespace editor {
     static float g_edit[3] = { 0, 0, 0 }, g_editScale = 1; static Rot g_editRot, g_editRot0; static Vec3 g_editPos0{}; static float g_editScale0 = 1;
     static int   g_editUid = 0; static bool g_live = true;
     static std::vector<std::string> g_log;
+    static std::set<int> g_managedNpcSel; static int g_managedNpcPrimary = 0, g_managedNpcLast = 0;
+    static void SelectAllManagedNpcs(const std::vector<ManagedNpc>& list, int projectFilter = -1);
+    static void DeleteSelectedNpcs();
+    static void GroupSelectedNpcs(bool makeGroup);
     // snapping
     static bool  g_snap = false; static int g_snapPosIdx = 3, g_snapYawIdx = 2;
     static const float kSnapPos[] = { 0.1f, 0.25f, 0.5f, 1.0f, 2.0f }; static const char* kSnapPosNames[] = { "0.1 m", "0.25 m", "0.5 m", "1 m", "2 m" };
@@ -181,7 +185,11 @@ namespace editor {
     static float g_mx = 1, g_mz = 0;                                // last movement direction
 
     // ---- undo / redo ----
-    struct Act { enum Kind { Spawn, Move, Delete, SetGroup } kind; int uid; std::string prefab; Vec3 pos0{}, pos1{}; Rot rot0, rot1; float sc0 = 1, sc1 = 1; int group = 0, group1 = 0; int proj = 0; };   // group/group1: old/new group for undoable grouping; proj keeps deleted objects in their project
+    struct Act {
+        enum Kind { Spawn, Move, Delete, SetGroup, NpcSpawn, NpcMove, NpcDelete, NpcControl, NpcGroup, ObjectNote, NpcNote, NpcLabel, GroupName } kind;
+        int uid = 0; std::string prefab; Vec3 pos0{}, pos1{}; Rot rot0, rot1; float sc0 = 1, sc1 = 1;
+        int group = 0, group1 = 0; int proj = 0; bool flag0 = false, flag1 = false; int behavior0 = 0, behavior1 = 0; std::string text0, text1;
+    };   // object and managed-NPC committed edits share one chronological undo/redo stack
     struct HistoryEntry { unsigned long long serial = 0; std::vector<Act> acts; };
     static constexpr size_t kHistoryLimit = 1000;
     static unsigned long long g_historySerial = 0;
@@ -189,8 +197,11 @@ namespace editor {
     static bool VecChanged(Vec3 a, Vec3 b) { return a.x != b.x || a.y != b.y || a.z != b.z; }
     static bool RotChanged(Rot a, Rot b) { return a.yaw != b.yaw || a.pitch != b.pitch || a.roll != b.roll; }
     static bool ActChanged(const Act& a) {
-        if (a.kind == Act::Spawn || a.kind == Act::Delete) return true;
-        if (a.kind == Act::SetGroup) return a.group != a.group1;
+        if (a.kind == Act::Spawn || a.kind == Act::Delete || a.kind == Act::NpcSpawn || a.kind == Act::NpcDelete) return true;
+        if (a.kind == Act::SetGroup || a.kind == Act::NpcGroup) return a.group != a.group1;
+        if (a.kind == Act::NpcMove) return VecChanged(a.pos0, a.pos1);
+        if (a.kind == Act::NpcControl) return a.flag0 != a.flag1 || a.behavior0 != a.behavior1;
+        if (a.kind == Act::ObjectNote || a.kind == Act::NpcNote || a.kind == Act::NpcLabel || a.kind == Act::GroupName) return a.text0 != a.text1;
         // History is intentionally exact: even a sub-millimetre move or a tiny typed rotation/scale change counts.
         return VecChanged(a.pos0, a.pos1) || RotChanged(a.rot0, a.rot1) || a.sc0 != a.sc1;
     }
@@ -329,6 +340,7 @@ namespace editor {
         bool failed = false;
         std::set<int> ids;
         for (const auto& o : core::Spawned()) if (o.proj > 0) ids.insert(o.proj);
+        for (const auto& n : core::ManagedNpcs()) if (n.proj > 0) ids.insert(n.proj);
         for (int id : ids) {
             if (!core::ProjectDirty(id)) continue;
             const std::string name = core::ProjectNameOf(id);
@@ -1060,7 +1072,7 @@ namespace editor {
     }
     static void DeleteSel() {
         auto list = core::Spawned(); std::vector<Act> acts;
-        for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; Act a; a.kind = Act::Delete; a.uid = uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale; a.group = o->group; a.proj = o->proj; acts.push_back(a); core::HideUid(uid); }
+        for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; Act a; a.kind = Act::Delete; a.uid = uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale; a.group = o->group; a.proj = o->proj; a.text0 = o->note; acts.push_back(a); core::HideUid(uid); }
         if (!acts.empty()) { Note(T("deleted %d objects"), (int)acts.size()); Push(acts); }
         g_sel.clear(); g_primary = 0;
     }
@@ -1100,9 +1112,23 @@ namespace editor {
         std::vector<core::MoveReq> moves;
         for (auto& a : acts) {
             if (a.kind == Act::Spawn) { core::HideUid(a.uid); RemoveSelectionUid(a.uid); }
-            else if (a.kind == Act::Delete) { const int oldUid = a.uid, nu = core::SpawnAt(a.prefab, a.pos0, a.rot0, a.sc0, a.group, a.proj); if (nu) { a.uid = nu; RemapUid(oldUid, nu); g_sel.insert(nu); g_primary = nu; } }
+            else if (a.kind == Act::Delete) { const int oldUid = a.uid, nu = core::SpawnAt(a.prefab, a.pos0, a.rot0, a.sc0, a.group, a.proj); if (nu) { a.uid = nu; RemapUid(oldUid, nu); if (!a.text0.empty()) core::SetObjectNote(nu, a.text0); g_sel.insert(nu); g_primary = nu; } }
             else if (a.kind == Act::SetGroup) core::SetGroup(a.uid, a.group);
-            else moves.push_back({ a.uid, a.pos0, a.rot0, a.sc0 });
+            else if (a.kind == Act::Move) moves.push_back({ a.uid, a.pos0, a.rot0, a.sc0 });
+            else if (a.kind == Act::NpcSpawn) {
+                core::HideManagedNpc(a.uid); g_managedNpcSel.erase(a.uid);
+                if (g_managedNpcPrimary == a.uid) g_managedNpcPrimary = g_managedNpcSel.empty() ? 0 : *g_managedNpcSel.begin();
+            }
+            else if (a.kind == Act::NpcDelete) {
+                if (core::RestoreManagedNpc(a.uid)) { g_managedNpcSel.insert(a.uid); g_managedNpcPrimary = a.uid; g_managedNpcLast = a.uid; }
+            }
+            else if (a.kind == Act::NpcMove) core::MoveManagedNpc(a.uid, a.pos0);
+            else if (a.kind == Act::NpcControl) core::SetManagedNpcControl(a.uid, a.flag0, a.behavior0);
+            else if (a.kind == Act::NpcGroup) core::SetManagedNpcGroup(a.uid, a.group);
+            else if (a.kind == Act::ObjectNote) core::SetObjectNote(a.uid, a.text0);
+            else if (a.kind == Act::NpcNote) core::SetManagedNpcNote(a.uid, a.text0);
+            else if (a.kind == Act::NpcLabel) core::SetManagedNpcLabel(a.uid, a.text0);
+            else if (a.kind == Act::GroupName) core::SetGroupName(a.group, a.text0);
         }
         if (!moves.empty()) core::MoveMany(moves, true);
         g_redo.push_back(std::move(entry)); Note(T("undo"));
@@ -1116,7 +1142,21 @@ namespace editor {
             if (a.kind == Act::Spawn) { const int oldUid = a.uid, nu = core::SpawnAt(a.prefab, a.pos1, a.rot1, a.sc1, a.group, a.proj); if (nu) { a.uid = nu; RemapUid(oldUid, nu); g_sel.insert(nu); g_primary = nu; } }
             else if (a.kind == Act::Delete) { core::HideUid(a.uid); RemoveSelectionUid(a.uid); }
             else if (a.kind == Act::SetGroup) core::SetGroup(a.uid, a.group1);
-            else moves.push_back({ a.uid, a.pos1, a.rot1, a.sc1 });
+            else if (a.kind == Act::Move) moves.push_back({ a.uid, a.pos1, a.rot1, a.sc1 });
+            else if (a.kind == Act::NpcSpawn) {
+                if (core::RestoreManagedNpc(a.uid)) { g_managedNpcSel.insert(a.uid); g_managedNpcPrimary = a.uid; g_managedNpcLast = a.uid; }
+            }
+            else if (a.kind == Act::NpcDelete) {
+                core::HideManagedNpc(a.uid); g_managedNpcSel.erase(a.uid);
+                if (g_managedNpcPrimary == a.uid) g_managedNpcPrimary = g_managedNpcSel.empty() ? 0 : *g_managedNpcSel.begin();
+            }
+            else if (a.kind == Act::NpcMove) core::MoveManagedNpc(a.uid, a.pos1);
+            else if (a.kind == Act::NpcControl) core::SetManagedNpcControl(a.uid, a.flag1, a.behavior1);
+            else if (a.kind == Act::NpcGroup) core::SetManagedNpcGroup(a.uid, a.group1);
+            else if (a.kind == Act::ObjectNote) core::SetObjectNote(a.uid, a.text1);
+            else if (a.kind == Act::NpcNote) core::SetManagedNpcNote(a.uid, a.text1);
+            else if (a.kind == Act::NpcLabel) core::SetManagedNpcLabel(a.uid, a.text1);
+            else if (a.kind == Act::GroupName) core::SetGroupName(a.group, a.text1);
         }
         if (!moves.empty()) core::MoveMany(moves, true);
         g_undo.push_back(std::move(entry)); Note(T("redo"));
@@ -1124,10 +1164,18 @@ namespace editor {
     static const char* HistoryActionName(const HistoryEntry& entry) {
         if (entry.acts.empty()) return "";
         const Act::Kind k = entry.acts[0].kind;
-        for (const auto& a : entry.acts) if (a.kind != k) return T("Grab / move");
+        for (const auto& a : entry.acts) if (a.kind != k) return T("Edit");
         if (k == Act::Spawn) return T("SPAWN");
         if (k == Act::Delete) return T("Delete");
         if (k == Act::SetGroup) return T("Group");
+        if (k == Act::NpcSpawn) return T("NPC spawn");
+        if (k == Act::NpcMove) return T("NPC move");
+        if (k == Act::NpcDelete) return T("NPC delete");
+        if (k == Act::NpcControl) return T("NPC AI / behavior");
+        if (k == Act::NpcGroup) return T("NPC group");
+        if (k == Act::ObjectNote || k == Act::NpcNote) return T("Note");
+        if (k == Act::NpcLabel) return T("Rename NPC");
+        if (k == Act::GroupName) return T("Rename group");
         bool pos = false, rot = false, scale = false;
         for (const auto& a : entry.acts) {
             pos |= VecChanged(a.pos0, a.pos1);
@@ -1161,6 +1209,26 @@ namespace editor {
             if (a.sc1 != a.sc0) { ImGui::Text("%s: %.6f  ->  %.6f", T("scale"), a.sc0, a.sc1); ImGui::TextDisabled("d: %+.6f", a.sc1 - a.sc0); }
         } else if (a.kind == Act::SetGroup) {
             ImGui::Text("%s: %d  ->  %d", T("Group"), a.group, a.group1);
+        } else if (a.kind == Act::NpcMove) {
+            ImGui::TextDisabled("%s", T("managed NPC"));
+            drawPos(a.pos0, a.pos1, true);
+        } else if (a.kind == Act::NpcControl) {
+            ImGui::TextDisabled("%s", T("managed NPC"));
+            ImGui::Text("%s: %s / %s  ->  %s / %s", T("AI"),
+                a.flag0 ? T("On") : T("Off"), a.behavior0 == 1 ? T("Hold") : T("Normal"),
+                a.flag1 ? T("On") : T("Off"), a.behavior1 == 1 ? T("Hold") : T("Normal"));
+        } else if (a.kind == Act::NpcGroup) {
+            ImGui::TextDisabled("%s", T("managed NPC"));
+            ImGui::Text("%s: %d  ->  %d", T("Group"), a.group, a.group1);
+        } else if (a.kind == Act::ObjectNote || a.kind == Act::NpcNote || a.kind == Act::NpcLabel || a.kind == Act::GroupName) {
+            ImGui::Text("%s: \"%s\"  ->  \"%s\"", a.kind == Act::NpcLabel ? T("NPC") : a.kind == Act::GroupName ? T("Group") : T("Note"), a.text0.c_str(), a.text1.c_str());
+        } else if (a.kind == Act::NpcSpawn || a.kind == Act::NpcDelete) {
+            ImGui::TextDisabled("%s", T("managed NPC"));
+            const bool spawn = a.kind == Act::NpcSpawn;
+            const Vec3 p = spawn ? a.pos1 : a.pos0; const bool ai = spawn ? a.flag1 : a.flag0; const int behavior = spawn ? a.behavior1 : a.behavior0;
+            drawPos({}, p, false);
+            ImGui::Text("%s: %s / %s", T("AI"), ai ? T("On") : T("Off"), behavior == 1 ? T("Hold") : T("Normal"));
+            if (a.group) ImGui::Text("%s: %d", T("Group"), a.group);
         } else {
             const bool spawn = a.kind == Act::Spawn; const Vec3 p = spawn ? a.pos1 : a.pos0; const Rot r = spawn ? a.rot1 : a.rot0; const float sc = spawn ? a.sc1 : a.sc0;
             drawPos({}, p, false); drawRot({}, r, false); ImGui::Text("%s: %.6f", T("scale"), sc);
@@ -1321,6 +1389,19 @@ namespace editor {
     }
     static void HandleHotkeys(bool havePos) {
         ImGuiIO& io = ImGui::GetIO();
+        const bool npcContext = g_compact ? g_compactPage == TabNpcs : g_mainTab == TabNpcs;
+        auto selectAllForContext = [&]() {
+            if (npcContext) SelectAllManagedNpcs(core::ManagedNpcs());
+            else { g_sel.clear(); for (auto& o : core::Spawned()) if (!o.hidden) g_sel.insert(o.uid); }
+        };
+        auto deleteForContext = [&]() {
+            if (npcContext) { if (!g_managedNpcSel.empty()) DeleteSelectedNpcs(); }
+            else if (!g_sel.empty()) DeleteSel();
+        };
+        auto groupForContext = [&]() {
+            if (npcContext) { if (!g_managedNpcSel.empty()) GroupSelectedNpcs(true); }
+            else GroupSel(true);
+        };
         if (g_cameraMode) {
             // Camera movement uses async key state because the game may not forward legacy keyboard messages.
             // Editing shortcuts must use the same reliable source while camera mode owns the workflow.
@@ -1336,23 +1417,23 @@ namespace editor {
             if (io.WantTextInput || g_playMode) return;
             if (ctrl && pZ) Undo();
             if (ctrl && pY) Redo();
-            if (ctrl && pC) CopySel();
-            if (ctrl && pV) Paste(havePos);
-            if (ctrl && pD && !g_sel.empty()) { CopySel(); Paste(havePos); }
-            if (ctrl && pG) GroupSel(true);
-            if (ctrl && pA) { g_sel.clear(); for (auto& o : core::Spawned()) if (!o.hidden) g_sel.insert(o.uid); }
-            if (!ctrl && pDelete && !g_sel.empty()) DeleteSel();
+            if (!npcContext && ctrl && pC) CopySel();
+            if (!npcContext && ctrl && pV) Paste(havePos);
+            if (!npcContext && ctrl && pD && !g_sel.empty()) { CopySel(); Paste(havePos); }
+            if (ctrl && pG) groupForContext();
+            if (ctrl && pA) selectAllForContext();
+            if (!ctrl && pDelete) deleteForContext();
             return;
         }
         if (io.WantTextInput || g_playMode) return;
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) Undo();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) Redo();
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) CopySel();
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false)) Paste(havePos);
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false) && !g_sel.empty()) { CopySel(); Paste(havePos); }
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false)) GroupSel(true);
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) { g_sel.clear(); for (auto& o : core::Spawned()) if (!o.hidden) g_sel.insert(o.uid); }
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && !g_sel.empty()) DeleteSel();
+        if (!npcContext && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) CopySel();
+        if (!npcContext && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false)) Paste(havePos);
+        if (!npcContext && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false) && !g_sel.empty()) { CopySel(); Paste(havePos); }
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false)) groupForContext();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) selectAllForContext();
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) deleteForContext();
     }
 
     // ---- line / circle tools ----
@@ -1448,22 +1529,28 @@ namespace editor {
         }
         ImGui::EndChild();
     }
-    // ---- NPCs and creatures: every character of the game's characterinfo, spawned through the game's own spawn request ----
-    // They become ordinary actors of the world (AI, combat, own despawn rules), so they are not scene objects: no moving, undo
-    // or project saving. The list is read from the installed game at runtime (thumbgen::Characters), names in the UI language.
+    // ---- NPCs and creatures: catalog + managed server actors ------------------------------------------------------------
+    // NPCs created here are registered by World Builder. Their live actor is captured from the game's own SpawnCharacter
+    // request so they can be selected, moved (remove + respawn), deleted, AI-controlled and persisted in .cdproj files.
     static char g_npcFilter[128] = ""; static int g_npcCat = 0, g_npcSel = -1, g_npcCount = 1; static float g_npcDist = 5.0f;
     static int g_npcFormation = 0; static float g_npcSpacing = 1.5f, g_npcRadius = 8.0f;
+    static bool g_npcSpawnAi = true; static int g_npcSpawnBehavior = 0;
+    static int g_npcNoteEditUid = 0, g_npcLabelEditUid = 0, g_groupNameEditId = 0, g_objectNoteEditUid = 0;
+    static int g_metadataPopupRequest = 0;   // opened from the root ID scope so row/context-menu IDs do not trap the modal
+    static char g_npcNoteEdit[512] = "", g_npcLabelEdit[160] = "", g_groupNameEdit[160] = "", g_objectNoteEdit[512] = "";
     // NPCs only live where the world is streamed in around the character, and every one is a full server actor: a few hundred
     // within a few hundred metres is what the game copes with (the server jobs are spread over ticks, see ProcessServerJobs).
     static const int kNpcMaxCount = 500; static const float kNpcMaxDist = 500.0f, kNpcMaxExtent = 200.0f;
     static std::vector<int> g_npcRows; static std::string g_npcKey;
     static const char* kNpcCats[] = { "all", "people", "animals and mounts", "monsters", "bosses", "other" };
     static const char* kNpcFormations[] = { "Line", "Matrix", "Circle" };
-    static void SpawnNpcFormation(uint32_t key, Vec3 center, int count, int formation, float spacing, float radius, float fx, float fz) {
+    static const char* kNpcBehaviors[] = { "Normal / autonomous", "Hold position / AI paused" };
+    static void SpawnNpcFormation(uint32_t key, Vec3 center, int count, int formation, float spacing, float radius, float fx, float fz, bool ai, int behavior) {
         count = std::clamp(count, 1, kNpcMaxCount); formation = std::clamp(formation, 0, 2);
         const float fl = sqrtf(fx * fx + fz * fz); if (fl > 1e-4f) { fx /= fl; fz /= fl; } else { fx = 0; fz = 1; }
         const float rx = fz, rz = -fx;
         const int cols = std::max(1, (int)ceilf(sqrtf((float)count))), rows = std::max(1, (count + cols - 1) / cols);
+        std::vector<Act> acts; acts.reserve(count);
         for (int k = 0; k < count; ++k) {
             float side = 0, depth = 0;
             if (formation == 0) side = (k - (count - 1) * 0.5f) * spacing;
@@ -1474,8 +1561,11 @@ namespace editor {
                 const float a = 6.28318530718f * k / (float)count, r = count > 1 ? radius : 0.0f;
                 side = cosf(a) * r; depth = sinf(a) * r;
             }
-            core::SpawnNpc(key, { center.x + rx * side + fx * depth, center.y, center.z + rz * side + fz * depth });
+            const Vec3 at{ center.x + rx * side + fx * depth, center.y, center.z + rz * side + fz * depth };
+            const int uid = core::SpawnManagedNpc(key, at, 1, 0, ai, behavior);
+            if (uid) { Act a; a.kind = Act::NpcSpawn; a.uid = uid; a.prefab = std::string("NPC ") + std::to_string(key); a.pos1 = at; a.flag1 = ai; a.behavior1 = behavior; acts.push_back(std::move(a)); }
         }
+        Push(std::move(acts));
     }
     static int NpcCategory(const std::string& n) {   // from the internal name's first token: NHM_ = human male, NGW_ = goblin female, ...
         const std::string t = n.substr(0, n.find('_'));
@@ -1488,7 +1578,110 @@ namespace editor {
     static bool g_npcCards = false;
     static void SpawnNpcInFront(const thumbgen::CharInfo& c) {
         Vec3 at = { g_lastPlayer.x + g_fx * g_npcDist, g_lastPlayer.y, g_lastPlayer.z + g_fz * g_npcDist };
-        core::SpawnNpc(c.key, at); Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str());
+        const int uid = core::SpawnManagedNpc(c.key, at, 1, 0, g_npcSpawnAi, g_npcSpawnBehavior);
+        if (uid) { Act a; a.kind = Act::NpcSpawn; a.uid = uid; a.prefab = c.name.empty() ? c.internal : c.name; a.pos1 = at; a.flag1 = g_npcSpawnAi; a.behavior1 = g_npcSpawnBehavior; Push({ a }); }
+        Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str());
+    }
+    static const ManagedNpc* FindManagedNpc(const std::vector<ManagedNpc>& list, int uid) {
+        for (const auto& n : list) if (n.uid == uid) return &n; return nullptr;
+    }
+    static std::string ManagedNpcName(const ManagedNpc& n, const std::vector<thumbgen::CharInfo>* chars) {
+        if (!n.label.empty()) return n.label;
+        if (chars) for (const auto& c : *chars) if (c.key == n.key) return c.name.empty() ? c.internal : c.name;
+        return std::string("NPC ") + std::to_string(n.key);
+    }
+    static std::string ManagedNpcHistoryName(const ManagedNpc& n) { return n.label.empty() ? std::string("NPC ") + std::to_string(n.key) : n.label; }
+    static void SelectManagedNpc(int uid, bool add) {
+        if (!add) g_managedNpcSel.clear();
+        if (add && g_managedNpcSel.count(uid)) g_managedNpcSel.erase(uid); else g_managedNpcSel.insert(uid);
+        g_managedNpcPrimary = uid; g_managedNpcLast = uid;
+    }
+    static void SelectAllManagedNpcs(const std::vector<ManagedNpc>& list, int projectFilter) {
+        g_managedNpcSel.clear(); for (const auto& n : list) if (!n.hidden && (projectFilter < 0 || n.proj == projectFilter)) g_managedNpcSel.insert(n.uid);
+        g_managedNpcPrimary = g_managedNpcSel.empty() ? 0 : *g_managedNpcSel.begin();
+    }
+    static void SetSelectedNpcAi(bool enabled) {
+        const auto list = core::ManagedNpcs(); std::vector<Act> acts;
+        for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
+            const int afterBehavior = enabled && n->behavior == 1 ? 0 : n->behavior;
+            Act a; a.kind = Act::NpcControl; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.flag0 = n->aiEnabled; a.flag1 = enabled; a.behavior0 = n->behavior; a.behavior1 = afterBehavior;
+            core::SetManagedNpcControl(uid, enabled, afterBehavior); acts.push_back(std::move(a));
+        }
+        Push(std::move(acts));
+    }
+    static void SetSelectedNpcBehavior(int behavior) {
+        behavior = behavior == 1 ? 1 : 0; const bool enabled = behavior == 0;
+        const auto list = core::ManagedNpcs(); std::vector<Act> acts;
+        for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
+            Act a; a.kind = Act::NpcControl; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.flag0 = n->aiEnabled; a.flag1 = enabled; a.behavior0 = n->behavior; a.behavior1 = behavior;
+            core::SetManagedNpcControl(uid, enabled, behavior); acts.push_back(std::move(a));
+        }
+        Push(std::move(acts));
+    }
+    static void MoveSelectedNpcs(Vec3 delta) {
+        const auto list = core::ManagedNpcs(); std::vector<Act> acts;
+        for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
+            const Vec3 after{ n->pos.x + delta.x, n->pos.y + delta.y, n->pos.z + delta.z };
+            Act a; a.kind = Act::NpcMove; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = n->pos; a.pos1 = after; core::MoveManagedNpc(uid, after); acts.push_back(std::move(a));
+        }
+        Push(std::move(acts));
+    }
+    static void DeleteSelectedNpcs() {
+        const auto list = core::ManagedNpcs(); std::vector<Act> acts;
+        for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) if (!n->hidden) {
+            Act a; a.kind = Act::NpcDelete; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = n->pos; a.flag0 = n->aiEnabled; a.behavior0 = n->behavior; a.group = n->group; a.text0 = n->label;
+            acts.push_back(a); core::HideManagedNpc(uid);
+        }
+        Push(std::move(acts)); g_managedNpcSel.clear(); g_managedNpcPrimary = 0;
+    }
+    static void GroupSelectedNpcs(bool makeGroup) {
+        if (g_managedNpcSel.empty()) return; const int gid = makeGroup ? core::NewGroupId() : 0; const auto list = core::ManagedNpcs(); std::vector<Act> acts;
+        for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) { Act a; a.kind = Act::NpcGroup; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.group = n->group; a.group1 = gid; acts.push_back(a); core::SetManagedNpcGroup(uid, gid); }
+        Push(std::move(acts));
+    }
+    static void OpenNpcNoteEdit(const ManagedNpc& n) { g_npcNoteEditUid = n.uid; strncpy_s(g_npcNoteEdit, n.note.c_str(), _TRUNCATE); g_metadataPopupRequest = 1; }
+    static void OpenNpcLabelEdit(const ManagedNpc& n) { g_npcLabelEditUid = n.uid; strncpy_s(g_npcLabelEdit, n.label.c_str(), _TRUNCATE); g_metadataPopupRequest = 2; }
+    static void OpenGroupNameEdit(int gid) { g_groupNameEditId = gid; const std::string name = core::GroupName(gid); strncpy_s(g_groupNameEdit, name.c_str(), _TRUNCATE); g_metadataPopupRequest = 3; }
+    static void OpenObjectNoteEdit(const SpawnedObj& o) { g_objectNoteEditUid = o.uid; strncpy_s(g_objectNoteEdit, o.note.c_str(), _TRUNCATE); g_metadataPopupRequest = 4; }
+    static void DrawMetadataPopups() {
+        if (g_metadataPopupRequest) {
+            const char* id = g_metadataPopupRequest == 1 ? "Edit NPC note" : g_metadataPopupRequest == 2 ? "Rename NPC" : g_metadataPopupRequest == 3 ? "Rename group" : "Edit object note";
+            ImGui::OpenPopup(id); g_metadataPopupRequest = 0;
+        }
+        if (ImGui::BeginPopupModal("Edit NPC note", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::SetNextItemWidth(460); ImGui::InputTextMultiline("##npcnote", g_npcNoteEdit, sizeof g_npcNoteEdit, ImVec2(460, 110));
+            if (ImGui::Button(T("Save"))) {
+                const auto list = core::ManagedNpcs(); if (const auto* n = FindManagedNpc(list, g_npcNoteEditUid)) {
+                    Act a; a.kind = Act::NpcNote; a.uid = n->uid; a.text0 = n->note; a.text1 = g_npcNoteEdit; core::SetManagedNpcNote(a.uid, a.text1); Push({ a });
+                } ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
+        }
+        if (ImGui::BeginPopupModal("Rename NPC", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::SetNextItemWidth(360); ImGui::InputText("##npclabel", g_npcLabelEdit, sizeof g_npcLabelEdit);
+            if (ImGui::Button(T("Save"))) {
+                const auto list = core::ManagedNpcs(); if (const auto* n = FindManagedNpc(list, g_npcLabelEditUid)) {
+                    Act a; a.kind = Act::NpcLabel; a.uid = n->uid; a.text0 = n->label; a.text1 = g_npcLabelEdit; core::SetManagedNpcLabel(a.uid, a.text1); Push({ a });
+                } ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
+        }
+        if (ImGui::BeginPopupModal("Rename group", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::SetNextItemWidth(360); ImGui::InputText("##groupname", g_groupNameEdit, sizeof g_groupNameEdit);
+            if (ImGui::Button(T("Save"))) {
+                Act a; a.kind = Act::GroupName; a.group = g_groupNameEditId; a.text0 = core::GroupName(a.group); a.text1 = g_groupNameEdit; core::SetGroupName(a.group, a.text1); Push({ a }); ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
+        }
+        if (ImGui::BeginPopupModal("Edit object note", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::SetNextItemWidth(460); ImGui::InputTextMultiline("##objectnote", g_objectNoteEdit, sizeof g_objectNoteEdit, ImVec2(460, 110));
+            if (ImGui::Button(T("Save"))) {
+                const auto list = core::Spawned(); if (const auto* o = Find(list, g_objectNoteEditUid)) {
+                    Act a; a.kind = Act::ObjectNote; a.uid = o->uid; a.text0 = o->note; a.text1 = g_objectNoteEdit; core::SetObjectNote(a.uid, a.text1); Push({ a });
+                } ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
+        }
     }
     // tiles like the prefab browser's cards: the appearance preview, the in-game name below, a double-click spawns
     static void DrawNpcCards(const std::vector<thumbgen::CharInfo>& chars, float listH, float ui, bool canSpawn) {
@@ -1533,14 +1726,149 @@ namespace editor {
         }
         ImGui::EndChild();
     }
+    static void DrawManagedNpcs(const std::vector<thumbgen::CharInfo>* chars, bool compact, float ui, int projectFilter = -1) {
+        auto list = core::ManagedNpcs();
+        for (auto it = g_managedNpcSel.begin(); it != g_managedNpcSel.end();) {
+            const auto* n = FindManagedNpc(list, *it); if (!n || n->hidden || (projectFilter >= 0 && n->proj != projectFilter)) it = g_managedNpcSel.erase(it); else ++it;
+        }
+        if (g_managedNpcPrimary && !g_managedNpcSel.count(g_managedNpcPrimary)) g_managedNpcPrimary = g_managedNpcSel.empty() ? 0 : *g_managedNpcSel.begin();
+        int visible = 0; for (const auto& n : list) if (!n.hidden && (projectFilter < 0 || n.proj == projectFilter)) visible++;
+        char hdr[96]; snprintf(hdr, sizeof hdr, "%s  (%d)", T("Spawned NPCs"), visible);
+        if (!ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) return;
+
+        int selCount = 0, pendingCount = 0, syncCount = 0; bool anyOn = false, anyOff = false, anyNormal = false, anyHold = false;
+        for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
+            if (projectFilter >= 0 && n->proj != projectFilter) continue;
+            selCount++; pendingCount += (!n->actor || n->spawnPending) ? 1 : 0;
+            syncCount += (n->actor && n->aiApplied != n->aiEnabled) ? 1 : 0;
+            anyOn |= n->aiEnabled; anyOff |= !n->aiEnabled; anyNormal |= n->behavior == 0; anyHold |= n->behavior == 1;
+        }
+        if (selCount) {
+            const char* aiState = anyOn && anyOff ? T("Mixed") : anyOn ? T("On") : T("Off");
+            const char* behaviorState = anyNormal && anyHold ? T("Mixed") : anyHold ? T("Hold") : T("Normal");
+            ImGui::TextDisabled("%s %d  |  %s: %s  |  %s: %s", T("selected"), selCount, T("AI"), aiState, T("Behavior"), behaviorState);
+            if (pendingCount) { ImGui::SameLine(); ImGui::TextDisabled("  |  %d %s", pendingCount, T("pending")); }
+            if (syncCount) { ImGui::SameLine(); ImGui::TextDisabled("  |  %d %s", syncCount, T("syncing")); }
+        }
+        if (ImGui::Button(T("Select all NPCs"))) SelectAllManagedNpcs(list, projectFilter);
+        ImGui::SameLine(); if (ImGui::Button(T("Clear selection"))) { g_managedNpcSel.clear(); g_managedNpcPrimary = 0; }
+        ImGui::SameLine(); ImGui::BeginDisabled(g_managedNpcSel.empty() || !core::NpcAiControlAvailable());
+        if (ImGui::Button(T("AI on"))) SetSelectedNpcAi(true);
+        ImGui::SameLine(); if (ImGui::Button(T("AI off"))) SetSelectedNpcAi(false);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(170 * ui);
+        const char* behaviorPreview = anyNormal && anyHold ? T("Mixed") : anyHold ? T("Hold") : T("Normal");
+        if (ImGui::BeginCombo("##selectednpcbehavior", behaviorPreview)) {
+            if (ImGui::Selectable(T("Normal / autonomous"), anyNormal && !anyHold)) SetSelectedNpcBehavior(0);
+            if (ImGui::Selectable(T("Hold position / AI paused"), anyHold && !anyNormal)) SetSelectedNpcBehavior(1);
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine(); ImGui::BeginDisabled(g_managedNpcSel.empty());
+        if (ImGui::Button(T("Delete selected"))) DeleteSelectedNpcs();
+        ImGui::EndDisabled();
+        if (!core::NpcAiControlAvailable()) { ImGui::SameLine(); ImGui::TextDisabled("%s", T("native AI control unavailable")); }
+
+        std::vector<int> rows; rows.reserve(list.size());
+        for (int i = 0; i < (int)list.size(); ++i) if (!list[i].hidden && (projectFilter < 0 || list[i].proj == projectFilter)) rows.push_back(i);
+        std::sort(rows.begin(), rows.end(), [&](int a, int b) { return list[a].uid < list[b].uid; });
+        const float h = (compact ? 155.0f : 205.0f) * ui;
+        if (ImGui::BeginTable("managednpcs", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable, ImVec2(0, h))) {
+            ImGui::TableSetupColumn(T("NPC"), ImGuiTableColumnFlags_WidthStretch, 2.5f);
+            ImGui::TableSetupColumn(T("AI"), ImGuiTableColumnFlags_WidthFixed, 58 * ui);
+            ImGui::TableSetupColumn(T("Behavior"), ImGuiTableColumnFlags_WidthFixed, 105 * ui);
+            ImGui::TableSetupColumn(T("Group"), ImGuiTableColumnFlags_WidthFixed, 120 * ui);
+            ImGui::TableSetupColumn(T("Position"), ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn(T("ID"), ImGuiTableColumnFlags_WidthFixed, 62 * ui);
+            ImGui::TableHeadersRow();
+            ImGuiListClipper clip; clip.Begin((int)rows.size());
+            while (clip.Step()) for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r) {
+                const ManagedNpc& n = list[rows[r]]; const bool selected = g_managedNpcSel.count(n.uid) != 0;
+                const std::string name = ManagedNpcName(n, chars);
+                ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::PushID(n.uid);
+                if (ImGui::Selectable(name.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                    ImGuiIO& io = ImGui::GetIO();
+                    if (ShiftHeld(io) && g_managedNpcLast) {
+                        int a = -1, b = -1; for (int q = 0; q < (int)rows.size(); ++q) { if (list[rows[q]].uid == g_managedNpcLast) a = q; if (list[rows[q]].uid == n.uid) b = q; }
+                        if (a >= 0 && b >= 0) { if (a > b) std::swap(a, b); if (!CtrlHeld(io)) g_managedNpcSel.clear(); for (int q = a; q <= b; ++q) g_managedNpcSel.insert(list[rows[q]].uid); g_managedNpcPrimary = n.uid; }
+                    } else SelectManagedNpc(n.uid, CtrlHeld(io));
+                }
+                if (ImGui::BeginPopupContextItem("npcctx")) {
+                    if (!g_managedNpcSel.count(n.uid)) SelectManagedNpc(n.uid, false);
+                    if (!n.note.empty()) { ImGui::TextDisabled("%s", n.note.c_str()); ImGui::Separator(); }
+                    ImGui::BeginDisabled(!core::NpcAiControlAvailable());
+                    if (ImGui::MenuItem(T("Enable AI"))) SetSelectedNpcAi(true);
+                    if (ImGui::MenuItem(T("Disable AI"))) SetSelectedNpcAi(false);
+                    ImGui::EndDisabled();
+                    if (ImGui::BeginMenu(T("Behavior"))) {
+                        if (ImGui::MenuItem(T("Normal / autonomous"), nullptr, n.behavior == 0)) SetSelectedNpcBehavior(0);
+                        if (ImGui::MenuItem(T("Hold position / AI paused"), nullptr, n.behavior == 1)) SetSelectedNpcBehavior(1);
+                        ImGui::EndMenu();
+                    }
+                    if (ImGui::BeginMenu(T("Move"))) {
+                        ImGui::SetNextItemWidth(110); ImGui::DragFloat(T("amount##npcmove"), &g_moveStep, 0.05f, 0.01f, 100.0f, "%.2f m"); g_moveStep = std::clamp(g_moveStep, 0.01f, 100.0f);
+                        if (ImGui::MenuItem(T("+X"))) MoveSelectedNpcs({ g_moveStep, 0, 0 });
+                        if (ImGui::MenuItem(T("-X"))) MoveSelectedNpcs({ -g_moveStep, 0, 0 });
+                        if (ImGui::MenuItem(T("+Y"))) MoveSelectedNpcs({ 0, g_moveStep, 0 });
+                        if (ImGui::MenuItem(T("-Y"))) MoveSelectedNpcs({ 0, -g_moveStep, 0 });
+                        if (ImGui::MenuItem(T("+Z"))) MoveSelectedNpcs({ 0, 0, g_moveStep });
+                        if (ImGui::MenuItem(T("-Z"))) MoveSelectedNpcs({ 0, 0, -g_moveStep });
+                        ImGui::EndMenu();
+                    }
+                    if (ImGui::MenuItem(T(n.group > 0 ? "Ungroup" : "Group selection"))) GroupSelectedNpcs(n.group == 0);
+                    if (n.group > 0 && ImGui::MenuItem(T("Rename group"))) OpenGroupNameEdit(n.group);
+                    if (ImGui::MenuItem(T("Rename NPC"))) OpenNpcLabelEdit(n);
+                    if (ImGui::MenuItem(T("Edit note"))) OpenNpcNoteEdit(n);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem(T("Select all NPCs"))) SelectAllManagedNpcs(list, projectFilter);
+                    if (ImGui::MenuItem(T("Delete"))) DeleteSelectedNpcs();
+                    ImGui::EndPopup();
+                }
+                ImGui::TableSetColumnIndex(1);
+                if (n.actor && n.aiApplied != n.aiEnabled) {
+                    ImGui::TextDisabled("%s *", n.aiEnabled ? T("On") : T("Off"));
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("desired AI state has not reached the game yet; World Builder will retry when the server session is available"));
+                } else ImGui::TextUnformatted(n.aiEnabled ? T("On") : T("Off"));
+                ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", n.behavior == 1 ? T("Hold") : T("Normal"));
+                ImGui::TableSetColumnIndex(3);
+                if (n.group > 0) { const std::string gn = core::GroupName(n.group); if (!gn.empty()) ImGui::TextUnformatted(gn.c_str()); else ImGui::Text(T("Group %d"), n.group); } else ImGui::TextDisabled("-");
+                ImGui::TableSetColumnIndex(4);
+                if (n.actor && !n.spawnPending) ImGui::TextDisabled("%.2f  %.2f  %.2f", n.pos.x, n.pos.y, n.pos.z);
+                else ImGui::TextDisabled("%.2f  %.2f  %.2f  [%s]", n.pos.x, n.pos.y, n.pos.z, T("pending"));
+                ImGui::TableSetColumnIndex(5); ImGui::TextDisabled("#%d", n.uid);
+                if (ImGui::IsItemHovered() && !n.note.empty()) ImGui::SetTooltip("%s", n.note.c_str());
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (g_managedNpcPrimary) {
+            if (const auto* n = FindManagedNpc(list, g_managedNpcPrimary)) {
+                static int posUid = 0; static float ep[3] = {}; static Vec3 base{};
+                if (posUid != n->uid || (!ImGui::IsAnyItemActive() && (ep[0] != n->pos.x || ep[1] != n->pos.y || ep[2] != n->pos.z))) {
+                    posUid = n->uid; ep[0] = base.x = n->pos.x; ep[1] = base.y = n->pos.y; ep[2] = base.z = n->pos.z;
+                }
+                ImGui::TextDisabled("%s", T("Selected NPC properties"));
+                ImGui::SameLine(); ImGui::Text("%s", ManagedNpcName(*n, chars).c_str());
+                ImGui::SetNextItemWidth(compact ? -1.0f : 330 * ui);
+                if (ImGui::DragFloat3(T("position##managednpc"), ep, 0.05f, -100000.0f, 100000.0f, "%.3f")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    const Vec3 delta{ ep[0] - base.x, ep[1] - base.y, ep[2] - base.z }; MoveSelectedNpcs(delta); base = { ep[0], ep[1], ep[2] };
+                }
+                ImGui::SameLine(); if (ImGui::SmallButton(T("Edit note"))) OpenNpcNoteEdit(*n);
+                if (!n->note.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", n->note.c_str()); }
+            }
+        }
+        ImGui::Separator();
+    }
     static void DrawNpcs(const PosInfo& p, bool havePos, bool compact = false) {
         const auto chars = thumbgen::Characters();
         const float ui = ImGui::GetFontSize() / 17.0f;
         const int st = core::NpcState();
         if (st == 0) { ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), T("NPC spawning is not available in this game build (see the log).")); }
         else if (st == 1) { ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), T("walk a few steps first: the game's spawn request needs your character's server actor")); }
-        else if (!compact) ImGui::TextDisabled(T("Spawned characters are part of the game world: they fight, walk and despawn by the game's rules, and are not in the scene list or in projects."));
+        else if (!compact) ImGui::TextDisabled(T("NPCs spawned here are managed scene entities: select, move, group, annotate, control AI, delete, and save them with projects."));
+        DrawManagedNpcs(chars ? chars.get() : nullptr, compact, ui);
         if (!chars) { ImGui::TextDisabled(T("reading the character list from the game files...")); return; }
+        ImGui::SeparatorText(T("Character catalog"));
         if (!compact) {   // view switch: list or tiles (tile size shared with the browser)
             const ImVec4 on = ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive), off = ImGui::GetStyleColorVec4(ImGuiCol_Button);
             ImGui::PushStyleColor(ImGuiCol_Button, g_npcCards ? off : on); if (ImGui::Button(T(ICON_LIST " list"))) g_npcCards = false; ImGui::PopStyleColor();
@@ -1620,11 +1948,23 @@ namespace editor {
                 ImGui::DragFloat(T("spacing"), &g_npcSpacing, 0.1f, 0.25f, 50.0f, "%.1f m");
                 g_npcSpacing = std::clamp(g_npcSpacing, 0.25f, 50.0f);
             }
+            SameLineOrWrap(compact, 160 * ui);
+            ImGui::BeginDisabled(!core::NpcAiControlAvailable());
+            bool spawnAi = g_npcSpawnAi;
+            if (ImGui::Checkbox(T("AI enabled on spawn"), &spawnAi)) { g_npcSpawnAi = spawnAi; g_npcSpawnBehavior = spawnAi ? 0 : 1; }
+            ImGui::SameLine(); ImGui::SetNextItemWidth(compact ? 170 * ui : 210 * ui);
+            int behavior = g_npcSpawnBehavior;
+            if (ComboT("##npcspawnbehavior", &behavior, kNpcBehaviors, 2)) { g_npcSpawnBehavior = behavior; g_npcSpawnAi = behavior == 0; }
+            ImGui::EndDisabled();
+            if (!core::NpcAiControlAvailable()) {
+                g_npcSpawnAi = true; g_npcSpawnBehavior = 0;
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", T("The native AI-control request was not resolved in this game build; NPCs will spawn with normal AI."));
+            }
             ImGui::BeginDisabled(!havePos || st != 2);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
             if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS "   SPAWN   "), ImVec2(150 * ui, 0))) {
                 const Vec3 center{ g_lastPlayer.x + g_fx * g_npcDist, g_lastPlayer.y, g_lastPlayer.z + g_fz * g_npcDist };
-                SpawnNpcFormation(c.key, center, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, g_fx, g_fz);
+                SpawnNpcFormation(c.key, center, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, g_fx, g_fz, g_npcSpawnAi, g_npcSpawnBehavior);
                 Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str());
             }
             ImGui::PopStyleColor(2); ImGui::EndDisabled();
@@ -1949,14 +2289,17 @@ namespace editor {
             if (!all) { if (g_place.active) DropCarried(); g_sel.clear(); for (int m : *members) if (!list[(size_t)m].hidden) g_sel.insert(list[(size_t)m].uid); g_primary = o.uid; }
         }
         else if (!g_sel.count(o.uid)) SelectUid(o.uid, false, list);   // grouped members select their group by default
+        if (!o.note.empty()) { ImGui::TextDisabled("%s", o.note.c_str()); ImGui::Separator(); }
         ImGui::BeginDisabled(!core::FreeCamAvailable());
         if (ImGui::MenuItem(T("Focus"))) FocusSelection();
         ImGui::EndDisabled();
         DrawSelectionTransformMenu();
+        if (ImGui::MenuItem(T("Edit note"))) OpenObjectNoteEdit(o);
         if (ImGui::MenuItem(T("Grab"))) StartGrab(SelUids(), false, g_sel.size() == 1 ? ShortName(o.prefab) : "selection");
         if (ImGui::MenuItem(T("To ground"))) SnapSelToGround();
         if (ImGui::MenuItem(T("Duplicate"))) { CopySel(); Paste(havePos); }
         if (ImGui::MenuItem(T(o.group > 0 ? "Ungroup" : "Group selection"))) GroupSel(o.group == 0);
+        if (o.group > 0 && ImGui::MenuItem(T("Rename group"))) OpenGroupNameEdit(o.group);
         if (ImGui::BeginMenu(T("Rotate"))) {
             if (ImGui::MenuItem(T("Rotate left"))) RotateSel(-g_rotationStep);
             if (ImGui::MenuItem(T("Rotate right"))) RotateSel(g_rotationStep);
@@ -2013,7 +2356,11 @@ namespace editor {
             const std::string cardName = pi >= 0 ? ShownName(idx[pi]) : ShortName(o.prefab);
             dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), { p0.x + pad, t1.y + 2 }, ImGui::GetColorU32(o.hidden ? ImGuiCol_TextDisabled : ImGuiCol_Text), cardName.c_str(), nullptr, tile);
             dl->PopClipRect();
-            if (hov && !ImGui::IsPopupOpen("scardctx")) ImGui::SetTooltip(T("%s\n%.1f  %.1f  %.1f   yaw %.0f   scale %.2f%s"), o.prefab.c_str(), o.pos.x, o.pos.y, o.pos.z, o.rot.yaw, o.scale, o.group > 0 ? (std::string("\n") + T("(in a group)")).c_str() : "");
+            if (hov && !ImGui::IsPopupOpen("scardctx")) {
+                std::string extra = o.group > 0 ? std::string("\n") + T("(in a group)") : std::string();
+                if (!o.note.empty()) extra += std::string("\n") + T("Note") + ": " + o.note;
+                ImGui::SetTooltip(T("%s\n%.1f  %.1f  %.1f   yaw %.0f   scale %.2f%s"), o.prefab.c_str(), o.pos.x, o.pos.y, o.pos.z, o.rot.yaw, o.scale, extra.c_str());
+            }
             ImGui::PopID();
         };
         auto grid = [&](const std::vector<int>& order) { for (size_t k = 0; k < order.size(); k++) { if (k % cols) ImGui::SameLine(); card(order[k], (int)order.size(), order); } };
@@ -2026,11 +2373,17 @@ namespace editor {
             ImGui::PushID(gid);
             if (ImGui::SmallButton(closed ? ">" : "v")) { if (closed) g_closedGroups.erase(gid); else g_closedGroups.insert(gid); }
             ImGui::SameLine();
-            char glbl[64]; snprintf(glbl, sizeof glbl, T("Group %d  (%d objects)"), gid, (int)mem.size());
+            const std::string groupName = core::GroupName(gid);
+            char glbl[224]; if (!groupName.empty()) snprintf(glbl, sizeof glbl, "%s  (%d)", groupName.c_str(), (int)mem.size()); else snprintf(glbl, sizeof glbl, T("Group %d  (%d objects)"), gid, (int)mem.size());
             ImGui::PushStyleColor(ImGuiCol_Text, GroupColor(gid, 255));
             if (ImGui::Selectable(glbl, allSel)) { ImGuiIO& io = ImGui::GetIO(); const bool ctrl = CtrlHeld(io); if (!ctrl) g_sel.clear(); for (int m : mem) { if (allSel && ctrl) g_sel.erase(list[m].uid); else g_sel.insert(list[m].uid); } g_primary = list[mem[0]].uid; g_editUid = 0; }
             ImGui::PopStyleColor();
-            if (ImGui::BeginPopupContextItem("gctx")) { if (ImGui::MenuItem(T("Grab group"))) { g_sel.clear(); for (int m : mem) g_sel.insert(list[m].uid); StartGrab(SelUids(), false, "group"); } if (ImGui::MenuItem(T("Ungroup"))) { g_sel.clear(); for (int m : mem) g_sel.insert(list[m].uid); GroupSel(false); } ImGui::EndPopup(); }
+            if (ImGui::BeginPopupContextItem("gctx")) {
+                if (ImGui::MenuItem(T("Rename group"))) OpenGroupNameEdit(gid);
+                if (ImGui::MenuItem(T("Grab group"))) { g_sel.clear(); for (int m : mem) g_sel.insert(list[m].uid); StartGrab(SelUids(), false, groupName.empty() ? "group" : groupName); }
+                if (ImGui::MenuItem(T("Ungroup"))) { g_sel.clear(); for (int m : mem) g_sel.insert(list[m].uid); GroupSel(false); }
+                ImGui::EndPopup();
+            }
             if (!closed) grid(mem);
             ImGui::PopID();
             const ImVec2 f1 = { f0.x + ImGui::GetContentRegionAvail().x + ImGui::GetCursorScreenPos().x - ImGui::GetCursorScreenPos().x, ImGui::GetCursorScreenPos().y };
@@ -2051,6 +2404,13 @@ namespace editor {
             if (o.proj == 0) { newCount++; continue; }
             if (std::find(ids.begin(), ids.end(), o.proj) == ids.end()) ids.push_back(o.proj);
         }
+        const auto npcs = core::ManagedNpcs();
+        for (const auto& n : npcs) {
+            if (n.hidden) continue;
+            visible++;
+            if (n.proj == 0) { newCount++; continue; }
+            if (std::find(ids.begin(), ids.end(), n.proj) == ids.end()) ids.push_back(n.proj);
+        }
         if (ids.empty()) { g_projTab = -1; return; }   // nothing from a project in the scene: the tabs would say nothing
         // the selected project can disappear (deleted, or the scene was emptied); without this the scene would stay blank
         if (g_projTab > 0 && std::find(ids.begin(), ids.end(), g_projTab) == ids.end()) g_projTab = -1;
@@ -2068,7 +2428,7 @@ namespace editor {
         }
         for (int id : ids) {
             const std::string name = core::ProjectNameOf(id);
-            const bool dirty = core::ProjectDirty(id);   // a star means: objects of it were moved, deleted or regrouped since the load / save
+            const bool dirty = core::ProjectDirty(id);   // a star means: entities of it changed since the load / save
             snprintf(lbl, sizeof lbl, "%s%s (%d)###pt%d", name.c_str(), dirty ? " *" : "", core::ProjectObjectCount(id), id);
             if (dirty) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.82f, 0.35f, 1));
             const bool open = ImGui::BeginTabItem(lbl);
@@ -2082,24 +2442,31 @@ namespace editor {
             const bool dirty = core::ProjectDirty(g_projTab);
             if (dirty) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.33f, 0.12f, 1));
             if (ImGui::SmallButton(T(dirty ? ICON_FLOPPY_DISK " Save the changes" : ICON_FLOPPY_DISK " Overwrite this project"))) {
-                if (core::SaveProject(name, core::SaveProjectOnly)) Note(T("overwrote %s (%d objects)"), name.c_str(), n);
+                if (core::SaveProject(name, core::SaveProjectOnly)) Note(T("overwrote %s (%d entities)"), name.c_str(), n);
                 else Note(T("save failed"));
             }
             if (dirty) ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("writes exactly the %d objects shown here back to %s.cdproj.\nObjects of other projects and new objects are not touched."), n, name.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("writes exactly the %d entities shown here back to %s.cdproj.\nEntities of other projects and new entities are not touched."), n, name.c_str());
             SameLineOrWrap(compact, 110);
-            if (ImGui::SmallButton(T("Select all of them"))) { g_sel.clear(); for (const auto& o : all) if (!o.hidden && o.proj == g_projTab) g_sel.insert(o.uid); }
+            if (ImGui::SmallButton(T("Select all of them"))) {
+                g_sel.clear(); for (const auto& o : all) if (!o.hidden && o.proj == g_projTab) g_sel.insert(o.uid);
+                SelectAllManagedNpcs(npcs, g_projTab);
+            }
             SameLineOrWrap(compact, ImGui::CalcTextSize(name.c_str()).x); ImGui::TextDisabled("%s", name.c_str());
         }
     }
     static void DrawScene(const PosInfo& p, bool havePos, bool compact = false) {
         auto list = core::Spawned();
+        const float ui = ImGui::GetFontSize() / 17.0f;
         DrawProjectTabs(list, compact);
         if (g_projTab >= 0) {   // show one project only; everything below works on uids, so a filtered copy is enough
             std::vector<SpawnedObj> f;
             for (auto& o : list) if (o.proj == g_projTab) f.push_back(o);
             list.swap(f);
         }
+        // Scene manages both prefab objects and managed NPCs. Project filtering applies to both, so a loaded
+        // project can be edited/saved without accidentally touching NPCs belonging to another project.
+        { const auto chars = thumbgen::Characters(); DrawManagedNpcs(chars ? chars.get() : nullptr, compact, ui, g_projTab); }
         // toolbar
         if (compact) g_sceneCards = true;
         if (!compact) {   // list or tiles (the dock is intentionally cards-only, like the compact Browser)
@@ -2120,7 +2487,6 @@ namespace editor {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("rotation step for Rotate - / Rotate +"));
         ImGui::BeginDisabled(g_undo.empty()); if (ImGui::SmallButton(T("Undo"))) Undo(); ImGui::EndDisabled(); SameLineOrWrap(compact, 45);
         ImGui::BeginDisabled(g_redo.empty()); if (ImGui::SmallButton(T("Redo"))) Redo(); ImGui::EndDisabled();
-        const float ui = ImGui::GetFontSize() / 17.0f;
         const float availY = ImGui::GetContentRegionAvail().y;
         const bool hasSelection = !g_sel.empty() && Find(list, g_primary);
         const float footer = compact ? (hasSelection ? (g_sel.size() == 1 ? 238.0f : 113.0f) : 56.0f) * ui : 178.0f * ui;
@@ -2147,7 +2513,8 @@ namespace editor {
                     char lbl[48]; snprintf(lbl, sizeof lbl, "%s##g%d", s_closed.count(gid) ? ">" : "v", gid);
                     if (ImGui::SmallButton(lbl)) { if (s_closed.count(gid)) s_closed.erase(gid); else s_closed.insert(gid); }
                     ImGui::TableSetColumnIndex(1);
-                    char glbl[64]; snprintf(glbl, sizeof glbl, T("Group %d  (%d objects)##gs%d"), gid, (int)mem.size(), gid);
+                    const std::string groupName = core::GroupName(gid);
+                    char glbl[240]; if (!groupName.empty()) snprintf(glbl, sizeof glbl, "%s  (%d)##gs%d", groupName.c_str(), (int)mem.size(), gid); else snprintf(glbl, sizeof glbl, T("Group %d  (%d objects)##gs%d"), gid, (int)mem.size(), gid);
                     if (ImGui::Selectable(glbl, allSel, ImGuiSelectableFlags_SpanAllColumns)) { ImGuiIO& io = ImGui::GetIO(); const bool ctrl = CtrlHeld(io); if (!ctrl) g_sel.clear(); for (int m : mem) { if (allSel && ctrl) g_sel.erase(list[m].uid); else g_sel.insert(list[m].uid); } g_primary = list[mem[0]].uid; g_lastClicked = g_primary; g_editUid = 0; }
                     ImGui::PushID(gid);
                     SceneObjectContext(list[mem[0]], list, havePos, "groupctx", &mem);
@@ -2177,8 +2544,9 @@ namespace editor {
                 ImGui::PopID();
                 if (rw.second) ImGui::Unindent(14.0f);
                 ImGui::TableSetColumnIndex(1);
-                std::string name = ShortName(o.prefab);
+                std::string name = ShortName(o.prefab); if (!o.note.empty()) name += "  *";
                 if (o.hidden) ImGui::TextDisabled(T("%s (deleted)"), name.c_str()); else ImGui::TextUnformatted(name.c_str());
+                if (!o.note.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", o.note.c_str());
                 ImGui::TableSetColumnIndex(2); if (o.group) ImGui::TextDisabled("%d", o.group);
                 ImGui::TableSetColumnIndex(3); ImGui::Text("%.1f  %.1f  %.1f", o.pos.x, o.pos.y, o.pos.z);
                 ImGui::TableSetColumnIndex(4); if (fabsf(o.rot.pitch) > 0.05f || fabsf(o.rot.roll) > 0.05f) ImGui::Text("%.0f*", o.rot.yaw); else ImGui::Text("%.0f", o.rot.yaw);
@@ -2625,7 +2993,7 @@ namespace editor {
             if (!core::GroundResult(j.ticket, &gh)) { ++i; continue; }
             Vec3 at = j.at;
             if (gh.hit) at.y = gh.centerY - core::g_probeRadius;
-            SpawnNpcFormation(j.key, at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz);
+            SpawnNpcFormation(j.key, at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz, j.ai, j.behavior);
             g_npcDropJobs.erase(g_npcDropJobs.begin() + i);
         }
     }
@@ -2652,9 +3020,9 @@ namespace editor {
         if (groundPlane && core::GroundProbeReady()) {
             const float startY = at.y + 150.0f;
             const int ticket = core::GroundProbe({ at.x, startY, at.z }, 400.0f);
-            if (ticket) { g_npcDropJobs.push_back({ key, ticket, at, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, fx, fz }); return; }
+            if (ticket) { g_npcDropJobs.push_back({ key, ticket, at, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, fx, fz, g_npcSpawnAi, g_npcSpawnBehavior }); return; }
         }
-        SpawnNpcFormation(key, at, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, fx, fz);
+        SpawnNpcFormation(key, at, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, fx, fz, g_npcSpawnAi, g_npcSpawnBehavior);
     }
     static void DrawWorldContextPopup(bool havePos) {
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
@@ -2931,7 +3299,7 @@ namespace editor {
         ImGuiIO& io = ImGui::GetIO();
         io.MouseDrawCursor = !g_playMode;
         ClickSelect(p, havePos); DrawWorldContextPopup(havePos); DrawSelectionOutlines();
-        if (g_compact) { DrawCompact(p, havePos); CameraTick(); return; }
+        if (g_compact) { DrawCompact(p, havePos); DrawMetadataPopups(); CameraTick(); return; }
         {   // initial size follows the UI scale (style is scaled by screen height / 1080) and stays inside the screen
             const float ui = ImGui::GetFontSize() / 17.0f;
             ImVec2 want(1320.0f * ui, 800.0f * ui);
@@ -3147,6 +3515,7 @@ namespace editor {
         }
         ProcessBrowserDrag();
         ProcessNpcDrag();
+        DrawMetadataPopups();
         ImGui::End();
         if (playAlpha) ImGui::PopStyleVar();
         CameraTick();

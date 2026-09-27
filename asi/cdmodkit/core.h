@@ -15,8 +15,10 @@ struct Vec3 { float x, y, z; };
 struct Rot { float yaw = 0, pitch = 0, roll = 0; };   // degrees; rotation = Ry(yaw) * Rx(pitch) * Rz(roll) (yaw about the up axis, then tilt, then roll)
 struct PosInfo { Vec3 tiled, world; int tileX, tileZ; };
 struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float scale; bool hidden; DWORD tick; Rot colRot; float colScale;
-                    int uid; int group; int proj; bool gimmick = false; uintptr_t actor = 0; bool standin = false; };   // gimmick: spawned through the game's server path (obj = its server scene object, actor = its actor)   // uid: stable id for the editor (indices shift when entries are forgotten); group 0 = none;
-                                                       // proj: which project the object belongs to (0 = placed by hand, not part of a saved project yet)
+                    int uid; int group; int proj; bool gimmick = false; uintptr_t actor = 0; bool standin = false; std::string note; };   // gimmick: spawned through the game's server path (obj = its server scene object, actor = its actor)   // uid: stable id for the editor (indices shift when entries are forgotten); group 0 = none;
+                                                        // proj: which project the object belongs to (0 = placed by hand, not part of a saved project yet)
+struct ManagedNpc { int uid = 0; uint32_t key = 0; Vec3 pos{}; int type = 1; uint32_t extra = 0; uintptr_t actor = 0; uint32_t actorId = 0;
+                    bool aiEnabled = true; bool aiApplied = true; int behavior = 0; bool hidden = false; bool spawnPending = false; int group = 0; int proj = 0; std::string label, note; };
 
 namespace core {
     constexpr int kResourcePrefabs = 101;
@@ -90,10 +92,26 @@ namespace core {
     // Spawning (queued to the game thread). The registry keeps every object we created.
     int  SpawnAt(const std::string& prefab, Vec3 world, Rot rot = {}, float scale = 1.0f, int group = 0, int proj = 0);   // returns the uid (0 = not queued)
     bool SpawnNpc(uint32_t characterKey, Vec3 world, int type = 1, uint32_t extra = 0);   // NPC / creature via the game's spawn-character request (queued to the server tick)
+    int  SpawnManagedNpc(uint32_t characterKey, Vec3 world, int type = 1, uint32_t extra = 0, bool aiEnabled = true, int behavior = 0,
+                         int group = 0, int proj = 0, const std::string& label = {}, const std::string& note = {});
+    std::vector<ManagedNpc> ManagedNpcs();
+    bool MoveManagedNpc(int uid, Vec3 world);           // committed move: remove + respawn through the game's server path
+    bool HideManagedNpc(int uid);                       // remove the live actor, keep the registry entry for undo/project state
+    bool RestoreManagedNpc(int uid);                    // respawn a hidden managed NPC
+    void ForgetManagedNpc(int uid);
+    bool SetManagedNpcControl(int uid, bool enabled, int behavior); // atomically set desired AI state + behavior preset
+    bool SetManagedNpcAi(int uid, bool enabled);        // exact desired state; internally uses the game's AI-control toggle request
+    bool SetManagedNpcBehavior(int uid, int behavior);  // 0 normal/autonomous, 1 hold position (AI paused)
+    void SetManagedNpcGroup(int uid, int group);
+    void SetManagedNpcNote(int uid, const std::string& note);
+    void SetManagedNpcLabel(int uid, const std::string& label);
     int  NpcState();                                  // 0 = not available in this game build, 1 = walk a few steps first (player actor unknown), 2 = ready
+    bool NpcAiControlAvailable();                      // native server AI-control toggle request + actor-id registry resolved
     std::vector<SpawnedObj> Spawned();
     int  IndexOfUid(int uid);                   // -1 when the object was forgotten
     void SetGroup(int uid, int group); int NewGroupId();
+    std::string GroupName(int group); void SetGroupName(int group, const std::string& name);
+    void SetObjectNote(int uid, const std::string& note);
     struct MoveReq { int uid; Vec3 pos; Rot rot; float scale; };
     bool MoveMany(const std::vector<MoveReq>& reqs, bool final);   // all moves in one game-thread job; false = dropped (live, queue lagging)
     bool HideUid(int uid); void ForgetUid(int uid);
