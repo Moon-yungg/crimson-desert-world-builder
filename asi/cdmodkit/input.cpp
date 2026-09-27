@@ -232,16 +232,24 @@ namespace input {
         if (ri->data.mouse.usButtonFlags & ups) return 0;   // button releases still reach the game (see keys)
         return 1;   // the game's own camera must not turn while flying: its view decides what gets culled
     }
-    static std::vector<int> g_placeVks;
-    void SetPlaceVks(const int* vks, int count) { g_placeVks.assign(vks, vks + count); }
+    // written from the settings (render thread), read by the window procedure: a fixed array and an atomic count, so the
+    // reader never walks storage that is being reallocated (a std::vector here could be)
+    static const int kMaxPlaceVks = 32; static volatile LONG g_placeVkN = 0; static volatile LONG g_placeVkArr[kMaxPlaceVks] = {};
+    void SetPlaceVks(const int* vks, int count) {
+        const int n = count < 0 ? 0 : count > kMaxPlaceVks ? kMaxPlaceVks : count;
+        InterlockedExchange(&g_placeVkN, 0);
+        for (int i = 0; i < n; i++) InterlockedExchange(&g_placeVkArr[i], vks[i]);
+        InterlockedExchange(&g_placeVkN, n);
+    }
     static bool IsPlaceKeyFixed(WPARAM vk) { return vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN || vk == VK_PRIOR || vk == VK_NEXT || vk == VK_ADD || vk == VK_SUBTRACT || vk == VK_RETURN || vk == VK_BACK || vk == VK_DECIMAL || vk == VK_CLEAR || vk == VK_MULTIPLY || vk == VK_DIVIDE || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9); }
     static bool IsPlaceKey(WPARAM vk) {
         if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LSHIFT || vk == VK_RSHIFT || vk == VK_LCONTROL || vk == VK_RCONTROL) return false;
-        if (g_placeVks.empty()) return IsPlaceKeyFixed(vk);
-        for (int k : g_placeVks) if ((WPARAM)k == vk) return true;
+        const int n = (int)g_placeVkN;
+        if (n == 0) return IsPlaceKeyFixed(vk);
+        for (int i = 0; i < n; i++) if ((WPARAM)g_placeVkArr[i] == vk) return true;
         static const int nav[] = { VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_DELETE, VK_CLEAR };
         static const int np[]  = { VK_NUMPAD8, VK_NUMPAD2, VK_NUMPAD4, VK_NUMPAD6, VK_NUMPAD9, VK_NUMPAD3, VK_NUMPAD7, VK_NUMPAD1, VK_NUMPAD0, VK_DECIMAL, VK_NUMPAD5 };
-        for (int j = 0; j < 11; j++) if (vk == (WPARAM)nav[j]) for (int k : g_placeVks) if (k == np[j]) return true;
+        for (int j = 0; j < 11; j++) if (vk == (WPARAM)nav[j]) for (int i = 0; i < n; i++) if (g_placeVkArr[i] == np[j]) return true;
         return false;
     }
     static bool IsMouse(UINT m) { return m >= WM_MOUSEFIRST && m <= WM_MOUSELAST; }
