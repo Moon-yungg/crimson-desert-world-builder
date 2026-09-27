@@ -167,6 +167,7 @@ namespace editor {
     static std::set<int> g_managedNpcSel; static int g_managedNpcPrimary = 0, g_managedNpcLast = 0;
     static int g_projTab = -1;   // -1 = whole scene, 0/new = unassigned, >0 = loaded project
     static const ManagedNpc* FindManagedNpc(const std::vector<ManagedNpc>& list, int uid);
+    static Vec3 ManagedNpcDisplayPos(const ManagedNpc& n);
     static void SelectAllManagedNpcs(const std::vector<ManagedNpc>& list, int projectFilter = -1);
     static void DeleteSelectedNpcs();
     static void GroupSelectedNpcs(bool makeGroup);
@@ -1014,11 +1015,11 @@ namespace editor {
         if (!SceneHasSelection() || !core::FreeCamAvailable()) return false;
         const auto list = core::Spawned(); const auto npcs = core::ManagedNpcs(); Vec3 c{}; int n = 0;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; const Vec3 bc = BboxCenter(*o); c.x += bc.x; c.y += bc.y; c.z += bc.z; n++; }
-        for (int uid : g_managedNpcSel) { const ManagedNpc* m = FindManagedNpc(npcs, uid); if (!m || m->hidden) continue; c.x += m->pos.x; c.y += m->pos.y + 0.9f; c.z += m->pos.z; n++; }
+        for (int uid : g_managedNpcSel) { const ManagedNpc* m = FindManagedNpc(npcs, uid); if (!m || m->hidden) continue; const Vec3 p = ManagedNpcDisplayPos(*m); c.x += p.x; c.y += p.y + 0.9f; c.z += p.z; n++; }
         if (!n) return false; c.x /= n; c.y /= n; c.z /= n;
         float radius = 1.0f;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; const Vec3 bc = BboxCenter(*o); const float dx = bc.x - c.x, dy = bc.y - c.y, dz = bc.z - c.z; radius = std::max(radius, sqrtf(dx * dx + dy * dy + dz * dz) + ObjectRadius(*o)); }
-        for (int uid : g_managedNpcSel) { const ManagedNpc* m = FindManagedNpc(npcs, uid); if (!m || m->hidden) continue; const float dx = m->pos.x - c.x, dy = (m->pos.y + 0.9f) - c.y, dz = m->pos.z - c.z; radius = std::max(radius, sqrtf(dx * dx + dy * dy + dz * dz) + 1.2f); }
+        for (int uid : g_managedNpcSel) { const ManagedNpc* m = FindManagedNpc(npcs, uid); if (!m || m->hidden) continue; const Vec3 p = ManagedNpcDisplayPos(*m); const float dx = p.x - c.x, dy = (p.y + 0.9f) - c.y, dz = p.z - c.z; radius = std::max(radius, sqrtf(dx * dx + dy * dy + dz * dz) + 1.2f); }
         if (!g_cameraMode) ToggleCameraMode();
         if (!g_cameraMode) return false;
         g_cameraViewMode = 0;   // the focus sets its own direction
@@ -1629,9 +1630,16 @@ namespace editor {
     static const ManagedNpc* FindManagedNpc(const std::vector<ManagedNpc>& list, int uid) {
         for (const auto& n : list) if (n.uid == uid) return &n; return nullptr;
     }
+    static const thumbgen::CharInfo* ManagedNpcChar(const ManagedNpc& n, const std::vector<thumbgen::CharInfo>* chars) {
+        if (chars) for (const auto& c : *chars) if (c.key == n.key) return &c;
+        return nullptr;
+    }
+    static Vec3 ManagedNpcDisplayPos(const ManagedNpc& n) {
+        Vec3 p{}; return core::ManagedNpcLivePosition(n, &p) ? p : n.pos;
+    }
     static std::string ManagedNpcName(const ManagedNpc& n, const std::vector<thumbgen::CharInfo>* chars) {
         if (!n.label.empty()) return n.label;
-        if (chars) for (const auto& c : *chars) if (c.key == n.key) return c.name.empty() ? c.internal : c.name;
+        if (const auto* c = ManagedNpcChar(n, chars)) return c->name.empty() ? c->internal : c->name;
         return std::string("NPC ") + std::to_string(n.key);
     }
     static std::string ManagedNpcHistoryName(const ManagedNpc& n) { return n.label.empty() ? std::string("NPC ") + std::to_string(n.key) : n.label; }
@@ -1672,8 +1680,9 @@ namespace editor {
     static void MoveSelectedNpcs(Vec3 delta) {
         const auto list = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
-            const Vec3 after{ n->pos.x + delta.x, n->pos.y + delta.y, n->pos.z + delta.z };
-            Act a; a.kind = Act::NpcMove; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = n->pos; a.pos1 = after; core::MoveManagedNpc(uid, after); acts.push_back(std::move(a));
+            const Vec3 before = ManagedNpcDisplayPos(*n);
+            const Vec3 after{ before.x + delta.x, before.y + delta.y, before.z + delta.z };
+            Act a; a.kind = Act::NpcMove; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = before; a.pos1 = after; core::MoveManagedNpc(uid, after); acts.push_back(std::move(a));
         }
         Push(std::move(acts));
     }
@@ -1730,8 +1739,9 @@ namespace editor {
             acts.push_back(a); moves.push_back({ uid, p, o->rot, o->scale });
         }
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(npcs, uid)) if (!n->hidden) {
-            Vec3 p{ n->pos.x + delta.x, n->pos.y + delta.y, n->pos.z + delta.z };
-            Act a; a.kind = Act::NpcMove; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = n->pos; a.pos1 = p;
+            const Vec3 before = ManagedNpcDisplayPos(*n);
+            Vec3 p{ before.x + delta.x, before.y + delta.y, before.z + delta.z };
+            Act a; a.kind = Act::NpcMove; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = before; a.pos1 = p;
             acts.push_back(a); core::MoveManagedNpc(uid, p);
         }
         if (!moves.empty()) core::MoveMany(moves, true);
@@ -2463,7 +2473,7 @@ namespace editor {
         return ShortName(objects[e.index].prefab);
     }
     static Vec3 SceneEntityPos(const SceneEntityRef& e, const std::vector<SpawnedObj>& objects, const std::vector<ManagedNpc>& npcs) {
-        return e.npc ? npcs[e.index].pos : objects[e.index].pos;
+        return e.npc ? ManagedNpcDisplayPos(npcs[e.index]) : objects[e.index].pos;
     }
     static void SelectSceneEntity(const SceneEntityRef& e, bool add, bool range, const std::vector<SceneEntityRef>& order,
                                   const std::vector<SpawnedObj>& objects, const std::vector<ManagedNpc>& npcs) {
@@ -2542,15 +2552,24 @@ namespace editor {
                 if (ImTextureID tex = overlay::Thumb(core::ThumbFile(o.prefab))) dl->AddImage(tex, t0, t1, ImVec2(0, 0), ImVec2(1, 1), o.hidden ? IM_COL32(255,255,255,90) : IM_COL32_WHITE);
                 else { dl->AddRectFilled(t0, t1, IM_COL32(0,0,0,70), 3.0f); if (thumbgen::Ready() && !thumbgen::Processed(o.prefab)) thumbgen::Request(o.prefab); }
             } else {
-                dl->AddRectFilled(t0, t1, IM_COL32(28,31,38,220), 3.0f);
-                const char* tag = T("NPC"); const ImVec2 ts = ImGui::CalcTextSize(tag); dl->AddText({ t0.x + (tile-ts.x)*0.5f, t0.y + (tile-ts.y)*0.5f }, IM_COL32(210,220,235,230), tag);
+                const auto& n = npcs[e.index]; const auto* c = ManagedNpcChar(n, chars);
+                ImTextureID tex{};
+                if (c && !c->app.empty()) {
+                    if (thumbgen::Ready() && !thumbgen::Processed(c->app)) thumbgen::Request(c->app);
+                    tex = overlay::Thumb(core::ThumbFile(c->app));
+                }
+                if (tex) dl->AddImage(tex, t0, t1, ImVec2(0, 0), ImVec2(1, 1), n.hidden ? IM_COL32(255,255,255,90) : IM_COL32_WHITE);
+                else {
+                    dl->AddRectFilled(t0, t1, IM_COL32(28,31,38,220), 3.0f);
+                    const char* tag = T("NPC"); const ImVec2 ts = ImGui::CalcTextSize(tag); dl->AddText({ t0.x + (tile-ts.x)*0.5f, t0.y + (tile-ts.y)*0.5f }, IM_COL32(210,220,235,230), tag);
+                }
             }
             float dist = 0; if (havePos) { float dx=pos.x-p.world.x,dy=pos.y-p.world.y,dz=pos.z-p.world.z; dist=sqrtf(dx*dx+dy*dy+dz*dz); }
             char info[80]; snprintf(info,sizeof info,"#%d  %s  %.0f m",e.uid,e.npc?T("NPC"):T("Object"),dist); dl->AddText({t0.x+3,t0.y+2},IM_COL32(255,255,255,210),info);
             if (e.group > 0) dl->AddRectFilled({t1.x-7,t0.y},{t1.x,t0.y+7},GroupColor(e.group,255));
             dl->PushClipRect({p0.x+pad,t1.y},{p1.x-pad,p1.y},true); dl->AddText(ImGui::GetFont(),ImGui::GetFontSize(),{p0.x+pad,t1.y+2},ImGui::GetColorU32(e.hidden?ImGuiCol_TextDisabled:ImGuiCol_Text),name.c_str(),nullptr,tile); dl->PopClipRect();
             if (hov) {
-                if (e.npc) { const auto& n=npcs[e.index]; ImGui::SetTooltip(T("%s\nNPC #%d\n%.2f  %.2f  %.2f\nAI: %s   Behavior: %s%s%s"), name.c_str(),n.uid,n.pos.x,n.pos.y,n.pos.z,n.aiEnabled?T("On"):T("Off"),n.behavior==1?T("Hold"):T("Normal"),n.note.empty()?"":"\n",n.note.c_str()); }
+                if (e.npc) { const auto& n=npcs[e.index]; ImGui::SetTooltip(T("%s\nNPC #%d\n%.2f  %.2f  %.2f\nAI: %s   Behavior: %s%s%s"), name.c_str(),n.uid,pos.x,pos.y,pos.z,n.aiEnabled?T("On"):T("Off"),n.behavior==1?T("Hold"):T("Normal"),n.note.empty()?"":"\n",n.note.c_str()); }
                 else { const auto& o=objects[e.index]; ImGui::SetTooltip(T("%s\nObject #%d\n%.2f  %.2f  %.2f   yaw %.0f   scale %.2f%s%s"),o.prefab.c_str(),o.uid,o.pos.x,o.pos.y,o.pos.z,o.rot.yaw,o.scale,o.note.empty()?"":"\n",o.note.c_str()); }
             }
             ImGui::PopID();
@@ -2678,7 +2697,7 @@ namespace editor {
             const DWORD now=GetTickCount();static DWORD liveAt=0;if(changed&&g_live&&now-liveAt>50){core::MoveMany({{o.uid,{g_edit[0],g_edit[1],g_edit[2]},g_editRot,g_editScale}},false);liveAt=now;}
             if(rel1||rel2||rel3){Vec3 p1{g_edit[0],g_edit[1],g_edit[2]};if(p1.x!=g_editPos0.x||p1.y!=g_editPos0.y||p1.z!=g_editPos0.z||g_editRot.yaw!=g_editRot0.yaw||g_editRot.pitch!=g_editRot0.pitch||g_editRot.roll!=g_editRot0.roll||g_editScale!=g_editScale0){core::MoveMany({{o.uid,p1,g_editRot,g_editScale}},true);Act a;a.kind=Act::Move;a.uid=o.uid;a.prefab=o.prefab;a.pos0=g_editPos0;a.rot0=g_editRot0;a.sc0=g_editScale0;a.pos1=p1;a.rot1=g_editRot;a.sc1=g_editScale;Push({a});g_editPos0=p1;g_editRot0=g_editRot;g_editScale0=g_editScale;}}
         } else if(npcPrim){
-            const auto&n=*npcPrim;static int posUid=0;static float ep[3]={};static Vec3 base{};if(posUid!=n.uid||(!ImGui::IsAnyItemActive()&&(ep[0]!=n.pos.x||ep[1]!=n.pos.y||ep[2]!=n.pos.z))){posUid=n.uid;ep[0]=base.x=n.pos.x;ep[1]=base.y=n.pos.y;ep[2]=base.z=n.pos.z;}
+            const auto&n=*npcPrim;const Vec3 livePos=ManagedNpcDisplayPos(n);static int posUid=0;static float ep[3]={};static Vec3 base{};if(posUid!=n.uid||(!ImGui::IsAnyItemActive()&&(ep[0]!=livePos.x||ep[1]!=livePos.y||ep[2]!=livePos.z))){posUid=n.uid;ep[0]=base.x=livePos.x;ep[1]=base.y=livePos.y;ep[2]=base.z=livePos.z;}
             ImGui::TextDisabled(T("NPC properties"));ImGui::SameLine();ImGui::Text("%s",ManagedNpcName(n,chars?chars.get():nullptr).c_str());ImGui::SetNextItemWidth(330*ui);ImGui::DragFloat3(T("position##scene_npc"),ep,0.05f,-100000,100000,"%.3f");if(ImGui::IsItemDeactivatedAfterEdit()){Vec3 d{ep[0]-base.x,ep[1]-base.y,ep[2]-base.z};MoveSelectedNpcs(d);base={ep[0],ep[1],ep[2]};}
             ImGui::SameLine();bool ai=n.aiEnabled;ImGui::BeginDisabled(!core::NpcAiControlAvailable());if(ImGui::Checkbox(T("AI enabled"),&ai))SetSelectedNpcAi(ai);ImGui::SameLine();int behavior=n.behavior;ImGui::SetNextItemWidth(180*ui);if(ComboT("##npc_behavior_scene",&behavior,kNpcBehaviors,2))SetSelectedNpcBehavior(behavior);ImGui::EndDisabled();ImGui::SameLine();if(ImGui::SmallButton(T("Rename")))OpenNpcLabelEdit(n);ImGui::SameLine();if(ImGui::SmallButton(T("Edit note")))OpenNpcNoteEdit(n);
         } else ImGui::TextDisabled(T("Mixed selection: %d objects and %d NPCs"),(int)g_sel.size(),(int)g_managedNpcSel.size());
@@ -3049,7 +3068,8 @@ namespace editor {
     // edit mode: a click on a placed object selects it (Ctrl adds), a double-click grabs the selection
     static bool IsCarried(int uid) { if (!g_place.active) return false; for (const auto& m : g_place.m) if (m.uid == uid) return true; return false; }
     static bool NpcScreenRect(const CamFrame& cf, const ManagedNpc& n, ImVec2* mn, ImVec2* mx, float* depth) {
-        Vec3 c{n.pos.x,n.pos.y+0.9f,n.pos.z}, feet=n.pos, head{n.pos.x,n.pos.y+1.8f,n.pos.z}; ImVec2 sc,sf,sh;
+        const Vec3 p = ManagedNpcDisplayPos(n);
+        Vec3 c{p.x,p.y+0.9f,p.z}, feet=p, head{p.x,p.y+1.8f,p.z}; ImVec2 sc,sf,sh;
         if(!WorldToScreen(cf,c,&sc))return false; WorldToScreen(cf,feet,&sf); WorldToScreen(cf,head,&sh);
         const float h=std::max(28.0f,fabsf(sf.y-sh.y)); const float w=std::max(18.0f,h*0.34f); *mn={sc.x-w*0.5f,sc.y-h*0.5f}; *mx={sc.x+w*0.5f,sc.y+h*0.5f};
         Vec3 d{c.x-cf.pos.x,c.y-cf.pos.y,c.z-cf.pos.z}; *depth=d.x*cf.fwd.x+d.y*cf.fwd.y+d.z*cf.fwd.z; return *depth>0;
