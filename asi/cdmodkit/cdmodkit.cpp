@@ -2726,33 +2726,31 @@ static uintptr_t RelCallTarget(uintptr_t p) {
     const uintptr_t t = p + 5 + rel; return InImage(t) ? t : 0;
 }
 static void ResolveNpcAiControl() {
-    // Real AI enable/disable path. AIFunction_TerminateAi::execute forwards its bool to this helper with the actor as rcx.
-    // Resolve it by its stable prologue/body instead of pinning build 1.0.0.2976's RVA 0x17f41f0.
+    // Keep TerminateAi only as a research/diagnostic helper. It terminates the current AI action, but the scheduler can
+    // immediately start another one, so it is NOT the persistent editor AI switch.
     int termHits = 0;
     g_npcAiTerminate = FindPatternCount("48 89 5C 24 08 57 48 83 EC 30 0F B6 FA 48 8B 41 68 48 8B 98 90 01 00 00 48 8B 43 08", &termHits);
     if (g_npcAiTerminate && termHits == 1) Log("[npc] AI terminate helper rva 0x%llx", (unsigned long long)(g_npcAiTerminate - g_base));
     else { Log("[npc] AI terminate helper not resolved (%d matches)", termHits); g_npcAiTerminate = 0; }
 
-    // Keep the old request resolver only for actor-id diagnostics. AiControlChangeCheatReq changes control ownership;
-    // it is deliberately NOT used as the AI on/off implementation.
+    // AiControlChangeCheatReq is the game's persistent control-ownership toggle. It consumes one u32 actor id.
     const uintptr_t vt = FindVtableByName(".?AVTrocTrAiControlChangeCheatReq@pa@@");
     if (!vt) { Log("[npc] AI-control request vtable not found"); return; }
     uintptr_t exec = 0; ReadPtr(vt + 2 * 8, &exec); int n = 0; const uintptr_t handler = FindObjectWithVtable(vt, &n);
     if (!InImage(exec) || !handler) { Log("[npc] AI-control handler object not found (%d instances, execute %p)", n, (void*)exec); return; }
-    // The request deserializes one u32 actor id and calls a helper. That helper resolves the id through the server actor
-    // registry. Derive the singleton global from its RIP-relative load instead of pinning a build-specific RVA.
+    // The execute body itself loads the actor registry immediately before calling the id lookup:
+    //   mov rcx,[rip+global]; mov rcx,[rcx]; call lookup
+    // Resolve that exact sequence. The older resolver incorrectly searched inside called helpers and therefore never found it.
     uintptr_t registryGlobal = 0;
-    for (uintptr_t p = exec; p < exec + 0x220 && !registryGlobal; ++p) {
-        const uintptr_t t = RelCallTarget(p); if (!t) continue;
-        for (uintptr_t q = t; q < t + 0x220; ++q) {
-            uint8_t b[10] = {}; if (!ReadBytes(q, b, sizeof b)) break;
-            if (b[0] != 0x48 || b[1] != 0x8B || b[2] != 0x0D || b[7] != 0x48 || b[8] != 0x8B || b[9] != 0x09) continue;
-            int32_t d = 0; memcpy(&d, b + 3, 4); const uintptr_t g = q + 7 + d;
-            uintptr_t holder = 0, manager = 0; uint32_t buckets = 0;
-            if (ReadPtr(g, &holder) && holder && ReadPtr(holder, &manager) && manager && ReadBytes(manager + 0x98, &buckets, 4) && buckets > 0 && buckets < (1u << 20)) {
-                registryGlobal = g; break;
-            }
-        }
+    for (uintptr_t q = exec; q < exec + 0x220 && !registryGlobal; ++q) {
+        uint8_t b[10] = {}; if (!ReadBytes(q, b, sizeof b)) break;
+        if (b[0] != 0x48 || b[1] != 0x8B || b[2] != 0x0D || b[7] != 0x48 || b[8] != 0x8B || b[9] != 0x09) continue;
+        int32_t d = 0; memcpy(&d, b + 3, 4); const uintptr_t g = q + 7 + d;
+        uintptr_t holder = 0, manager = 0, bucketsPtr = 0, nodesPtr = 0; uint32_t buckets = 0;
+        if (ReadPtr(g, &holder) && holder && ReadPtr(holder, &manager) && manager &&
+            ReadBytes(manager + 0x98, &buckets, 4) && ReadPtr(manager + 0xA8, &bucketsPtr) &&
+            ReadPtr(manager + 0xB0, &nodesPtr) && buckets > 0 && buckets < (1u << 20) && bucketsPtr && nodesPtr)
+            registryGlobal = g;
     }
     g_npcAiHandler = handler; g_npcAiExecute = (void*)exec; g_actorRegistryGlobal = registryGlobal;
     Log("[npc] control-ownership handler rva 0x%llx execute rva 0x%llx actor-registry %s",
@@ -2819,9 +2817,9 @@ static uint32_t ManagedNpcActorId(uintptr_t actor) {
     }
     return 0;
 }
-bool NpcAiControlAvailable() { return g_npcAiTerminate != 0; }
+bool NpcAiControlAvailable() { return g_npcAiExecute && g_npcAiHandler && g_actorRegistryGlobal; }
 static bool SetNpcAiTerminatedNow(uintptr_t actor, bool terminated) {
-    if (!actor || !NpcAiControlAvailable()) return false;
+    if (!actor || !g_npcAiTerminate) return false;
     typedef void (__fastcall* Fn)(void*, bool);
     CDK_GUARD_BEGIN
         ((Fn)g_npcAiTerminate)((void*)actor, terminated);
@@ -2834,23 +2832,60 @@ static bool SetNpcAiTerminatedNow(uintptr_t actor, bool terminated) {
     CDK_GUARD_END
     return false;
 }
+static bool ToggleNpcAiControlNow(uint32_t actorId) {
+    if (!actorId || !NpcAiControlAvailable()) return false;
+    alignas(16) uint8_t pkt[0x40]; uintptr_t s = 0, vt = 0, cur = 0;
+    AcquireSRWLockShared(&g_npcLock);
+    memcpy(pkt, g_pktTemplate, sizeof pkt); s = g_serverSession; vt = g_sessionVt;
+    ReleaseSRWLockShared(&g_npcLock);
+    if (!s || !ReadPtr(s, &cur) || cur != vt) {
+        Log("[npc] AI control: player session is stale; waiting for the next movement packet");
+        g_lastSender = 0;
+        return false;
+    }
+    uint8_t buf[5 + 4] = {}; const uint16_t plen = 4; memcpy(buf + 3, &plen, 2); memcpy(buf + 5, &actorId, 4);
+    const uint16_t total = sizeof buf; memcpy(pkt + 0x10, &total, 2); uint8_t* bp = buf; memcpy(pkt + 0x18, &bp, 8);
+    int res = -1; const bool ok = CallNpcAiExecute(pkt, &res);
+    Log("[npc] AI control toggle id 0x%08x: %s, result %d (%s)", actorId, ok ? "executed" : "FAULTED", res, DecodeErr((uint32_t)res).c_str());
+    return ok && res == 0;
+}
+static bool SetManagedNpcRuntimeAiNow(int uid, bool enabled) {
+    uintptr_t actor = 0; uint32_t actorId = 0; bool desired = true;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0) return false;
+        const ManagedNpc& n = g_npcReg[i];
+        if (n.hidden || !n.actor) return false;
+        if (n.aiApplied == enabled) return true;
+        actor = n.actor; actorId = n.actorId; desired = enabled;
+    }
+    if (!actorId) {
+        actorId = ManagedNpcActorId(actor);
+        if (!actorId) { Log("[npc] managed #%d AI control: actor id not found yet", uid); return false; }
+    }
+    // Control ownership is a toggle. aiApplied is our last confirmed toggle state, so only issue it when desired differs.
+    // Do not call TerminateAi here: that AI-function helper only terminates the current action and is not the persistent switch.
+    if (!ToggleNpcAiControlNow(actorId)) return false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0) return false;
+        ManagedNpc& n = g_npcReg[i];
+        if (n.hidden || n.actor != actor) return false;
+        n.actorId = actorId;
+        n.aiApplied = desired;
+    }
+    return true;
+}
 static void SyncManagedNpcAiNow(int uid) {
-    uintptr_t actor = 0; bool desired = true;
+    bool desired = true;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (i < 0) return;
         const ManagedNpc& n = g_npcReg[i];
-        if (n.hidden || !n.actor || n.aiApplied == n.aiEnabled) return;
-        actor = n.actor; desired = n.aiEnabled;
+        if (n.hidden || !n.actor || n.editMoving || n.aiApplied == n.aiEnabled) return;
+        desired = n.aiEnabled;
     }
-    if (!SetNpcAiTerminatedNow(actor, !desired)) return;
-    {
-        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
-        if (i < 0) return;
-        ManagedNpc& n = g_npcReg[i];
-        if (n.hidden || n.actor != actor) return;
-        n.aiApplied = desired;
-    }
+    SetManagedNpcRuntimeAiNow(uid, desired);
 }
 static void ReconcileManagedNpcActors() {
     static DWORD s_last = 0; const DWORD now = GetTickCount();
@@ -2891,7 +2926,7 @@ static void ReconcileManagedNpcActors() {
             }
             if (!best) continue;
             n.actor = best; n.transform = bestTf; n.actorId = ManagedNpcActorId(best);
-            n.spawnPending = false; n.aiApplied = true; g_managedNpcActors.insert(best);
+            n.spawnPending = false; n.editMoving = false; n.liveMovePending = false; n.aiApplied = true; g_managedNpcActors.insert(best);
             Log("[npc] managed #%d late-bound actor %p (%s) at (%.2f %.2f %.2f), spawn (%.2f %.2f %.2f)",
                 n.uid, (void*)best, RttiName(best) ? RttiName(best) : "?", bestPos.x, bestPos.y, bestPos.z, n.pos.x, n.pos.y, n.pos.z);
             if (n.aiApplied != n.aiEnabled) aiSync.push_back(n.uid);
@@ -2903,7 +2938,7 @@ static void QueueManagedNpcAiReconcile() {
     std::vector<int> ids;
     {
         std::lock_guard<std::mutex> l(g_regMutex);
-        for (const auto& n : g_npcReg) if (!n.hidden && n.actor && n.aiApplied != n.aiEnabled) ids.push_back(n.uid);
+        for (const auto& n : g_npcReg) if (!n.hidden && n.actor && !n.editMoving && n.aiApplied != n.aiEnabled) ids.push_back(n.uid);
     }
     for (int uid : ids) RunOnServerTick([uid]() { SyncManagedNpcAiNow(uid); });
 }
@@ -3042,7 +3077,7 @@ static void SpawnManagedNpcNow(int uid) {
             ManagedNpc& live = g_npcReg[i];
             live.actor = actor; live.actorId = actorId; live.transform = actor ? FindActorTransform(actor) : 0;
             live.spawnPending = actor == 0;   // asynchronous SpawnCharacter creation is reconciled from recent ServerActor constructors
-            live.aiApplied = true;   // a fresh SpawnCharacter actor starts under the game's normal AI control
+            live.editMoving = false; live.liveMovePending = false; live.aiApplied = true;   // a fresh SpawnCharacter actor starts under the game's normal AI control
             needAiSync = live.aiApplied != live.aiEnabled;
         }
     }
@@ -3096,7 +3131,7 @@ static void QueuePendingManagedNpcs() {
 bool HideManagedNpc(int uid) {
     uintptr_t actor = 0;
     { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || g_npcReg[i].hidden) return false;
-      ManagedNpc& n = g_npcReg[i]; n.hidden = true; actor = n.actor; n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.aiApplied = true; MarkDirtyLocked(n.proj); }
+      ManagedNpc& n = g_npcReg[i]; n.hidden = true; actor = n.actor; n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.editMoving = false; n.liveMovePending = false; n.aiApplied = true; MarkDirtyLocked(n.proj); }
     if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
     return true;
 }
@@ -3105,11 +3140,132 @@ bool RestoreManagedNpc(int uid) {
       g_npcReg[i].hidden = false; MarkDirtyLocked(g_npcReg[i].proj); }
     QueueManagedNpcIfReady(uid); return true;
 }
+static bool WriteManagedNpcTransformNow(uintptr_t tf, Vec3 world) {
+    if (!tf) return false;
+    uint8_t snap[0x48] = {};
+    if (!ReadBytes(tf + kOff_Tf_Pos, snap, sizeof snap)) return false;
+    float parent[3] = {}; int16_t parentSector[2] = {};
+    memcpy(parent, snap + 0x38, sizeof parent); memcpy(parentSector, snap + 0x44, sizeof parentSector);
+    // Do not tear an attached/mounted actor away from its parent with a plain world-space write.
+    if (parentSector[0] || parentSector[1] || fabsf(parent[0]) > 0.001f || fabsf(parent[1]) > 0.001f || fabsf(parent[2]) > 0.001f)
+        return false;
+    const int tx = (int)(world.x * 0.001f), tz = (int)(world.z * 0.001f);
+    struct PosTile { float x, y, z; int16_t tileX, tileZ; } packed{
+        world.x - tx * kTileSize, world.y, world.z - tz * kTileSize, (int16_t)tx, (int16_t)tz
+    };
+    static_assert(sizeof(PosTile) == 16, "TransformSync position/tile layout changed");
+    return WriteBytes(tf + kOff_Tf_Pos, &packed, sizeof packed);
+}
+bool BeginManagedNpcMove(int uid) {
+    bool queuePause = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0) return false; ManagedNpc& n = g_npcReg[i];
+        if (n.hidden || !n.actor || !n.transform || n.editMoving) { Log("[npc] managed #%d live move not ready (hidden=%d actor=%p transform=%p moving=%d)", uid, n.hidden, (void*)n.actor, (void*)n.transform, n.editMoving); return false; }
+        uint8_t snap[0x48] = {}; if (!ReadBytes(n.transform + kOff_Tf_Pos, snap, sizeof snap)) { Log("[npc] managed #%d live move: TransformSync snapshot unreadable", uid); return false; }
+        float parent[3] = {}; int16_t psec[2] = {}; memcpy(parent, snap + 0x38, 12); memcpy(psec, snap + 0x44, 4);
+        if (psec[0] || psec[1] || fabsf(parent[0]) > 0.001f || fabsf(parent[1]) > 0.001f || fabsf(parent[2]) > 0.001f) { Log("[npc] managed #%d live move refused: actor is parented/attached", uid); return false; }
+        // An NPC whose runtime AI is already off needs no native control request just to move. If AI is still active,
+        // however, the edit transaction must be able to take control before queued transform writes begin.
+        queuePause = n.aiApplied;
+        if (queuePause) {
+            if (!NpcAiControlAvailable()) { Log("[npc] managed #%d live move: AI control is not available to pause the actor", uid); return false; }
+            if (!n.actorId) n.actorId = ManagedNpcActorId(n.actor);
+            if (!n.actorId) { Log("[npc] managed #%d live move: actor id not resolved", uid); return false; }
+        }
+        n.editMoving = true; n.liveMoveTarget = n.pos; n.liveMovePending = false;
+    }
+    if (queuePause) RunOnServerTick([uid]() { SetManagedNpcRuntimeAiNow(uid, false); });
+    return true;
+}
+static void QueueManagedNpcLiveWrite(int uid, uintptr_t tf) {
+    RunOnServerTick([uid, tf]() {
+        Vec3 world{};
+        {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+            if (i < 0) return; ManagedNpc& n = g_npcReg[i];
+            if (n.transform == tf) n.liveMovePending = false;
+            if (n.hidden || !n.editMoving || n.transform != tf) return;
+            world = n.liveMoveTarget;
+        }
+        if (!WriteManagedNpcTransformNow(tf, world))
+            Log("[npc] managed #%d live move could not write TransformSync", uid);
+    });
+}
+bool MoveManagedNpcLive(int uid, Vec3 world) {
+    uintptr_t tf = 0; bool queue = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0 || !g_npcReg[i].editMoving || g_npcReg[i].hidden) return false;
+        ManagedNpc& n = g_npcReg[i]; tf = n.transform; n.liveMoveTarget = world;
+        if (!n.liveMovePending) { n.liveMovePending = true; queue = true; }
+    }
+    if (queue) QueueManagedNpcLiveWrite(uid, tf);
+    return true;
+}
+bool CommitManagedNpcMove(int uid, Vec3 world) {
+    uintptr_t tf = 0; bool queue = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0 || !g_npcReg[i].editMoving || g_npcReg[i].hidden) return false;
+        ManagedNpc& n = g_npcReg[i]; n.pos = world; n.liveMoveTarget = world; tf = n.transform; MarkDirtyLocked(n.proj);
+        if (!n.liveMovePending) { n.liveMovePending = true; queue = true; }
+    }
+    if (queue) QueueManagedNpcLiveWrite(uid, tf);
+    return true;
+}
+bool EndManagedNpcMove(int uid, Vec3 world) {
+    uintptr_t tf = 0; bool moving = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0 || g_npcReg[i].hidden) return false; ManagedNpc& n = g_npcReg[i];
+        moving = n.editMoving; tf = n.transform;
+    }
+    if (!moving || !tf) return MoveManagedNpc(uid, world);
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0 || g_npcReg[i].hidden) return false;
+        g_npcReg[i].pos = world; g_npcReg[i].liveMoveTarget = world; MarkDirtyLocked(g_npcReg[i].proj);
+    }
+    RunOnServerTick([uid, tf, world]() {
+        {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+            if (i < 0 || g_npcReg[i].hidden || !g_npcReg[i].editMoving || g_npcReg[i].transform != tf) return;
+        }
+        const bool moved = WriteManagedNpcTransformNow(tf, world);
+        bool desired = true; uintptr_t actor = 0;
+        {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+            if (i < 0) return; ManagedNpc& n = g_npcReg[i];
+            if (n.hidden || !n.editMoving || n.transform != tf) return;
+            desired = n.aiEnabled; n.editMoving = false; n.liveMovePending = false;
+            if (!moved) {
+                actor = n.actor;
+                n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.aiApplied = true;
+                n.spawnPending = true;
+            }
+        }
+        if (!moved) {
+            Log("[npc] managed #%d final live move write failed; respawning at the committed position", uid);
+            if (actor) RemoveSpawnedActor(actor);
+            SpawnManagedNpcNow(uid);
+            return;
+        }
+        SetManagedNpcRuntimeAiNow(uid, desired);
+    });
+    return true;
+}
 bool MoveManagedNpc(int uid, Vec3 world) {
+    // Bound actors can move in place through their server TransformSync component. Use an edit transaction so autonomous
+    // AI cannot immediately walk over the editor's position while the write is being committed.
+    if (BeginManagedNpcMove(uid)) {
+        MoveManagedNpcLive(uid, world);
+        return EndManagedNpcMove(uid, world);
+    }
     uintptr_t actor = 0; bool pending = false;
     { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || g_npcReg[i].hidden) return false;
       ManagedNpc& n = g_npcReg[i]; if (n.pos.x == world.x && n.pos.y == world.y && n.pos.z == world.z) return true;
-      n.pos = world; actor = n.actor; pending = n.spawnPending; n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.aiApplied = true; MarkDirtyLocked(n.proj);
+      n.pos = world; actor = n.actor; pending = n.spawnPending; n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.editMoving = false; n.liveMovePending = false; n.aiApplied = true; MarkDirtyLocked(n.proj);
       if (actor && !pending) n.spawnPending = true; }
     if (pending) return true;   // the already queued spawn reads the latest registry position when it actually runs
     if (actor) RunOnServerTick([uid, actor]() { RemoveSpawnedActor(actor); SpawnManagedNpcNow(uid); });

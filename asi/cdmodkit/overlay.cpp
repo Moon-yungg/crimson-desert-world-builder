@@ -1081,7 +1081,8 @@ namespace overlay {
         static bool s_homeDown = false;
         bool home = (GetAsyncKeyState(core::g_keyMode) & 0x8000) != 0;
         if (home && !s_homeDown && editor::IsOpen()) {
-            editor::TogglePlay();
+            if (editor::PlayMode()) editor::TogglePlay();
+            else editor::ToggleCameraMode();
         }
         s_homeDown = home;
 
