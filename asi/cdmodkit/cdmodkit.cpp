@@ -2738,19 +2738,20 @@ static void ResolveNpcAiControl() {
     if (!vt) { Log("[npc] AI-control request vtable not found"); return; }
     uintptr_t exec = 0; ReadPtr(vt + 2 * 8, &exec); int n = 0; const uintptr_t handler = FindObjectWithVtable(vt, &n);
     if (!InImage(exec) || !handler) { Log("[npc] AI-control handler object not found (%d instances, execute %p)", n, (void*)exec); return; }
-    // The execute body itself loads the actor registry immediately before calling the id lookup:
+    // The request execute calls a helper which resolves the actor id. That helper loads the registry as:
     //   mov rcx,[rip+global]; mov rcx,[rcx]; call lookup
-    // Resolve that exact sequence. The older resolver incorrectly searched inside called helpers and therefore never found it.
+    // Do NOT require the manager/buckets to be initialized here: this resolver runs at plugin startup, before the player
+    // necessarily enters a world. ManagedNpcActorId validates the live manager later, when an NPC actually needs the id.
     uintptr_t registryGlobal = 0;
-    for (uintptr_t q = exec; q < exec + 0x220 && !registryGlobal; ++q) {
-        uint8_t b[10] = {}; if (!ReadBytes(q, b, sizeof b)) break;
-        if (b[0] != 0x48 || b[1] != 0x8B || b[2] != 0x0D || b[7] != 0x48 || b[8] != 0x8B || b[9] != 0x09) continue;
-        int32_t d = 0; memcpy(&d, b + 3, 4); const uintptr_t g = q + 7 + d;
-        uintptr_t holder = 0, manager = 0, bucketsPtr = 0, nodesPtr = 0; uint32_t buckets = 0;
-        if (ReadPtr(g, &holder) && holder && ReadPtr(holder, &manager) && manager &&
-            ReadBytes(manager + 0x98, &buckets, 4) && ReadPtr(manager + 0xA8, &bucketsPtr) &&
-            ReadPtr(manager + 0xB0, &nodesPtr) && buckets > 0 && buckets < (1u << 20) && bucketsPtr && nodesPtr)
-            registryGlobal = g;
+    for (uintptr_t p = exec; p < exec + 0x220 && !registryGlobal; ++p) {
+        const uintptr_t helper = RelCallTarget(p);
+        if (!helper || !InImage(helper)) continue;
+        for (uintptr_t q = helper; q < helper + 0x380; ++q) {
+            uint8_t b[10] = {}; if (!ReadBytes(q, b, sizeof b)) break;
+            if (b[0] != 0x48 || b[1] != 0x8B || b[2] != 0x0D || b[7] != 0x48 || b[8] != 0x8B || b[9] != 0x09) continue;
+            int32_t d = 0; memcpy(&d, b + 3, 4); const uintptr_t g = q + 7 + d;
+            if (InImage(g)) { registryGlobal = g; break; }
+        }
     }
     g_npcAiHandler = handler; g_npcAiExecute = (void*)exec; g_actorRegistryGlobal = registryGlobal;
     Log("[npc] control-ownership handler rva 0x%llx execute rva 0x%llx actor-registry %s",
@@ -2812,7 +2813,16 @@ static uint32_t ManagedNpcActorId(uintptr_t actor) {
             uint32_t key = 0, index = 0; if (!ReadBytes(bucket + 8 + j * 8, &key, 4) || !ReadBytes(bucket + 12 + j * 8, &index, 4)) continue;
             uintptr_t node = 0, foundActor = 0; uint32_t nodeKey = 0;
             if (!ReadPtr(nodesPtr + (uintptr_t)index * 8, &node) || !node || !ReadBytes(node + 4, &nodeKey, 4) || !ReadPtr(node + 8, &foundActor)) continue;
-            if (foundActor == actor) return nodeKey ? nodeKey : key;
+            if (foundActor == actor) {
+                const uint32_t low = nodeKey ? nodeKey : key;
+                // ServerNormalInGameActor keeps the complete entity handle next to the low registry key.
+                // The hash table indexes only the low 20 bits, but native requests carry the full handle.
+                uint32_t full58 = 0, full60 = 0;
+                ReadBytes(actor + 0x58, &full58, 4); ReadBytes(actor + 0x60, &full60, 4);
+                if (full58 && (full58 & 0x000FFFFFu) == (low & 0x000FFFFFu)) return full58;
+                if (full60 && (full60 & 0x000FFFFFu) == (low & 0x000FFFFFu)) return full60;
+                return low;
+            }
         }
     }
     return 0;

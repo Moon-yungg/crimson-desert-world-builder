@@ -694,6 +694,20 @@ namespace editor {
             ImGui::SameLine(); if (ImGui::Button(T("To ground"))) StartGroundSnap(P);
             if (!P.hasNpc) { ImGui::SameLine(); if (ImGui::Button(T("level"))) { if (P.m.size() == 1) { P.pitch = -P.m[0].rot0.pitch; P.roll = -P.m[0].rot0.roll; } else { P.pitch = P.roll = 0; } P.dirty = P.touched = true; CommitPlaceHistory(P); } }
             ImGui::SameLine(); ImGui::Checkbox(T("snap"), &g_snap);
+            // Explicit translation controls are useful when a world-space gizmo handle is hard to hit (especially for NPCs).
+            // They operate on the same placement transaction, so one click is one undoable move and NPC AI stays paused until Drop.
+            const float moveStep = g_snap ? kSnapPos[g_snapPosIdx] : 0.25f;
+            auto nudge = [&](float dx, float dy, float dz) {
+                P.center.x += dx; P.center.y += dy; P.center.z += dz;
+                P.dirty = P.touched = true; CommitPlaceHistory(P);
+            };
+            ImGui::TextDisabled("%s  %.2f m", T("Move"), moveStep);
+            ImGui::SameLine(); if (ImGui::SmallButton("X-")) nudge(-moveStep, 0, 0);
+            ImGui::SameLine(); if (ImGui::SmallButton("X+")) nudge( moveStep, 0, 0);
+            ImGui::SameLine(); if (ImGui::SmallButton("Y-")) nudge(0, -moveStep, 0);
+            ImGui::SameLine(); if (ImGui::SmallButton("Y+")) nudge(0,  moveStep, 0);
+            ImGui::SameLine(); if (ImGui::SmallButton("Z-")) nudge(0, 0, -moveStep);
+            ImGui::SameLine(); if (ImGui::SmallButton("Z+")) nudge(0, 0,  moveStep);
             if (core::g_keyboardPlacement && !g_compact) {
                 auto kn = [](int pk) { return core::KeyName(core::g_placeKeys[pk]); };
                 ImGui::TextDisabled(T("Move: %s %s %s %s%s     Rotate: %s %s     Height: %s %s     Size: %s %s"), kn(core::PK_FWD), kn(core::PK_BACK), kn(core::PK_LEFT), kn(core::PK_RIGHT),
@@ -3585,7 +3599,7 @@ namespace editor {
         PumpBrowserDropJobs();                 // a drop whose ground probe returns after the window was hidden still spawns
         PumpNpcDropJobs();
         if (g_place.active) DrawPlaceHud();
-        if (g_place.active && (g_gizmo || MouseMode())) { const bool one = g_place.m.size() == 1; const CamFrame cf = CurrentCam();
+        if (g_place.active && (g_place.hasNpc || g_gizmo || MouseMode())) { const bool one = g_place.m.size() == 1; const CamFrame cf = CurrentCam();
             DrawGizmo(g_place.center, one ? WrapYaw(g_place.m[0].rot0.yaw + g_place.yaw) : g_place.yaw, one ? WrapYaw(g_place.m[0].rot0.pitch + g_place.pitch) : g_place.pitch, GizmoScreenSize(cf, g_place.center, g_place.radius), g_place.drag ? g_place.drag : g_place.hover); }
         if (g_place.active && !g_open) ImGui::GetIO().MouseDrawCursor = MouseMode();
         DrawCalibrationMarker(p, havePos);
