@@ -51,7 +51,8 @@ namespace core {
     void ResearchFind(const std::vector<uint8_t>& pat, int maxHits);   // research: byte pattern search (logged)
     void SetFallWatch(bool on, uintptr_t addr = 0, bool breakpoints = true, uintptr_t probe = 0, unsigned probeLen = 0);   // research: log falls of the player, the code that moves it (addr: explicit field) and what changed in a probed object
     void ResearchFindPos();
-    void GroundTrace(int seconds);   // research: log the character's ground probe casts for a few seconds   // research: search the player's server actor for its position
+    void GroundTrace(int seconds);
+    void GeoTraceInstall(uintptr_t vt, int slots); void GeoTraceArm();   // research: trace the terrain geometry calls of the next ground cast   // research: log the character's ground probe casts for a few seconds   // research: search the player's server actor for its position
     void ResearchVtScan(const std::string& mangled, int maxHits, int dumpBytes);   // research: live objects of an RTTI class (logged)
     void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)

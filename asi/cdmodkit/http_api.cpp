@@ -269,6 +269,11 @@ static std::string Handle(const std::string& method, const std::string& path, co
         for (size_t i = 0; i < h.size(); i++) { if (i) out += ','; if (std::isfinite(h[i])) { snprintf(t, sizeof t, "%.2f", h[i]); out += t; } else out += "null"; }
         return out + "]}";
     }
+    if (method == "POST" && path == "/api/research/geotrace") {   // research: {"vt":"0x...","slots":40} installs; {"arm":1} traces the next ground cast
+        auto v = arg.find("vt"); if (v != arg.end()) { float sl = 40; Number(arg, "slots", sl); core::GeoTraceInstall((uintptr_t)strtoull(v->second.c_str(), nullptr, 0), (int)sl); }
+        if (Flag(arg, "arm")) core::GeoTraceArm();
+        return "{\"ok\":true}";
+    }
     if (method == "POST" && path == "/api/research/groundtrace") {   // research: {"seconds":15}
         float sec = 15; Number(arg, "seconds", sec); core::GroundTrace((int)sec); return "{\"ok\":true}";
     }

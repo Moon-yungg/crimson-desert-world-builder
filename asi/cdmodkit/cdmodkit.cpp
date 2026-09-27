@@ -2062,8 +2062,11 @@ void ResearchFind(const std::vector<uint8_t>& pat, int maxHits) {
         Log("[find] %zu-byte pattern: %d hits in %.1f GB, %lu ms", pat.size(), hits, scanned / 1e9, GetTickCount() - t0);
     }).detach();
 }
-static const int kVtMax = 160; static const int kVtClasses = 5;
-static void* g_vtOrig[kVtClasses][kVtMax] = {}; static const char* g_vtClass[kVtClasses] = { "", "", "", "", "" };
+static const int kVtMax = 160; static const int kVtClasses = 6;
+static void* g_vtOrig[kVtClasses][kVtMax] = {}; static const char* g_vtClass[kVtClasses] = { "", "", "", "", "", "" };
+// class 5: the game's terrain heightfield geometry (no RTTI name; vtable given at runtime), logged only on a thread that is
+// inside one of our traced ground casts (research: which geometry calls a character-style cast makes and what they return)
+static thread_local bool t_geoTracing = false; static volatile LONG g_geoTraceArm = 0;
 // class 4 (TrocTrSpawnCharacterCheatReq, a static handler object): slot 2 = execute(handler, &result, packet). Always logged with
 // the packet object, its sender and its buffer, to learn the request format from a mod that uses it (NPC spawn research).
 // class 3 (ServerNormalInGameActor): the first actor whose method runs during one of our replays is the actor the replay created
@@ -2086,6 +2089,19 @@ static std::string ArgText(void* a) {   // what an argument might be: an object 
 }
 template<int C, int N> static void* __fastcall VtThunk(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
     typedef void* (__fastcall* Fn)(void*, void*, void*, void*, void*, void*, void*, void*);
+    if (C == 5) {
+        if (!t_geoTracing) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h);
+        Log("[geo] slot %d: this=%p rdx=%s r8=%s r9=%s s5=%s s6=%s", N, a, ArgText(b).c_str(), ArgText(c).c_str(), ArgText(d).c_str(), ArgText(e).c_str(), ArgText(f).c_str());
+        void* r = ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h);
+        float q[4] = {}; uint16_t mat = 0; uint8_t flag = 0;
+        if (N == 4) { ReadBytes((uintptr_t)d, q, 16); ReadBytes((uintptr_t)e, &mat, 2); ReadBytes((uintptr_t)f, &flag, 1); }
+        if (N == 4) Log("[geo] slot 4 (%lld, %lld) -> corners %.3f %.3f %.3f %.3f material %u flag %u", (long long)(intptr_t)b, (long long)(intptr_t)c, q[0], q[1], q[2], q[3], mat, flag);
+        { void* fr[10] = {}; const USHORT n = RtlCaptureStackBackTrace(1, 10, fr, nullptr); char chain[240]; int k = 0;
+          for (USHORT i = 0; i < n && k < (int)sizeof chain - 16; i++) { const uintptr_t v = (uintptr_t)fr[i]; k += snprintf(chain + k, sizeof chain - k, InImage(v) ? " %llx" : " ?", InImage(v) ? (unsigned long long)(v - g_base) : 0ull); }
+          Log("[geo] slot %d chain:%s", N, chain); }
+        if (N != 4) Log("[geo] slot %d returned %s", N, ArgText(r).c_str());
+        return r;
+    }
     if (C == 4) {
         Log("[troc] %s slot %d: handler=%p result=%p packet=%p thread %lu", g_vtClass[C], N, a, b, c, GetCurrentThreadId());
         if (N == 2 && c) { DumpBlock("troc packet", (uintptr_t)c, 0x60); uintptr_t sess = 0, buf = 0; uint16_t len = 0; ReadBytes((uintptr_t)c, &sess, 8); ReadBytes((uintptr_t)c + 0x10, &len, 2); ReadBytes((uintptr_t)c + 0x18, &buf, 8);
@@ -2115,9 +2131,9 @@ static bool SharedStub(uintptr_t f) {   // pure-virtual placeholders and tiny th
     if (!rf) return true;
     return (rf->EndAddress - rf->BeginAddress) < 32 || base + rf->BeginAddress != f;
 }
-static void InstallVtableTracer(int cls, const char* mangled, const char* shortName, int slots) {
-    const uintptr_t vt = FindVtableByName(mangled); if (!vt) { Log("[vt] %s: vtable not found", shortName); return; }
-    void* thunks[kVtMax]; if (cls == 0) VtThunkTable<0, kVtMax - 1>::fill(thunks); else if (cls == 1) VtThunkTable<1, kVtMax - 1>::fill(thunks); else if (cls == 2) VtThunkTable<2, kVtMax - 1>::fill(thunks); else if (cls == 3) VtThunkTable<3, kVtMax - 1>::fill(thunks); else VtThunkTable<4, kVtMax - 1>::fill(thunks);
+static void InstallVtableTracer(int cls, const char* mangled, const char* shortName, int slots, uintptr_t vtGiven = 0) {
+    const uintptr_t vt = vtGiven ? vtGiven : FindVtableByName(mangled); if (!vt) { Log("[vt] %s: vtable not found", shortName); return; }
+    void* thunks[kVtMax]; if (cls == 0) VtThunkTable<0, kVtMax - 1>::fill(thunks); else if (cls == 1) VtThunkTable<1, kVtMax - 1>::fill(thunks); else if (cls == 2) VtThunkTable<2, kVtMax - 1>::fill(thunks); else if (cls == 3) VtThunkTable<3, kVtMax - 1>::fill(thunks); else if (cls == 4) VtThunkTable<4, kVtMax - 1>::fill(thunks); else VtThunkTable<5, kVtMax - 1>::fill(thunks);
     g_vtClass[cls] = shortName; int ok = 0, skipped = 0;
     for (int i = 0; i < slots && i < kVtMax; i++) {
         uintptr_t f = 0; if (!ReadPtr(vt + (uintptr_t)i * 8, &f) || !InImage(f)) continue;
@@ -2678,7 +2694,10 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
     if (!g_probeCalibrated && !batch.empty()) CalibrateProbe(world);
     for (const auto& rq : batch) {
         const int tx = (int)(rq.start.x * 0.001), tz = (int)(rq.start.z * 0.001);
+        t_geoTracing = InterlockedExchange(&g_geoTraceArm, 0) != 0;   // research: log the geometry calls of this one cast
+        if (t_geoTracing) Log("[geo] ---- traced cast from (%.2f %.2f %.2f) %.2f m down", rq.start.x, rq.start.y, rq.start.z, rq.len);
         GroundHit h; if (!RunGroundCast(world, rq.start, rq.len, tx, tz, &h, rq.verbose)) { h.done = true; h.hit = false; }
+        if (t_geoTracing) { Log("[geo] ---- result: %s y %.2f", h.hit ? "hit" : "MISS", h.centerY); t_geoTracing = false; }
         std::lock_guard<std::mutex> l(g_groundMutex); g_groundResults[rq.id] = h; if (g_groundResults.size() > 40000) g_groundResults.erase(g_groundResults.begin());
     }
     s_inside = false;
@@ -2721,6 +2740,12 @@ void ProbeGround(float above, float len) {
     QueueGround(start, len, true); Vec3 s2 = { start.x, start.y + 3.0f, start.z }; QueueGround(s2, len, true); QueueGround(s2, 30.0f, true);
     if (GameThreadReady()) RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });
 }
+void GeoTraceInstall(uintptr_t vt, int slots) {
+    static bool s_done = false; if (s_done) { Log("[geo] already installed"); return; }
+    if (!InImage(vt)) { Log("[geo] %p is not a vtable in the image", (void*)vt); return; }
+    s_done = true; InstallVtableTracer(5, "", "TerrainHeightFieldGeometry", std::clamp(slots, 1, kVtMax), vt);
+}
+void GeoTraceArm() { InterlockedExchange(&g_geoTraceArm, 1); }
 void RayTrace(int calls) { InterlockedExchange(&g_rayTraceLeft, calls); InterlockedExchange(&g_shapeTraceLeft, calls);
     Log("[ray] tracing the next %d ray casts and %d shape casts (walk a few steps for the ground probe, then aim / interact for ray casts)", calls, calls); }
 

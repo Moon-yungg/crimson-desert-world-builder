@@ -296,6 +296,14 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   and the inside test uses data we have not found: not the float heights, not the bounding-volume tree (lower levels or root),
   not the in-memory height tile. Next: the hknpHeightFieldShape cast code (vtable rva 0x530ab48 slots) - where it decides
   that the start lies below the surface and which data it reads.
+- Geometry tracer (/api/research/geotrace: class 5 of the vtable tracer on the terrain geometry vtable, logged only inside one
+  of our ground casts): a character-style cast makes exactly ONE geometry call, slot 4 (0x39f3390, the quad query), for one quad,
+  and gets the NEW (dipped) corner heights in both the hitting and the missing case. Chain: 0x42d0f90 (in 0x42d0e00, Havok's
+  heightfield-vs-shape cast: a traversal stack of 0x30-byte nodes {min, max, level, x, z}, quantized children from the
+  bounding-volume tree, leaf = quad fetch; flag 2 from the quad = hole) <- 0x42cede7 (0x42cebe0) <- 0x42c48fc <- castShape
+  0x428d5f2 <- worldCastShape 0x42b0d2d. After the quad fetch the triangle / sphere test (from 0x42d1731 / 0x42d14eb) rejects it.
+- Same xz points, different dip depths: 1 m dips always hit, 2-3 m dips always miss, the limit is ~1.35-1.5 m (varies per
+  point) - depth, not the quad's material (6 vs 24 was a coincidence).
 - Open: what drops the character 1-2 m below the original ground (a write breakpoint on the player's position during the drop
   / respawn would find the code), and the hknp body per patch (placement, broadphase AABB).
 - Pitfall: after a fall the game streams patches out; writing saved addresses then corrupts its heap (one crash). Check the
