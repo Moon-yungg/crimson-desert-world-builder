@@ -1,0 +1,6 @@
+World Builder 0.96
+
+Fixed
+- Autoload could stop halfway (the rest of the objects never appeared) when a project contains airship parts or other
+  attachable interactive objects near where you stand. These parts are spawned the old, safe way again; everything else
+  keeps spawning right after loading.
