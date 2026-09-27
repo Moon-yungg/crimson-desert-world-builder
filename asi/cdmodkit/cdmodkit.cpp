@@ -233,22 +233,42 @@ bool PlayerPosInfo(PosInfo* out) { uintptr_t a = PlayerActor(); return a && Read
 // (logged with position), then hardware write breakpoints on the transform snapshot's local x/y/z and tile words show which code
 // moves the character (physics integration vs. a rescue teleport). A jump of more than 20 m afterwards is logged as a respawn.
 static volatile bool g_fallWatch = false; static volatile uintptr_t g_fallWatchAddr = 0;   // 0: the client transform snapshot
-void SetFallWatch(bool on, uintptr_t addr) {
-    if (on && g_fallWatch && addr != g_fallWatchAddr) { g_fallWatch = false; Sleep(200); }   // restart on another field
+static volatile bool g_fallBreak = true; static volatile uintptr_t g_fallProbe = 0; static volatile unsigned g_fallProbeLen = 0;   // probe: sampled every poll
+void SetFallWatch(bool on, uintptr_t addr, bool breakpoints, uintptr_t probe, unsigned probeLen) {
+    if (on && g_fallWatch) { g_fallWatch = false; Sleep(200); }   // restart with the new settings
     if (on == g_fallWatch) return;
-    g_fallWatchAddr = addr; g_fallWatch = on; Log("[fallwatch] %s%s", on ? "on" : "off", on && addr ? " (explicit address)" : "");
+    g_fallWatchAddr = addr; g_fallBreak = breakpoints; g_fallProbe = probe; g_fallProbeLen = probe ? std::min(probeLen ? probeLen : 0x400u, 0x1000u) & ~3u : 0;
+    g_fallWatch = on; Log("[fallwatch] %s%s%s", on ? "on" : "off", on && addr ? " (explicit address)" : "", on && !breakpoints ? " (no breakpoints)" : "");
+    if (on && probe) Log("[fallwatch] probe %p, 0x%x bytes (%s)", (void*)probe, g_fallProbeLen, RttiName(probe) ? RttiName(probe) : "-");
     if (!on) return;
     std::thread([]() {
         float stableY = NAN; DWORD stableTick = 0; bool falling = false; PosInfo last{}; bool haveLast = false;
         uintptr_t watchedTf = 0; DWORD lastRefresh = 0;
+        static const int kRing = 48; std::vector<std::vector<uint8_t>> ring(kRing); int ringPos = 0, ringFill = 0;   // ~2.4 s of probe samples
+        auto dumpProbe = [&](const char* why) {   // every dword that differs between the oldest kept sample and the newest
+            if (!g_fallProbe || ringFill < 2) return;
+            const auto& oldS = ring[(ringPos - ringFill + kRing) % kRing]; const auto& newS = ring[(ringPos - 1 + kRing) % kRing];
+            int n = 0;
+            for (size_t o = 0; o + 4 <= oldS.size() && o + 4 <= newS.size() && n < 120; o += 4) {
+                uint32_t a, b; memcpy(&a, &oldS[o], 4); memcpy(&b, &newS[o], 4); if (a == b) continue;
+                float fa, fb; memcpy(&fa, &a, 4); memcpy(&fb, &b, 4);
+                Log("[fallwatch] probe %s +0x%03zX: %08x -> %08x (%g -> %g)", why, o, a, b, fa, fb); n++;
+            }
+            Log("[fallwatch] probe %s: %d changed dwords over %d samples", why, n, ringFill);
+        };
         while (g_fallWatch) {
             Sleep(50);
+            if (g_fallProbe) {
+                auto& slot = ring[ringPos]; slot.resize(g_fallProbeLen);
+                if (ReadBytes(g_fallProbe, slot.data(), slot.size())) { ringPos = (ringPos + 1) % kRing; ringFill = std::min(ringFill + 1, kRing); }
+            }
             const uintptr_t actor = PlayerActor(); PosInfo p{};
             if (!actor || !ReadPos(actor, &p)) continue;
             const DWORD now = GetTickCount();
             {   // keep the write watch on the current player's transform snapshot (x, y, z, tile), re-armed for new threads
                 uintptr_t comps = Deref(actor, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) + kOff_Tf_Pos : 0;
                 if (g_fallWatchAddr) tf = g_fallWatchAddr;   // an explicit field (x, y, z, next dword)
+                if (!g_fallBreak) tf = 0;
                 if (tf && tf != watchedTf) {
                     if (watchedTf) StopWatch();
                     const uintptr_t a[4] = { tf, tf + 4, tf + 8, tf + 0x0C };
@@ -257,7 +277,7 @@ void SetFallWatch(bool on, uintptr_t addr) {
             }
             if (haveLast && (fabsf(p.world.x - last.world.x) > 20.0f || fabsf(p.world.z - last.world.z) > 20.0f || p.world.y - last.world.y > 20.0f)) {
                 Log("[fallwatch] RESPAWN / teleport: (%.2f %.2f %.2f) -> (%.2f %.2f %.2f); writers in the last 1.5 s:", last.world.x, last.world.y, last.world.z, p.world.x, p.world.y, p.world.z);
-                DumpWatch("fallwatch", GetTickCount64() - 1500, GetTickCount64());
+                DumpWatch("fallwatch", GetTickCount64() - 1500, GetTickCount64()); dumpProbe("at respawn");
                 falling = false; stableY = p.world.y; stableTick = now;
             }
             if (!falling) {
@@ -266,7 +286,7 @@ void SetFallWatch(bool on, uintptr_t addr) {
                 if (p.world.y < stableY - 3.0f) {
                     falling = true;
                     Log("[fallwatch] FALL: y %.2f is %.2f m below the last stable %.2f at (%.2f %.2f), falling for %lu ms; writers in the 2.5 s before:", p.world.y, stableY - p.world.y, stableY, p.world.x, p.world.z, now - stableTick);
-                    DumpWatch("fallwatch", GetTickCount64() - 2500, GetTickCount64());
+                    DumpWatch("fallwatch", GetTickCount64() - 2500, GetTickCount64()); dumpProbe("before the fall");
                 }
             } else if (p.world.y < -2000.0f || now - stableTick > 60000) { falling = false; stableY = NAN; }
             last = p; haveLast = true;
@@ -2458,6 +2478,12 @@ void ResearchFindPos() {
         }
     }
     Log("[findpos] %d hits", hits);
+    if (comps) {   // the client player's components (the character control component is the next research target)
+        for (unsigned i = 0; i < 0x400; i += 8) {
+            uintptr_t c = 0; if (!ReadPtr(comps + i, &c) || !c || InImage(c)) continue;
+            if (const char* rn = RttiName(c)) if (strstr(rn, "Component")) Log("[findpos] client component list+0x%X %p %s", i, (void*)c, rn);
+        }
+    }
 }
 bool SpawnNpc(uint32_t key, Vec3 pos, int type, uint32_t extra) {
     if (!g_npcExecute) { Log("[npc] not available (handler not resolved)"); return false; }

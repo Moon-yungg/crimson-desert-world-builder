@@ -49,7 +49,7 @@ namespace core {
     bool ReadMem(uintptr_t addr, void* out, size_t n); bool WriteMem(uintptr_t addr, const void* in, size_t n);   // research: guarded raw access
     void ResearchPeek(uintptr_t addr, int bytes, bool u16);   // research: log raw memory
     void ResearchFind(const std::vector<uint8_t>& pat, int maxHits);   // research: byte pattern search (logged)
-    void SetFallWatch(bool on, uintptr_t addr = 0);   // research: log falls of the player and the code that moves it (addr: explicit field)
+    void SetFallWatch(bool on, uintptr_t addr = 0, bool breakpoints = true, uintptr_t probe = 0, unsigned probeLen = 0);   // research: log falls of the player, the code that moves it (addr: explicit field) and what changed in a probed object
     void ResearchFindPos();   // research: search the player's server actor for its position
     void ResearchVtScan(const std::string& mangled, int maxHits, int dumpBytes);   // research: live objects of an RTTI class (logged)
     void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object

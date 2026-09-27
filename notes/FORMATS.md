@@ -271,6 +271,20 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   x/y/z (same layout as the client snapshot), +0x324 and +0x3D0 world x/y/z; copies in Knowledge (+0x2C8 world, +0x2F4 local),
   Interaction (+0x2C8), QuestDialog (+0xC4), Wanted (+0x164), RemoteCatch (+0x188). Found with /api/research/findpos.
   Player movement is probably client-authoritative (the client sends MoveActorReq), so the server copy may only mirror it.
+- Fall watcher on the server field: only two writers, both ending in the setter 0x2bc5420; one comes from
+  TrocTrMoveActorReq::execute (vtable slot 2, 0x2977e10). The server takes the position the client reports: player movement,
+  ground contact and falling are decided CLIENT-side. Candidates: hknpCharacterProxy (Havok character, shape-cast ground
+  support), ClientCharacterControlActorComponent, CharacterControlPhysicsListener.
+- Client character control (ClientCharacterControlActorComponent, client player component list +0x40): probing 0x800 bytes
+  every 50 ms around a fall shows the ground result block at +0x160..+0x1E8: +0x168/+0x16C/+0x170 position, +0x174 ground distance
+  (0 on the ground, FLT_MAX = no ground found), state words +0x15C 0->1, +0x1F8 1->2 (ground -> air), flags +0x298 / +0x304 /
+  +0x364 -> 0. So the character's own ground query finds NOTHING over a 3 m dip (1 m dips are found).
+- That block is written by 0x85ed00 (hardware watch on +0x174: rva 0x85eff9 / 0x85f006, chain 85fcd9 8b586d 8bcc0c 8b6931 8b6883):
+  it calls 0xa751c0 with the ground sensor object at component+0xE0 and copies the result. 0xa751c0 first compares the squared
+  distance to a cached position (a ground cache), then queries through 0xa75700, which calls the physics world through vtable
+  slots (+0x200, +0xE8, +0x1E8, +0x368, +0xF8). Next: the ray / shape cast hooks (console "raytrace", castRay 0x428d080,
+  worldCastRay 0x42b0b50, castShape 0x428d260, worldCastShape 0x42b0c50) while walking into a dip, to see the query type and
+  length (likely a short downward cast, or a cached / filtered ground source).
 - Open: what drops the character 1-2 m below the original ground (a write breakpoint on the player's position during the drop
   / respawn would find the code), and the hknp body per patch (placement, broadphase AABB).
 - Pitfall: after a fall the game streams patches out; writing saved addresses then corrupts its heap (one crash). Check the

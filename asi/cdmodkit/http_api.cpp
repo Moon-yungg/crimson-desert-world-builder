@@ -255,7 +255,9 @@ static std::string Handle(const std::string& method, const std::string& path, co
     }
     if (method == "POST" && path == "/api/research/fallwatch") {   // research: {"on":1}
         auto ad = arg.find("addr"); const uintptr_t a = ad == arg.end() ? 0 : (uintptr_t)strtoull(ad->second.c_str(), nullptr, 0);
-        core::SetFallWatch(Flag(arg, "on"), a); return "{\"ok\":true}";
+        auto pr = arg.find("probe"); const uintptr_t pa = pr == arg.end() ? 0 : (uintptr_t)strtoull(pr->second.c_str(), nullptr, 0);
+        float pl = 0x400, bp = 1; Number(arg, "bytes", pl); Number(arg, "breakpoints", bp);
+        core::SetFallWatch(Flag(arg, "on"), a, bp != 0, pa, (unsigned)pl); return "{\"ok\":true}";
     }
     if (method == "POST" && path == "/api/research/findpos") {   // research: log where the server actor keeps the player's position
         core::ResearchFindPos(); return "{\"done\":true}";
