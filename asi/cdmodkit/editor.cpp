@@ -1688,6 +1688,20 @@ namespace editor {
         if (const auto* c = ManagedNpcChar(n, chars)) return c->name.empty() ? c->internal : c->name;
         return std::string("NPC ") + std::to_string(n.key);
     }
+    static void ManagedNpcRuntimeTooltip(const ManagedNpc& n, const std::string& name, Vec3 pos) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(name.c_str());
+        ImGui::TextDisabled("NPC #%d   key %u", n.uid, n.key);
+        ImGui::Text("%.2f  %.2f  %.2f", pos.x, pos.y, pos.z);
+        ImGui::Separator();
+        ImGui::Text("AI desired: %s   applied: %s", n.aiEnabled ? T("On") : T("Off"), n.aiApplied ? T("On") : T("Off"));
+        ImGui::TextDisabled("behavior: %s", n.behavior == 1 ? T("Hold") : T("Normal"));
+        ImGui::TextDisabled("actor: %p   id: 0x%08X", (void*)n.actor, n.actorId);
+        ImGui::TextDisabled("TransformSync: %p", (void*)n.transform);
+        ImGui::TextDisabled("spawnPending=%d   editMoving=%d   liveWritePending=%d", n.spawnPending ? 1 : 0, n.editMoving ? 1 : 0, n.liveMovePending ? 1 : 0);
+        if (!n.note.empty()) { ImGui::Separator(); ImGui::TextWrapped("%s", n.note.c_str()); }
+        ImGui::EndTooltip();
+    }
     static std::string ManagedNpcHistoryName(const ManagedNpc& n) { return n.label.empty() ? std::string("NPC ") + std::to_string(n.key) : n.label; }
     static void SelectManagedNpc(int uid, bool add) {
         if (g_place.active) DropCarried();
@@ -2634,7 +2648,7 @@ namespace editor {
             if (e.group > 0) dl->AddRectFilled({t1.x-7,t0.y},{t1.x,t0.y+7},GroupColor(e.group,255));
             dl->PushClipRect({p0.x+pad,t1.y},{p1.x-pad,p1.y},true); dl->AddText(ImGui::GetFont(),ImGui::GetFontSize(),{p0.x+pad,t1.y+2},ImGui::GetColorU32(e.hidden?ImGuiCol_TextDisabled:ImGuiCol_Text),name.c_str(),nullptr,tile); dl->PopClipRect();
             if (hov) {
-                if (e.npc) { const auto& n=npcs[e.index]; ImGui::SetTooltip(T("%s\nNPC #%d\n%.2f  %.2f  %.2f\nAI: %s   Behavior: %s%s%s"), name.c_str(),n.uid,pos.x,pos.y,pos.z,n.aiEnabled?T("On"):T("Off"),n.behavior==1?T("Hold"):T("Normal"),n.note.empty()?"":"\n",n.note.c_str()); }
+                if (e.npc) { const auto& n=npcs[e.index]; ManagedNpcRuntimeTooltip(n, name, pos); }
                 else { const auto& o=objects[e.index]; ImGui::SetTooltip(T("%s\nObject #%d\n%.2f  %.2f  %.2f   yaw %.0f   scale %.2f%s%s"),o.prefab.c_str(),o.uid,o.pos.x,o.pos.y,o.pos.z,o.rot.yaw,o.scale,o.note.empty()?"":"\n",o.note.c_str()); }
             }
             ImGui::PopID();
@@ -2744,7 +2758,7 @@ namespace editor {
                 const std::string note=e.npc?npcs[e.index].note:objects[e.index].note;if(!note.empty()&&ImGui::IsItemHovered())ImGui::SetTooltip("%s",note.c_str());
                 ImGui::TableSetColumnIndex(2);ImGui::TextDisabled("%s",e.npc?T("NPC"):T("Object"));ImGui::TableSetColumnIndex(3);if(e.group)ImGui::TextDisabled("%d",e.group);
                 ImGui::TableSetColumnIndex(4);ImGui::Text("%.2f  %.2f  %.2f",pos.x,pos.y,pos.z);ImGui::TableSetColumnIndex(5);
-                if(e.npc){const auto&n=npcs[e.index];if(!n.actor||n.spawnPending)ImGui::TextDisabled("%s",T("pending"));else if(n.aiApplied!=n.aiEnabled)ImGui::TextDisabled("%s",T("syncing"));else ImGui::Text("%s   %s",n.aiEnabled?T("AI on"):T("AI off"),n.behavior==1?T("Hold"):T("Normal"));}
+                if(e.npc){const auto&n=npcs[e.index];if(!n.actor||n.spawnPending)ImGui::TextDisabled("%s",T("pending"));else if(n.aiApplied!=n.aiEnabled)ImGui::TextDisabled("%s",T("syncing"));else ImGui::Text("%s   %s",n.aiEnabled?T("AI on"):T("AI off"),n.behavior==1?T("Hold"):T("Normal"));if(ImGui::IsItemHovered())ManagedNpcRuntimeTooltip(n,name,pos);}
                 else{const auto&o=objects[e.index];ImGui::TextDisabled(T("yaw %.0f   scale %.2f"),o.rot.yaw,o.scale);}
                 ImGui::TableSetColumnIndex(6);if(havePos){float dx=pos.x-p.world.x,dy=pos.y-p.world.y,dz=pos.z-p.world.z;ImGui::Text("%.0f m",sqrtf(dx*dx+dy*dy+dz*dz));}ImGui::PopID();
             }
