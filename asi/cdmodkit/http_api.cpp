@@ -293,6 +293,12 @@ static std::string Handle(const std::string& method, const std::string& path, co
           if (mg != arg.end() && Number(arg, "tx", tx, true) && Number(arg, "tz", tz, true)) core::TerrainTexReload((int)tx, (int)tz, (uintptr_t)strtoull(mg->second.c_str(), nullptr, 0), rv == arg.end() ? 0x3772ee0 : (uintptr_t)strtoull(rv->second.c_str(), nullptr, 0)); }   // research
         { auto rt = arg.find("rettrace"); if (rt != arg.end()) core::TerrainRetTrace((uintptr_t)strtoull(rt->second.c_str(), nullptr, 0)); }   // research
         { auto tk = arg.find("tiletask"); if (tk != arg.end()) core::TerrainTileTaskTrace((uintptr_t)strtoull(tk->second.c_str(), nullptr, 0)); }   // research
+        { float rx = 0, ry = 0, rz = 0; if (arg.count("rsx") && Number(arg, "rsx", rx, true) && Number(arg, "rsy", ry, true) && Number(arg, "rsz", rz, true)) core::ReloadStageReplay(rx, ry, rz); }   // research
+        { auto cr = arg.find("crtrace"); if (cr != arg.end()) core::ClientReloadTrace((uintptr_t)strtoull(cr->second.c_str(), nullptr, 0)); }   // research
+        { float cx = 0, cy = 0, cz = 0; if (arg.count("crx") && Number(arg, "crx", cx, true) && Number(arg, "cry", cy, true) && Number(arg, "crz", cz, true)) core::ClientReloadReplay(cx, cy, cz); }   // research
+        { auto ss = arg.find("rssend"); if (ss != arg.end()) core::RsSendTrace((uintptr_t)strtoull(ss->second.c_str(), nullptr, 0)); }   // research
+        { auto rs = arg.find("rstrace"); if (rs != arg.end()) core::ReloadStageTrace((uintptr_t)strtoull(rs->second.c_str(), nullptr, 0)); }   // research
+        { auto te = arg.find("teletrace"); if (te != arg.end()) core::TeleTraceInstall((uintptr_t)strtoull(te->second.c_str(), nullptr, 0)); }   // research
         { auto tt = arg.find("textrace"); if (tt != arg.end()) core::TerrainTexTrace((uintptr_t)strtoull(tt->second.c_str(), nullptr, 0)); }   // research
         { auto jt = arg.find("jobtrace"); if (jt != arg.end()) core::TerrainJobTrace((uintptr_t)strtoull(jt->second.c_str(), nullptr, 0)); }   // research   // research: read watch on the next patched tile buffer
         float x = 0, z = 0, r = 0, dm = 0, tx = 0, tz = 0;
@@ -304,6 +310,12 @@ static std::string Handle(const std::string& method, const std::string& path, co
         float x = 0, y = 0, z = 0;
         if (!Number(arg, "x", x, true) || !Number(arg, "y", y, true) || !Number(arg, "z", z, true)) { status = 400; return Error("x/y/z required"); }
         return core::SetPlayerPos(Vec3{ x, y, z }) ? "{\"ok\":true}" : "{\"ok\":false}";
+    }
+    if (method == "POST" && path == "/api/research/watch") {   // research: {"a0":"0x..","a1":..,"seconds":20} hardware write watch, writers logged at the end
+        uintptr_t ad[4] = {}; const char* keys[4] = { "a0", "a1", "a2", "a3" };
+        for (int i = 0; i < 4; i++) { auto it = arg.find(keys[i]); if (it != arg.end()) ad[i] = (uintptr_t)strtoull(it->second.c_str(), nullptr, 0); }
+        float sec = 20; Number(arg, "seconds", sec);
+        return core::ResearchWatchWrites(ad, (int)sec) ? "{\"started\":true}" : "{\"started\":false}";
     }
     if (method == "POST" && path == "/api/research/points") {   // research: reload bin64\cdmodkit\debugpoints.txt ({"clear":1} removes them)
         return "{\"points\":" + Int(core::LoadDebugPoints(Flag(arg, "clear"))) + "}";

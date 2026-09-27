@@ -258,6 +258,106 @@ void TerrainTileTaskTrace(uintptr_t rva) {
     static bool s_done = false; if (s_done || !rva) return; s_done = true;
     if (InstallInternalHook((void*)(g_base + rva), (void*)HookTileTask, (void**)&g_origTileTask, "terrain tile task (research)")) Log("[terrain] tile task trace on rva 0x%llx", (unsigned long long)rva);
 }
+// Research: the client's teleport handling (DoTeleportAck execute -> 0x9fea40(transform component, &result, &pos12, &extra8)).
+static Gen10 g_origTele = nullptr;
+static uintptr_t __fastcall HookTele(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f, uintptr_t g, uintptr_t h, uintptr_t i, uintptr_t j) {
+    float pos[3] = {}; uint8_t ex[8] = {}; ReadBytes(c, pos, 12); ReadBytes(d, ex, 8);
+    void* fr[16]; const USHORT k = RtlCaptureStackBackTrace(1, 16, fr, nullptr); std::string st;
+    for (USHORT q = 0; q < k; q++) { const uintptr_t x = (uintptr_t)fr[q]; if (x >= g_base && x < g_base + 0x8000000) { char t[24]; snprintf(t, sizeof t, " %llx", (unsigned long long)(x - g_base)); st += t; } }
+    const char* rt = RttiName(a);
+    Log("[tele] comp %p (%s) pos %.3f %.3f %.3f extra %02x%02x%02x%02x %02x%02x%02x%02x (as i16: %d %d %d %d) thread %lu stack:%s", (void*)a, rt ? rt : "?", pos[0], pos[1], pos[2],
+        ex[0], ex[1], ex[2], ex[3], ex[4], ex[5], ex[6], ex[7], *(int16_t*)ex, *(int16_t*)(ex + 2), *(int16_t*)(ex + 4), *(int16_t*)(ex + 6), GetCurrentThreadId(), st.c_str());
+    const uintptr_t r = g_origTele(a, b, c, d, e, f, g, h, i, j);
+    uint32_t res = 0; ReadBytes(r ? r : b, &res, 4); Log("[tele] -> result %u", res);
+    return r;
+}
+void TeleTraceInstall(uintptr_t rva) {
+    static bool s_done = false; if (s_done || !rva) return; s_done = true;
+    if (InstallInternalHook((void*)(g_base + rva), (void*)HookTele, (void**)&g_origTele, "teleport (research)")) Log("[tele] trace on rva 0x%llx", (unsigned long long)rva);
+}
+bool ResearchWatchWrites(const uintptr_t addr[4], int seconds) { return WatchWrites(addr, seconds, "watch"); }
+// Research: TrocTrReloadStageStartReq::execute (0x2a5f580 on 2976) - the fast travel request as the server gets it.
+// Logs handler, message struct and payload, and keeps a copy for a replay with another position.
+static Gen10 g_origReload = nullptr; static uint8_t g_rsMsg[0x40]; static uint8_t g_rsPay[256]; static uint32_t g_rsPayLen = 0; static uintptr_t g_rsThis = 0;
+static uintptr_t __fastcall HookReloadStage(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f, uintptr_t g, uintptr_t h, uintptr_t i, uintptr_t j) {
+    uint8_t msg[0x40] = {}; ReadBytes(c, msg, sizeof msg); uintptr_t pay = *(uintptr_t*)(msg + 0x18); uint16_t tot = *(uint16_t*)(msg + 0x10);
+    uint8_t pb[256] = {}; const uint32_t pl = tot < sizeof pb ? tot : sizeof pb; if (pay) ReadBytes(pay, pb, pl);
+    char hx[600] = { 0 }; for (uint32_t k = 0; k < pl && k < 250; k++) snprintf(hx + 2 * k, 3, "%02x", pb[k]);
+    char mh[140] = { 0 }; for (int k = 0; k < 0x40; k++) snprintf(mh + 2 * k, 3, "%02x", msg[k]);
+    Log("[reloadstage] this %p (+c %04x) msg %s total %u payload %s thread %lu", (void*)a, a ? *(uint16_t*)(a + 0xc) : 0, mh, tot, hx, GetCurrentThreadId());
+    memcpy(g_rsMsg, msg, sizeof msg); memcpy(g_rsPay, pb, pl); g_rsPayLen = pl; g_rsThis = a;
+    const uintptr_t r = g_origReload(a, b, c, d, e, f, g, h, i, j);
+    uint32_t res = 0; ReadBytes(b, &res, 4); Log("[reloadstage] result %u", res);
+    return r;
+}
+void ReloadStageTrace(uintptr_t rva) {
+    static bool s_done = false; if (s_done || !rva) return; s_done = true;
+    if (InstallInternalHook((void*)(g_base + rva), (void*)HookReloadStage, (void**)&g_origReload, "reload stage (research)")) Log("[reloadstage] trace on rva 0x%llx", (unsigned long long)rva);
+}
+// Research: replay the recorded ReloadStageStartReq with another destination (payload data +12: position x, y, z).
+static uint8_t g_rsReplayPay[256]; static uint8_t g_rsReplayMsg[0x40];
+static uint32_t CallReloadGuarded2(uintptr_t fn, uintptr_t self, uintptr_t msg) {
+    uint32_t res = 0xEEEE;
+    CDK_GUARD_BEGIN
+        ((uintptr_t(__fastcall*)(uintptr_t, uint32_t*, uintptr_t))fn)(self, &res, msg);
+    CDK_GUARD_FAIL res = 0xFFFF; g_lastFaultCode = cdk::t_fault.rec.ExceptionCode; g_lastFaultAddr = (uintptr_t)cdk::t_fault.rec.ExceptionAddress;
+    CDK_GUARD_END
+    return res;
+}
+void ReloadStageReplay(float x, float y, float z) {
+    if (!g_rsPayLen || !g_origReload) { Log("[reloadstage] nothing recorded"); return; }
+    RunOnGameThread([x, y, z]() {
+        memcpy(g_rsReplayPay, g_rsPay, sizeof g_rsPay); memcpy(g_rsReplayMsg, g_rsMsg, sizeof g_rsMsg);
+        float* pos = (float*)(g_rsReplayPay + 5 + 12); pos[0] = x; pos[1] = y; pos[2] = z;
+        *(uintptr_t*)(g_rsReplayMsg + 0x18) = (uintptr_t)g_rsReplayPay;
+        Log("[reloadstage] replay to (%.2f %.2f %.2f) on %p", x, y, z, (void*)g_rsThis);
+        const uint32_t r = CallReloadGuarded2((uintptr_t)g_origReload, g_rsThis, (uintptr_t)g_rsReplayMsg);
+        Log("[reloadstage] replay result %u (fault %08lx at rva 0x%llx)", r, g_lastFaultCode, (unsigned long long)(g_lastFaultAddr >= g_base ? g_lastFaultAddr - g_base : 0));
+    });
+}
+// Research: the client's ReloadStageStartReq sender (0xc04d20 on 2976): (conn, edx, &a, &b, &c, transform*, &flag).
+static Gen10 g_origRsSend = nullptr;
+static uintptr_t __fastcall HookRsSend(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f, uintptr_t g, uintptr_t h, uintptr_t i, uintptr_t j) {
+    uint32_t A = 0, B = 0, C = 0; uint8_t fl = 0; float tf[10] = {}; ReadBytes(c, &A, 4); ReadBytes(d, &B, 4); ReadBytes(e, &C, 4); ReadBytes(f, tf, 40); ReadBytes(g, &fl, 1);
+    void* fr[24]; const USHORT k = RtlCaptureStackBackTrace(1, 24, fr, nullptr); std::string st;
+    for (USHORT q = 0; q < k; q++) { const uintptr_t x = (uintptr_t)fr[q]; if (x >= g_base && x < g_base + 0x8000000) { char t[24]; snprintf(t, sizeof t, " %llx", (unsigned long long)(x - g_base)); st += t; } }
+    const char* rt = RttiName(a);
+    Log("[rssend] conn %p (%s) edx %llx A %u B %u C %u pos %.2f %.2f %.2f quat %.3f %.3f %.3f %.3f flag %u thread %lu stack:%s", (void*)a, rt ? rt : "?", (unsigned long long)b, A, B, C,
+        tf[7], tf[8], tf[9], tf[3], tf[4], tf[5], tf[6], fl, GetCurrentThreadId(), st.c_str());
+    return g_origRsSend(a, b, c, d, e, f, g, h, i, j);
+}
+void RsSendTrace(uintptr_t rva) {
+    static bool s_done = false; if (s_done || !rva) return; s_done = true;
+    if (InstallInternalHook((void*)(g_base + rva), (void*)HookRsSend, (void**)&g_origRsSend, "reload stage send (research)")) Log("[rssend] trace on rva 0x%llx", (unsigned long long)rva);
+}
+// Research: the client's "reload stage at transform" (0xa9a860 on 2976): (obj, key, b, c, transform* {scale3, quat4, pos3}).
+// Recorded on a real fast travel, replayed with another position: the game's own teleport with loading screen.
+typedef void(__fastcall* ClientReloadFn)(uintptr_t, uint32_t, uint32_t, uint32_t, const float*);
+static ClientReloadFn g_origCReload = nullptr; static uintptr_t g_crObj = 0; static uint32_t g_crKey = 0, g_crB = 0, g_crC = 0; static float g_crTf[10] = {};
+static void __fastcall HookCReload(uintptr_t obj, uint32_t key, uint32_t b, uint32_t c, const float* tf) {
+    float t[10] = {}; if (tf) ReadBytes((uintptr_t)tf, t, sizeof t);
+    Log("[creload] obj %p (%s) key %u b %u c %u scale %.2f quat %.3f %.3f %.3f %.3f pos %.2f %.2f %.2f thread %lu", (void*)obj, RttiName(obj) ? RttiName(obj) : "?", key, b, c, t[0], t[3], t[4], t[5], t[6], t[7], t[8], t[9], GetCurrentThreadId());
+    g_crObj = obj; g_crKey = key; g_crB = b; g_crC = c; memcpy(g_crTf, t, sizeof t);
+    g_origCReload(obj, key, b, c, tf);
+}
+static void CallCReloadGuarded(float* tf) {
+    CDK_GUARD_BEGIN
+        g_origCReload(g_crObj, g_crKey, g_crB, g_crC, tf);
+    CDK_GUARD_FAIL g_lastFaultCode = cdk::t_fault.rec.ExceptionCode; g_lastFaultAddr = (uintptr_t)cdk::t_fault.rec.ExceptionAddress;
+    CDK_GUARD_END
+}
+void ClientReloadTrace(uintptr_t rva) {
+    static bool s_done = false; if (s_done || !rva) return; s_done = true;
+    if (InstallInternalHook((void*)(g_base + rva), (void*)HookCReload, (void**)&g_origCReload, "client reload stage (research)")) Log("[creload] trace on rva 0x%llx", (unsigned long long)rva);
+}
+void ClientReloadReplay(float x, float y, float z) {
+    if (!g_crObj || !g_origCReload) { Log("[creload] nothing recorded"); return; }
+    RunOnGameThread([x, y, z]() {
+        static float tf[10]; memcpy(tf, g_crTf, sizeof tf); tf[7] = x; tf[8] = y; tf[9] = z; g_lastFaultCode = 0;
+        Log("[creload] replay to (%.2f %.2f %.2f)", x, y, z); CallCReloadGuarded(tf);
+        Log("[creload] replay done (fault %08lx at rva 0x%llx)", g_lastFaultCode, (unsigned long long)(g_lastFaultAddr >= g_base ? g_lastFaultAddr - g_base : 0));
+    });
+}
 void TerrainJobTrace(uintptr_t rva) {
     static bool s_done = false; if (s_done || !rva) return; s_done = true;
     if (InstallInternalHook((void*)(g_base + rva), (void*)HookJobExec, (void**)&g_origJobExec, "terrain job exec (research)")) Log("[terrain] job trace on rva 0x%llx", (unsigned long long)rva);
