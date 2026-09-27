@@ -139,7 +139,7 @@ namespace editor {
     static bool  g_showSpawnOpts = false, g_showMass = false; static int g_hoverUid = 0, g_hoverNpcUid = 0;
     static bool  g_cardView = false; static float g_cardSize = 96.0f;   // browser: tile view instead of the list (same matches / filters)
     static int   g_browserDragPrefab = -1;   // browser row/card being dragged out into the game view
-    struct BrowserDropJob { int prefab = -1, ticket = 0; Vec3 center{}; float yaw = 0, scale = 1; };
+    struct BrowserDropJob { int prefab = -1, ticket = 0; DWORD queuedAt = 0; Vec3 center{}; float yaw = 0, scale = 1; };
     static std::vector<BrowserDropJob> g_browserDropJobs;   // ground is probed before spawning, so a new object's own collision cannot be mistaken for the surface
     static int   g_npcDragIndex = -1;        // character row/card being dragged out into the game view
     struct NpcDropJob { uint32_t key = 0; int ticket = 0; DWORD queuedAt = 0; Vec3 at{}; int count = 1, formation = 0; float spacing = 1.5f, radius = 8.0f, fx = 0, fz = 1; bool ai = true; int behavior = 0; };
@@ -1645,7 +1645,7 @@ namespace editor {
         const float fl = sqrtf(fx * fx + fz * fz); if (fl > 1e-4f) { fx /= fl; fz /= fl; } else { fx = 0; fz = 1; }
         const float rx = fz, rz = -fx;
         const int cols = std::max(1, (int)ceilf(sqrtf((float)count))), rows = std::max(1, (count + cols - 1) / cols);
-        std::vector<Act> acts; acts.reserve(count);
+        std::vector<Act> acts; acts.reserve(count); std::vector<int> spawned; spawned.reserve(count);
         for (int k = 0; k < count; ++k) {
             float side = 0, depth = 0;
             if (formation == 0) side = (k - (count - 1) * 0.5f) * spacing;
@@ -1658,9 +1658,14 @@ namespace editor {
             }
             const Vec3 at{ center.x + rx * side + fx * depth, center.y, center.z + rz * side + fz * depth };
             const int uid = core::SpawnManagedNpc(key, at, 1, 0, ai, behavior);
-            if (uid) { Act a; a.kind = Act::NpcSpawn; a.uid = uid; a.prefab = std::string("NPC ") + std::to_string(key); a.pos1 = at; a.flag1 = ai; a.behavior1 = behavior; acts.push_back(std::move(a)); }
+            if (uid) { Act a; a.kind = Act::NpcSpawn; a.uid = uid; a.prefab = std::string("NPC ") + std::to_string(key); a.pos1 = at; a.flag1 = ai; a.behavior1 = behavior; acts.push_back(std::move(a)); spawned.push_back(uid); }
         }
         Push(std::move(acts));
+        if (!spawned.empty()) {
+            ClearSceneSelection();
+            for (int uid : spawned) g_managedNpcSel.insert(uid);
+            g_managedNpcPrimary = spawned.front(); g_managedNpcLast = spawned.back(); g_sceneLastEntity = -g_managedNpcPrimary;
+        }
     }
     static void SpawnNpcFormationGrounded(uint32_t key, Vec3 center, int count, int formation, float spacing, float radius, float fx, float fz, bool ai, int behavior) {
         if (core::GroundProbeReady()) {
@@ -3254,7 +3259,13 @@ namespace editor {
         const auto& idx = core::PrefabIndex();
         for (size_t i = 0; i < g_browserDropJobs.size(); ) {
             BrowserDropJob& j = g_browserDropJobs[i]; core::GroundHit gh;
-            if (!core::GroundResult(j.ticket, &gh)) { ++i; continue; }
+            if (!core::GroundResult(j.ticket, &gh)) {
+                if (GetTickCount() - j.queuedAt < 1200) { ++i; continue; }
+                core::Log("[ground] browser drop probe timed out; using projected placement height");
+                SpawnBrowserDrop(j.prefab, j.center, j.yaw, j.scale);
+                g_browserDropJobs.erase(g_browserDropJobs.begin() + i);
+                continue;
+            }
             Vec3 center = j.center;
             if (j.prefab >= 0 && j.prefab < (int)idx.size() && gh.hit) {
                 const auto& pi = idx[j.prefab]; const float groundY = gh.centerY - core::g_probeRadius;
@@ -3288,7 +3299,7 @@ namespace editor {
             const float startY = center.y + 150.0f;
             const int ticket = core::GroundProbe({ center.x, startY, center.z }, 400.0f);
             if (ticket) {
-                g_browserDropJobs.push_back({ prefab, ticket, center, g_spawnYaw, g_spawnScale });
+                g_browserDropJobs.push_back({ prefab, ticket, GetTickCount(), center, g_spawnYaw, g_spawnScale });
                 return;
             }
         }
@@ -3368,8 +3379,8 @@ namespace editor {
     }
     static void DrawSelectionOutlines() {
         if(g_sel.empty()&&g_managedNpcSel.empty()&&!g_hoverUid&&!g_hoverNpcUid)return;CamFrame cf=CurrentCam();if(!cf.ok)return;ImDrawList*dl=ImGui::GetForegroundDrawList();auto objects=core::Spawned();auto npcs=core::ManagedNpcs();
-        for(const auto&o:objects){const bool sel=g_sel.count(o.uid)>0,hov=o.uid==g_hoverUid;if(o.hidden||(!sel&&!hov))continue;float cx=0,cy=0.5f,cz=0,sx=1,sy=1,sz=1;int pi=IndexOfPrefab(o.prefab);if(pi>=0){const auto&info=core::PrefabIndex()[pi];if(info.hasCenter){cx=info.cx;cy=info.cy;cz=info.cz;}if(info.sx>0){sx=info.sx;sy=info.sy;sz=info.sz;}}ImVec2 sp[8];bool ok[8];for(int k=0;k<8;k++)ok[k]=WorldToScreen(cf,LocalToWorld(o,cx+((k&1)?sx:-sx)*0.5f,cy+((k&2)?sy:-sy)*0.5f,cz+((k&4)?sz:-sz)*0.5f),&sp[k]);static const int edges[12][2]={{0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}};const ImU32 col=sel?IM_COL32(240,140,80,230):IM_COL32(255,255,255,120);for(auto&e:edges)if(ok[e[0]]&&ok[e[1]])dl->AddLine(sp[e[0]],sp[e[1]],col,sel?2.0f:1.0f);}
-        for(const auto&n:npcs){const bool sel=g_managedNpcSel.count(n.uid)>0,hov=n.uid==g_hoverNpcUid;if(n.hidden||(!sel&&!hov))continue;ImVec2 mn,mx;float dep=0;if(!NpcScreenRect(cf,n,&mn,&mx,&dep))continue;const ImU32 col=sel?IM_COL32(240,140,80,230):IM_COL32(255,255,255,150);dl->AddRect(mn,mx,col,3.0f,0,sel?2.0f:1.0f);}
+        for(const auto&o:objects){const bool sel=g_sel.count(o.uid)>0,hov=o.uid==g_hoverUid;if(o.hidden||(!sel&&!hov))continue;float cx=0,cy=0.5f,cz=0,sx=1,sy=1,sz=1;int pi=IndexOfPrefab(o.prefab);if(pi>=0){const auto&info=core::PrefabIndex()[pi];if(info.hasCenter){cx=info.cx;cy=info.cy;cz=info.cz;}if(info.sx>0){sx=info.sx;sy=info.sy;sz=info.sz;}}ImVec2 sp[8];bool ok[8];for(int k=0;k<8;k++)ok[k]=WorldToScreen(cf,LocalToWorld(o,cx+((k&1)?sx:-sx)*0.5f,cy+((k&2)?sy:-sy)*0.5f,cz+((k&4)?sz:-sz)*0.5f),&sp[k]);static const int edges[12][2]={{0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}};const ImU32 col=sel?IM_COL32(255,150,55,255):IM_COL32(255,255,255,150);for(auto&e:edges)if(ok[e[0]]&&ok[e[1]])dl->AddLine(sp[e[0]],sp[e[1]],col,sel?2.5f:1.0f);ImVec2 mn,mx;float dep=0;if(ObjScreenRect(cf,o,&mn,&mx,&dep))dl->AddRect(mn,mx,col,3.0f,0,sel?2.5f:1.0f);}
+        for(const auto&n:npcs){const bool sel=g_managedNpcSel.count(n.uid)>0,hov=n.uid==g_hoverNpcUid;if(n.hidden||(!sel&&!hov))continue;ImVec2 mn,mx;float dep=0;if(!NpcScreenRect(cf,n,&mn,&mx,&dep))continue;const ImU32 col=sel?IM_COL32(255,150,55,255):IM_COL32(255,255,255,180);dl->AddRect(mn,mx,col,3.0f,0,sel?3.0f:1.5f);}
     }
     static void DrawDockPlacementControls(const PosInfo& p, bool havePos, float ui) {
         if (g_selPrefab < 0 || g_selPrefab >= (int)core::PrefabIndex().size()) { ImGui::TextDisabled(T("pick a card, then PLACE")); return; }
