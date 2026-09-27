@@ -72,13 +72,15 @@ Zum Neuaufbau einfach den Ordner `thumbs` und die Datei `prefab_size.tsv` lösch
   und setzen die Kopie vor dir ab (Platzierungsmodus), Entf löscht. "snap" schaltet Raster und Winkelschritte für das Maus-Gizmo
   ein. Einzelnes Objekt: Position/Yaw/Neigung/Scale ziehen, "level" nimmt die Neigung raus. Mit "live" folgt das Objekt sofort, beim Loslassen
   wird die Kollision nachgezogen (bei Yaw/Scale-Änderung wird das Objekt dafür kurz neu erzeugt). "Delete" entfernt es, "Duplicate" kopiert es.
-- **Project:** Aufbau unter einem Namen speichern/laden (`bin64\cdmodkit\projects\*.cdproj`, absolute Weltkoordinaten, Gruppen
-  bleiben erhalten), optional Autoload beim Spielstart – beliebig viele Projekte gleichzeitig (Häkchen pro Zeile; die Liste steht in
-  `bin64\cdmodkit\autoload.txt`, ein Projektname pro Zeile). "Import .cdproj" übernimmt eine Datei von jemand anderem, "Open folder" zeigt deine.
-  Jedes Objekt merkt sich, aus welchem Projekt es stammt: im Scene-Tab klickst du dich über eine Tab-Leiste durch "all", "new" und die
-  geladenen Projekte, ein Stern zeigt ungespeicherte Änderungen, und "Save the changes" schreibt nur die Objekte dieses Projekts zurück.
-  Beim Speichern wählst du zwischen "everything in the scene" und "only the new objects" – so baust du ein zweites Projekt in einem
-  geladenen, ohne das erste vorher löschen zu müssen. "New" leert die Szene für einen echten Neuanfang.
+- **Project:** Objekte und verwaltete NPCs sind gleichwertige Projekt-Entitäten. Beim Laden werden beide erzeugt; **Unload**
+  entfernt beide nur aus der laufenden Szene und lässt die `.cdproj`-Datei bestehen. Die Projektseite bietet klare Aktionen für
+  **Load, Reload, Save, Unload und Autoload**. Neue, noch nicht zugeordnete Objekte und NPCs lassen sich gezielt mit
+  **Add unassigned** in ein bereits geladenes Projekt übernehmen und speichern.
+- **Echtzeit-Autosave:** Ein eigener Schalter auf der Projektseite aktiviert oder deaktiviert das automatische Speichern.
+  Ist er aktiv, wird jede bestätigte Änderung an einer bereits zu einem Projekt gehörenden Entität sofort beim nächsten Editor-Frame
+  in genau dieses Projekt zurückgeschrieben. Neue, nicht zugeordnete Entitäten werden niemals heimlich einem Projekt zugeordnet.
+- **Kompatibilität:** Alte `.cdproj`-Objektzeilen bleiben lesbar. Das aktuelle Format behält diese Zeilen kompatibel bei und speichert
+  zusätzlich Gruppennamen, Notizen und verwaltete NPCs als optionale Metadaten.
 - Konsole: `help` listet die Befehle.
 
 ## Interaktive Objekte
@@ -106,10 +108,10 @@ in die Spielwelt gezogen werden; beim Loslassen wird ein einzelner NPC am markie
 liest die Mod zur Laufzeit aus deinem installierten Spiel, es wird nichts davon mitgeliefert.
 
 Die Figuren entstehen weiterhin über die Spawn-Anfrage des Spiels selbst, werden vom World Builder aber als **verwaltete NPCs**
-registriert. Schon beim Erzeugen kannst du normale KI oder **Hold / AI paused** wählen. Danach lassen sich NPCs per Ctrl/Shift
+registriert. Schon beim Erzeugen kannst du normale KI oder **Hold (AI paused)** wählen. Danach lassen sich NPCs mit Ctrl und Shift
 mehrfach auswählen oder komplett markieren und gemeinsam bewegen, löschen, gruppieren, benennen, mit Notizen versehen sowie
-in der KI ein-/ausschalten bzw. zwischen normalem Verhalten und Hold wechseln. Dieselben verwalteten NPCs erscheinen auch im
-**Scene**-Tab; ihre Änderungen laufen durch Undo/Redo.
+die KI ein- und ausschalten sowie zwischen normalem Verhalten und Hold wechseln. Dieselben verwalteten NPCs erscheinen auch im
+**Scene**-Tab direkt zwischen den normalen Objekten; ihre Änderungen laufen durch Undo und Redo.
 
 Verwaltete NPCs werden zusammen mit dem Projekt gespeichert: Position, KI-Zustand, Verhalten, Gruppe, eigener Name und Notiz
 werden beim Laden wiederhergestellt. Ist die Server-Figur des Spielers nach einem Ladebildschirm noch nicht bekannt, bleibt der
@@ -117,7 +119,7 @@ NPC kurz als "pending" eingetragen und wird automatisch erzeugt, sobald das Spie
 
 Der NPC-Browser funktioniert auch im Dock. Dort wird die Trefferliste automatisch als kompakte Kachelansicht gezeigt; Suche,
 Kategorie, Abstand, Anzahl, Formation, KI beim Spawn und SPAWN bleiben verfügbar. Der NPC-Tab bleibt dabei bewusst ein
-Browser/Spawner; bereits erzeugte, verwaltete NPCs werden ausschließlich im **Scene**-Tab bearbeitet.
+Browser und Spawner; bereits erzeugte, verwaltete NPCs werden ausschließlich im **Scene**-Tab bearbeitet.
 
 Beim Schließen des World-Builder-Fensters – per Hotkey oder über das X in der Titelleiste – wird ein aktiver Freikamera-/Flugmodus
 sofort beendet und die Steuerung vollständig an das Spiel zurückgegeben.

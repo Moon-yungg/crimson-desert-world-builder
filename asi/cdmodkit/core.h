@@ -18,7 +18,8 @@ struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float 
                     int uid; int group; int proj; bool gimmick = false; uintptr_t actor = 0; bool standin = false; std::string note; };   // gimmick: spawned through the game's server path (obj = its server scene object, actor = its actor)   // uid: stable id for the editor (indices shift when entries are forgotten); group 0 = none;
                                                         // proj: which project the object belongs to (0 = placed by hand, not part of a saved project yet)
 struct ManagedNpc { int uid = 0; uint32_t key = 0; Vec3 pos{}; int type = 1; uint32_t extra = 0; uintptr_t actor = 0; uint32_t actorId = 0;
-                    bool aiEnabled = true; bool aiApplied = true; int behavior = 0; bool hidden = false; bool spawnPending = false; int group = 0; int proj = 0; std::string label, note; };
+                    bool aiEnabled = true; bool aiApplied = true; int behavior = 0; bool hidden = false; bool spawnPending = false; DWORD tick = 0;
+                    int group = 0; int proj = 0; std::string label, note; };
 
 namespace core {
     constexpr int kResourcePrefabs = 101;
@@ -205,17 +206,18 @@ namespace core {
     bool PreviewActive();
     bool PreviewPending();         // a PreviewSet job is still queued (commit only once it ran)
 
-    // Projects: bin64\cdmodkit\projects\<name>.cdproj, one object per line "prefab|x|y|z|yaw|scale|group|pitch|roll" (v3; older files have fewer fields)
-    // Project membership: every object knows which project it came from, so a project can be overwritten with exactly its
-    // own objects while other loaded projects stay untouched. Ids are per session and name the .cdproj files; 0 = new object.
+    // Projects: bin64\cdmodkit\projects\<name>.cdproj. Legacy v1-v3 object rows stay readable; current files also persist
+    // managed NPC entities, notes and named groups in backward-compatible comment records. Objects and NPCs are equal project
+    // entities: both carry a project id, both load/autoload with the project and both are included in dirty/save counts.
     enum SaveScope { SaveWholeScene = 0, SaveProjectAndNew = 1, SaveNewOnly = 2, SaveProjectOnly = 3 };
     int  ProjectId(const std::string& name);       // id for a project name, creating one on first use (0 for an empty name)
     std::string ProjectNameOf(int id);             // "" for 0 / unknown
-    int  ProjectObjectCount(int id);               // visible objects currently belonging to that project (0 = the new ones)
-    bool ProjectDirty(int id);                     // an object of it was moved, deleted or regrouped since the last load / save
+    int  ProjectObjectCount(int id);               // visible entities (objects + managed NPCs) belonging to the project; 0 = new/unassigned
+    bool ProjectDirty(int id);                     // an entity/metadata item changed since the last load/save
     void AssignProject(int uid, int proj);
     bool SaveProject(const std::string& name, int scope = SaveWholeScene);   // saved objects become members of that project
     bool LoadProject(const std::string& name, bool clearFirst);   // spawns are queued one per game tick
+    bool UnloadProject(int id);                     // removes this project's live objects and managed NPCs without touching its file
     std::vector<std::string> ListProjects();
     void DeleteAllSpawned();
     // Autoload: bin64\cdmodkit\autoload.txt, one project name per line (without .cdproj), '#' at the line start = comment.
