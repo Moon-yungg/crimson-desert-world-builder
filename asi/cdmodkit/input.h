@@ -12,7 +12,10 @@ namespace input {
     void TakeMouseDelta(float* dx, float* dy); // consumes raw relative motion accumulated since the previous frame
     // key state by scan code, tracked from the window messages; ext = extended key flag
     bool ScanDown(int scan, bool ext);
+    bool ScanDownAny(int scan);
     void ClearKeys();
+    bool VkDown(int vk);           // virtual-key state; numpad bindings also accept their navigation-key variants
+    void SetPlaceVks(const int* vks, int count);
     void SetFreeCam(bool on);      // free-fly camera: WASD/QE/Shift/Ctrl/Space and the look mouse go to World Builder
     bool FreeCamLooking();         // the mouse currently turns the free camera (menu closed, or right button held over the world)
     void TakeLookDelta(float* dx, float* dy);   // raw mouse movement collected for the free camera since the last call   // keys that belong to World Builder while an object is carried

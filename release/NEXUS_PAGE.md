@@ -13,8 +13,8 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 1. Press **Insert** in the game world. The editor opens in edit mode: the mouse belongs to the menu, the world keeps running.
 2. Type a word into the search box, pick a card or a row, press **PLACE** (or double-click).
 3. The object appears in front of your character with the mouse gizmo active. Drag the arrows, rings, center point or scale handles to position it. Use the placement HUD to Drop, Cancel, level or snap it to the ground; placing/selecting something else or double-clicking into the open also finishes the placement.
-4. Prefer a small panel? Click **dock**: the narrow side window can switch between Browser, Scene, NPCs and Time & Weather, and stays open while you work.
-5. **Home** switches camera mode on and off: a free-flying camera (WASD, right-drag to look, mouse wheel forward) while the editor stays open. **Insert** hides the editor and hands the controls back to the game. Save your build in the Project tab.
+4. Prefer a small panel? Click **dock**: the narrow side window can switch between Browser, Scene, NPCs, Project and Time & Weather, and stays open while you work.
+5. **Home** switches between editing and transparent click-through player control; keyboard and mouse go fully to the game. Use the **free camera** button for flight, or enable automatic free camera on editor open in Settings. **Insert** hides the editor.
 
 ## Features
 
@@ -27,12 +27,13 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 - **Snapping**: grid steps (0.1 to 2 m) and angle steps (5 to 90 degrees) apply to gizmo movement and rotation
 - **Snap to ground**: "To ground" on the placement HUD or in the Scene tab drops objects onto the surface below them using the game's own physics probe
 - **Click to select**: in edit mode a click on a placed object selects it, a double-click grabs it. Selected objects are outlined
-- **Scene tab**: every placed object with position and distance; multi-select (Ctrl / Shift + click), groups (Ctrl+G) as collapsible rows, undo / redo (Ctrl+Z / Ctrl+Y), copy / paste with orientation (Ctrl+C / Ctrl+V), duplicate, delete, To ground, Grab, Remove duplicates
+- **Scene tab**: placed objects and World Builder-managed NPCs are mixed in the same list and card view, the same named groups, and the same selection model. World clicks and box selection can hit either type; Ctrl and Shift multi-select can mix them. Common move, group, focus, delete, notes and history actions work on the combined selection, while object-only transform tools stay object-only
 - **Time & Weather**: set the visual time of day, freeze the day/night lighting without pausing gameplay, restore native time progression, and control clear sky, rain, snow, clouds and wind. The controls are also available in the dock
-- **NPC spawning**: spawn one or many NPCs/creatures at a directly entered distance, with counts up to 100,000 and Line, Matrix or Circle formations with adjustable spacing/radius; drag a row or card into the game view to spawn one NPC at the marked drop point; the same controls are available in the narrow NPC dock
+- **NPC browser and spawning**: the NPC page stays focused on browsing and spawning: search, list or cards, count presets up to 500, line, matrix and circle formations, footprint feedback, normal AI or Hold, and drag-to-world spawning with ground probing. Spawned NPCs are managed directly beside objects in **Scene**
 - **Line and circle tools**: N copies in a row or on a ring in front of you, grouped, handed to the placement mode
-- **Projects**: save and load whole builds (absolute world coordinates, groups and tilt included), import .cdproj files shared by others, optional autoload when the game starts (tick as many projects as you like; they are all placed into the same world)
-- **One scene, several projects**: every object knows which project it came from. The scene has a tab per loaded project plus "new" for what you just placed, a star marks unsaved changes, and each project is written back into its own file - so you can build inside a loaded project without having to clear it first
+- **Projects**: objects and managed NPCs are equal project entities. Loading a project recreates both; unloading removes both from the live scene without deleting the file. The project page has explicit Load, Reload, Save, Unload and Autoload actions, plus an action to attach unassigned objects and NPCs to an existing project
+- **Real-time project auto-save**: a manual master switch controls immediate saving. When enabled, every committed edit to an entity already belonging to a project is written back on the next editor frame. New unassigned entities are never attached silently
+- **Backward-compatible files**: existing `.cdproj` object rows from older versions remain readable. Current files keep those rows compatible and add named groups, notes and managed NPC records as optional metadata records
 - **Simple controls**: only the editor and camera-mode hotkeys are configurable; object placement is handled by the mouse gizmo instead of a separate keyboard control scheme
 - **Modding SDK**: `cdk_spawn`, `cdk_move`, `cdk_remove`, `cdk_player_pos` and friends, callable from any other ASI mod
 - **Interactive objects**: every gimmick prefab (torches, lamps, doors, chests, campfires, levers - 16,591 of them) is spawned through the game's own spawn path and behaves like the real thing: light a torch, open a chest, knock a stand over. Select, drag, rotate, undo and save them like any other object. The game provides the spawn template by itself a few steps after loading
@@ -43,7 +44,7 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 | Key | Action |
 | --- | --- |
 | Insert | show / hide the editor |
-| Home | camera mode on / off (free-flying camera, the editor stays open) |
+| Home | edit / player-control mode; the transparent editor does not capture keyboard or mouse |
 | Placement HUD | Drop / Cancel / To ground / level / snapping |
 | Mouse gizmo | move / rotate / tilt / scale the carried object or selection |
 | Placing or selecting something else, or double-click into the open | finish the current placement |
@@ -57,7 +58,7 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 ## Installation
 
 1. Install Ultimate ASI Loader if you do not have it: download Ultimate-ASI-Loader_x64.zip, copy the included dinput8.dll into `<game>\bin64\` and rename it to winmm.dll.
-2. Copy `cdmodkit.asi` and the `cdmodkit` folder from this archive into `<game>\bin64\`. Mod managers (DMM, Vortex) work too: the prefab list is built into the plugin and written out if the folder is missing.
+2. Copy `cdmodkit.asi` from this archive into `<game>\bin64\`. The `cdmodkit` runtime folder and `settings.txt` are created automatically on first start.
 3. Start the game through Steam. The log is written to `bin64\cdmodkit\cdmodkit.log` (set `console=1` in settings.txt if you want a console window).
 
 On the first start the mod renders preview images for all prefabs in the background (low priority, about 20 minutes). The prefab you select is always rendered first.

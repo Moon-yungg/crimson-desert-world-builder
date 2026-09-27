@@ -33,7 +33,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: cdmodkit-msvc
-          path: |
-            asi/cdmodkit/build/cdmodkit.asi
-            asi/cdmodkit/data/settings.txt
+          path: asi/cdmodkit/build/cdmodkit.asi
 

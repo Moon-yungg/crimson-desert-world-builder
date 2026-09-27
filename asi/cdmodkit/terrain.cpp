@@ -300,7 +300,17 @@ bool TerrainUndo() {
     std::vector<std::pair<int, int>> t; { std::lock_guard<std::mutex> l(g_mx); for (auto& kv : g_cpu) t.push_back(kv.first); } QueueLive(t);
     return true;
 }
-void TerrainClear() { std::lock_guard<std::mutex> l(g_mx); if (!g_strokes.empty()) g_needsApply = true; g_strokes.clear(); RebuildEditedLocked(); RecomputeCpuLocked(); Log("[terrain] strokes cleared"); }
+void TerrainClear() {
+    std::set<int> dirty;
+    {
+        std::lock_guard<std::mutex> l(g_mx);
+        if (!g_strokes.empty()) g_needsApply = true;
+        for (const auto& s : g_strokes) if (s.proj) dirty.insert(s.proj);
+        g_strokes.clear(); RebuildEditedLocked(); RecomputeCpuLocked();
+    }
+    for (int proj : dirty) MarkProjectDirty(proj);
+    Log("[terrain] strokes cleared");
+}
 std::vector<TerrainStroke> TerrainStrokes() { std::lock_guard<std::mutex> l(g_mx); return g_strokes; }
 void TerrainSetProject(int from, int to) { std::lock_guard<std::mutex> l(g_mx); for (auto& s : g_strokes) if (s.proj == from) s.proj = to; }
 // A project's strokes as loaded from its file: replaces what that project had. Identical strokes (the startup preload followed

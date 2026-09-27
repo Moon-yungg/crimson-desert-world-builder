@@ -14,8 +14,8 @@ im Log steht `RESOLVE FAILED`, und nichts wird gehookt.
    die enthaltene `dinput8.dll` nach `bin64\winmm.dll` kopieren (umbenennen).
 2. Aus diesem Zip nach `<Spiel>\bin64\` kopieren:
    - `cdmodkit.asi`
-   - `cdmodkit\settings.txt` (bei einem Update kannst du deine eigene `settings.txt` behalten)
-3. Spiel normal über Steam starten. Das Log liegt in `bin64\cdmodkit\cdmodkit.log`; ein Konsolenfenster gibt es nur mit `console=1` in der `settings.txt`.
+   Der Ordner `cdmodkit\` und `settings.txt` werden beim ersten Start automatisch erzeugt.
+3. Spiel normal über Steam starten. Das Log liegt in `bin64\cdmodkit\cdmodkit.log`; ein Konsolenfenster gibt es nur mit `console=1` in der automatisch erzeugten `settings.txt`.
 
 Prefab-Index, Fehlernamen und Übersetzungen sind direkt in `cdmodkit.asi` eingebettet und werden nicht als separate Dateien installiert oder erzeugt.
 
@@ -36,8 +36,8 @@ Zum Neuaufbau einfach den Ordner `thumbs` und die Datei `prefab_size.tsv` lösch
 
 - Spielstand laden, dann **Einfg** (Insert) drücken: Fenster "World Builder" erscheint im **Bearbeitungsmodus**. Die Welt läuft
   weiter, aber Maus und Tastatur gehören komplett dem Menü (die Figur reagiert nicht, der Cursor ist sichtbar).
-- **Pos1** (Home) schaltet in den **Kameramodus**: eine frei fliegende Kamera, der Editor bleibt offen (siehe „Freie
-  Kamera“). Nochmal Pos1 schaltet zurück, Einfg blendet das Fenster aus und gibt die Steuerung ans Spiel zurück. Beide Tasten sind im Tab "Settings" umbelegbar, dort lässt sich auch das Konsolenfenster abschalten
+- **Pos1** (Home) schaltet zwischen **Bearbeiten** und **Spielsteuerung**. In Spielsteuerung bleibt der Editor transparent sichtbar,
+  fängt aber weder Tastatur noch Maus ab. Die freie Kamera wird über den Button im Editor eingeschaltet; in Settings kann sie optional beim Öffnen des Editors automatisch starten. Beide Tasten sind im Tab "Settings" umbelegbar, dort lässt sich auch das Konsolenfenster abschalten
   (gespeichert in `bin64\cdmodkit\settings.txt`).
 - **Browser:** Kategorien links (Breite ziehbar), Suche und Tag-Filter oben, Favoriten mit dem Stern. Eintrag anklicken zeigt
   Vorschau, Größe in Metern und Tags. Versatz zum Spieler, Yaw und Scale einstellen, dann "SPAWN" oder Doppelklick.
@@ -72,13 +72,15 @@ Zum Neuaufbau einfach den Ordner `thumbs` und die Datei `prefab_size.tsv` lösch
   und setzen die Kopie vor dir ab (Platzierungsmodus), Entf löscht. "snap" schaltet Raster und Winkelschritte für das Maus-Gizmo
   ein. Einzelnes Objekt: Position/Yaw/Neigung/Scale ziehen, "level" nimmt die Neigung raus. Mit "live" folgt das Objekt sofort, beim Loslassen
   wird die Kollision nachgezogen (bei Yaw/Scale-Änderung wird das Objekt dafür kurz neu erzeugt). "Delete" entfernt es, "Duplicate" kopiert es.
-- **Project:** Aufbau unter einem Namen speichern/laden (`bin64\cdmodkit\projects\*.cdproj`, absolute Weltkoordinaten, Gruppen
-  bleiben erhalten), optional Autoload beim Spielstart – beliebig viele Projekte gleichzeitig (Häkchen pro Zeile; die Liste steht in
-  `bin64\cdmodkit\autoload.txt`, ein Projektname pro Zeile). "Import .cdproj" übernimmt eine Datei von jemand anderem, "Open folder" zeigt deine.
-  Jedes Objekt merkt sich, aus welchem Projekt es stammt: im Scene-Tab klickst du dich über eine Tab-Leiste durch "all", "new" und die
-  geladenen Projekte, ein Stern zeigt ungespeicherte Änderungen, und "Save the changes" schreibt nur die Objekte dieses Projekts zurück.
-  Beim Speichern wählst du zwischen "everything in the scene" und "only the new objects" – so baust du ein zweites Projekt in einem
-  geladenen, ohne das erste vorher löschen zu müssen. "New" leert die Szene für einen echten Neuanfang.
+- **Project:** Objekte und verwaltete NPCs sind gleichwertige Projekt-Entitäten. Beim Laden werden beide erzeugt; **Unload**
+  entfernt beide nur aus der laufenden Szene und lässt die `.cdproj`-Datei bestehen. Die Projektseite bietet klare Aktionen für
+  **Load, Reload, Save, Unload und Autoload**. Neue, noch nicht zugeordnete Objekte und NPCs lassen sich gezielt mit
+  **Add unassigned** in ein bereits geladenes Projekt übernehmen und speichern.
+- **Echtzeit-Autosave:** Ein eigener Schalter auf der Projektseite aktiviert oder deaktiviert das automatische Speichern.
+  Ist er aktiv, wird jede bestätigte Änderung an einer bereits zu einem Projekt gehörenden Entität sofort beim nächsten Editor-Frame
+  in genau dieses Projekt zurückgeschrieben. Neue, nicht zugeordnete Entitäten werden niemals heimlich einem Projekt zugeordnet.
+- **Kompatibilität:** Alte `.cdproj`-Objektzeilen bleiben lesbar. Das aktuelle Format behält diese Zeilen kompatibel bei und speichert
+  zusätzlich Gruppennamen, Notizen und verwaltete NPCs als optionale Metadaten.
 - Konsole: `help` listet die Befehle.
 
 ## Interaktive Objekte
@@ -99,18 +101,25 @@ den Weg blockieren; das Log nennt dann den fehlenden Hook, alles andere läuft w
 
 Der Tab **NPCs** listet alle rund 7.250 Figuren des Spiels (Menschen, Goblins, Tiere, Reittiere, Monster, Bosse) mit ihrem
 Spielnamen in deiner Sprache, dem internen Namen und dem Schlüssel. Suche und Kategorie grenzen die Liste ein, **SPAWN** (oder
-ein Doppelklick) setzt die Figur mit dem eingestellten Abstand vor dich. Mit "count" können bis zu 100.000 Figuren erzeugt werden;
+ein Doppelklick) setzt die Figur mit dem eingestellten Abstand vor dich. Mit "count" können bis zu 500 Figuren pro Vorgang erzeugt werden;
 als Formation stehen **Line**, **Matrix** und **Circle** mit einstellbarem Abstand bzw. Radius zur Verfügung. Der Spawn-Abstand
 kann auch für weit entfernte Gruppen direkt eingegeben werden. Eine Figur kann außerdem aus der Liste oder Kachelansicht direkt
 in die Spielwelt gezogen werden; beim Loslassen wird ein einzelner NPC am markierten Bodenpunkt erzeugt. Die Liste
 liest die Mod zur Laufzeit aus deinem installierten Spiel, es wird nichts davon mitgeliefert.
 
-Die Figuren entstehen über die Spawn-Anfrage des Spiels selbst und sind danach ganz normale Bewohner der Welt: Sie laufen,
-kämpfen, fliehen und verschwinden nach den Regeln des Spiels. Feindliche Figuren greifen an. Deshalb stehen sie nicht in der
-Szenenliste, lassen sich nicht verschieben oder rückgängig machen und werden nicht in Projekten gespeichert.
+Die Figuren entstehen weiterhin über die Spawn-Anfrage des Spiels selbst, werden vom World Builder aber als **verwaltete NPCs**
+registriert. Schon beim Erzeugen kannst du normale KI oder **Hold (AI paused)** wählen. Danach lassen sich NPCs mit Ctrl und Shift
+mehrfach auswählen oder komplett markieren und gemeinsam bewegen, löschen, gruppieren, benennen, mit Notizen versehen sowie
+die KI ein- und ausschalten sowie zwischen normalem Verhalten und Hold wechseln. Dieselben verwalteten NPCs erscheinen auch im
+**Scene**-Tab direkt zwischen den normalen Objekten; ihre Änderungen laufen durch Undo und Redo.
+
+Verwaltete NPCs werden zusammen mit dem Projekt gespeichert: Position, KI-Zustand, Verhalten, Gruppe, eigener Name und Notiz
+werden beim Laden wiederhergestellt. Ist die Server-Figur des Spielers nach einem Ladebildschirm noch nicht bekannt, bleibt der
+NPC kurz als "pending" eingetragen und wird automatisch erzeugt, sobald das Spiel wieder eine gültige Server-Session liefert.
 
 Der NPC-Browser funktioniert auch im Dock. Dort wird die Trefferliste automatisch als kompakte Kachelansicht gezeigt; Suche,
-Kategorie, Abstand, Anzahl, Formation und SPAWN bleiben verfügbar.
+Kategorie, Abstand, Anzahl, Formation, KI beim Spawn und SPAWN bleiben verfügbar. Der NPC-Tab bleibt dabei bewusst ein
+Browser und Spawner; bereits erzeugte, verwaltete NPCs werden ausschließlich im **Scene**-Tab bearbeitet.
 
 Beim Schließen des World-Builder-Fensters – per Hotkey oder über das X in der Titelleiste – wird ein aktiver Freikamera-/Flugmodus
 sofort beendet und die Steuerung vollständig an das Spiel zurückgegeben.
@@ -133,11 +142,11 @@ per Signatur aufgelöst; wenn ein Patch sie verändert, wird nur der betroffene 
 
 ## Freie Kamera
 
-**Home** (oder der Button „free camera“ oben im Editor) schaltet den Kameramodus ein: eine frei fliegende Kamera, während
-der Editor offen bleibt. W/A/S/D bewegen, E oder Leertaste hoch, Q oder Strg runter, Shift schneller, das Mausrad fährt
+Der Button **free camera** oben im Editor schaltet den Kameramodus ein: eine frei fliegende Kamera, während
+der Editor offen bleibt. W/A/S/D bewegen, E oder Leertaste hoch, Q runter, Shift schneller, das Mausrad fährt
 vorwärts. Mit gedrückter rechter Maustaste über der Welt ziehen dreht den Blick; ein Rechtsklick ohne Bewegung öffnet das
 Kontextmenü. Editor-Kürzel wie Strg+Z bleiben aktiv. Deine Figur bleibt stehen, neue Objekte erscheinen vor der Kamera,
-Gizmo und Rahmen folgen ihr. Home noch einmal (oder den Editor schließen) beendet den Kameramodus. Tempo und
+Gizmo und Rahmen folgen ihr. Home wechselt direkt zur Spielsteuerung und beendet dabei den Kameramodus. Tempo und
 Mausempfindlichkeit stehen im Tab Settings. Die Welt lädt Details weiterhin rund um deine Figur, bei sehr weiten Flügen wird es daher gröber.
 
 ## Bekannte Einschränkungen

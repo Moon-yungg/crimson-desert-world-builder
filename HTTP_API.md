@@ -25,6 +25,7 @@ Both list endpoints return `total`, `offset`, `limit`, `nextOffset` and `items`.
 
 | Request | JSON body | Result |
 | --- | --- | --- |
+| `POST /api/camera` | Any of `on`, exact `x/y/z`, relative `forward/right/up`, `turnYaw/turnPitch`, `dolly`, `focusX/focusY/focusZ/focusRadius`, or `view` = `level` / `down` / `up` | Controls the free camera. Turn it on with `{"on":true}` first; movement/position requests return 409 until the free camera has initialized. `{"on":false}` restores the game camera. |
 | `POST /api/objects` | `{"prefab":"/object/...prefab","x":1,"y":2,"z":3,"yaw":0,"scale":1}` | Queue a spawn; returns a stable `uid` |
 | `PATCH /api/objects/{uid}` | Any of `x`, `y`, `z`, `yaw`, `pitch`, `roll`, `scale` | Move/rotate/scale; omitted values stay unchanged |
 | `POST /api/objects/{uid}/hide` | `{}` | Hide the instance but keep its record |
@@ -36,10 +37,12 @@ Both list endpoints return `total`, `offset`, `limit`, `nextOffset` and `items`.
 | `POST /api/projects/save` | `{"name":"Camp","scope":0}` | Save a project. Scope: 0 whole scene, 1 this project and new objects, 2 new objects only, 3 this project only. |
 | `POST /api/projects/load` | `{"name":"Camp","clearFirst":false}` | Load a project; optionally clear the scene first |
 | `POST /api/autoload` | `{"name":"Camp","enabled":true}` | Add or remove a project from autoload |
-| `POST /api/npc` | `{"key":30191,"x":1,"y":2,"z":3,"type":1}` | Spawn an NPC or creature through the game's own spawn request. `key` is the character's row key in the game's characterinfo table (the NPCs tab shows it), `type` the spawn reason (default 1). Returns 202 when queued; 409 until the player has walked a few steps after loading; 503 if the game build does not support it. The character is a game actor, not a scene object: it has no `uid` and is not saved in projects. |
+| `POST /api/npc` | `{"key":30191,"x":1,"y":2,"z":3,"type":1}` | Legacy one-shot NPC spawn through the game's own request. `key` is the characterinfo row key and `type` the spawn reason (default 1). Returns 202 when queued; 409 until the player has walked a few steps after loading; 503 if unsupported. This HTTP endpoint remains unmanaged (no editor UID/project persistence); NPCs created from the World Builder NPC/Scene UI use the separate managed-NPC registry with selection, AI/behavior control, movement, undo/redo and project saving. |
 | `POST /api/log` | `{"text":"hello"}` | Write a line to `cdmodkit.log` |
 
 Spawns, moves and removals run on the next game simulation tick. These requests return HTTP 202 when queued; `GET /api/status` reports the remaining job count. The ASI must be installed and running in Crimson Desert, and the game must be in a state where its simulation tick runs. `GET /api/status` remains available while the game is still loading.
+
+Object scale accepted by the editor and HTTP object endpoints is 0.05–20.0.
 
 The HTTP `uid` is stable while the instance remains in the scene. The older C API uses scene-list indices, which may shift after an object is forgotten.
 

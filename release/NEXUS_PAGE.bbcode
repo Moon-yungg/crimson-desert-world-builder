@@ -14,8 +14,8 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 [*]Press [b]Insert[/b] in the game world. The editor opens in edit mode: the mouse belongs to the menu, the world keeps running.
 [*]Type a word into the search box, pick a card or a row, press [b]PLACE[/b] (or double-click).
 [*]The object appears in front of your character with the mouse gizmo active. Drag the arrows, rings, center point or scale handles to position it. Use the placement HUD to Drop, Cancel, level or snap it to the ground; placing/selecting something else or double-clicking into the open also finishes the placement.
-[*]Prefer a small panel? Click [b]dock[/b]: the narrow side window can switch between Browser, Scene, NPCs and Time & Weather, and stays open while you work.
-[*][b]Home[/b] switches camera mode on and off: a free-flying camera (WASD, right-drag to look, mouse wheel forward) while the editor stays open. [b]Insert[/b] hides the editor and hands the controls back to the game. Save your build in the Project tab.
+[*]Prefer a small panel? Click [b]dock[/b]: the narrow side window can switch between Browser, Scene, NPCs, Project and Time & Weather, and stays open while you work.
+[*][b]Home[/b] switches between editing and transparent click-through player control; keyboard and mouse go fully to the game. Use the [b]free camera[/b] button for flight, or enable automatic free camera on editor open in Settings. [b]Insert[/b] hides the editor.
 [/list]
 
 [size=4][b]Features[/b][/size]
@@ -45,7 +45,7 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 
 [list]
 [*][b]Insert[/b]: show / hide the editor
-[*][b]Home[/b]: camera mode on / off (free-flying camera, the editor stays open)
+[*][b]Home[/b]: edit / player-control mode; the transparent editor does not capture keyboard or mouse
 [*][b]Placement HUD[/b]: Drop / Cancel / To ground / level / snapping
 [*][b]Mouse gizmo[/b]: move / rotate / tilt / scale the carried object or selection
 [*]Placing or selecting something else, or double-clicking into the open: finish the current placement
@@ -63,7 +63,7 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 
 [list=1]
 [*]Install Ultimate ASI Loader if you do not have it: download Ultimate-ASI-Loader_x64.zip, copy the included dinput8.dll into <game>\bin64\ and rename it to winmm.dll.
-[*]Copy cdmodkit.asi and the cdmodkit folder from this archive into <game>\bin64\. Mod managers (DMM, Vortex) work too: the prefab list is built into the plugin and written out if the folder is missing.
+[*]Copy cdmodkit.asi from this archive into <game>\bin64\. The cdmodkit runtime folder and settings.txt are created automatically on first start.
 [*]Start the game through Steam. The log is written to bin64\cdmodkit\cdmodkit.log (set console=1 in settings.txt if you want a console window).
 [/list]
 

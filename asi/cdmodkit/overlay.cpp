@@ -441,7 +441,7 @@ namespace overlay {
         { const bool edit = editor::IsOpen() && !editor::PlayMode();
           const bool gizmo = editor::Placing() && editor::MouseMode();   // placement is mouse/gizmo driven
           core::g_uiWantsMouse = edit || gizmo; core::g_uiWantsKeyboard = edit;
-          const ImGuiIO& io = ImGui::GetIO(); core::g_uiTextInput = io.WantTextInput; core::g_uiMouseOverUi = io.WantCaptureMouse; }
+          const ImGuiIO& io = ImGui::GetIO(); core::g_uiTextInput = edit && io.WantTextInput; core::g_uiMouseOverUi = edit && io.WantCaptureMouse; }
 
         const UINT idx = sc->GetCurrentBackBufferIndex();
         if (idx >= g_frames.size()) return;

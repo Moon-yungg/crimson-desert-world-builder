@@ -1,7 +1,7 @@
 # Build cdmodkit and assemble a Nexus-ready zip.
 #   python scripts/make_release.py 0.36            -> release/WorldBuilder-v0.36.zip (+ folder)
 #   python scripts/make_release.py 0.36 --no-build -> package the existing build
-# Steps: bump version strings in the sources, run build.bat, verify the .asi exports, copy plugin + settings + docs + sdk,
+# Steps: bump version strings in the sources, run build.bat, verify the .asi exports, copy plugin + docs + sdk,
 # write THIRD_PARTY_NOTICES.md, zip. The game must not be running when you later copy the .asi into bin64.
 import sys, re, os, shutil, subprocess, pathlib, datetime
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -39,11 +39,10 @@ except ImportError:
 # 4) assemble
 out = REL / f"WorldBuilder-v{ver}"
 if out.exists(): shutil.rmtree(out)
-(out / "bin64" / "cdmodkit").mkdir(parents=True)
+(out / "bin64").mkdir(parents=True)
 (out / "sdk").mkdir()
 shutil.copy(ASI / "build" / "cdmodkit.asi", out / "bin64")
-shutil.copy(ASI / "data" / "settings.txt", out / "bin64" / "cdmodkit")
-# thumbnails and prefab_size.tsv are NOT shipped: the mod renders them locally from the player's own pack files
+# bin64/cdmodkit and settings.txt are created automatically on first run. Thumbnails and prefab_size.tsv are not shipped either.
 shutil.copy(ASI / "cdmodkit_api.h", out / "sdk")
 shutil.copy(REL / "README.md", out)
 shutil.copy(ROOT / "THIRD_PARTY_NOTICES.md", out)
@@ -53,4 +52,4 @@ if (REL / f"WorldBuilder-v{ver}.zip").exists(): (REL / f"WorldBuilder-v{ver}.zip
 shutil.make_archive(str(zip_path), "zip", out)
 size = os.path.getsize(f"{zip_path}.zip")
 print(f"release: {zip_path}.zip ({size/1e6:.2f} MB)")
-print("next: copy bin64\\cdmodkit.asi + bin64\\cdmodkit\\settings.txt into the game to test, then upload the zip to Nexus and tag the git commit")
+print("next: copy bin64\\cdmodkit.asi into the game to test, then upload the zip to Nexus and tag the git commit")

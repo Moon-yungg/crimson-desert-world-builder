@@ -39,6 +39,25 @@ namespace input {
         if (g_hwnd && GetClientRect(g_hwnd, &rc)) { *w = rc.right - rc.left; *h = rc.bottom - rc.top; }
         else { *w = 1920; *h = 1080; }
     }
+    static bool WindowedClient() {
+        if (!g_hwnd) return false;
+        RECT rc{}; if (!GetClientRect(g_hwnd, &rc)) return false;
+        POINT tl{0, 0}; if (!ClientToScreen(g_hwnd, &tl)) return false;
+        HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST); MONITORINFO mi{ sizeof(mi) };
+        if (!GetMonitorInfoW(mon, &mi)) return false;
+        const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+        return tl.x != mi.rcMonitor.left || tl.y != mi.rcMonitor.top ||
+               w != mi.rcMonitor.right - mi.rcMonitor.left || h != mi.rcMonitor.bottom - mi.rcMonitor.top;
+    }
+    static void SetVirtualCursorClient(LONG x, LONG y) {
+        int w, h; ClientSize(&w, &h);
+        const float maxX = (float)(w > 0 ? w - 1 : 0);
+        const float maxY = (float)(h > 0 ? h - 1 : 0);
+        Lock();
+        g_vx = (float)x < 0.0f ? 0.0f : ((float)x > maxX ? maxX : (float)x);
+        g_vy = (float)y < 0.0f ? 0.0f : ((float)y > maxY ? maxY : (float)y);
+        Unlock();
+    }
 
     static void OnRawInput(HRAWINPUT h) {
         UINT size = 0;
@@ -54,7 +73,9 @@ namespace input {
             const bool virt = (m.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
             const int sw = GetSystemMetrics(virt ? SM_CXVIRTUALSCREEN : SM_CXSCREEN);
             const int sh = GetSystemMetrics(virt ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
-            POINT p = { static_cast<LONG>(m.lLastX * sw / 65535.0), static_cast<LONG>(m.lLastY * sh / 65535.0) };
+            const int sx = virt ? GetSystemMetrics(SM_XVIRTUALSCREEN) : 0;
+            const int sy = virt ? GetSystemMetrics(SM_YVIRTUALSCREEN) : 0;
+            POINT p = { sx + static_cast<LONG>(m.lLastX * sw / 65535.0), sy + static_cast<LONG>(m.lLastY * sh / 65535.0) };
             ScreenToClient(g_hwnd, &p);
             g_vx = static_cast<float>(p.x); g_vy = static_cast<float>(p.y);
         } else if (FreeCamLookingNow()) {
@@ -138,7 +159,8 @@ namespace input {
 
     void MenuOpened() {
         int w, h; ClientSize(&w, &h);
-        Lock(); g_vx = w * 0.5f; g_vy = h * 0.5f; g_pendingDx = g_pendingDy = 0; for (auto& b : g_pendingButtons) b[0] = b[1] = 0; g_pendingWheel = 0; Unlock();
+        POINT p{}; const bool haveWindowCursor = WindowedClient() && oGetCursorPos && oGetCursorPos(&p) && ScreenToClient(g_hwnd, &p);
+        Lock(); g_vx = haveWindowCursor ? (float)p.x : w * 0.5f; g_vy = haveWindowCursor ? (float)p.y : h * 0.5f; g_pendingDx = g_pendingDy = 0; for (auto& b : g_pendingButtons) b[0] = b[1] = 0; g_pendingWheel = 0; Unlock();
         if (ImGui::GetCurrentContext()) {
             ImGuiIO& io = ImGui::GetIO();
             for (int b = 0; b < 5; ++b) if (io.MouseDown[b]) io.AddMouseButtonEvent(b, false);
@@ -154,16 +176,36 @@ namespace input {
         Lock(); g_pendingDx = g_pendingDy = 0; for (auto& b : g_pendingButtons) b[0] = b[1] = 0; g_pendingWheel = 0; Unlock();
     }
 
-    // scan code key state for the free camera: set on key-down, cleared on key-up/focus loss and on mode transitions.
+    // scan code key state for free camera and optional keyboard placement: set on key-down, cleared on key-up/focus loss and mode transitions.
     // No time-out: Windows auto-repeats only the last pressed key, so a held key may stay silent.
     static bool g_scanDown[512] = { false };
     static void TrackKey(UINT msg, LPARAM lParam) {
         const int scan = (int)((lParam >> 16) & 0xFF), ext = (int)((lParam >> 24) & 1);
         if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) g_scanDown[scan | (ext << 8)] = true;
-        else if (msg == WM_KEYUP || msg == WM_SYSKEYUP) { g_scanDown[scan] = false; g_scanDown[scan | 256] = false; }
+        else if (msg == WM_KEYUP || msg == WM_SYSKEYUP) {
+            // Shift+numpad inserts a fake extended Shift-up around the numpad event. Do not clear the real Shift for that event.
+            if ((scan == 0x2A || scan == 0x36) && ext) g_scanDown[scan | 256] = false;
+            else { g_scanDown[scan] = false; g_scanDown[scan | 256] = false; }
+        }
     }
     bool ScanDown(int scan, bool ext) { return g_scanDown[(scan & 0xFF) | (ext ? 256 : 0)]; }
     void ClearKeys() { memset(g_scanDown, 0, sizeof g_scanDown); }
+    bool ScanDownAny(int scan) {
+        if (scan == 0x1C || scan == 0x35) return ScanDown(scan, false) || ScanDown(scan, true); // Enter, /
+        const bool shift = ScanDown(0x2A, false) || ScanDown(0x36, false);
+        return ScanDown(scan, false) || (shift && ScanDown(scan, true));
+    }
+    bool VkDown(int vk) {
+        if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) return ScanDown(0x2A, false) || ScanDown(0x36, false);
+        if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) return ScanDown(0x1D, false) || ScanDown(0x1D, true);
+        if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) return ScanDown(0x38, false) || ScanDown(0x38, true);
+        const int scan = (int)MapVirtualKeyA((UINT)vk, MAPVK_VK_TO_VSC); if (!scan) return false;
+        const bool numpad = (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) || vk == VK_DECIMAL || vk == VK_ADD || vk == VK_SUBTRACT || vk == VK_MULTIPLY;
+        const bool ext = vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT || vk == VK_PRIOR || vk == VK_NEXT || vk == VK_HOME || vk == VK_END || vk == VK_INSERT || vk == VK_DELETE || vk == VK_DIVIDE;
+        if (vk == VK_RETURN) return ScanDown(scan, false) || ScanDown(scan, true);
+        if (numpad) return ScanDownAny(scan);
+        return ScanDown(scan, ext);
+    }
     static bool IsFreeCamScan(int scan) { return scan == 0x11 || scan == 0x1E || scan == 0x1F || scan == 0x20 || scan == 0x10 || scan == 0x12 || scan == 0x2A || scan == 0x1D || scan == 0x39; }   // W A S D Q E Shift Ctrl Space
     void SetFreeCam(bool on) { g_freeCam = on; Lock(); g_lookDx = g_lookDy = 0; Unlock(); }
     bool FreeCamLooking() { return FreeCamLookingNow(); }
@@ -189,6 +231,18 @@ namespace input {
         static const USHORT ups = RI_MOUSE_LEFT_BUTTON_UP | RI_MOUSE_RIGHT_BUTTON_UP | RI_MOUSE_MIDDLE_BUTTON_UP | RI_MOUSE_BUTTON_4_UP | RI_MOUSE_BUTTON_5_UP;
         if (ri->data.mouse.usButtonFlags & ups) return 0;   // button releases still reach the game (see keys)
         return 1;   // the game's own camera must not turn while flying: its view decides what gets culled
+    }
+    static std::vector<int> g_placeVks;
+    void SetPlaceVks(const int* vks, int count) { g_placeVks.assign(vks, vks + count); }
+    static bool IsPlaceKeyFixed(WPARAM vk) { return vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN || vk == VK_PRIOR || vk == VK_NEXT || vk == VK_ADD || vk == VK_SUBTRACT || vk == VK_RETURN || vk == VK_BACK || vk == VK_DECIMAL || vk == VK_CLEAR || vk == VK_MULTIPLY || vk == VK_DIVIDE || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9); }
+    static bool IsPlaceKey(WPARAM vk) {
+        if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LSHIFT || vk == VK_RSHIFT || vk == VK_LCONTROL || vk == VK_RCONTROL) return false;
+        if (g_placeVks.empty()) return IsPlaceKeyFixed(vk);
+        for (int k : g_placeVks) if ((WPARAM)k == vk) return true;
+        static const int nav[] = { VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_DELETE, VK_CLEAR };
+        static const int np[]  = { VK_NUMPAD8, VK_NUMPAD2, VK_NUMPAD4, VK_NUMPAD6, VK_NUMPAD9, VK_NUMPAD3, VK_NUMPAD7, VK_NUMPAD1, VK_NUMPAD0, VK_DECIMAL, VK_NUMPAD5 };
+        for (int j = 0; j < 11; j++) if (vk == (WPARAM)nav[j]) for (int k : g_placeVks) if (k == np[j]) return true;
+        return false;
     }
     static bool IsMouse(UINT m) { return m >= WM_MOUSEFIRST && m <= WM_MOUSELAST; }
     static bool IsKeyboard(UINT m) { return m == WM_KEYDOWN || m == WM_KEYUP || m == WM_SYSKEYDOWN || m == WM_SYSKEYUP || m == WM_CHAR || m == WM_SYSCHAR; }
@@ -247,6 +301,9 @@ namespace input {
         }
         if (core::g_menuOpen) {
             const bool mouseToUi = core::g_uiWantsMouse, keysToUi = core::g_uiWantsKeyboard;
+            if (msg == WM_MOUSEMOVE && WindowedClient()) {
+                SetVirtualCursorClient((short)LOWORD(lParam), (short)HIWORD(lParam));
+            }
             if (core::g_uiTextInput && IsIme(msg)) {
                 TrackImeComposition(hwnd, msg, lParam);
                 // The game owns the real HWND and may consume IME composition messages. Give them to DefWindowProc instead;
@@ -266,6 +323,7 @@ namespace input {
                 return CallWindowProc(g_original, hwnd, msg, wParam, lParam);
             }
             if (IsKeyboard(msg)) {
+                if (!keysToUi && core::g_keyboardPlacement && core::g_placing && IsPlaceKey(wParam)) return 0;
                 if (keysToUi) {
                     ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
                     if (msg == WM_KEYUP || msg == WM_SYSKEYUP) return CallWindowProc(g_original, hwnd, msg, wParam, lParam);

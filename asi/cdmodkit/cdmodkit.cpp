@@ -35,6 +35,7 @@ bool      g_menuOpen = false;
 bool      g_uiWantsMouse = false;
 bool      g_uiWantsKeyboard = false;
 bool      g_uiTextInput = false, g_uiMouseOverUi = false;
+bool      g_placing = false;
 static HMODULE g_self = nullptr;
 static FILE*   g_log = nullptr;
 static bool    g_console = false;
@@ -192,9 +193,8 @@ uintptr_t PlayerActor() {
     }
     return child;
 }
-bool ReadPos(uintptr_t actor, PosInfo* out) {
-    uintptr_t comps = Deref(actor, kOff_Ent_Comps); uintptr_t tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
-    if (!tf) return false;
+static bool ReadTransformPos(uintptr_t tf, PosInfo* out, bool logParent) {
+    if (!tf || !out) return false;
     // Committed transform snapshot, 0x48 bytes at +0xB4 (layout confirmed with the CrimsonRoute author): local xyz, int16 sector x/z,
     // scale (+0x1C), quaternion xyzw (+0x28), parent translation (+0x38), parent sector (+0x44). Unparented actors have parent 0 and
     // the plain sector*1000 + local is the world position. On a mount the local part is relative to the horse: world =
@@ -216,7 +216,7 @@ bool ReadPos(uintptr_t actor, PosInfo* out) {
         }
         const double wx = vx + psec[0] * 1000.0 + px, wy = vy + py, wz = vz + psec[1] * 1000.0 + pz;
         if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz) || fabs(wx) > 200000 || fabs(wz) > 200000 || fabs(wy) > 50000) return false;
-        static bool s_parentLogged = false; if (!s_parentLogged) { s_parentLogged = true; Log("player transform has a parent (mounted?): local (%.2f %.2f %.2f) sector %d,%d parent (%.2f %.2f %.2f) sector %d,%d -> world (%.2f %.2f %.2f)", v[0], v[1], v[2], tile[0], tile[1], px, py, pz, psec[0], psec[1], wx, wy, wz); }
+        static bool s_parentLogged = false; if (logParent && !s_parentLogged) { s_parentLogged = true; Log("player transform has a parent (mounted?): local (%.2f %.2f %.2f) sector %d,%d parent (%.2f %.2f %.2f) sector %d,%d -> world (%.2f %.2f %.2f)", v[0], v[1], v[2], tile[0], tile[1], px, py, pz, psec[0], psec[1], wx, wy, wz); }
         const int tx2 = (int)(wx * 0.001), tz2 = (int)(wz * 0.001);
         out->world = { (float)wx, (float)wy, (float)wz }; out->tileX = tx2; out->tileZ = tz2; out->tiled = { (float)(wx - tx2 * 1000.0), (float)wy, (float)(wz - tz2 * 1000.0) };
         return true;
@@ -227,6 +227,26 @@ bool ReadPos(uintptr_t actor, PosInfo* out) {
     out->tiled = { v[0], v[1], v[2] }; out->tileX = tile[0]; out->tileZ = tile[1];
     out->world = { v[0] + tile[0] * kTileSize, v[1], v[2] + tile[1] * kTileSize };
     return true;
+}
+bool ReadPos(uintptr_t actor, PosInfo* out) {
+    uintptr_t comps = Deref(actor, kOff_Ent_Comps); uintptr_t tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
+    return ReadTransformPos(tf, out, true);
+}
+static uintptr_t FindActorTransform(uintptr_t actor) {
+    if (!actor) return 0;
+    uintptr_t comps = Deref(actor, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
+    const char* n = tf ? RttiName(tf) : nullptr;
+    if (n && strstr(n, "TransformSyncActorComponent@")) return tf;
+    // ServerNormalInGameActor uses the same component-table concept as the client actor, but its transform slot can move
+    // independently between builds. Discover it once per spawned NPC from RTTI rather than assuming the client slot.
+    for (unsigned co = 0x40; co < 0x100; co += 8) {
+        uintptr_t table = Deref(actor, co); if (!table) continue;
+        for (unsigned to = 0; to < 0x300; to += 8) {
+            uintptr_t c = Deref(table, to); const char* cn = c ? RttiName(c) : nullptr;
+            if (cn && strstr(cn, "TransformSyncActorComponent@")) return c;
+        }
+    }
+    return 0;
 }
 bool PlayerPosInfo(PosInfo* out) { uintptr_t a = PlayerActor(); return a && ReadPos(a, out); }
 // Research: fall watcher. Polls the player every 50 ms; a drop of more than 3 m below the last stable height counts as a fall
@@ -358,8 +378,20 @@ static void* __fastcall HookCreate(void* mgr, void* tag, void* b, void* c, void*
 // ---- spawn registry ----
 static std::mutex g_regMutex;
 static std::vector<SpawnedObj> g_reg;
-static int g_nextUid = 1, g_nextGroup = 1;
+static std::vector<ManagedNpc> g_npcReg;
+static std::set<uintptr_t> g_managedNpcActors;
+static std::map<int, std::string> g_groupNames;
+static int g_nextUid = 1, g_nextNpcUid = 1, g_nextGroup = 1;
+static void ReconcileManagedNpcActors();
 std::vector<SpawnedObj> Spawned() { std::lock_guard<std::mutex> l(g_regMutex); return g_reg; }
+std::vector<ManagedNpc> ManagedNpcs() { ReconcileManagedNpcActors(); std::lock_guard<std::mutex> l(g_regMutex); return g_npcReg; }
+bool ManagedNpcLivePosition(const ManagedNpc& npc, Vec3* out) {
+    if (!out || npc.hidden || !npc.actor) return false;
+    PosInfo p{};
+    if (npc.transform && ReadTransformPos(npc.transform, &p, false)) { *out = p.world; return true; }
+    if (ReadPos(npc.actor, &p)) { *out = p.world; return true; }
+    return false;
+}
 void ForgetSpawned(size_t idx) { std::lock_guard<std::mutex> l(g_regMutex); if (idx < g_reg.size()) g_reg.erase(g_reg.begin() + idx); }
 // A project is "dirty" once one of its objects was moved, deleted or regrouped since it was loaded or saved; the scene
 // tabs mark that with a star. Guarded by g_regMutex together with the registry it describes.
@@ -367,10 +399,25 @@ static std::set<int> g_projDirty;
 static bool g_loading = false;          // LoadProject is running: the objects it spawns must not mark the project dirty
 static void MarkDirtyLocked(int proj) { if (proj > 0) g_projDirty.insert(proj); }
 static int IndexOfUidLocked(int uid) { for (size_t i = 0; i < g_reg.size(); i++) if (g_reg[i].uid == uid) return (int)i; return -1; }
+static int NpcIndexOfUidLocked(int uid) { for (size_t i = 0; i < g_npcReg.size(); i++) if (g_npcReg[i].uid == uid) return (int)i; return -1; }
+static bool IsManagedNpcActor(uintptr_t actor) { std::lock_guard<std::mutex> l(g_regMutex); return g_managedNpcActors.count(actor) != 0; }
 int IndexOfUid(int uid) { std::lock_guard<std::mutex> l(g_regMutex); return IndexOfUidLocked(uid); }
 void SetGroup(int uid, int group) { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(uid); if (i >= 0) { g_reg[i].group = group; MarkDirtyLocked(g_reg[i].proj); } }
 int NewGroupId() { std::lock_guard<std::mutex> l(g_regMutex); return g_nextGroup++; }
+std::string GroupName(int group) { std::lock_guard<std::mutex> l(g_regMutex); auto it = g_groupNames.find(group); return it == g_groupNames.end() ? std::string() : it->second; }
+void SetGroupName(int group, const std::string& name) {
+    if (group <= 0) return;
+    std::lock_guard<std::mutex> l(g_regMutex);
+    if (name.empty()) g_groupNames.erase(group); else g_groupNames[group] = name;
+    for (const auto& o : g_reg) if (!o.hidden && o.group == group) MarkDirtyLocked(o.proj);
+    for (const auto& n : g_npcReg) if (!n.hidden && n.group == group) MarkDirtyLocked(n.proj);
+}
+void SetObjectNote(int uid, const std::string& note) { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(uid); if (i >= 0) { g_reg[i].note = note; MarkDirtyLocked(g_reg[i].proj); } }
+void SetManagedNpcGroup(int uid, int group) { std::lock_guard<std::mutex> l(g_regMutex); int i = NpcIndexOfUidLocked(uid); if (i >= 0) { g_npcReg[i].group = group; MarkDirtyLocked(g_npcReg[i].proj); } }
+void SetManagedNpcNote(int uid, const std::string& note) { std::lock_guard<std::mutex> l(g_regMutex); int i = NpcIndexOfUidLocked(uid); if (i >= 0) { g_npcReg[i].note = note; MarkDirtyLocked(g_npcReg[i].proj); } }
+void SetManagedNpcLabel(int uid, const std::string& label) { std::lock_guard<std::mutex> l(g_regMutex); int i = NpcIndexOfUidLocked(uid); if (i >= 0) { g_npcReg[i].label = label; MarkDirtyLocked(g_npcReg[i].proj); } }
 void ForgetUid(int uid) { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(uid); if (i >= 0) g_reg.erase(g_reg.begin() + i); }
+void ForgetManagedNpc(int uid) { std::lock_guard<std::mutex> l(g_regMutex); int i = NpcIndexOfUidLocked(uid); if (i >= 0) g_npcReg.erase(g_npcReg.begin() + i); }
 
 // The game's SceneObject API takes a TiledTransform (44 bytes): scale3, quat4, pos3 (relative to the tile), int16 tile x/z.
 // setWorldTransform reads the tile pair at +0x28; the housing code normalizes world -> tile (rva 0x50ea00) right before calling it.
@@ -982,8 +1029,13 @@ std::string ProjectNameOf(int id) {
     return (id > 0 && id < (int)g_projNames.size()) ? g_projNames[id] : std::string();
 }
 int ProjectObjectCount(int id) {
-    std::lock_guard<std::mutex> l(g_regMutex);
-    int n = 0; for (auto& o : g_reg) if (!o.hidden && o.proj == id) n++;
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex);
+        for (auto& o : g_reg) if (!o.hidden && o.proj == id) n++;
+        for (auto& npc : g_npcReg) if (!npc.hidden && npc.proj == id) n++;
+    }
+    for (const auto& t : TerrainStrokes()) if (t.proj == id) n++;
     return n;
 }
 bool ProjectDirty(int id) { std::lock_guard<std::mutex> l(g_regMutex); return g_projDirty.count(id) != 0; }
@@ -991,6 +1043,25 @@ void MarkProjectDirty(int proj) { if (proj) { std::lock_guard<std::mutex> l(g_re
 void AssignProject(int uid, int proj) {
     std::lock_guard<std::mutex> l(g_regMutex);
     int i = IndexOfUidLocked(uid); if (i >= 0) g_reg[i].proj = proj;
+}
+static void AssignNpcProject(int uid, int proj) {
+    std::lock_guard<std::mutex> l(g_regMutex);
+    const int i = NpcIndexOfUidLocked(uid); if (i >= 0) g_npcReg[i].proj = proj;
+}
+static std::string HexText(const std::string& s) {
+    static const char* d = "0123456789ABCDEF"; std::string out; out.reserve(s.size() * 2);
+    for (unsigned char c : s) { out.push_back(d[c >> 4]); out.push_back(d[c & 15]); } return out;
+}
+static std::string UnhexText(const std::string& s) {
+    auto nib = [](char c)->int { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'A' && c <= 'F') return c - 'A' + 10; if (c >= 'a' && c <= 'f') return c - 'a' + 10; return -1; };
+    if (s.size() & 1) return {}; std::string out; out.reserve(s.size() / 2);
+    for (size_t i = 0; i < s.size(); i += 2) { int a = nib(s[i]), b = nib(s[i + 1]); if (a < 0 || b < 0) return {}; out.push_back((char)((a << 4) | b)); } return out;
+}
+static std::vector<std::string> SplitPipe(std::string s) {
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+    std::vector<std::string> out; size_t p = 0;
+    for (;;) { size_t q = s.find('|', p); out.push_back(s.substr(p, q == std::string::npos ? std::string::npos : q - p)); if (q == std::string::npos) break; p = q + 1; }
+    return out;
 }
 
 bool SaveProject(const std::string& rawName, int scope) {
@@ -1003,15 +1074,28 @@ bool SaveProject(const std::string& rawName, int scope) {
     CreateDirectoryA(ProjDir().c_str(), nullptr);
     FILE* f = fopen(ProjPath(name).c_str(), "w");
     if (!f) { Log("save: cannot write %s", ProjPath(name).c_str()); return false; }
-    fprintf(f, "# cdmodkit project v3: prefab|x|y|z|yawDeg|scale|group|pitchDeg|rollDeg (absolute world coordinates)\n");
-    auto l = Spawned(); int n = 0; std::vector<int> written;
+    fprintf(f, "# cdmodkit project v4: object rows remain v3-compatible; optional note hex, named groups, managed NPCs and terrain strokes are comment records\n");
+    auto l = Spawned(); auto npcs = ManagedNpcs(); int n = 0, nn = 0; std::vector<int> written, writtenNpcs; std::set<int> usedGroups;
+    auto inScope = [&](int proj) {
+        if (scope == SaveProjectAndNew) return proj == pid || proj == 0;
+        if (scope == SaveNewOnly) return proj == 0;
+        if (scope == SaveProjectOnly) return proj == pid;
+        return true;
+    };
+    for (const auto& o : l) if (!o.hidden && inScope(o.proj) && o.group > 0) usedGroups.insert(o.group);
+    for (const auto& npc : npcs) if (!npc.hidden && inScope(npc.proj) && npc.group > 0) usedGroups.insert(npc.group);
+    for (int gid : usedGroups) { const std::string gn = GroupName(gid); if (!gn.empty()) fprintf(f, "#group|%d|%s\n", gid, HexText(gn).c_str()); }
     for (auto& o : l) {
         if (o.hidden) continue;
-        if (scope == SaveProjectAndNew && !(o.proj == pid || o.proj == 0)) continue;   // other projects stay where they are
-        if (scope == SaveNewOnly && o.proj != 0) continue;
-        if (scope == SaveProjectOnly && o.proj != pid) continue;   // exactly what the project tab shows
-        fprintf(f, "%s|%.3f|%.3f|%.3f|%.2f|%.3f|%d|%.2f|%.2f\n", o.prefab.c_str(), o.pos.x, o.pos.y, o.pos.z, o.rot.yaw, o.scale, o.group, o.rot.pitch, o.rot.roll);
+        if (!inScope(o.proj)) continue;
+        fprintf(f, "%s|%.6f|%.6f|%.6f|%.5f|%.6f|%d|%.5f|%.5f|%s\n", o.prefab.c_str(), o.pos.x, o.pos.y, o.pos.z, o.rot.yaw, o.scale, o.group, o.rot.pitch, o.rot.roll, HexText(o.note).c_str());
         written.push_back(o.uid); n++;
+    }
+    for (const auto& npc : npcs) {
+        if (npc.hidden || !inScope(npc.proj)) continue;
+        fprintf(f, "#npc|%u|%.6f|%.6f|%.6f|%d|%u|%d|%d|%d|%s|%s\n", npc.key, npc.pos.x, npc.pos.y, npc.pos.z, npc.type, npc.extra,
+            npc.aiEnabled ? 1 : 0, npc.behavior, npc.group, HexText(npc.label).c_str(), HexText(npc.note).c_str());
+        writtenNpcs.push_back(npc.uid); nn++;
     }
     int ns = 0;   // terrain strokes, same scope rules as the objects; '#' lines, so older versions simply skip them
     for (const auto& t : TerrainStrokes()) {
@@ -1019,24 +1103,58 @@ bool SaveProject(const std::string& rawName, int scope) {
         if (scope == SaveNewOnly && t.proj != 0) continue;
         if (scope == SaveProjectOnly && t.proj != pid) continue;
         fprintf(f, "#terrain|%d|%.3f|%.3f|%.3f|%.4f|%.3f|%.3f|%.3f|%.3f\n", t.mode, t.x, t.z, t.r, t.amount, t.strength, t.ax, t.az, t.y); ns++;
+
     }
     fclose(f);
     if (scope == SaveWholeScene) { for (const auto& t : TerrainStrokes()) if (t.proj != pid) TerrainSetProject(t.proj, pid); }
     else if (scope != SaveProjectOnly) TerrainSetProject(0, pid);   // written strokes join the project, like the objects
     for (int uid : written) AssignProject(uid, pid);   // what was written is now part of that project
+    for (int uid : writtenNpcs) AssignNpcProject(uid, pid);
     { std::lock_guard<std::mutex> l(g_regMutex); if (scope == SaveWholeScene) g_projDirty.clear(); else g_projDirty.erase(pid); }
-    Log("save: %d objects, %d terrain strokes (scope %d) -> %s", n, ns, scope, ProjPath(name).c_str());
+    Log("save: %d objects, %d NPCs, %d terrain strokes (scope %d) -> %s", n, nn, ns, scope, ProjPath(name).c_str());
+
     return true;
 }
 void DeleteAllSpawned() {
-    { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.clear(); }   // nothing left that could differ from a file
     TerrainClear();   // the terrain strokes belong to the scene as well (loaded tiles keep the old shape until an apply)
     std::vector<uintptr_t> objs, actors;
-    { std::lock_guard<std::mutex> l(g_regMutex); for (auto& o : g_reg) if (!o.hidden) { if (o.gimmick && !o.standin) { if (o.actor) actors.push_back(o.actor); } else if (o.obj) objs.push_back(o.obj); } g_reg.clear(); }
+    { std::lock_guard<std::mutex> l(g_regMutex);
+      g_projDirty.clear();   // TerrainClear marks affected projects dirty; the whole scene is gone, so clear that bookkeeping again
+      for (auto& o : g_reg) if (!o.hidden) { if (o.gimmick && !o.standin) { if (o.actor) actors.push_back(o.actor); } else if (o.obj) objs.push_back(o.obj); }
+      for (auto& npc : g_npcReg) if (!npc.hidden && npc.actor) actors.push_back(npc.actor);
+      g_reg.clear(); g_npcReg.clear(); g_groupNames.clear(); }
     for (auto actor : actors) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
     if (!GameThreadReady()) return;
     for (auto obj : objs) RunOnGameThread([obj]() { DoRemove(obj); });
     Log("delete all: %zu objects", objs.size());
+}
+bool UnloadProject(int id) {
+    if (id <= 0) return false;
+    std::vector<uintptr_t> objs, actors;
+    int objectCount = 0, npcCount = 0, terrainCount = 0;
+    for (const auto& t : TerrainStrokes()) if (t.proj == id) terrainCount++;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex);
+        for (auto it = g_reg.begin(); it != g_reg.end();) {
+            if (it->proj != id) { ++it; continue; }
+            if (!it->hidden) {
+                if (it->gimmick && !it->standin) { if (it->actor) actors.push_back(it->actor); }
+                else if (it->obj) objs.push_back(it->obj);
+            }
+            it = g_reg.erase(it); objectCount++;
+        }
+        for (auto it = g_npcReg.begin(); it != g_npcReg.end();) {
+            if (it->proj != id) { ++it; continue; }
+            if (!it->hidden && it->actor) actors.push_back(it->actor);
+            it = g_npcReg.erase(it); npcCount++;
+        }
+        g_projDirty.erase(id);
+    }
+    if (terrainCount) TerrainReplaceProject(id, {});
+    for (uintptr_t actor : actors) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
+    for (uintptr_t obj : objs) RunOnGameThread([obj]() { DoRemove(obj); });
+    Log("unload project %d: %d objects, %d NPCs, %d terrain strokes", id, objectCount, npcCount, terrainCount);
+    return objectCount || npcCount || terrainCount;
 }
 static bool g_autoDone = false; static DWORD g_worldSince = 0, g_worldLast = 0;
 // "#terrain|mode|x|z|r|amount|strength|ax|az|y": one terrain brush stroke of the project (see TerrainStroke)
@@ -1052,23 +1170,41 @@ bool LoadProject(const std::string& name, bool clearFirst) {
     if (clearFirst) DeleteAllSpawned();
     const int pid = ProjectId(name);   // the objects remember where they came from, so this project can be overwritten on its own
     g_loading = true;
-    char line[1024]; int n = 0; std::map<int, int> groups;   // file group ids -> fresh ids
+    char line[2048]; int n = 0, nn = 0; std::map<int, int> groups;   // file group ids -> fresh ids
     std::vector<TerrainStroke> strokes;
+    auto mapGroup = [&](int fileGroup) {
+        if (fileGroup <= 0) return 0;
+        auto it = groups.find(fileGroup); if (it == groups.end()) it = groups.emplace(fileGroup, NewGroupId()).first; return it->second;
+    };
     while (fgets(line, sizeof line, f)) {
         TerrainStroke t{}; if (ParseTerrainLine(line, &t)) { strokes.push_back(t); continue; }
-        if (line[0] == '#' || line[0] == '\n') continue;
-        char prefab[600] = {0}; float x, y, z, yaw = 0, sc = 1, pitch = 0, roll = 0; int grp = 0;
-        char* bar = strchr(line, '|'); if (!bar) continue;
-        *bar = 0; strncpy_s(prefab, line, _TRUNCATE);
-        if (sscanf(bar + 1, "%f|%f|%f|%f|%f|%d|%f|%f", &x, &y, &z, &yaw, &sc, &grp, &pitch, &roll) < 3) continue;
-        int g = 0; if (grp > 0) { auto it = groups.find(grp); if (it == groups.end()) it = groups.emplace(grp, NewGroupId()).first; g = it->second; }
-        SpawnAt(prefab, { x, y, z }, Rot{ yaw, pitch, roll }, sc, g, pid); n++;
+        if (line[0] == '\n') continue;
+        const std::vector<std::string> p = SplitPipe(line); if (p.empty()) continue;
+        if (p[0] == "#group") {
+            if (p.size() >= 3) { const int g = mapGroup(atoi(p[1].c_str())); const std::string gn = UnhexText(p[2]); if (g > 0 && !gn.empty()) SetGroupName(g, gn); }
+            continue;
+        }
+        if (p[0] == "#npc") {
+            if (p.size() < 10) continue;
+            const uint32_t key = (uint32_t)strtoul(p[1].c_str(), nullptr, 10); Vec3 pos{ (float)atof(p[2].c_str()), (float)atof(p[3].c_str()), (float)atof(p[4].c_str()) };
+            const int type = atoi(p[5].c_str()); const uint32_t extra = (uint32_t)strtoul(p[6].c_str(), nullptr, 10); const bool ai = atoi(p[7].c_str()) != 0;
+            const int behavior = atoi(p[8].c_str()), g = mapGroup(atoi(p[9].c_str())); const std::string label = p.size() > 10 ? UnhexText(p[10]) : std::string(), note = p.size() > 11 ? UnhexText(p[11]) : std::string();
+            if (SpawnManagedNpc(key, pos, type, extra, ai, behavior, g, pid, label, note)) nn++; continue;
+        }
+        if (!p[0].empty() && p[0][0] == '#') continue;
+        if (p.size() < 4) continue;
+        const float x = (float)atof(p[1].c_str()), y = (float)atof(p[2].c_str()), z = (float)atof(p[3].c_str());
+        const float yaw = p.size() > 4 ? (float)atof(p[4].c_str()) : 0.0f, sc = p.size() > 5 ? (float)atof(p[5].c_str()) : 1.0f;
+        const int grp = p.size() > 6 ? atoi(p[6].c_str()) : 0; const float pitch = p.size() > 7 ? (float)atof(p[7].c_str()) : 0.0f, roll = p.size() > 8 ? (float)atof(p[8].c_str()) : 0.0f;
+        const int g = mapGroup(grp); const int uid = SpawnAt(p[0], { x, y, z }, Rot{ yaw, pitch, roll }, sc, g, pid);
+        if (uid && p.size() > 9) SetObjectNote(uid, UnhexText(p[9])); if (uid) n++;
+
     }
     fclose(f);
     TerrainReplaceProject(pid, strokes);   // a tile that is already loaded shows them after an apply
     g_loading = false;
     { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.erase(pid); }   // freshly loaded = in sync with the file
-    Log("load: %d objects queued from %s", n, ProjPath(name).c_str());
+    Log("load: %d objects, %d NPCs queued from %s", n, nn, ProjPath(name).c_str());
     return true;
 }
 std::vector<std::string> ListProjects() {
@@ -1236,7 +1372,7 @@ static void* __fastcall HookCastShape(void* ctx, void* world, void* query, void*
 struct CastTemplate { bool have = false; void* world = nullptr; uint8_t query[0x200], xform[0x100], collector[0x200], hits[0x100], shape[0x200]; uintptr_t collAddr = 0, hitsAddr = 0, shapeAddr = 0; };
 static CastTemplate g_tpl;
 static std::mutex g_tplMutex;
-struct GroundReq { int id; Vec3 start; float len; bool verbose; Vec3 dir; };   // dir: unit direction of the cast (straight down for ground probes)
+struct GroundReq { int id; Vec3 start; float len; bool verbose; Vec3 dir; bool robust; };   // robust = editor ground query, samples neighbours to reject terrain-hole fall-throughs
 static std::mutex g_groundMutex; static std::vector<GroundReq> g_groundQueue; static std::map<int, GroundHit> g_groundResults; static int g_groundNext = 0;
 static volatile LONG g_groundQueued = 0;
 static void ServiceGroundQueue(void* world);
@@ -2054,9 +2190,10 @@ static void RemoveSpawnedActor(uintptr_t actor) {
     {   // does this actor refer to the scene object our replay made? (a wrong actor must not be touched)
         uintptr_t so = 0; { std::lock_guard<std::mutex> l(g_spawnedMutex); for (const auto& g : g_spawned) if (g.actor == actor) so = g.so; }
         int found = -1; { int w = 0; if (ActorRefersTo(actor, so, &w)) found = w; }
-        Log("[remove] actor %p refers to scene object %p: %s", (void*)actor, (void*)so, found < 0 ? (IsOurActor(actor) ? "not by pointer, but it was constructed during our replay" : "NOT FOUND (wrong actor?)") : "yes");
+        const bool managedNpc = IsManagedNpcActor(actor);
+        Log("[remove] actor %p refers to scene object %p: %s", (void*)actor, (void*)so, found < 0 ? (managedNpc ? "managed World Builder NPC" : IsOurActor(actor) ? "not by pointer, but it was constructed during our replay" : "NOT FOUND (wrong actor?)") : "yes");
         if (found >= 0) Log("[remove]   at actor+0x%x%s%s", found & 0xFFF, (found >> 12) & 0xFF ? " -> +0x.." : "", (found >> 20) ? " -> +0x.. (two pointers deep)" : "");
-        if (found < 0 && !IsOurActor(actor)) return;
+        if (found < 0 && !IsOurActor(actor) && !managedNpc) return;
     }
     const bool tr = g_trace; g_trace = true; g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount(); WatchObject(actor);   // the removal traces itself
     struct Restore { bool tr; ~Restore() { g_trace = tr; } } restore{ tr };
@@ -2072,6 +2209,7 @@ static void RemoveSpawnedActor(uintptr_t actor) {
     ((F1)unlockF)((void*)lockObj);
     int result = 0; ((F2)f34)((void*)actor, &result);
     Log("[remove] vtable[34] result %d (%s)", result, DecodeErr((uint32_t)result).c_str());
+    { std::lock_guard<std::mutex> l(g_regMutex); g_managedNpcActors.erase(actor); }
     std::lock_guard<std::mutex> l(g_spawnedMutex); for (auto it = g_spawned.begin(); it != g_spawned.end(); ++it) if (it->actor == actor) { g_spawned.erase(it); break; }
 }
 int SpawnedList(SpawnedInfo* out, int max) {
@@ -2088,9 +2226,30 @@ static uintptr_t kRva_ActorCtor = 0;
 typedef void* (__fastcall* ActorCtorFn)(void* self);
 static ActorCtorFn g_origActorCtor = nullptr;
 static void NoteReplayActorRaw(uintptr_t a);
+static volatile LONG g_npcActorCapture = 0;
+static DWORD g_npcActorCaptureThread = 0;
+static uintptr_t g_npcActorCandidates[8] = {};
+static int g_npcActorCandidateCount = 0;
+struct RecentServerActor { uintptr_t actor = 0; DWORD tick = 0; };
+static SRWLOCK g_recentActorLock = SRWLOCK_INIT;
+static RecentServerActor g_recentActors[1024] = {};
+static unsigned g_recentActorWrite = 0;
+static void NoteRecentServerActor(uintptr_t a) {
+    if (!a) return;
+    AcquireSRWLockExclusive(&g_recentActorLock);
+    g_recentActors[g_recentActorWrite++ % (unsigned)(sizeof g_recentActors / sizeof g_recentActors[0])] = { a, GetTickCount() };
+    ReleaseSRWLockExclusive(&g_recentActorLock);
+}
+static void NoteNpcActorRaw(uintptr_t a) {
+    if (!a || g_npcActorCandidateCount >= (int)(sizeof g_npcActorCandidates / sizeof g_npcActorCandidates[0])) return;
+    for (int i = 0; i < g_npcActorCandidateCount; ++i) if (g_npcActorCandidates[i] == a) return;
+    g_npcActorCandidates[g_npcActorCandidateCount++] = a;
+}
 static void* __fastcall HookActorCtor(void* self) {
     void* r = g_origActorCtor(self);
+    NoteRecentServerActor((uintptr_t)self);
     if (g_inGimmickReplay && GetCurrentThreadId() == g_spawnWindowThread) NoteReplayActorRaw((uintptr_t)self);
+    if (g_npcActorCapture && GetCurrentThreadId() == g_npcActorCaptureThread) NoteNpcActorRaw((uintptr_t)self);
     return r;
 }
 static void ResolveActorCtor() {
@@ -2395,11 +2554,11 @@ static void FcStep() {
     const bool ctrl = input::ScanDown(0x1D, false) || input::ScanDown(0x1D, true);
     const bool ctrlCommand = ctrl && (input::ScanDown(0x2C, false) || input::ScanDown(0x15, false) || input::ScanDown(0x2E, false) || input::ScanDown(0x2D, false) ||
                                       input::ScanDown(0x2F, false) || input::ScanDown(0x20, false) || input::ScanDown(0x22, false) || input::ScanDown(0x1E, false));
-    if (!g_uiTextInput && !g_fcHoldMove && !ctrlCommand) {   // W/S along the view, A/D sideways, E/Space up, Q/Ctrl down; Shift x4
+    if (!g_uiTextInput && !g_fcHoldMove && !ctrlCommand) {   // W/S along the view, A/D sideways, E/Space up, Q down; Shift x4. Ctrl stays free for editor multi-select/shortcuts.
         float v = g_fcSpeed * dt * (input::ScanDown(0x2A, false) ? 4.0f : 1.0f);
         const float fw = (input::ScanDown(0x11, false) ? 1.0f : 0.0f) - (input::ScanDown(0x1F, false) ? 1.0f : 0.0f);
         const float sd = (input::ScanDown(0x20, false) ? 1.0f : 0.0f) - (input::ScanDown(0x1E, false) ? 1.0f : 0.0f);
-        const float up = (input::ScanDown(0x12, false) || input::ScanDown(0x39, false) ? 1.0f : 0.0f) - (input::ScanDown(0x10, false) || input::ScanDown(0x1D, false) ? 1.0f : 0.0f);
+        const float up = (input::ScanDown(0x12, false) || input::ScanDown(0x39, false) ? 1.0f : 0.0f) - (input::ScanDown(0x10, false) ? 1.0f : 0.0f);
         for (int i = 0; i < 3; i++) g_fcPos[i] += v * (f[i] * fw + r[i] * sd) + (i == 1 ? v * up : 0.0f);
     }
 }
@@ -2498,6 +2657,16 @@ void FreeCamFocus(Vec3 target, float radius) {
 }
 void FreeCamViewPreset(int preset) { if (preset >= 1 && preset <= 3) g_fcViewPresetPending = preset; }
 void FreeCamTurn(float dyaw, float dpitch) { g_fcYaw += dyaw; g_fcPitch += dpitch; }   // tests without a mouse
+bool FreeCamSetPosition(Vec3 pos) {
+    if (!g_fcOn || !g_fcInit || !std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) return false;
+    g_fcPos[0] = pos.x; g_fcPos[1] = pos.y; g_fcPos[2] = pos.z; return true;
+}
+bool FreeCamMove(float forward, float right, float up) {
+    if (!g_fcOn || !g_fcInit || !std::isfinite(forward) || !std::isfinite(right) || !std::isfinite(up)) return false;
+    float r[3], u[3], f[3]; FcBasis(r, u, f);
+    for (int i = 0; i < 3; i++) g_fcPos[i] += f[i] * forward + r[i] * right + u[i] * up;
+    return true;
+}
 bool FreeCamPose(Vec3* pos, Vec3* fwd) {
     if (!g_fcOn || !g_fcInit) return false;
     float r[3], u[3], f[3]; FcBasis(r, u, f);
@@ -2514,10 +2683,15 @@ bool FreeCamPose(Vec3* pos, Vec3* fwd) {
 // really sends while walking (MoveActorReq, EchoMoveSessionIDReq) and re-taken whenever it changes (save loaded, respawn).
 // If the handler's byte +0x21 is set it answers ok and does nothing.
 static uintptr_t g_npcHandler = 0; static void* g_npcExecute = nullptr;
+static uintptr_t g_npcAiHandler = 0; static void* g_npcAiExecute = nullptr;
+static uintptr_t g_npcAiTerminate = 0;   // AIFunction_TerminateAi target: (actor, terminate)
+static uintptr_t g_actorRegistryGlobal = 0;   // address of the game's singleton-holder pointer, derived from AiControlChangeCheatReq
 static SRWLOCK g_npcLock = SRWLOCK_INIT;
 static uintptr_t g_serverSession = 0, g_sessionVt = 0; static uint8_t g_pktTemplate[0x40];   // under g_npcLock
 static volatile uintptr_t g_lastSender = 0;   // fast path of the capture: same sender as last time, nothing to do
 static void* g_capOrig[2] = {}; static const char* g_capName[2] = { "", "" };
+static void QueuePendingManagedNpcs();
+static void QueueManagedNpcAiReconcile();
 template<int K> static void* __fastcall CapThunk(void* h, void* res, void* pkt, void* d, void* e, void* f, void* g, void* i) {
     uintptr_t s = 0;
     if (pkt && ReadPtr((uintptr_t)pkt, &s) && s && s != g_lastSender) {
@@ -2530,6 +2704,8 @@ template<int K> static void* __fastcall CapThunk(void* h, void* res, void* pkt, 
             ReleaseSRWLockExclusive(&g_npcLock);
             g_lastSender = s;
             Log("[npc] player actor %p (%s) from %s", (void*)s, sn, g_capName[K]);
+            QueuePendingManagedNpcs();
+            QueueManagedNpcAiReconcile();
         }
     }
     return ((void* (__fastcall*)(void*, void*, void*, void*, void*, void*, void*, void*))g_capOrig[K])(h, res, pkt, d, e, f, g, i);
@@ -2543,6 +2719,44 @@ static uintptr_t FindObjectWithVtable(uintptr_t vt, int* count) {   // static ha
         for (size_t k = 0; k + 8 <= n; k += 8) { uintptr_t v; memcpy(&v, p + k, 8); if (v == vt) { if (!first) first = (uintptr_t)(p + k); (*count)++; } }
     }
     return first;
+}
+static uintptr_t RelCallTarget(uintptr_t p) {
+    uint8_t op = 0; int32_t rel = 0;
+    if (!ReadBytes(p, &op, 1) || op != 0xE8 || !ReadBytes(p + 1, &rel, 4)) return 0;
+    const uintptr_t t = p + 5 + rel; return InImage(t) ? t : 0;
+}
+static void ResolveNpcAiControl() {
+    // Keep TerminateAi only as a research/diagnostic helper. It terminates the current AI action, but the scheduler can
+    // immediately start another one, so it is NOT the persistent editor AI switch.
+    int termHits = 0;
+    g_npcAiTerminate = FindPatternCount("48 89 5C 24 08 57 48 83 EC 30 0F B6 FA 48 8B 41 68 48 8B 98 90 01 00 00 48 8B 43 08", &termHits);
+    if (g_npcAiTerminate && termHits == 1) Log("[npc] AI terminate helper rva 0x%llx", (unsigned long long)(g_npcAiTerminate - g_base));
+    else { Log("[npc] AI terminate helper not resolved (%d matches)", termHits); g_npcAiTerminate = 0; }
+
+    // AiControlChangeCheatReq is the game's persistent control-ownership toggle. It consumes one u32 actor id.
+    const uintptr_t vt = FindVtableByName(".?AVTrocTrAiControlChangeCheatReq@pa@@");
+    if (!vt) { Log("[npc] AI-control request vtable not found"); return; }
+    uintptr_t exec = 0; ReadPtr(vt + 2 * 8, &exec); int n = 0; const uintptr_t handler = FindObjectWithVtable(vt, &n);
+    if (!InImage(exec) || !handler) { Log("[npc] AI-control handler object not found (%d instances, execute %p)", n, (void*)exec); return; }
+    // The request execute calls a helper which resolves the actor id. That helper loads the registry as:
+    //   mov rcx,[rip+global]; mov rcx,[rcx]; call lookup
+    // Do NOT require the manager/buckets to be initialized here: this resolver runs at plugin startup, before the player
+    // necessarily enters a world. ManagedNpcActorId validates the live manager later, when an NPC actually needs the id.
+    uintptr_t registryGlobal = 0;
+    for (uintptr_t p = exec; p < exec + 0x220 && !registryGlobal; ++p) {
+        const uintptr_t helper = RelCallTarget(p);
+        if (!helper || !InImage(helper)) continue;
+        for (uintptr_t q = helper; q < helper + 0x380; ++q) {
+            uint8_t b[10] = {}; if (!ReadBytes(q, b, sizeof b)) break;
+            if (b[0] != 0x48 || b[1] != 0x8B || b[2] != 0x0D || b[7] != 0x48 || b[8] != 0x8B || b[9] != 0x09) continue;
+            int32_t d = 0; memcpy(&d, b + 3, 4); const uintptr_t g = q + 7 + d;
+            if (InImage(g)) { registryGlobal = g; break; }
+        }
+    }
+    g_npcAiHandler = handler; g_npcAiExecute = (void*)exec; g_actorRegistryGlobal = registryGlobal;
+    Log("[npc] control-ownership handler rva 0x%llx execute rva 0x%llx actor-registry %s",
+        (unsigned long long)(handler - g_base), (unsigned long long)(exec - g_base),
+        registryGlobal ? (std::string("rva 0x") + [&]() { char b[32]; snprintf(b, sizeof b, "%llx", (unsigned long long)(registryGlobal - g_base)); return std::string(b); }()).c_str() : "not resolved");
 }
 static void InstallNpcSpawn() {
     const uintptr_t vt = FindVtableByName(".?AVTrocTrSpawnCharacterCheatReq@pa@@"); if (!vt) { Log("[npc] spawn cheat handler vtable not found: NPC spawning off"); return; }
@@ -2558,6 +2772,7 @@ static void InstallNpcSpawn() {
     }
     if (!hooked) { Log("[npc] no request to take the player actor from: NPC spawning off"); return; }
     g_npcHandler = handler; g_npcExecute = (void*)exec;
+    ResolveNpcAiControl();
     Log("[npc] spawn handler at rva 0x%llx (%d instance(s)), execute rva 0x%llx, %d request hook(s)", (unsigned long long)(handler - g_base), n, (unsigned long long)(exec - g_base), hooked);
 }
 static void NpcUnwind(const CONTEXT* fault) {   // call chain of a fault via the unwind tables, for bug reports
@@ -2577,10 +2792,227 @@ static bool CallNpcExecute(void* pkt, int* res) {   // guarded: a wrong packet m
     CDK_GUARD_END
     return false;
 }
+static bool CallNpcAiExecute(void* pkt, int* res) {
+    if (!g_npcAiExecute || !g_npcAiHandler) return false;
+    typedef void* (__fastcall* Exec)(void*, int*, void*);
+    CDK_GUARD_BEGIN ((Exec)g_npcAiExecute)((void*)g_npcAiHandler, res, pkt); return true;
+    CDK_GUARD_FAIL { EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); NpcUnwind(ep.ContextRecord); } return false;
+    CDK_GUARD_END
+    return false;
+}
+static uint32_t ManagedNpcActorId(uintptr_t actor) {
+    if (!actor || !g_actorRegistryGlobal) return 0;
+    uintptr_t holder = 0, manager = 0, bucketsPtr = 0, nodesPtr = 0; uint32_t bucketCount = 0;
+    if (!ReadPtr(g_actorRegistryGlobal, &holder) || !holder || !ReadPtr(holder, &manager) || !manager ||
+        !ReadBytes(manager + 0x98, &bucketCount, 4) || !ReadPtr(manager + 0xA8, &bucketsPtr) || !ReadPtr(manager + 0xB0, &nodesPtr) ||
+        !bucketsPtr || !nodesPtr || bucketCount == 0 || bucketCount > (1u << 20)) return 0;
+    for (uint32_t b = 0; b < bucketCount; ++b) {
+        const uintptr_t bucket = bucketsPtr + (uintptr_t)b * 0x100; uint32_t count = 0;
+        if (!ReadBytes(bucket, &count, 4) || count > 31) continue;
+        for (uint32_t j = 0; j < count; ++j) {
+            uint32_t key = 0, index = 0; if (!ReadBytes(bucket + 8 + j * 8, &key, 4) || !ReadBytes(bucket + 12 + j * 8, &index, 4)) continue;
+            uintptr_t node = 0, foundActor = 0; uint32_t nodeKey = 0;
+            if (!ReadPtr(nodesPtr + (uintptr_t)index * 8, &node) || !node || !ReadBytes(node + 4, &nodeKey, 4) || !ReadPtr(node + 8, &foundActor)) continue;
+            if (foundActor == actor) {
+                const uint32_t low = nodeKey ? nodeKey : key;
+                // ServerNormalInGameActor keeps the complete entity handle next to the low registry key.
+                // The hash table indexes only the low 20 bits, but native requests carry the full handle.
+                uint32_t full58 = 0, full60 = 0;
+                ReadBytes(actor + 0x58, &full58, 4); ReadBytes(actor + 0x60, &full60, 4);
+                if (full58 && (full58 & 0x000FFFFFu) == (low & 0x000FFFFFu)) return full58;
+                if (full60 && (full60 & 0x000FFFFFu) == (low & 0x000FFFFFu)) return full60;
+                return low;
+            }
+        }
+    }
+    return 0;
+}
+bool NpcAiControlAvailable() { return g_npcAiExecute && g_npcAiHandler && g_actorRegistryGlobal; }
+static bool SetNpcAiTerminatedNow(uintptr_t actor, bool terminated) {
+    if (!actor || !g_npcAiTerminate) return false;
+    typedef void (__fastcall* Fn)(void*, bool);
+    CDK_GUARD_BEGIN
+        ((Fn)g_npcAiTerminate)((void*)actor, terminated);
+        Log("[npc] AI %s actor %p through AIFunction_TerminateAi helper", terminated ? "terminated" : "resumed", (void*)actor);
+        return true;
+    CDK_GUARD_FAIL {
+        EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); NpcUnwind(ep.ContextRecord);
+        Log("[npc] AI terminate helper faulted for actor %p", (void*)actor);
+    }
+    CDK_GUARD_END
+    return false;
+}
+static bool ToggleNpcAiControlNow(uint32_t actorId) {
+    if (!actorId || !NpcAiControlAvailable()) return false;
+    alignas(16) uint8_t pkt[0x40]; uintptr_t s = 0, vt = 0, cur = 0;
+    AcquireSRWLockShared(&g_npcLock);
+    memcpy(pkt, g_pktTemplate, sizeof pkt); s = g_serverSession; vt = g_sessionVt;
+    ReleaseSRWLockShared(&g_npcLock);
+    if (!s || !ReadPtr(s, &cur) || cur != vt) {
+        Log("[npc] AI control: player session is stale; waiting for the next movement packet");
+        g_lastSender = 0;
+        return false;
+    }
+    uint8_t buf[5 + 4] = {}; const uint16_t plen = 4; memcpy(buf + 3, &plen, 2); memcpy(buf + 5, &actorId, 4);
+    const uint16_t total = sizeof buf; memcpy(pkt + 0x10, &total, 2); uint8_t* bp = buf; memcpy(pkt + 0x18, &bp, 8);
+    int res = -1; const bool ok = CallNpcAiExecute(pkt, &res);
+    Log("[npc] AI control toggle id 0x%08x: %s, result %d (%s)", actorId, ok ? "executed" : "FAULTED", res, DecodeErr((uint32_t)res).c_str());
+    return ok && res == 0;
+}
+static bool SetManagedNpcRuntimeAiNow(int uid, bool enabled) {
+    uintptr_t actor = 0; uint32_t actorId = 0; bool desired = true;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0) return false;
+        const ManagedNpc& n = g_npcReg[i];
+        if (n.hidden || !n.actor) return false;
+        if (n.aiApplied == enabled) return true;
+        actor = n.actor; actorId = n.actorId; desired = enabled;
+    }
+    if (!actorId) {
+        actorId = ManagedNpcActorId(actor);
+        if (!actorId) { Log("[npc] managed #%d AI control: actor id not found yet", uid); return false; }
+    }
+    // Control ownership is a toggle. aiApplied is our last confirmed toggle state, so only issue it when desired differs.
+    // Do not call TerminateAi here: that AI-function helper only terminates the current action and is not the persistent switch.
+    if (!ToggleNpcAiControlNow(actorId)) return false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0) return false;
+        ManagedNpc& n = g_npcReg[i];
+        if (n.hidden || n.actor != actor) return false;
+        n.actorId = actorId;
+        n.aiApplied = desired;
+    }
+    return true;
+}
+static void SyncManagedNpcAiNow(int uid) {
+    bool desired = true;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0) return;
+        const ManagedNpc& n = g_npcReg[i];
+        if (n.hidden || !n.actor || n.editMoving || n.aiApplied == n.aiEnabled) return;
+        desired = n.aiEnabled;
+    }
+    SetManagedNpcRuntimeAiNow(uid, desired);
+}
+static void ReconcileManagedNpcActors() {
+    static DWORD s_last = 0; const DWORD now = GetTickCount();
+    if (now - s_last < 50) return;
+    s_last = now;
+
+    RecentServerActor recent[1024]; unsigned recentN = 0;
+    AcquireSRWLockShared(&g_recentActorLock);
+    for (const auto& r : g_recentActors) if (r.actor && now - r.tick < 8000)
+        recent[recentN++] = r;
+    ReleaseSRWLockShared(&g_recentActorLock);
+    if (!recentN) return;
+
+    std::vector<int> aiSync;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex);
+        for (auto& n : g_npcReg) {
+            if (n.hidden || n.actor || !n.spawnRequestTick) continue;
+            if (now - n.spawnRequestTick >= 8000) {
+                if (n.spawnPending) Log("[npc] managed #%d actor bind timed out after spawn request", n.uid);
+                n.spawnPending = false; n.spawnRequestTick = 0;
+                continue;
+            }
+            uintptr_t best = 0, bestTf = 0; float bestScore = 1e9f; Vec3 bestPos{};
+            for (unsigned ri = 0; ri < recentN; ++ri) {
+                const auto& r = recent[ri];
+                const int dt = (int)(r.tick - n.spawnRequestTick);
+                if (dt < -100 || dt > 8000 || g_managedNpcActors.count(r.actor)) continue;
+                const char* rn = RttiName(r.actor);
+                if (!rn || !strstr(rn, "ServerNormalInGameActor@")) continue;
+                const uintptr_t tf = FindActorTransform(r.actor); PosInfo p{};
+                if (!tf || !ReadTransformPos(tf, &p, false)) continue;
+                const float dx = p.world.x - n.pos.x, dy = p.world.y - n.pos.y, dz = p.world.z - n.pos.z;
+                const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (d > 30.0f) continue;
+                const float score = d + std::max(0, dt) * 0.0005f;
+                if (score < bestScore) { bestScore = score; best = r.actor; bestTf = tf; bestPos = p.world; }
+            }
+            if (!best) continue;
+            n.actor = best; n.transform = bestTf; n.actorId = ManagedNpcActorId(best);
+            n.spawnPending = false; n.editMoving = false; n.liveMovePending = false; n.aiApplied = true; g_managedNpcActors.insert(best);
+            Log("[npc] managed #%d late-bound actor %p (%s) at (%.2f %.2f %.2f), spawn (%.2f %.2f %.2f)",
+                n.uid, (void*)best, RttiName(best) ? RttiName(best) : "?", bestPos.x, bestPos.y, bestPos.z, n.pos.x, n.pos.y, n.pos.z);
+            if (n.aiApplied != n.aiEnabled) aiSync.push_back(n.uid);
+        }
+    }
+    for (int uid : aiSync) RunOnServerTick([uid]() { SyncManagedNpcAiNow(uid); });
+}
+static void QueueManagedNpcAiReconcile() {
+    std::vector<int> ids;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex);
+        for (const auto& n : g_npcReg) if (!n.hidden && n.actor && !n.editMoving && n.aiApplied != n.aiEnabled) ids.push_back(n.uid);
+    }
+    for (int uid : ids) RunOnServerTick([uid]() { SyncManagedNpcAiNow(uid); });
+}
 int NpcState() {
     if (!g_npcExecute) return 0;
     AcquireSRWLockShared(&g_npcLock); const bool have = g_serverSession != 0; ReleaseSRWLockShared(&g_npcLock);
     return have ? 2 : 1;
+}
+static uintptr_t PickNpcSpawnActor(Vec3 expected, uintptr_t innerActor) {
+    uintptr_t candidates[9] = {}; int count = 0;
+    if (innerActor) candidates[count++] = innerActor;
+    for (int i = 0; i < g_npcActorCandidateCount && count < (int)(sizeof candidates / sizeof candidates[0]); ++i) {
+        const uintptr_t a = g_npcActorCandidates[i]; bool dup = false;
+        for (int j = 0; j < count; ++j) if (candidates[j] == a) { dup = true; break; }
+        if (!dup) candidates[count++] = a;
+    }
+    uintptr_t best = 0; float bestScore = -1e9f;
+    for (int i = 0; i < count; ++i) {
+        const uintptr_t a = candidates[i]; if (!a) continue;
+        const char* rn = RttiName(a); float score = 0;
+        if (rn && strstr(rn, "ServerNormalInGameActor@")) score += 500.0f;
+        else if (rn && strstr(rn, "Actor@")) score += 100.0f;
+        const uintptr_t tf = FindActorTransform(a); PosInfo p{};
+        if (tf && ReadTransformPos(tf, &p, false)) {
+            const float dx = p.world.x - expected.x, dy = p.world.y - expected.y, dz = p.world.z - expected.z;
+            const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d < 50.0f) score += 500.0f - d * 5.0f; else score -= std::min(d, 500.0f);
+        }
+        if (score > bestScore) { bestScore = score; best = a; }
+    }
+    if (best) {
+        const char* rn = RttiName(best); const uintptr_t tf = FindActorTransform(best); PosInfo p{};
+        if (tf && ReadTransformPos(tf, &p, false))
+            Log("[npc] bound actor %p (%s), live pos (%.2f %.2f %.2f), %d ctor candidate%s",
+                (void*)best, rn ? rn : "?", p.world.x, p.world.y, p.world.z, count, count == 1 ? "" : "s");
+        else
+            Log("[npc] bound actor %p (%s), transform unresolved, %d ctor candidate%s",
+                (void*)best, rn ? rn : "?", count, count == 1 ? "" : "s");
+    }
+    return best;
+}
+static bool SpawnNpcNow(uint32_t key, Vec3 pos, int type, uint32_t extra, uintptr_t* actorOut = nullptr, uint32_t* actorIdOut = nullptr) {
+    if (actorOut) *actorOut = 0; if (actorIdOut) *actorIdOut = 0;
+    if (type < 1 || type > 255) type = 1;   // 0 is no valid reason and faults inside the game
+    alignas(16) uint8_t pkt[0x40]; uintptr_t s = 0, vt = 0, cur = 0;
+    AcquireSRWLockShared(&g_npcLock); memcpy(pkt, g_pktTemplate, sizeof pkt); s = g_serverSession; vt = g_sessionVt; ReleaseSRWLockShared(&g_npcLock);
+    if (!s || !ReadPtr(s, &cur) || cur != vt) {   // the actor was replaced (save loaded) and no move has been seen since
+        Log("[npc] player actor %p is gone: walk a few steps, then spawn again", (void*)s); g_lastSender = 0;
+        AcquireSRWLockExclusive(&g_npcLock); if (g_serverSession == s) g_serverSession = 0; ReleaseSRWLockExclusive(&g_npcLock);
+        return false;
+    }
+    uint8_t buf[5 + 21] = {}; const uint16_t plen = 21; memcpy(buf + 3, &plen, 2);
+    memcpy(buf + 5, &key, 4); memcpy(buf + 9, &extra, 4); memcpy(buf + 13, &pos, 12); buf[25] = (uint8_t)type;
+    const uint16_t total = sizeof buf; memcpy(pkt + 0x10, &total, 2); uint8_t* bp = buf; memcpy(pkt + 0x18, &bp, 8);
+    g_lastActorCreated_ = 0; g_npcActorCandidateCount = 0; memset(g_npcActorCandidates, 0, sizeof g_npcActorCandidates);
+    g_npcActorCaptureThread = GetCurrentThreadId(); InterlockedExchange(&g_npcActorCapture, 1);
+    int res = -1; const bool ok = CallNpcExecute(pkt, &res);
+    InterlockedExchange(&g_npcActorCapture, 0);
+    const uintptr_t actor = PickNpcSpawnActor(pos, g_lastActorCreated_);
+    const uint32_t actorId = actor ? ManagedNpcActorId(actor) : 0;
+    if (actorOut) *actorOut = actor; if (actorIdOut) *actorIdOut = actorId;
+    Log("[npc] spawn character %u at (%.2f %.2f %.2f) type %d: %s, result %d (%s), actor %p id 0x%08x",
+        key, pos.x, pos.y, pos.z, type, ok ? "executed" : "FAULTED", res, DecodeErr((uint32_t)res).c_str(), (void*)actor, actorId);
+    return ok && res == 0;
 }
 // Research: where the player's SERVER actor keeps its position. Takes the client snapshot's tile-local x/y/z (and the world
 // position) and searches the server actor, every object it points to and every object those point to (0x800 bytes each) for
@@ -2623,26 +3055,251 @@ void ResearchFindPos() {
             if (const char* rn = RttiName(c)) if (strstr(rn, "Component")) Log("[findpos] client component list+0x%X %p %s", i, (void*)c, rn);
         }
     }
+
 }
 bool SpawnNpc(uint32_t key, Vec3 pos, int type, uint32_t extra) {
     if (!g_npcExecute) { Log("[npc] not available (handler not resolved)"); return false; }
     if (NpcState() < 2) { Log("[npc] player actor not known yet: walk a few steps"); return false; }
-    if (type < 1 || type > 255) type = 1;   // 0 is no valid reason and faults inside the game
-    RunOnServerTick([key, pos, type, extra]() {
-        alignas(16) uint8_t pkt[0x40]; uintptr_t s = 0, vt = 0, cur = 0;
-        AcquireSRWLockShared(&g_npcLock); memcpy(pkt, g_pktTemplate, sizeof pkt); s = g_serverSession; vt = g_sessionVt; ReleaseSRWLockShared(&g_npcLock);
-        if (!ReadPtr(s, &cur) || cur != vt) {   // the actor was replaced (save loaded) and no move has been seen since
-            Log("[npc] player actor %p is gone: walk a few steps, then spawn again", (void*)s); g_lastSender = 0;
-            AcquireSRWLockExclusive(&g_npcLock); if (g_serverSession == s) g_serverSession = 0; ReleaseSRWLockExclusive(&g_npcLock);
+    RunOnServerTick([key, pos, type, extra]() { SpawnNpcNow(key, pos, type, extra); });
+    return true;
+}
+
+static void SpawnManagedNpcNow(int uid) {
+    ManagedNpc n;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0) return;
+        if (g_npcReg[i].hidden) { g_npcReg[i].spawnPending = false; return; }
+        g_npcReg[i].spawnRequestTick = GetTickCount();
+        n = g_npcReg[i];
+    }
+    uintptr_t actor = 0; uint32_t actorId = 0;
+    if (!SpawnNpcNow(n.key, n.pos, n.type, n.extra, &actor, &actorId)) {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i >= 0) { g_npcReg[i].spawnPending = false; g_npcReg[i].spawnRequestTick = 0; }
+        return;
+    }
+    bool discard = false, needAiSync = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (actor) g_managedNpcActors.insert(actor);
+        if (i < 0 || g_npcReg[i].hidden) discard = true;
+        else {
+            ManagedNpc& live = g_npcReg[i];
+            live.actor = actor; live.actorId = actorId; live.transform = actor ? FindActorTransform(actor) : 0;
+            live.spawnPending = actor == 0;   // asynchronous SpawnCharacter creation is reconciled from recent ServerActor constructors
+            live.editMoving = false; live.liveMovePending = false; live.aiApplied = true;   // a fresh SpawnCharacter actor starts under the game's normal AI control
+            needAiSync = live.aiApplied != live.aiEnabled;
+        }
+    }
+    if (discard) { if (actor) RemoveSpawnedActor(actor); return; }
+    if (needAiSync) {
+        SyncManagedNpcAiNow(uid);
+        bool stillPending = false; uintptr_t curActor = 0; uint32_t curActorId = 0;
+        {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+            if (i >= 0) { const auto& cur = g_npcReg[i]; stillPending = cur.aiApplied != cur.aiEnabled; curActor = cur.actor; curActorId = cur.actorId; }
+        }
+        if (stillPending) {
+            Log("[npc] managed #%d AI desired=%d still not applied (actor %p id 0x%08x); will retry after the next session capture",
+                uid, n.aiEnabled ? 1 : 0, (void*)curActor, curActorId);
+        }
+    }
+}
+static bool QueueManagedNpcIfReady(int uid) {
+    if (NpcState() < 2) return false;
+    bool queue = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i >= 0) {
+            ManagedNpc& n = g_npcReg[i];
+            if (!n.hidden && !n.actor && !n.spawnPending) { n.spawnPending = true; queue = true; }
+        }
+    }
+    if (queue) RunOnServerTick([uid]() { SpawnManagedNpcNow(uid); });
+    return queue;
+}
+int SpawnManagedNpc(uint32_t key, Vec3 pos, int type, uint32_t extra, bool aiEnabled, int behavior, int group, int proj, const std::string& label, const std::string& note) {
+    if (!g_npcExecute || !key) return 0;
+    if (type < 1 || type > 255) type = 1; behavior = behavior == 1 ? 1 : 0; if (behavior == 1) aiEnabled = false;
+    int uid = 0;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextNpcUid++;
+        ManagedNpc n; n.uid = uid; n.key = key; n.pos = pos; n.type = type; n.extra = extra; n.aiEnabled = aiEnabled; n.behavior = behavior; n.tick = GetTickCount(); n.group = group; n.proj = proj; n.label = label; n.note = note;
+        g_npcReg.push_back(std::move(n)); if (!g_loading) MarkDirtyLocked(proj);
+    }
+    QueueManagedNpcIfReady(uid);
+    return uid;
+}
+static void QueuePendingManagedNpcs() {
+    std::vector<int> pending;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex);
+        for (auto& n : g_npcReg) if (!n.hidden && !n.actor && !n.spawnPending) { n.spawnPending = true; pending.push_back(n.uid); }
+    }
+    for (int uid : pending) RunOnServerTick([uid]() { SpawnManagedNpcNow(uid); });
+}
+bool HideManagedNpc(int uid) {
+    uintptr_t actor = 0;
+    { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || g_npcReg[i].hidden) return false;
+      ManagedNpc& n = g_npcReg[i]; n.hidden = true; actor = n.actor; n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.editMoving = false; n.liveMovePending = false; n.aiApplied = true; MarkDirtyLocked(n.proj); }
+    if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
+    return true;
+}
+bool RestoreManagedNpc(int uid) {
+    { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || !g_npcReg[i].hidden) return false;
+      g_npcReg[i].hidden = false; MarkDirtyLocked(g_npcReg[i].proj); }
+    QueueManagedNpcIfReady(uid); return true;
+}
+static bool WriteManagedNpcTransformNow(uintptr_t tf, Vec3 world) {
+    if (!tf) return false;
+    uint8_t snap[0x48] = {};
+    if (!ReadBytes(tf + kOff_Tf_Pos, snap, sizeof snap)) return false;
+    float parent[3] = {}; int16_t parentSector[2] = {};
+    memcpy(parent, snap + 0x38, sizeof parent); memcpy(parentSector, snap + 0x44, sizeof parentSector);
+    // Do not tear an attached/mounted actor away from its parent with a plain world-space write.
+    if (parentSector[0] || parentSector[1] || fabsf(parent[0]) > 0.001f || fabsf(parent[1]) > 0.001f || fabsf(parent[2]) > 0.001f)
+        return false;
+    const int tx = (int)(world.x * 0.001f), tz = (int)(world.z * 0.001f);
+    struct PosTile { float x, y, z; int16_t tileX, tileZ; } packed{
+        world.x - tx * kTileSize, world.y, world.z - tz * kTileSize, (int16_t)tx, (int16_t)tz
+    };
+    static_assert(sizeof(PosTile) == 16, "TransformSync position/tile layout changed");
+    return WriteBytes(tf + kOff_Tf_Pos, &packed, sizeof packed);
+}
+bool BeginManagedNpcMove(int uid) {
+    bool queuePause = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0) return false; ManagedNpc& n = g_npcReg[i];
+        if (n.hidden || !n.actor || !n.transform || n.editMoving) { Log("[npc] managed #%d live move not ready (hidden=%d actor=%p transform=%p moving=%d)", uid, n.hidden, (void*)n.actor, (void*)n.transform, n.editMoving); return false; }
+        uint8_t snap[0x48] = {}; if (!ReadBytes(n.transform + kOff_Tf_Pos, snap, sizeof snap)) { Log("[npc] managed #%d live move: TransformSync snapshot unreadable", uid); return false; }
+        float parent[3] = {}; int16_t psec[2] = {}; memcpy(parent, snap + 0x38, 12); memcpy(psec, snap + 0x44, 4);
+        if (psec[0] || psec[1] || fabsf(parent[0]) > 0.001f || fabsf(parent[1]) > 0.001f || fabsf(parent[2]) > 0.001f) { Log("[npc] managed #%d live move refused: actor is parented/attached", uid); return false; }
+        // An NPC whose runtime AI is already off needs no native control request just to move. If AI is still active,
+        // however, the edit transaction must be able to take control before queued transform writes begin.
+        queuePause = n.aiApplied;
+        if (queuePause) {
+            if (!NpcAiControlAvailable()) { Log("[npc] managed #%d live move: AI control is not available to pause the actor", uid); return false; }
+            if (!n.actorId) n.actorId = ManagedNpcActorId(n.actor);
+            if (!n.actorId) { Log("[npc] managed #%d live move: actor id not resolved", uid); return false; }
+        }
+        n.editMoving = true; n.liveMoveTarget = n.pos; n.liveMovePending = false;
+    }
+    if (queuePause) RunOnServerTick([uid]() { SetManagedNpcRuntimeAiNow(uid, false); });
+    return true;
+}
+static void QueueManagedNpcLiveWrite(int uid, uintptr_t tf) {
+    RunOnServerTick([uid, tf]() {
+        Vec3 world{};
+        {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+            if (i < 0) return; ManagedNpc& n = g_npcReg[i];
+            if (n.transform == tf) n.liveMovePending = false;
+            if (n.hidden || !n.editMoving || n.transform != tf) return;
+            world = n.liveMoveTarget;
+        }
+        if (!WriteManagedNpcTransformNow(tf, world))
+            Log("[npc] managed #%d live move could not write TransformSync", uid);
+    });
+}
+bool MoveManagedNpcLive(int uid, Vec3 world) {
+    uintptr_t tf = 0; bool queue = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0 || !g_npcReg[i].editMoving || g_npcReg[i].hidden) return false;
+        ManagedNpc& n = g_npcReg[i]; tf = n.transform; n.liveMoveTarget = world;
+        if (!n.liveMovePending) { n.liveMovePending = true; queue = true; }
+    }
+    if (queue) QueueManagedNpcLiveWrite(uid, tf);
+    return true;
+}
+bool CommitManagedNpcMove(int uid, Vec3 world) {
+    uintptr_t tf = 0; bool queue = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0 || !g_npcReg[i].editMoving || g_npcReg[i].hidden) return false;
+        ManagedNpc& n = g_npcReg[i]; n.pos = world; n.liveMoveTarget = world; tf = n.transform; MarkDirtyLocked(n.proj);
+        if (!n.liveMovePending) { n.liveMovePending = true; queue = true; }
+    }
+    if (queue) QueueManagedNpcLiveWrite(uid, tf);
+    return true;
+}
+bool EndManagedNpcMove(int uid, Vec3 world) {
+    uintptr_t tf = 0; bool moving = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0 || g_npcReg[i].hidden) return false; ManagedNpc& n = g_npcReg[i];
+        moving = n.editMoving; tf = n.transform;
+    }
+    if (!moving || !tf) return MoveManagedNpc(uid, world);
+    {
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+        if (i < 0 || g_npcReg[i].hidden) return false;
+        g_npcReg[i].pos = world; g_npcReg[i].liveMoveTarget = world; MarkDirtyLocked(g_npcReg[i].proj);
+    }
+    RunOnServerTick([uid, tf, world]() {
+        {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+            if (i < 0 || g_npcReg[i].hidden || !g_npcReg[i].editMoving || g_npcReg[i].transform != tf) return;
+        }
+        const bool moved = WriteManagedNpcTransformNow(tf, world);
+        bool desired = true; uintptr_t actor = 0;
+        {
+            std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+            if (i < 0) return; ManagedNpc& n = g_npcReg[i];
+            if (n.hidden || !n.editMoving || n.transform != tf) return;
+            desired = n.aiEnabled; n.editMoving = false; n.liveMovePending = false;
+            if (!moved) {
+                actor = n.actor;
+                n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.aiApplied = true;
+                n.spawnPending = true;
+            }
+        }
+        if (!moved) {
+            Log("[npc] managed #%d final live move write failed; respawning at the committed position", uid);
+            if (actor) RemoveSpawnedActor(actor);
+            SpawnManagedNpcNow(uid);
             return;
         }
-        uint8_t buf[5 + 21] = {}; const uint16_t plen = 21; memcpy(buf + 3, &plen, 2);
-        memcpy(buf + 5, &key, 4); memcpy(buf + 9, &extra, 4); memcpy(buf + 13, &pos, 12); buf[25] = (uint8_t)type;
-        const uint16_t total = sizeof buf; memcpy(pkt + 0x10, &total, 2); uint8_t* bp = buf; memcpy(pkt + 0x18, &bp, 8);
-        int res = -1; const bool ok = CallNpcExecute(pkt, &res);
-        Log("[npc] spawn character %u at (%.2f %.2f %.2f) type %d: %s, result %d (%s)", key, pos.x, pos.y, pos.z, type, ok ? "executed" : "FAULTED", res, DecodeErr((uint32_t)res).c_str());
+        SetManagedNpcRuntimeAiNow(uid, desired);
     });
     return true;
+}
+bool MoveManagedNpc(int uid, Vec3 world) {
+    // Bound actors can move in place through their server TransformSync component. Use an edit transaction so autonomous
+    // AI cannot immediately walk over the editor's position while the write is being committed.
+    if (BeginManagedNpcMove(uid)) {
+        MoveManagedNpcLive(uid, world);
+        return EndManagedNpcMove(uid, world);
+    }
+    uintptr_t actor = 0; bool pending = false;
+    { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || g_npcReg[i].hidden) return false;
+      ManagedNpc& n = g_npcReg[i]; if (n.pos.x == world.x && n.pos.y == world.y && n.pos.z == world.z) return true;
+      n.pos = world; actor = n.actor; pending = n.spawnPending; n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.editMoving = false; n.liveMovePending = false; n.aiApplied = true; MarkDirtyLocked(n.proj);
+      if (actor && !pending) n.spawnPending = true; }
+    if (pending) return true;   // the already queued spawn reads the latest registry position when it actually runs
+    if (actor) RunOnServerTick([uid, actor]() { RemoveSpawnedActor(actor); SpawnManagedNpcNow(uid); });
+    else QueueManagedNpcIfReady(uid);
+    return true;
+}
+bool SetManagedNpcControl(int uid, bool enabled, int behavior) {
+    behavior = behavior == 1 ? 1 : 0; bool needSync = false, changed = false;
+    { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || g_npcReg[i].hidden) return false;
+      ManagedNpc& n = g_npcReg[i]; changed = n.behavior != behavior || n.aiEnabled != enabled;
+      n.behavior = behavior; n.aiEnabled = enabled; if (changed) MarkDirtyLocked(n.proj);
+      needSync = n.actor && n.aiApplied != n.aiEnabled; }
+    if (needSync) RunOnServerTick([uid]() { SyncManagedNpcAiNow(uid); });
+    return true;
+}
+bool SetManagedNpcAi(int uid, bool enabled) {
+    int behavior = 0;
+    { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || g_npcReg[i].hidden) return false;
+      behavior = g_npcReg[i].behavior; if (enabled && behavior == 1) behavior = 0; }
+    return SetManagedNpcControl(uid, enabled, behavior);
+}
+bool SetManagedNpcBehavior(int uid, int behavior) {
+    behavior = behavior == 1 ? 1 : 0;
+    return SetManagedNpcControl(uid, behavior == 0, behavior);
 }
 
 // SceneObjectServer objects are born in the reflection factory's create() (the entry of the class meta table that follows the
@@ -2810,9 +3467,9 @@ static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int til
     if (verbose) Log("[probe] RESULT hits %u fraction %.4f -> sphere center y %.3f (%.2f m below start), normal (%.3f %.3f %.3f), returned %p", nh, frac, out->centerY, (float)frac * len, out->normal.x, out->normal.y, out->normal.z, r);
     return true;
 }
-static int QueueGround(Vec3 start, float len, bool verbose, Vec3 dir = Vec3{ 0, -1, 0 }) {
+static int QueueGround(Vec3 start, float len, bool verbose, Vec3 dir = Vec3{ 0, -1, 0 }, bool robust = false) {
     std::lock_guard<std::mutex> l(g_groundMutex); const int id = ++g_groundNext;
-    g_groundQueue.push_back({ id, start, len, verbose, dir }); InterlockedExchange(&g_groundQueued, 1); return id;
+    g_groundQueue.push_back({ id, start, len, verbose, dir, robust }); InterlockedExchange(&g_groundQueued, 1); return id;
 }
 // ---- ground queries for the editor
 float g_probeRadius = 0.0f; static bool g_probeCalibrated = false;
@@ -2833,7 +3490,51 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
         const int tx = (int)(rq.start.x * 0.001), tz = (int)(rq.start.z * 0.001);
         t_geoTracing = InterlockedExchange(&g_geoTraceArm, 0) != 0;   // research: log the geometry calls of this one cast
         if (t_geoTracing) Log("[geo] ---- traced cast from (%.2f %.2f %.2f) %.2f m down", rq.start.x, rq.start.y, rq.start.z, rq.len);
-        GroundHit h; if (!RunGroundCast(world, rq.start, rq.len, tx, tz, &h, rq.verbose, rq.dir)) { h.done = true; h.hit = false; }
+        GroundHit h;
+        if (!RunGroundCast(world, rq.start, rq.len, tx, tz, &h, rq.verbose, rq.dir)) { h.done = true; h.hit = false; }
+        // The captured character sphere cast can occasionally fall through one terrain heightfield quad (documented in
+        // notes/FORMATS.md) and return a perfectly valid hit on geometry below the ground. For editor ground queries only,
+        // compare the centre cast with four nearby casts. Preserve a normal centre hit (important for bridges/platforms);
+        // only replace it when at least two neighbours agree on a surface clearly ABOVE the centre result, or when the centre
+        // missed entirely. 0.36 m crosses a 0.5 m terrain quad without moving the placement visibly.
+        if (rq.robust && rq.dir.y < -0.99f && fabsf(rq.dir.x) < 0.01f && fabsf(rq.dir.z) < 0.01f) {
+            struct S { GroundHit h{}; float y = 0; };
+            S ns[4]; int nn = 0;
+            static const float off[4][2] = { { 0.36f, 0 }, { -0.36f, 0 }, { 0, 0.36f }, { 0, -0.36f } };
+            for (int k = 0; k < 4; ++k) {
+                const Vec3 s{ rq.start.x + off[k][0], rq.start.y, rq.start.z + off[k][1] };
+                const int stx = (int)(s.x * 0.001f), stz = (int)(s.z * 0.001f);
+                GroundHit qh;
+                if (RunGroundCast(world, s, rq.len, stx, stz, &qh, false, rq.dir) && qh.hit && std::isfinite(qh.centerY)) {
+                    ns[nn].h = qh; ns[nn].y = qh.centerY - g_probeRadius; nn++;
+                }
+            }
+            if (nn >= 2) {
+                float ys[4]; for (int k = 0; k < nn; ++k) ys[k] = ns[k].y;
+                std::sort(ys, ys + nn); const float median = ys[nn / 2];
+                int agree = 0, pick = -1; float best = 1e9f;
+                for (int k = 0; k < nn; ++k) {
+                    const float d = fabsf(ns[k].y - median);
+                    if (d <= 0.45f) agree++;
+                    if (d < best) { best = d; pick = k; }
+                }
+                const float cy = h.centerY - g_probeRadius;
+                const bool centreBad = !h.hit || !std::isfinite(cy);
+                const bool fellThrough = !centreBad && agree >= 2 && median > cy + 0.55f;
+                if ((centreBad && agree >= 2) || fellThrough) {
+                    if (pick >= 0) {
+                        GroundHit fixed = ns[pick].h;
+                        // Return the neighbour's surface height but keep the requested x/z as the semantic query point.
+                        fixed.center.x = rq.start.x; fixed.center.z = rq.start.z;
+                        h = fixed;
+                        static int s_fixLogs = 0;
+                        if (s_fixLogs++ < 30)
+                            Log("[ground] robust probe corrected %s: center surface %.2f -> %.2f (%d/%d neighbours agree)",
+                                centreBad ? "miss" : "low fall-through", centreBad ? -99999.0f : cy, median, agree, nn);
+                    }
+                }
+            }
+        }
         if (t_geoTracing) { Log("[geo] ---- result: %s y %.2f", h.hit ? "hit" : "MISS", h.centerY); t_geoTracing = false; }
         std::lock_guard<std::mutex> l(g_groundMutex); g_groundResults[rq.id] = h; if (g_groundResults.size() > 40000) g_groundResults.erase(g_groundResults.begin());
     }
@@ -2859,7 +3560,7 @@ bool GroundGrid(float x0, float z0, int nx, int nz, float step, float top, float
 }
 int GroundProbe(Vec3 start, float len) {
     if (!GroundProbeReady() || !GameThreadReady()) return 0;
-    const int id = QueueGround(start, len, false);
+    const int id = QueueGround(start, len, false, Vec3{ 0, -1, 0 }, true);
     RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });   // game thread, between the game's own casts (the only context that worked so far)
     return id;
 }
@@ -3043,6 +3744,10 @@ bool CameraPose(Vec3* fwd, Vec3* pos) {
 
 // ---- configurable hotkeys (bin64\cdmodkit\settings.txt: key_toggle=INSERT, key_mode=HOME) ----
 int g_keyToggle = VK_INSERT, g_keyMode = VK_HOME; bool g_showConsole = false;
+bool g_keyboardPlacement = false;
+bool g_projectAutoSave = false;
+bool g_autoFreeCamOnOpen = false;
+bool g_showSelectionDetails = true;
 float g_fovDeg = 55.0f; bool g_camMirror = false; bool g_fovAuto = true;
 struct KeyEntry { const char* name; int vk; };
 static const KeyEntry kKeyNames[] = {
@@ -3057,6 +3762,12 @@ static const KeyEntry kKeyNames[] = {
     { "N", 'N' }, { "O", 'O' }, { "P", 'P' }, { "Q", 'Q' }, { "R", 'R' }, { "S", 'S' }, { "T", 'T' }, { "U", 'U' }, { "V", 'V' }, { "W", 'W' }, { "X", 'X' }, { "Y", 'Y' }, { "Z", 'Z' },
     { "0", '0' }, { "1", '1' }, { "2", '2' }, { "3", '3' }, { "4", '4' }, { "5", '5' }, { "6", '6' }, { "7", '7' }, { "8", '8' }, { "9", '9' },
     { nullptr, 0 } };
+int g_placeKeys[PK_COUNT] = { VK_NUMPAD8, VK_NUMPAD2, VK_NUMPAD4, VK_NUMPAD6, VK_NUMPAD9, VK_NUMPAD3, VK_NUMPAD7, VK_NUMPAD1, VK_ADD, VK_SUBTRACT, VK_NUMPAD0, VK_DECIMAL, VK_NUMPAD5, VK_MULTIPLY, VK_DIVIDE, VK_RETURN, VK_BACK, VK_SHIFT };
+static const char* kPlaceKeyIds[PK_COUNT] = { "move_fwd", "move_back", "move_left", "move_right", "move_up", "move_down", "rotate_left", "rotate_right", "scale_up", "scale_down", "fetch", "snap", "mouse", "level", "ground", "drop", "cancel", "fast" };
+static const char* kPlaceKeyLabels[PK_COUNT] = { "move away from me", "move closer", "move left", "move right", "move up", "move down", "rotate left", "rotate right", "scale up", "scale down", "bring it in front of me", "snapping on / off", "mouse to gizmo / camera", "level (remove the tilt)", "snap to ground", "drop", "cancel / put back", "fast (hold)" };
+const char* PlaceKeyId(int i) { return (i >= 0 && i < PK_COUNT) ? kPlaceKeyIds[i] : ""; }
+const char* PlaceKeyLabel(int i) { return (i >= 0 && i < PK_COUNT) ? kPlaceKeyLabels[i] : ""; }
+void ApplyPlaceKeys() { input::SetPlaceVks(g_placeKeys, PK_COUNT); }
 int KeyCount() { int n = 0; while (kKeyNames[n].name) n++; return n; }
 const char* KeyNameAt(int i) { return kKeyNames[i].name; }
 int KeyVkAt(int i) { return kKeyNames[i].vk; }
@@ -3064,7 +3775,7 @@ const char* KeyName(int vk) { for (int i = 0; kKeyNames[i].name; i++) if (kKeyNa
 static int KeyFromName(const std::string& n) { for (int i = 0; kKeyNames[i].name; i++) if (_stricmp(kKeyNames[i].name, n.c_str()) == 0) return kKeyNames[i].vk; if (n.size() == 1 && isalnum((unsigned char)n[0])) return toupper((unsigned char)n[0]); return 0; }
 static std::string SettingsPath() { return g_modDir + "\\settings.txt"; }
 static void LoadSettings() {
-    std::ifstream f(SettingsPath()); std::string line;
+    std::ifstream f(SettingsPath()); const bool missing = !f.good(); std::string line;
     while (std::getline(f, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
         size_t eq = line.find('='); if (eq == std::string::npos) continue;
@@ -3081,6 +3792,11 @@ static void LoadSettings() {
         if (k == "preview_quality") { thumbgen::SetQuality(atoi(v.c_str())); continue; }
         if (k == "freecam_speed") { const float s = (float)atof(v.c_str()); if (s >= 0.5f && s <= 200.0f) g_fcSpeed = s; continue; }
         if (k == "freecam_sens") { const float s = (float)atof(v.c_str()); if (s >= 0.01f && s <= 2.0f) g_fcSens = s; continue; }
+        if (k == "keyboard_placement") { g_keyboardPlacement = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "project_autosave") { g_projectAutoSave = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "project_autosave_seconds") continue;   // legacy timed-auto-save setting; real-time auto-save no longer uses an interval
+        if (k == "auto_freecam_on_open") { g_autoFreeCamOnOpen = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "show_selection_details") { g_showSelectionDetails = v != "0" && v != "off" && v != "false"; continue; }
         // manual fallback for snap to ground if the collector vtable cannot be resolved after a game patch; deliberately
         // never written back by SaveSettings, otherwise a stale value would outrank the signature on the next build
         if (k == "probe_vtable") { g_probeVtableOverride = (uintptr_t)strtoull(v.c_str(), nullptr, 0); continue; }
@@ -3088,8 +3804,11 @@ static void LoadSettings() {
         int vk = KeyFromName(v);
         if (!vk) continue;
         if (k == "key_toggle") g_keyToggle = vk; else if (k == "key_mode") g_keyMode = vk;
+        else if (k.rfind("key_", 0) == 0) { for (int i = 0; i < PK_COUNT; i++) if (k == std::string("key_") + kPlaceKeyIds[i]) g_placeKeys[i] = vk; }
     }
-    Log("settings: toggle %s, mode %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off");
+    ApplyPlaceKeys();
+    if (missing) SaveSettings();
+    Log("settings: toggle %s, mode %s, keyboard placement %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_keyboardPlacement ? "on" : "off", g_showConsole ? "on" : "off");
 }
 void SaveSettings() {
     FILE* f = fopen(SettingsPath().c_str(), "w"); if (!f) return;
@@ -3098,9 +3817,13 @@ void SaveSettings() {
     fprintf(f, "# preview_quality: 0 base colour, 1 + dye colours, 2 + normal maps, 3 + specular/emissive. Lower renders the background pass faster\npreview_quality=%d\n", thumbgen::Quality());
     fprintf(f, "# gimmick_spawn=0: place gimmick prefabs (/object/cd_gimmick/...) as plain objects instead of through the game spawn path\ngimmick_spawn=%d\n", g_gimmickSpawn ? 1 : 0);
     fprintf(f, "# free camera (camera mode, key_mode in the editor): speed in m/s, mouse sensitivity in degrees per count\nfreecam_speed=%.1f\nfreecam_sens=%.3f\n", g_fcSpeed, g_fcSens);
+    fprintf(f, "# Optional keyboard object placement. Off by default; enable in Settings or set keyboard_placement=1.\nkeyboard_placement=%d\n", g_keyboardPlacement ? 1 : 0);
+    fprintf(f, "# Save dirty loaded projects immediately after each committed edit. New/unassigned objects are not attached to a project automatically.\nproject_autosave=%d\n", g_projectAutoSave ? 1 : 0);
+    fprintf(f, "# Editor UI behavior.\nauto_freecam_on_open=%d\nshow_selection_details=%d\n", g_autoFreeCamOnOpen ? 1 : 0, g_showSelectionDetails ? 1 : 0);
+    for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
     fprintf(f, "# Interface language: auto, en, zh-CN, zh-TW, de, fr, ko, ja, es, pt-BR, ru, tr\nlanguage=%s\n", i18n::Preference());
     fprintf(f, "# HTTP API for programs on this PC (127.0.0.1 only, see HTTP_API.md): http_api=1 runs it, http_port= its port. The Settings tab switches it at once\nhttp_api=%d\nhttp_port=%d\n", g_httpEnabled ? 1 : 0, g_httpPort);
-    fclose(f);
+    ApplyPlaceKeys(); fclose(f);
     Log("settings saved: toggle %s, mode %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off");
 }
 

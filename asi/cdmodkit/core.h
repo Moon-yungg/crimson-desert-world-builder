@@ -15,8 +15,12 @@ struct Vec3 { float x, y, z; };
 struct Rot { float yaw = 0, pitch = 0, roll = 0; };   // degrees; rotation = Ry(yaw) * Rx(pitch) * Rz(roll) (yaw about the up axis, then tilt, then roll)
 struct PosInfo { Vec3 tiled, world; int tileX, tileZ; };
 struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float scale; bool hidden; DWORD tick; Rot colRot; float colScale;
-                    int uid; int group; int proj; bool gimmick = false; uintptr_t actor = 0; bool standin = false; };   // gimmick: spawned through the game's server path (obj = its server scene object, actor = its actor)   // uid: stable id for the editor (indices shift when entries are forgotten); group 0 = none;
-                                                       // proj: which project the object belongs to (0 = placed by hand, not part of a saved project yet)
+                    int uid; int group; int proj; bool gimmick = false; uintptr_t actor = 0; bool standin = false; std::string note; };   // gimmick: spawned through the game's server path (obj = its server scene object, actor = its actor)   // uid: stable id for the editor (indices shift when entries are forgotten); group 0 = none;
+                                                        // proj: which project the object belongs to (0 = placed by hand, not part of a saved project yet)
+struct ManagedNpc { int uid = 0; uint32_t key = 0; Vec3 pos{}; int type = 1; uint32_t extra = 0; uintptr_t actor = 0; uint32_t actorId = 0;
+                    uintptr_t transform = 0; DWORD spawnRequestTick = 0; bool editMoving = false; Vec3 liveMoveTarget{}; bool liveMovePending = false;   // runtime-only live binding/edit state; not serialized
+                    bool aiEnabled = true; bool aiApplied = true; int behavior = 0; bool hidden = false; bool spawnPending = false; DWORD tick = 0;
+                    int group = 0; int proj = 0; std::string label, note; };
 
 namespace core {
     constexpr int kResourcePrefabs = 101;
@@ -26,6 +30,7 @@ namespace core {
     extern bool      g_menuOpen;      // set by the editor UI
     extern bool      g_uiWantsMouse;  // cursor is over a World Builder window (ImGui WantCaptureMouse), updated every frame
     extern bool      g_uiWantsKeyboard; // a text field is active (ImGui WantTextInput)
+    extern bool      g_placing;       // an editor object/group is currently carried
 
     void Log(const char* fmt, ...);
     std::string ModDir();             // bin64\cdmodkit
@@ -123,10 +128,31 @@ namespace core {
     // Spawning (queued to the game thread). The registry keeps every object we created.
     int  SpawnAt(const std::string& prefab, Vec3 world, Rot rot = {}, float scale = 1.0f, int group = 0, int proj = 0);   // returns the uid (0 = not queued)
     bool SpawnNpc(uint32_t characterKey, Vec3 world, int type = 1, uint32_t extra = 0);   // NPC / creature via the game's spawn-character request (queued to the server tick)
+    int  SpawnManagedNpc(uint32_t characterKey, Vec3 world, int type = 1, uint32_t extra = 0, bool aiEnabled = true, int behavior = 0,
+                         int group = 0, int proj = 0, const std::string& label = {}, const std::string& note = {});
+    std::vector<ManagedNpc> ManagedNpcs();
+    bool ManagedNpcLivePosition(const ManagedNpc& npc, Vec3* out);   // live actor position; false until the spawned actor is bound
+    bool MoveManagedNpc(int uid, Vec3 world);           // committed move; live TransformSync when bound, respawn fallback otherwise
+    bool BeginManagedNpcMove(int uid);                  // temporarily pauses runtime AI without changing the saved desired state
+    bool MoveManagedNpcLive(int uid, Vec3 world);       // live drag update; call between Begin/End
+    bool CommitManagedNpcMove(int uid, Vec3 world);     // commit position/history boundary but keep the edit move active and AI paused
+    bool EndManagedNpcMove(int uid, Vec3 world);        // commits the position and restores the desired AI state
+    bool HideManagedNpc(int uid);                       // remove the live actor, keep the registry entry for undo/project state
+    bool RestoreManagedNpc(int uid);                    // respawn a hidden managed NPC
+    void ForgetManagedNpc(int uid);
+    bool SetManagedNpcControl(int uid, bool enabled, int behavior); // atomically set desired AI state + behavior preset
+    bool SetManagedNpcAi(int uid, bool enabled);        // exact desired state; uses the game's native control-ownership toggle
+    bool SetManagedNpcBehavior(int uid, int behavior);  // 0 normal/autonomous, 1 hold position (AI paused)
+    void SetManagedNpcGroup(int uid, int group);
+    void SetManagedNpcNote(int uid, const std::string& note);
+    void SetManagedNpcLabel(int uid, const std::string& label);
     int  NpcState();                                  // 0 = not available in this game build, 1 = walk a few steps first (player actor unknown), 2 = ready
+    bool NpcAiControlAvailable();                      // native AI control-ownership request + actor registry resolved
     std::vector<SpawnedObj> Spawned();
     int  IndexOfUid(int uid);                   // -1 when the object was forgotten
     void SetGroup(int uid, int group); int NewGroupId();
+    std::string GroupName(int group); void SetGroupName(int group, const std::string& name);
+    void SetObjectNote(int uid, const std::string& note);
     struct MoveReq { int uid; Vec3 pos; Rot rot; float scale; };
     bool MoveMany(const std::vector<MoveReq>& reqs, bool final);   // all moves in one game-thread job; false = dropped (live, queue lagging)
     bool HideUid(int uid); void ForgetUid(int uid);
@@ -139,6 +165,13 @@ namespace core {
     extern int  g_liveMode;                     // live-drag method, see DoLiveMove
     extern bool g_uiTextInput, g_uiMouseOverUi;  // a text field is active / the cursor is over a World Builder window (finer than g_uiWants*: edit mode claims all input)
     extern int  g_keyToggle, g_keyMode;         // configurable hotkeys (virtual key codes), settings.txt in the mod folder
+    extern bool g_keyboardPlacement;             // optional legacy keyboard placement controls; off by default
+    extern bool g_projectAutoSave;               // saves dirty loaded projects as soon as an edit gesture/command is committed
+    extern bool g_autoFreeCamOnOpen;             // start free camera automatically when the editor opens
+    extern bool g_showSelectionDetails;          // Browser selected-item information panel
+    enum PlaceKey { PK_FWD, PK_BACK, PK_LEFT, PK_RIGHT, PK_UP, PK_DOWN, PK_ROT_L, PK_ROT_R, PK_SCALE_UP, PK_SCALE_DOWN, PK_FETCH, PK_SNAP, PK_MOUSE, PK_LEVEL, PK_GROUND, PK_DROP, PK_CANCEL, PK_FAST, PK_COUNT };
+    extern int g_placeKeys[PK_COUNT];
+    const char* PlaceKeyId(int i); const char* PlaceKeyLabel(int i); void ApplyPlaceKeys();
     extern float g_fcSpeed, g_fcSens;           // free camera: m/s and degrees per mouse count
     bool FreeCamAvailable();                    // the camera pose function and the renderer camera were found
     bool FreeCamActive();
@@ -149,6 +182,8 @@ namespace core {
     void FreeCamViewPreset(int preset);          // 1 level, 2 straight down, 3 straight up; position is unchanged
     void FreeCamDolly(float meters);            // move along the view (mouse wheel)
     void FreeCamTurn(float dyaw, float dpitch);  // degrees, as the mouse would (tests without a mouse)
+    bool FreeCamSetPosition(Vec3 pos);           // exact free-camera world position; false until the free camera initialized
+    bool FreeCamMove(float forward, float right, float up); // relative movement in the current camera frame
     extern volatile bool g_fcHoldMove;          // editor: no key movement now (context menu open, a field being edited)
     extern bool g_showConsole;                  // settings.txt console=0 hides the console window (takes effect on the next start)
 
@@ -211,17 +246,18 @@ namespace core {
     bool PreviewActive();
     bool PreviewPending();         // a PreviewSet job is still queued (commit only once it ran)
 
-    // Projects: bin64\cdmodkit\projects\<name>.cdproj, one object per line "prefab|x|y|z|yaw|scale|group|pitch|roll" (v3; older files have fewer fields)
-    // Project membership: every object knows which project it came from, so a project can be overwritten with exactly its
-    // own objects while other loaded projects stay untouched. Ids are per session and name the .cdproj files; 0 = new object.
+    // Projects: bin64\cdmodkit\projects\<name>.cdproj. Legacy v1-v3 object rows stay readable; current files also persist
+    // managed NPC entities, notes and named groups in backward-compatible comment records. Objects and NPCs are equal project
+    // entities: both carry a project id, both load/autoload with the project and both are included in dirty/save counts.
     enum SaveScope { SaveWholeScene = 0, SaveProjectAndNew = 1, SaveNewOnly = 2, SaveProjectOnly = 3 };
     int  ProjectId(const std::string& name);       // id for a project name, creating one on first use (0 for an empty name)
     std::string ProjectNameOf(int id);             // "" for 0 / unknown
-    int  ProjectObjectCount(int id);               // visible objects currently belonging to that project (0 = the new ones)
-    bool ProjectDirty(int id);                     // an object of it was moved, deleted or regrouped since the last load / save
+    int  ProjectObjectCount(int id);               // visible entities (objects + managed NPCs) belonging to the project; 0 = new/unassigned
+    bool ProjectDirty(int id);                     // an entity/metadata item changed since the last load/save
     void AssignProject(int uid, int proj);
     bool SaveProject(const std::string& name, int scope = SaveWholeScene);   // saved objects become members of that project
     bool LoadProject(const std::string& name, bool clearFirst);   // spawns are queued one per game tick
+    bool UnloadProject(int id);                     // removes this project's live objects and managed NPCs without touching its file
     std::vector<std::string> ListProjects();
     void DeleteAllSpawned();
     // Autoload: bin64\cdmodkit\autoload.txt, one project name per line (without .cdproj), '#' at the line start = comment.
