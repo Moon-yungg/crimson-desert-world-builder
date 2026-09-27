@@ -112,7 +112,7 @@ static uint8_t CallTexReloadGuarded(uintptr_t fn, uintptr_t tex, uintptr_t dev, 
 }
 void TerrainTexReload(int tx, int tz, uintptr_t mgr, uintptr_t rva) {
     uintptr_t tex = 0; { std::lock_guard<std::mutex> l(g_mx); auto it = g_texOf.find({ tx, tz }); if (it != g_texOf.end()) tex = it->second; }
-    if (!tex || !mgr) { Log("[terrain] texreload: tile %d,%d texture %p manager %p", tx, tz, (void*)tex, (void*)mgr); return; }
+    if (!tex || !mgr || !rva) { Log("[terrain] texreload: tile %d,%d texture %p manager %p rva 0x%llx (all required)", tx, tz, (void*)tex, (void*)mgr, (unsigned long long)rva); return; }
     RunOnGameThread([tex, mgr, rva, tx, tz]() {
         uintptr_t dev = 0, extra = 0; ReadBytes(mgr + 0x10, &dev, 8); ReadBytes(mgr + 0x48, &extra, 8);
         Log("[terrain] texreload tile %d,%d: texture %p, manager %p (+10 %p, +48 %p)", tx, tz, (void*)tex, (void*)mgr, (void*)dev, (void*)extra);

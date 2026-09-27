@@ -2385,8 +2385,6 @@ namespace editor {
         ImGui::EndDisabled();
         ImGui::TextWrapped(T("Strokes change the ground and its collision right away. Apply (a fast travel 5 km away and back, about half a minute) is only needed when a stroke could not be shown live. Strokes are saved with the project and are there right away when the project is autoloaded."));
         ImGui::TextDisabled(T("travel: %s"), core::TravelStatus().c_str());
-        ImGui::TextDisabled("brush %s at %.1f %.1f %.1f, ground %.1f, probe %s, last hit %s %.1f", g_brushHave ? "on ground" : "-", g_brushAt.x, g_brushAt.y, g_brushAt.z, g_brushY,
-            g_brushTicket ? "waiting" : "idle", g_brushLastHit ? "yes" : "no", g_brushLastHitY);   // diagnostics while the brush is new
     }
 
     // screen rectangle of a placed object's (yaw-rotated) bounding box; depth = distance along the view direction
