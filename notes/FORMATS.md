@@ -321,6 +321,9 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Working recipe (scratchpad hf_tool2.py deep/tall): base = min - 50, scale = (max - min + 100) / 65535, every node of every
   level = [0,0,0,0,65535,65535,65535,65535], shape AABB y widened to the same range, then write the heights. Character-style
   probes inside 3 m dips: 22/22 hit (0/22 before). A proper rebuild of the tree from the new heights would keep culling tight.
+  Seen in game: walking into and out of 3 m dips and up and down 3 m hills works, no sinking, no fall.
+- Open: one grid run over 3 m hills showed 30 new holes in a cluster at the edge of the loaded 5x5 area (~60 m away); a restore
+  did not bring them back (by then the player had moved and patches had streamed), so probably streaming - recheck.
 - Research overlay: /api/research/points draws world points from bin64\cdmodkit\debugpoints.txt ("x y z rrggbb") with the
   editor open or closed (scratchpad show_points.py: grey reference, blue lowered, red beyond the limit).
 - Open: what drops the character 1-2 m below the original ground (a write breakpoint on the player's position during the drop
