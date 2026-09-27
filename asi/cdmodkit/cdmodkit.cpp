@@ -428,7 +428,7 @@ extern volatile LONG g_queueCount;
 // The loader instance is captured from the game's own calls (hook on the same function), the path object is built like DoSpawn's.
 static uintptr_t kRva_ResLoad = 0;
 typedef void* (__fastcall* ResLoadFn)(void* self, void** out, void* path, uint32_t flags);
-static void ReleaseHookPiece();
+static void ReleaseHookPiece(); static uintptr_t FindVtableByName(const char* mangled); static uintptr_t FindPatternCount(const char* pat, int* count);
 static ResLoadFn g_origResLoad = nullptr; static void* g_resLoader = nullptr;
 // Research (/api/research/iotrace {"filter":"height"}): log the game's loads whose path contains the filter, plus the load
 // worker's read calls (vtable slots 4 / 5, hooked on first use from the worker the game uses) for those handlers.
@@ -510,6 +510,10 @@ static void* __fastcall HookResLoad(void* self, void** out, void* path, uint32_t
     }
     return r;
 }
+// Helpers for the optional modules (terrain.cpp): unique signature scan, RTTI vtable lookup, NormalizedPath text.
+uintptr_t SigScanUnique(const char* pat) { int n = 0; const uintptr_t f = FindPatternCount(pat, &n); return n == 1 ? f : 0; }
+uintptr_t VtableByName(const char* mangled) { return FindVtableByName(mangled); }
+std::string PathObjText(void* path) { return PathText(path); }
 void IoHeightDelta(int d) { g_ioHeightDelta = d; Log("[io] height read patch %d", d); }
 void IoTraceSet(const std::string& filter) {
     strncpy_s(g_ioFilter, filter.c_str(), _TRUNCATE); g_ioLines = 0;
@@ -3197,6 +3201,7 @@ static DWORD WINAPI InitThread(LPVOID) {
         ResolveSetCamPose(); if (kRva_SetCamPose && g_natCamGlobal) { void* t14 = (void*)(g_base + kRva_SetCamPose); HookFn(t14, (void*)HookSetCamPose, (void**)&g_origSetCamPose, "camera pose (free camera)"); }
         InstallNpcSpawn();   // NPC spawn research: the game's spawn-character cheat request
         EnvironmentInstall(); // optional time-of-day / weather bridge; failures do not affect the editor or spawning
+        TerrainInstall();     // optional terrain editing through the streamed height textures; failures only disable it
         if (g_traceHooks && kRva_UuidLookup) { void* t10 = (void*)(g_base + kRva_UuidLookup); HookFn(t10, (void*)HookUuidLookup, (void**)&g_origUuidLookup, "uuid lookup (trace)"); }
         if (kRva_SoServerCreate) { void* t9 = (void*)(g_base + kRva_SoServerCreate); HookFn(t9, (void*)HookSoServerCreate, (void**)&g_origSoServerCreate, "SceneObjectServer new (trace)"); }
         if (kRva_ActorCtor) { void* t13 = (void*)(g_base + kRva_ActorCtor); HookFn(t13, (void*)HookActorCtor, (void**)&g_origActorCtor, "actor constructor (trace)"); }

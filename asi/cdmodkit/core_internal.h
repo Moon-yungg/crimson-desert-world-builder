@@ -26,4 +26,8 @@ namespace core {
     // pack I/O tracing (diag.cpp): installed once at startup, switched by the console command "traceio on|off"
     void InstallIoTrace();
     void SetIoTrace(bool on);
+
+    // helpers for optional modules (cdmodkit.cpp)
+    uintptr_t SigScanUnique(const char* pat); uintptr_t VtableByName(const char* mangled); std::string PathObjText(void* path);
+    void TerrainInstall();
 }

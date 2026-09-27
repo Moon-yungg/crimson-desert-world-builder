@@ -54,7 +54,10 @@ namespace core {
     void GroundTrace(int seconds);
     struct DebugPt { Vec3 p; uint32_t col; };   // research overlay: world points drawn by the editor
     std::vector<DebugPt> DebugPoints(); size_t DebugPointCount(); int LoadDebugPoints(bool clear);   // file bin64\cdmodkit\debugpoints.txt: "x y z rrggbb" per line
-    void GeoTraceInstall(uintptr_t vt, int slots); void GeoTraceArm(); void FnTraceInstall(uintptr_t rva); void IoTraceSet(const std::string& filter); void IoHeightDelta(int d); void IoStreamDelta(int d);   // research: trace the terrain geometry calls of the next ground cast   // research: log the character's ground probe casts for a few seconds   // research: search the player's server actor for its position
+    void GeoTraceInstall(uintptr_t vt, int slots); void GeoTraceArm(); void FnTraceInstall(uintptr_t rva); void IoTraceSet(const std::string& filter); void IoHeightDelta(int d); void IoStreamDelta(int d);
+    // terrain editing (terrain.cpp): height changes applied to the terrain height textures as the game streams them in;
+    // collision is captured from the rendered terrain and follows. Tiles already on screen change when they stream again.
+    bool TerrainAvailable(); int TerrainEditDisc(float x, float z, float radius, float metres); int TerrainEditTile(int tx, int tz, float metres); void TerrainEditClear(); std::string TerrainStatus();   // research: trace the terrain geometry calls of the next ground cast   // research: log the character's ground probe casts for a few seconds   // research: search the player's server actor for its position
     void ResearchVtScan(const std::string& mangled, int maxHits, int dumpBytes);   // research: live objects of an RTTI class (logged)
     void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)

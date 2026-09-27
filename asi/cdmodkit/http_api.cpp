@@ -278,8 +278,15 @@ static std::string Handle(const std::string& method, const std::string& path, co
     if (method == "POST" && path == "/api/research/iotrace") {   // research: {"filter":"height"} logs matching game loads and their reads; "" = off
         auto f = arg.find("filter"); if (f != arg.end()) core::IoTraceSet(f->second);
         float hd = 0; if (Number(arg, "hdelta", hd)) core::IoHeightDelta((int)hd);
-        float sd = 0; if (Number(arg, "sdelta", sd)) core::IoStreamDelta((int)sd);   // research: the same for the streamed (GPU) copy   // research: {"hdelta":12000} lowers height DDS samples as they load
+        float sd = 0; if (Number(arg, "sdelta", sd)) core::IoStreamDelta((int)sd);
         return "{\"ok\":true}";
+    }
+    if (method == "POST" && path == "/api/research/terrain") {   // research: {"x","z","r","dm"} adds a smooth disc (dm metres, + up), {"clear":1}
+        if (Flag(arg, "clear")) core::TerrainEditClear();
+        float x = 0, z = 0, r = 0, dm = 0, tx = 0, tz = 0;
+        if (arg.count("tx") && Number(arg, "tx", tx, true) && Number(arg, "tz", tz, true) && Number(arg, "dm", dm, true)) return "{\"tiles\":" + Int(core::TerrainEditTile((int)tx, (int)tz, dm)) + "}";
+        if (arg.count("x") && Number(arg, "x", x, true) && Number(arg, "z", z, true) && Number(arg, "r", r, true) && Number(arg, "dm", dm, true)) return "{\"tiles\":" + Int(core::TerrainEditDisc(x, z, r, dm)) + "}";
+        return "{\"status\":\"" + core::TerrainStatus() + "\"}";
     }
     if (method == "POST" && path == "/api/research/points") {   // research: reload bin64\cdmodkit\debugpoints.txt ({"clear":1} removes them)
         return "{\"points\":" + Int(core::LoadDebugPoints(Flag(arg, "clear"))) + "}";
