@@ -332,8 +332,17 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   heightfield patches are captured from the rendered terrain on the GPU: CaptureHeightFieldCollision /
   _readbackHeightFieldCollisionTexture / TerrainHeightFieldCollision_%d_%d). Terrain paks: 0015\49.paz / 50.paz, uncompressed,
   unencrypted, "partial" entries. The reads completed synchronously (file cache); a robust patch belongs after completion.
-- Open: live update (re-stream a tile after an edit instead of only at load), per-sample edits in DDS space (height =
-  offset + v / 65535 * range from heighttable/sector_X_Z.xml, 2 m per texel, all 10 mips), persistence per project.
+- terrain.cpp (production path, no NtReadFile hook): the streamer's request function (unique signature "48 89 5C 24 18 48 89 74
+  24 20 55 57 41 54 41 56 41 57 48 8B EC 48 83 EC 70 48 8B D9 4C 8D 3D", rva 0x12d1340 on 2976) gets a request: +0x08 NormalizedPath,
+  +0x10 buffer holder (its +0 = the read buffer, filled during the call), +0x20 u32 length, +0x24 u32 file offset, +0x30 completion
+  event (BindableEventFileIO). Reads are whole (0xAAAAA at +0x80) or only the small mips (e.g. 0xAAA at +0xAA080). The consumer
+  learns of completion only through BindableEventFileIO slot 5 (poll, OVERLAPPED.Internal at event+0x40 != 0x103), so the
+  samples are shifted there, mip by mip. Verified: whole-tile shifts and discs change picture and collision.
+- Tile / texel mapping (verified with test dips measured through the collision, offsets <= 0.5 m): tile X,Z covers world
+  [X*1024, X*1024+1024) x [Z*1024, Z*1024+1024) - NOT centred on X*1024. Texel column c = +x, row r = -z (row 0 is the north
+  edge): texel centre x = X*1024 + 2c + 1, z = Z*1024 + 2(511 - r) + 1. Height = offset + v / 65535 * range (sector xml; tile -10,-5:
+  range 163, offset 465). NB the decoded DDS height is not exactly the collision height (captured terrain includes detail).
+- Open: live update (re-stream a tile after an edit instead of only at load), persistence per project.
 - Open: one grid run over 3 m hills showed 30 new holes in a cluster at the edge of the loaded 5x5 area (~60 m away); a restore
   did not bring them back (by then the player had moved and patches had streamed), so probably streaming - recheck.
 - Research overlay: /api/research/points draws world points from bin64\cdmodkit\debugpoints.txt ("x y z rrggbb") with the
