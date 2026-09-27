@@ -2260,24 +2260,44 @@ namespace editor {
             core::TerrainPreviewGrid(x0, z0, nx, nz, &g_shape.orig, &g_shape.edit);
         }
         if ((int)g_shape.edit.size() != nx * nz) return;
-        auto at = [&](int i, int j, Vec3* w, float* d) -> bool {
-            const size_t k = (size_t)j * nx + i; const float e = g_shape.edit[k], o = g_shape.orig[k]; if (std::isnan(e)) return false;
-            *w = { x0 + 2.0f * i + 1.0f, e + 0.15f, z0 + 2.0f * j + 1.0f }; *d = e - o; return true; };
-        auto colOf = [](float d) -> ImU32 { const float a = std::min(1.0f, std::fabs(d) / 3.0f);
-            return d >= 0 ? IM_COL32(255, (int)(210 - 90 * a), 80, (int)(90 + 150 * a)) : IM_COL32(80, (int)(200 - 60 * a), 255, (int)(90 + 150 * a)); };
-        for (int j = 0; j < nz; j++) for (int i = 0; i < nx; i++) {
-            Vec3 a; float da; if (!at(i, j, &a, &da)) continue;
-            const float depth = (a.x - cf.pos.x) * cf.fwd.x + (a.y - cf.pos.y) * cf.fwd.y + (a.z - cf.pos.z) * cf.fwd.z; if (depth < 1.0f) continue;
-            ImVec2 sa; if (!WorldToScreen(cf, a, &sa)) continue;
-            for (int n = 0; n < 2; n++) {
-                const int i2 = i + (n == 0), j2 = j + (n == 1); if (i2 >= nx || j2 >= nz) continue;
-                Vec3 b; float db; if (!at(i2, j2, &b, &db)) continue;
-                if (std::fabs(da) < 0.03f && std::fabs(db) < 0.03f) continue;
-                const float depthB = (b.x - cf.pos.x) * cf.fwd.x + (b.y - cf.pos.y) * cf.fwd.y + (b.z - cf.pos.z) * cf.fwd.z; if (depthB < 1.0f) continue;
-                ImVec2 sb; if (!WorldToScreen(cf, b, &sb)) continue;
-                dl->AddLine(sa, sb, colOf(0.5f * (da + db)), 1.0f);
+        // a shaded clay surface of the new ground: every 2 m cell that changes (plus the ring around it) as a lit quad, painted far
+        // to near so nearer slopes cover farther ones; slightly orange where it rises, blue where it sinks
+        auto H = [&](int i, int j) -> float { return g_shape.edit[(size_t)j * nx + i]; };
+        auto D = [&](int i, int j) -> float { const size_t k = (size_t)j * nx + i; return g_shape.edit[k] - g_shape.orig[k]; };
+        struct Quad { float depth; ImVec2 p[4]; ImU32 col; };
+        static std::vector<Quad> quads; quads.clear();
+        const float lx = 0.45f, ly = 0.80f, lz = 0.40f;   // light from above, slightly from the side (normalised below)
+        const float ll = sqrtf(lx * lx + ly * ly + lz * lz);
+        for (int j = 0; j + 1 < nz; j++) for (int i = 0; i + 1 < nx; i++) {
+            const float h00 = H(i, j), h10 = H(i + 1, j), h01 = H(i, j + 1), h11 = H(i + 1, j + 1);
+            if (std::isnan(h00) || std::isnan(h10) || std::isnan(h01) || std::isnan(h11)) continue;
+            float dmax = 0, dsum = 0;   // changed here or next to a change (the ring keeps the edge of an edit visible)
+            for (int jj = std::max(0, j - 1); jj <= std::min(nz - 1, j + 2); jj++) for (int ii = std::max(0, i - 1); ii <= std::min(nx - 1, i + 2); ii++) {
+                const float d = D(ii, jj); if (std::isnan(d)) continue; dmax = std::max(dmax, std::fabs(d)); }
+            if (dmax < 0.03f) continue;
+            dsum = 0.25f * (D(i, j) + D(i + 1, j) + D(i, j + 1) + D(i + 1, j + 1));
+            const float wx = x0 + 2.0f * i + 1.0f, wz = z0 + 2.0f * j + 1.0f;
+            const Vec3 c[4] = { { wx, h00 + 0.05f, wz }, { wx + 2.0f, h10 + 0.05f, wz }, { wx + 2.0f, h11 + 0.05f, wz + 2.0f }, { wx, h01 + 0.05f, wz + 2.0f } };
+            Quad q; bool ok = true; float dep = 0;
+            for (int k = 0; k < 4 && ok; k++) {
+                const float d = (c[k].x - cf.pos.x) * cf.fwd.x + (c[k].y - cf.pos.y) * cf.fwd.y + (c[k].z - cf.pos.z) * cf.fwd.z;
+                ok = d > 1.0f && WorldToScreen(cf, c[k], &q.p[k]); dep += d;
             }
+            if (!ok) continue;
+            // normal of the cell from its height differences (x and z spacing 2 m), Lambert shading
+            const float nxv = -((h10 + h11) - (h00 + h01)) * 0.25f, nzv = -((h01 + h11) - (h00 + h10)) * 0.25f, nyv = 1.0f;
+            const float nl = sqrtf(nxv * nxv + nyv * nyv + nzv * nzv);
+            const float lit = 0.30f + 0.70f * std::max(0.0f, (nxv * lx + nyv * ly + nzv * lz) / (nl * ll));
+            const float tint = std::min(1.0f, std::fabs(dsum) / 3.0f) * (std::fabs(dsum) >= 0.03f ? 1.0f : 0.0f);
+            float r = 205, g = 190, b = 165;   // clay
+            if (dsum > 0) { r += (255 - r) * tint * 0.5f; g += (170 - g) * tint * 0.5f; b += (90 - b) * tint * 0.5f; }
+            else          { r += (110 - r) * tint * 0.5f; g += (170 - g) * tint * 0.5f; b += (255 - b) * tint * 0.5f; }
+            const float edge = dmax < 0.3f ? dmax / 0.3f : 1.0f;   // the untouched ring fades out
+            q.col = IM_COL32((int)(r * lit), (int)(g * lit), (int)(b * lit), (int)(60 + 170 * edge));
+            q.depth = dep; quads.push_back(q);
         }
+        std::sort(quads.begin(), quads.end(), [](const Quad& a, const Quad& b) { return a.depth > b.depth; });
+        for (const auto& q : quads) dl->AddQuadFilled(q.p[0], q.p[1], q.p[2], q.p[3], q.col);
     }
     static bool BrushActive() { return TerrainTabShown() && g_brushOn && core::TerrainAvailable() && !g_playMode; }
     static void AddBrushStroke() {
@@ -2340,7 +2360,7 @@ namespace editor {
         core::TravelPrepare();
         ImGui::Checkbox(T("Brush active (left mouse paints in the world)"), &g_brushOn); ImGui::SameLine();
         ImGui::Checkbox(T("Shape preview"), &g_shapePreview);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Grid of the ground as it will be after Apply: orange = higher, blue = lower than now."));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("The ground as it will be after Apply, as a shaded surface: orange tint = higher, blue tint = lower than now."));
         ImGui::RadioButton(T("Raise"), &g_brushMode, BrushRaise); ImGui::SameLine();
         ImGui::RadioButton(T("Lower"), &g_brushMode, BrushLower); ImGui::SameLine();
         ImGui::RadioButton(T("Flatten"), &g_brushMode, BrushFlatten);
@@ -2358,7 +2378,7 @@ namespace editor {
         ImGui::Separator();
         const std::string st = core::TerrainApplyState();
         if (!st.empty()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Applying: %s"), st.c_str());
-        else if (core::TerrainNeedsApply()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Not applied yet: the grid shows the new shape."));
+        else if (core::TerrainNeedsApply()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Not applied yet: the shaded surface shows the new shape."));
         else ImGui::TextDisabled(T("The ground shows every stroke."));
         ImGui::BeginDisabled(!st.empty() || !havePos || !core::TravelAvailable() || strokes.empty() && !core::TerrainNeedsApply());
         if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Apply (two loading screens)"))) { if (core::TerrainApply(p.world)) Note(T("applying the terrain: fast travel away and back")); }
