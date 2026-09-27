@@ -7,7 +7,6 @@
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imm.h>
-#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -52,9 +51,11 @@ namespace input {
     }
     static void SetVirtualCursorClient(LONG x, LONG y) {
         int w, h; ClientSize(&w, &h);
+        const float maxX = (float)(w > 0 ? w - 1 : 0);
+        const float maxY = (float)(h > 0 ? h - 1 : 0);
         Lock();
-        g_vx = std::max(0.0f, std::min((float)std::max(0, w - 1), (float)x));
-        g_vy = std::max(0.0f, std::min((float)std::max(0, h - 1), (float)y));
+        g_vx = (float)x < 0.0f ? 0.0f : ((float)x > maxX ? maxX : (float)x);
+        g_vy = (float)y < 0.0f ? 0.0f : ((float)y > maxY ? maxY : (float)y);
         Unlock();
     }
 
