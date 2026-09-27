@@ -254,7 +254,11 @@ static std::string Handle(const std::string& method, const std::string& path, co
         float mx = 16; Number(arg, "max", mx); core::ResearchFind(pat, std::clamp((int)mx, 1, 256)); status = 202; return "{\"started\":true}";
     }
     if (method == "POST" && path == "/api/research/fallwatch") {   // research: {"on":1}
-        core::SetFallWatch(Flag(arg, "on")); return "{\"ok\":true}";
+        auto ad = arg.find("addr"); const uintptr_t a = ad == arg.end() ? 0 : (uintptr_t)strtoull(ad->second.c_str(), nullptr, 0);
+        core::SetFallWatch(Flag(arg, "on"), a); return "{\"ok\":true}";
+    }
+    if (method == "POST" && path == "/api/research/findpos") {   // research: log where the server actor keeps the player's position
+        core::ResearchFindPos(); return "{\"done\":true}";
     }
     if (method == "POST" && path == "/api/research/vtscan") {   // research: {"class":".?AVhknpHeightFieldShape@@","max":8,"bytes":256}
         auto it = arg.find("class"); if (it == arg.end() || it->second.size() < 6 || it->second.size() > 200) { status = 400; return Error("class (mangled RTTI name) required"); }

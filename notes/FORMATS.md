@@ -266,6 +266,11 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   component's current transform block at +0x98 from a newly computed one, or reverts to the saved old one; 0x71a0d0 only compares
   two tiled positions against a tolerance). The snapshot mirrors the server actor; the character's real movement (gravity,
   ground contact) runs server-side. Next: watch the player's SERVER actor position (ServerChildOnlyInGameActor) instead.
+- Player server actor (ServerChildOnlyInGameActor, the MoveActorReq sender) keeps its position in the components list at
+  actor+0x68 (same list also at actor+0x78, other stride): ServerTransformSyncActorComponent (+0x1A0 of the list) +0xB4 tile-local
+  x/y/z (same layout as the client snapshot), +0x324 and +0x3D0 world x/y/z; copies in Knowledge (+0x2C8 world, +0x2F4 local),
+  Interaction (+0x2C8), QuestDialog (+0xC4), Wanted (+0x164), RemoteCatch (+0x188). Found with /api/research/findpos.
+  Player movement is probably client-authoritative (the client sends MoveActorReq), so the server copy may only mirror it.
 - Open: what drops the character 1-2 m below the original ground (a write breakpoint on the player's position during the drop
   / respawn would find the code), and the hknp body per patch (placement, broadphase AABB).
 - Pitfall: after a fall the game streams patches out; writing saved addresses then corrupts its heap (one crash). Check the

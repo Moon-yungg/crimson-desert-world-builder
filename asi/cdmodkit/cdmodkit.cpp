@@ -232,10 +232,11 @@ bool PlayerPosInfo(PosInfo* out) { uintptr_t a = PlayerActor(); return a && Read
 // Research: fall watcher. Polls the player every 50 ms; a drop of more than 3 m below the last stable height counts as a fall
 // (logged with position), then hardware write breakpoints on the transform snapshot's local x/y/z and tile words show which code
 // moves the character (physics integration vs. a rescue teleport). A jump of more than 20 m afterwards is logged as a respawn.
-static volatile bool g_fallWatch = false;
-void SetFallWatch(bool on) {
+static volatile bool g_fallWatch = false; static volatile uintptr_t g_fallWatchAddr = 0;   // 0: the client transform snapshot
+void SetFallWatch(bool on, uintptr_t addr) {
+    if (on && g_fallWatch && addr != g_fallWatchAddr) { g_fallWatch = false; Sleep(200); }   // restart on another field
     if (on == g_fallWatch) return;
-    g_fallWatch = on; Log("[fallwatch] %s", on ? "on" : "off");
+    g_fallWatchAddr = addr; g_fallWatch = on; Log("[fallwatch] %s%s", on ? "on" : "off", on && addr ? " (explicit address)" : "");
     if (!on) return;
     std::thread([]() {
         float stableY = NAN; DWORD stableTick = 0; bool falling = false; PosInfo last{}; bool haveLast = false;
@@ -246,11 +247,12 @@ void SetFallWatch(bool on) {
             if (!actor || !ReadPos(actor, &p)) continue;
             const DWORD now = GetTickCount();
             {   // keep the write watch on the current player's transform snapshot (x, y, z, tile), re-armed for new threads
-                uintptr_t comps = Deref(actor, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
+                uintptr_t comps = Deref(actor, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) + kOff_Tf_Pos : 0;
+                if (g_fallWatchAddr) tf = g_fallWatchAddr;   // an explicit field (x, y, z, next dword)
                 if (tf && tf != watchedTf) {
                     if (watchedTf) StopWatch();
-                    const uintptr_t a[4] = { tf + kOff_Tf_Pos, tf + kOff_Tf_Pos + 4, tf + kOff_Tf_Pos + 8, tf + kOff_Tf_Pos + 0x0C };
-                    if (StartWatch(a)) { watchedTf = tf; Log("[fallwatch] watching writes to the player transform %p", (void*)tf); }
+                    const uintptr_t a[4] = { tf, tf + 4, tf + 8, tf + 0x0C };
+                    if (StartWatch(a)) { watchedTf = tf; Log("[fallwatch] watching writes to %p (%s)", (void*)tf, g_fallWatchAddr ? "explicit" : "client transform snapshot"); }
                 } else if (now - lastRefresh > 2000) { RefreshWatch(); lastRefresh = now; }
             }
             if (haveLast && (fabsf(p.world.x - last.world.x) > 20.0f || fabsf(p.world.z - last.world.z) > 20.0f || p.world.y - last.world.y > 20.0f)) {
@@ -2420,6 +2422,42 @@ int NpcState() {
     if (!g_npcExecute) return 0;
     AcquireSRWLockShared(&g_npcLock); const bool have = g_serverSession != 0; ReleaseSRWLockShared(&g_npcLock);
     return have ? 2 : 1;
+}
+// Research: where the player's SERVER actor keeps its position. Takes the client snapshot's tile-local x/y/z (and the world
+// position) and searches the server actor, every object it points to and every object those point to (0x800 bytes each) for
+// three consecutive floats within 0.5 m; hits are logged with their pointer path and RTTI.
+void ResearchFindPos() {
+    uintptr_t s = 0; AcquireSRWLockShared(&g_npcLock); s = g_serverSession; ReleaseSRWLockShared(&g_npcLock);
+    const uintptr_t cl = PlayerActor(); PosInfo p{};
+    if (!s || !cl || !ReadPos(cl, &p)) { Log("[findpos] no server actor yet (walk a few steps) or no player"); return; }
+    uintptr_t comps = Deref(cl, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
+    float loc[3] = {}; if (!tf || !ReadBytes(tf + kOff_Tf_Pos, loc, 12)) return;
+    const float want[2][3] = { { loc[0], loc[1], loc[2] }, { p.world.x, p.world.y, p.world.z } };
+    Log("[findpos] server actor %p (%s); client local (%.2f %.2f %.2f) world (%.2f %.2f %.2f)", (void*)s, RttiName(s) ? RttiName(s) : "?", loc[0], loc[1], loc[2], p.world.x, p.world.y, p.world.z);
+    int hits = 0;
+    auto scan = [&](uintptr_t obj, const char* path) {
+        uint8_t b[0x800]; if (!ReadBytes(obj, b, sizeof b)) return;
+        for (unsigned o = 0; o + 12 <= sizeof b && hits < 80; o += 4) {
+            float f[3]; memcpy(f, b + o, 12);
+            for (int w = 0; w < 2; w++)
+                if (fabsf(f[0] - want[w][0]) < 0.5f && fabsf(f[1] - want[w][1]) < 0.5f && fabsf(f[2] - want[w][2]) < 0.5f) {
+                    Log("[findpos] %s %p (%s) +0x%X = %s (%.3f %.3f %.3f) -> field %p", path, (void*)obj, RttiName(obj) ? RttiName(obj) : "-", o, w ? "world" : "local", f[0], f[1], f[2], (void*)(obj + o)); hits++;
+                }
+        }
+    };
+    auto heapPtr = [](uintptr_t q) { return q > 0x10000 && !(q >> 47) && !InImage(q) && !(q & 7); };
+    scan(s, "actor");
+    uint8_t a1[0x800]; if (!ReadBytes(s, a1, sizeof a1)) return;
+    for (unsigned i = 0; i < sizeof a1; i += 8) {
+        uintptr_t q; memcpy(&q, a1 + i, 8); if (!heapPtr(q)) continue;
+        char path[64]; snprintf(path, sizeof path, "actor+%X", i); scan(q, path);
+        uint8_t a2[0x400]; if (!ReadBytes(q, a2, sizeof a2)) continue;
+        for (unsigned k = 0; k < sizeof a2; k += 8) {
+            uintptr_t r; memcpy(&r, a2 + k, 8); if (!heapPtr(r) || r == s) continue;
+            char p2[64]; snprintf(p2, sizeof p2, "actor+%X+%X", i, k); scan(r, p2);
+        }
+    }
+    Log("[findpos] %d hits", hits);
 }
 bool SpawnNpc(uint32_t key, Vec3 pos, int type, uint32_t extra) {
     if (!g_npcExecute) { Log("[npc] not available (handler not resolved)"); return false; }
