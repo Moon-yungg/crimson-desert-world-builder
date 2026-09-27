@@ -291,6 +291,9 @@ static std::string Handle(const std::string& method, const std::string& path, co
         const bool started = core::TravelTo(Vec3{ x, y, z }, yaw);
         return std::string("{\"started\":") + (started ? "true" : "false") + ",\"status\":\"" + core::TravelStatus() + "\"}";
     }
+    if (method == "POST" && path == "/api/research/gputrace") {   // research: {"seconds":20} logs copies into 16-bit textures
+        float sec = 20; Number(arg, "seconds", sec); core::GpuTrace((int)sec); return "{\"ok\":true}";
+    }
     if (method == "POST" && path == "/api/research/terrain") {   // research: {"x","z","r","dm"} adds a smooth disc (dm metres, + up), {"clear":1}
         if (Flag(arg, "clear")) core::TerrainEditClear();
         if (Flag(arg, "synctrace")) core::TerrainSyncTrace();   // research

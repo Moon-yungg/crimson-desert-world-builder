@@ -31,4 +31,9 @@ namespace core {
     // helpers for optional modules (cdmodkit.cpp)
     uintptr_t SigScanUnique(const char* pat); uintptr_t VtableByName(const char* mangled); std::string PathObjText(void* path);
     void TerrainInstall(); void TravelInstall();
+    // live terrain (terrain_live.cpp)
+    void TerrainLiveInstall(); bool TerrainLiveAvailable(); bool TerrainLiveHasTexture(int tx, int tz);
+    void TerrainLiveNoteRead(int tx, int tz, const uint8_t* data, uint32_t len);
+    bool TerrainLiveUpload(int tx, int tz, const uint8_t* chain, size_t len);
+    void TerrainPhysInstall(); int TerrainPhysSync(int tx, int tz, const float* prev, const float* next);   // terrain_physics.cpp
 }

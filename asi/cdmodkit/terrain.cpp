@@ -40,7 +40,11 @@ static const uint32_t kHeader = 128;           // DDS header in front of the pix
 struct TileInfo { float range = 0, offset = 0; bool tried = false; };
 // CPU copy of a tile's mip 0 (metres) for the editor's shape preview: the original from the game's own file and the same
 // strokes applied the way the stream patch applies them, so the preview shows what the ground will look like after Apply.
-struct TileCpu { std::vector<float> orig, edit; bool ok = false, tried = false; };
+struct TileCpu {
+    std::vector<float> orig, edit; std::vector<uint8_t> chain; bool ok = false, tried = false;   // chain: the file's 10 mips (from offset 128)
+    std::vector<TerrainStroke> gpuStrokes;   // the strokes the texture got when it last streamed in
+    std::vector<float> gpu; bool gpuValid = false;   // the heights on the GPU after the last live upload (else orig + gpuStrokes)
+};
 struct PendingRead { int tx, tz; uintptr_t holder; uint32_t off, len; };
 
 static std::mutex g_mx;                                   // guards everything below
@@ -111,6 +115,7 @@ static void RebuildEditedLocked() {
 // Height tables are read through the game's loader; that needs the loader captured, so a helper thread fills them in as soon
 // as it can (in the menus, long before the world streams). A read that finds none yet fetches it on the spot.
 static std::atomic<bool> g_fetchRunning{ false };
+static void QueueLive(const std::vector<std::pair<int, int>>& tiles);
 static void FetchTables() {
     bool expected = false; if (!g_fetchRunning.compare_exchange_strong(expected, true)) return;
     std::thread([]() {
@@ -131,8 +136,10 @@ static void FetchTables() {
             std::vector<float> orig((size_t)kTile * kTile); const float k = range / 65535.0f;
             for (size_t i = 0; i < orig.size(); i++) { uint16_t v; memcpy(&v, dds.data() + kHeader + i * 2, 2); orig[i] = offset + v * k; }
             std::lock_guard<std::mutex> l(g_mx); auto& tc = g_cpu[want]; tc.orig.swap(orig); tc.edit = tc.orig; tc.ok = true;
+            tc.chain.assign(dds.begin() + kHeader, dds.begin() + std::min(dds.size(), (size_t)kHeader + 699050));
             for (const auto& s : g_strokes) if (StrokeTouchesTile(s, want.first, want.second)) ApplyStrokeCpu(tc.edit, want.first, want.second, s);
             g_gen++;
+            QueueLive({ want });   // strokes painted before the copy was there reach the texture now
         }
         g_fetchRunning = false;
     }).detach();
@@ -190,7 +197,9 @@ static uint32_t ApplyGuarded(uint8_t* buf, uint32_t off, uint32_t len, int tx, i
 static uint8_t __fastcall HookStreamReq(uintptr_t req) {
     const std::string s = PathObjText((void*)(req + 8)); int tx = 0, tz = 0;
     if (!s.empty() && ParseTilePath(s, &tx, &tz)) {
+        TerrainLiveInstall();   // needs the game's device, which exists by the time tiles stream
         bool edited; { std::lock_guard<std::mutex> l(g_mx); edited = g_edited.count({ tx, tz }) != 0; }
+        if (TerrainLiveAvailable()) edited = true;   // also unedited tiles: their read tells which texture they use
         uint32_t lenOff[2] = {}; uintptr_t holder = 0, ev = 0;
         if (edited && ReadBytes(req + 0x20, lenOff, 8) && ReadBytes(req + 0x10, &holder, 8) && ReadBytes(req + 0x30, &ev, 8) && holder && ev) {
             std::lock_guard<std::mutex> l(g_mx); g_pending[ev] = PendingRead{ tx, tz, holder, lenOff[1], lenOff[0] };
@@ -211,16 +220,19 @@ static uint8_t __fastcall HookEvPoll(uintptr_t ev) {
                 std::lock_guard<std::mutex> l(g_mx); g_pending.erase(ev); ti = g_info[{ pr.tx, pr.tz }];
                 const float x0 = pr.tx * 1024.0f, z0 = pr.tz * 1024.0f;
                 for (const auto& s : g_strokes) if (s.x + s.r >= x0 && s.x - s.r < x0 + 1024.0f && s.z + s.r >= z0 && s.z - s.r < z0 + 1024.0f) mineStrokes.push_back(s);
+                if (st == 0 && pr.off == kHeader && pr.len >= 699050) { auto& tc = g_cpu[{ pr.tx, pr.tz }]; tc.gpuStrokes = mineStrokes; tc.gpuValid = false; }   // a fresh texture
             }
             if (ti.range <= 0 && GameReadAvailable()) {   // not fetched yet: read it now (the game's own loader, outside any of its locks here)
                 float range = 0, offset = 0;
                 if (TileRange(pr.tx, pr.tz, &range, &offset)) { ti.range = range; ti.offset = offset; std::lock_guard<std::mutex> l(g_mx); auto& t = g_info[{ pr.tx, pr.tz }]; t.range = range; t.offset = offset; t.tried = true; }
             }
+            if (st == 0 && buf && pr.off == kHeader && pr.len >= 699050 && mineStrokes.empty()) TerrainLiveNoteRead(pr.tx, pr.tz, (const uint8_t*)buf, pr.len);
             if (st == 0 && buf && ti.range > 0 && !mineStrokes.empty()) {
                 const uint32_t n = ApplyGuarded((uint8_t*)buf, pr.off, pr.len, pr.tx, pr.tz, ti.range, ti.offset, mineStrokes.data(), (int)mineStrokes.size());
                 InterlockedIncrement(&g_patched);
                 Log("[terrain] tile %d,%d: read of %u bytes at +%u, %zu strokes, %u samples changed", pr.tx, pr.tz, pr.len, pr.off, mineStrokes.size(), n);
-            } else if (!mineStrokes.empty()) { InterlockedIncrement(&g_missed); Log("[terrain] tile %d,%d: read at +%u not patched (status %llx, buffer %p, range %.1f)", pr.tx, pr.tz, pr.off, (unsigned long long)st, (void*)buf, ti.range); }
+                if (pr.off == kHeader && pr.len >= 699050) TerrainLiveNoteRead(pr.tx, pr.tz, (const uint8_t*)buf, pr.len);
+            } else if (!mineStrokes.empty() && ti.range <= 0) { InterlockedIncrement(&g_missed); Log("[terrain] tile %d,%d: read at +%u not patched (status %llx, buffer %p, range %.1f)", pr.tx, pr.tz, pr.off, (unsigned long long)st, (void*)buf, ti.range); }
         }
     }
     return g_origPoll(ev);
@@ -243,16 +255,49 @@ void TerrainInstall() {
 
 bool TerrainAvailable() { return g_ok; }
 
+// Live: tiles whose strokes changed get their texture rewritten (original chain + all strokes, the stream patch's own code)
+static std::mutex g_liveMx; static std::set<std::pair<int, int>> g_liveDirty; static std::atomic<bool> g_liveRunning{ false };
+static std::atomic<int> g_liveDone{ 0 }; static bool g_liveFailed = false;   // guarded by g_liveMx
+static void QueueLive(const std::vector<std::pair<int, int>>& tiles) {
+    if (!TerrainLiveAvailable()) return;
+    { std::lock_guard<std::mutex> l(g_liveMx); for (auto& t : tiles) g_liveDirty.insert(t); }
+    bool expected = false; if (!g_liveRunning.compare_exchange_strong(expected, true)) return;
+    std::thread([]() {
+        for (;;) {
+            std::pair<int, int> t; { std::lock_guard<std::mutex> l(g_liveMx); if (g_liveDirty.empty()) break; t = *g_liveDirty.begin(); g_liveDirty.erase(g_liveDirty.begin()); }
+            if (!TerrainLiveHasTexture(t.first, t.second)) continue;
+            std::vector<uint8_t> chain; std::vector<TerrainStroke> st; TileInfo ti; std::vector<float> prev, next;
+            { std::lock_guard<std::mutex> l(g_mx); auto it = g_cpu.find(t); if (it == g_cpu.end() || !it->second.ok || it->second.chain.size() < 699050) continue;
+              chain = it->second.chain; ti = g_info[t]; for (const auto& s : g_strokes) if (StrokeTouchesTile(s, t.first, t.second)) st.push_back(s);
+              auto& tc = it->second; next = tc.edit;
+              if (tc.gpuValid) prev = tc.gpu; else { prev = tc.orig; for (const auto& s : tc.gpuStrokes) ApplyStrokeCpu(prev, t.first, t.second, s); } }
+            if (ti.range <= 0) continue;
+            // the chain holds file bytes [128, ...): build the buffer the patch expects (file offset 128, length of the chain)
+            const uint32_t n = st.empty() ? 0 : ApplyGuarded(chain.data(), kHeader, (uint32_t)chain.size(), t.first, t.second, ti.range, ti.offset, st.data(), (int)st.size());
+            const bool ok = TerrainLiveUpload(t.first, t.second, chain.data(), chain.size());
+            int patches = 0;
+            if (ok) { patches = TerrainPhysSync(t.first, t.second, prev.data(), next.data());   // the collision takes the same change
+                std::lock_guard<std::mutex> l(g_mx); auto& tc = g_cpu[t]; tc.gpu.swap(next); tc.gpuValid = true; }
+            g_liveDone++; if (!ok) g_liveFailed = true;
+            Log("[terrain] live: tile %d,%d, %zu strokes, %u samples -> %s, %d collision patches", t.first, t.second, st.size(), n, ok ? "uploaded" : "FAILED", patches);
+            Sleep(30);   // coalesce a drag: the next pass takes every stroke painted meanwhile
+        }
+        { std::lock_guard<std::mutex> l(g_liveMx); if (g_liveDirty.empty() && !g_liveFailed) TerrainMarkApplied(); g_liveFailed = false; }
+        g_liveRunning = false;
+    }).detach();
+}
 void TerrainAddStroke(const TerrainStroke& s) {
     { std::lock_guard<std::mutex> l(g_mx); g_strokes.push_back(s); std::vector<std::pair<int, int>> t; TilesOf(s, &t); for (auto& k : t) g_edited.insert(k); g_needsApply = true;
       for (auto& k : t) { auto it = g_cpu.find(k); if (it != g_cpu.end() && it->second.ok) ApplyStrokeCpu(it->second.edit, k.first, k.second, s); } g_gen++; }
     if (s.proj) MarkProjectDirty(s.proj);
     FetchTables();
+    std::vector<std::pair<int, int>> t; TilesOf(s, &t); QueueLive(t);
 }
 bool TerrainUndo() {
     int proj = 0;
     { std::lock_guard<std::mutex> l(g_mx); if (g_strokes.empty()) return false; proj = g_strokes.back().proj; g_strokes.pop_back(); RebuildEditedLocked(); RecomputeCpuLocked(); g_needsApply = true; }
     if (proj) MarkProjectDirty(proj);
+    std::vector<std::pair<int, int>> t; { std::lock_guard<std::mutex> l(g_mx); for (auto& kv : g_cpu) t.push_back(kv.first); } QueueLive(t);
     return true;
 }
 void TerrainClear() { std::lock_guard<std::mutex> l(g_mx); if (!g_strokes.empty()) g_needsApply = true; g_strokes.clear(); RebuildEditedLocked(); RecomputeCpuLocked(); Log("[terrain] strokes cleared"); }

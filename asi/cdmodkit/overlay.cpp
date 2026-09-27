@@ -130,6 +130,8 @@ namespace overlay {
 
     static ID3D12CommandQueue* g_queue = nullptr;
     static ID3D12Device* g_device = nullptr;
+    void* D3DDevice() { return g_device; }
+    void* D3DQueue() { return g_queue; }
     static uintptr_t g_swapChainIdentity = 0;
     static std::atomic<IDXGISwapChain*> g_boundSwapChain{nullptr};   // identity-only (pointer compare), never dereferenced, no reference held
     static std::atomic<HWND> g_boundSwapChainWindow{nullptr};

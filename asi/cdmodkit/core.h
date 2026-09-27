@@ -78,6 +78,7 @@ namespace core {
     bool TravelAvailable(); bool TravelPrepared(); void TravelPrepare(); std::string TravelStatus();
     bool TravelTo(Vec3 pos, float yawDeg);   // false while the travel system is still being found (TravelPrepare runs then)
     void MarkProjectDirty(int proj);
+    void GpuTrace(int seconds);   // research (gpu_research.cpp): log the game's copies into 16-bit textures for a while
     // research (terrain_research.cpp, rvas given at runtime)
     int TerrainEditDisc(float x, float z, float radius, float metres); void TerrainEditClear(); void TerrainSyncTrace();
     void TerrainJobTrace(uintptr_t rva); void TerrainLoadTrace(int slot); void TerrainTexTrace(uintptr_t rva); void TeleTraceInstall(uintptr_t rva); void ReloadStageTrace(uintptr_t rva); void RsSendTrace(uintptr_t rva); void ClientReloadTrace(uintptr_t rva); void ClientReloadReplay(float x, float y, float z); void ReloadStageReplay(float x, float y, float z); bool ResearchWatchWrites(const uintptr_t addr[4], int seconds); void TerrainTileTaskTrace(uintptr_t rva); void TerrainRetTrace(uintptr_t rva); void TerrainTexReload(int tx, int tz, uintptr_t mgr, uintptr_t rva); void TerrainReloadCall(uintptr_t obj, int slot, const std::string& name);

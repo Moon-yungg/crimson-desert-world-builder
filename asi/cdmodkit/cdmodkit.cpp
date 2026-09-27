@@ -2801,7 +2801,7 @@ static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int til
     { const double big = 1e19; memcpy(col + 0x10, &big, 8); uint32_t zero = 0; memcpy(col + 0x0C, &zero, 4); }   // reset: no hit, early-out far away
     if (verbose) { Log("[probe] cast: start (%.2f %.2f %.2f) tile %d,%d local (%.2f %.2f %.2f) down %.1f m", start.x, start.y, start.z, tileX, tileZ, fq[0x30 / 4], fq[0x34 / 4], fq[0x38 / 4], len); }
     void* r = nullptr;
-    if (!CallCastGuarded(world, q, xf, col, &r)) { Log("[probe] replay crashed (caught)"); return false; }
+    if (!CallCastGuarded(world, q, xf, col, &r)) { const uintptr_t fa = (uintptr_t)cdk::t_fault.rec.ExceptionAddress; Log("[probe] replay crashed (caught): %08lx at %p (rva 0x%llx), address %p", cdk::t_fault.rec.ExceptionCode, (void*)fa, (unsigned long long)(InImage(fa) ? fa - g_base : 0), cdk::t_fault.rec.NumberParameters > 1 ? (void*)cdk::t_fault.rec.ExceptionInformation[1] : nullptr); return false; }
     uint32_t nh = 0; double frac = 0; memcpy(&nh, col + 0x0C, 4); memcpy(&frac, col + 0x10, 8);
     const float* fc = (const float*)col;
     out->done = true; out->hit = nh > 0 && std::isfinite(frac) && frac <= 1.0; out->fraction = (float)frac;   // negative fraction = the cast started inside a body (penetration), reported as a hit so the caller can step lower
@@ -3247,6 +3247,7 @@ static DWORD WINAPI InitThread(LPVOID) {
         EnvironmentInstall(); // optional time-of-day / weather bridge; failures do not affect the editor or spawning
         TerrainInstall();     // optional terrain editing through the streamed height textures; failures only disable it
         TravelInstall();      // optional: the game's own fast travel to any position (travel tab, terrain apply)
+        TerrainPhysInstall(); // optional: live terrain edits reach the collision patches (before the world streams: every patch is seen)
         PreloadAutoloadTerrain();   // strokes of the autoload projects before the world streams: no apply needed at startup
         if (g_traceHooks && kRva_UuidLookup) { void* t10 = (void*)(g_base + kRva_UuidLookup); HookFn(t10, (void*)HookUuidLookup, (void**)&g_origUuidLookup, "uuid lookup (trace)"); }
         if (kRva_SoServerCreate) { void* t9 = (void*)(g_base + kRva_SoServerCreate); HookFn(t9, (void*)HookSoServerCreate, (void**)&g_origSoServerCreate, "SceneObjectServer new (trace)"); }

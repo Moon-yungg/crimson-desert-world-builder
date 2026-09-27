@@ -2240,7 +2240,7 @@ namespace editor {
     static int g_brushTicket = 0; static DWORD g_brushProbeTick = 0, g_brushHitTick = 0; static bool g_brushLastHit = false; static float g_brushLastHitY = 0;
     static bool g_brushPainting = false; static Vec3 g_brushLast{}; static float g_brushAx = 0, g_brushAz = 0;
     static bool TerrainTabShown() { return g_open && !g_compact && g_mainTab == TabTerrain; }
-    static bool g_shapePreview = true;
+    static bool g_shapePreview = false;   // with live editing the real ground changes at once; the preview is for builds without it
     struct ShapeGrid { int gen = -1; float x0 = 0, z0 = 0; int nx = 0, nz = 0; std::vector<float> orig, edit; };
     static ShapeGrid g_shape;
     // The edited surface as a wire grid on the 2 m texel grid (where it differs from the original): orange above, blue below the
@@ -2383,7 +2383,7 @@ namespace editor {
         ImGui::BeginDisabled(!st.empty() || !havePos || !core::TravelAvailable() || strokes.empty() && !core::TerrainNeedsApply());
         if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Apply (two loading screens)"))) { if (core::TerrainApply(p.world)) Note(T("applying the terrain: fast travel away and back")); }
         ImGui::EndDisabled();
-        ImGui::TextWrapped(T("The game only reads the ground when it streams in. Apply makes that happen with a fast travel 5 km away and back to where you stand (about half a minute). Strokes are saved with the project and are there right away when the project is autoloaded."));
+        ImGui::TextWrapped(T("Strokes change the ground and its collision right away. Apply (a fast travel 5 km away and back, about half a minute) is only needed when a stroke could not be shown live. Strokes are saved with the project and are there right away when the project is autoloaded."));
         ImGui::TextDisabled(T("travel: %s"), core::TravelStatus().c_str());
         ImGui::TextDisabled("brush %s at %.1f %.1f %.1f, ground %.1f, probe %s, last hit %s %.1f", g_brushHave ? "on ground" : "-", g_brushAt.x, g_brushAt.y, g_brushAt.z, g_brushY,
             g_brushTicket ? "waiting" : "idle", g_brushLastHit ? "yes" : "no", g_brushLastHitY);   // diagnostics while the brush is new
