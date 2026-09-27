@@ -229,6 +229,42 @@ bool ReadPos(uintptr_t actor, PosInfo* out) {
     return true;
 }
 bool PlayerPosInfo(PosInfo* out) { uintptr_t a = PlayerActor(); return a && ReadPos(a, out); }
+// Research: fall watcher. Polls the player every 50 ms; a drop of more than 3 m below the last stable height counts as a fall
+// (logged with position), then hardware write breakpoints on the transform snapshot's local x/y/z and tile words show which code
+// moves the character (physics integration vs. a rescue teleport). A jump of more than 20 m afterwards is logged as a respawn.
+static volatile bool g_fallWatch = false;
+void SetFallWatch(bool on) {
+    if (on == g_fallWatch) return;
+    g_fallWatch = on; Log("[fallwatch] %s", on ? "on" : "off");
+    if (!on) return;
+    std::thread([]() {
+        float stableY = NAN; DWORD stableTick = 0; bool falling = false; PosInfo last{}; bool haveLast = false;
+        while (g_fallWatch) {
+            Sleep(50);
+            const uintptr_t actor = PlayerActor(); PosInfo p{};
+            if (!actor || !ReadPos(actor, &p)) continue;
+            const DWORD now = GetTickCount();
+            if (haveLast && (fabsf(p.world.x - last.world.x) > 20.0f || fabsf(p.world.z - last.world.z) > 20.0f || p.world.y - last.world.y > 20.0f)) {
+                Log("[fallwatch] RESPAWN / teleport: (%.2f %.2f %.2f) -> (%.2f %.2f %.2f)", last.world.x, last.world.y, last.world.z, p.world.x, p.world.y, p.world.z);
+                falling = false; stableY = p.world.y; stableTick = now;
+            }
+            if (!falling) {
+                if (!std::isfinite(stableY) || fabsf(p.world.y - stableY) < 0.5f) { if (!std::isfinite(stableY) || now - stableTick > 300) { stableY = p.world.y; } stableTick = now; }
+                else if (p.world.y > stableY) { stableY = p.world.y; stableTick = now; }   // walking up: follow
+                if (p.world.y < stableY - 3.0f) {
+                    falling = true;
+                    Log("[fallwatch] FALL: y %.2f is %.2f m below the last stable %.2f at (%.2f %.2f), falling for %lu ms", p.world.y, stableY - p.world.y, stableY, p.world.x, p.world.z, now - stableTick);
+                    uintptr_t comps = Deref(actor, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
+                    if (tf) {
+                        const uintptr_t a[4] = { tf + kOff_Tf_Pos, tf + kOff_Tf_Pos + 4, tf + kOff_Tf_Pos + 8, tf + kOff_Tf_Pos + 0x0C };
+                        if (!WatchWrites(a, 15, "fallwatch")) Log("[fallwatch] a write watch is already running");
+                    }
+                }
+            } else if (p.world.y < -2000.0f || now - stableTick > 60000) { falling = false; stableY = NAN; }
+            last = p; haveLast = true;
+        }
+    }).detach();
+}
 bool PlayerWorldPos(Vec3* out) { PosInfo p; if (!PlayerPosInfo(&p)) return false; *out = p.world; return true; }
 
 // ---- strings / describe ----
@@ -1524,6 +1560,7 @@ static void ProcessServerJobs() {   // a bounded number per tick: a batch of hun
     for (int n = 0; n < 8; n++) { std::function<void()> job; { std::lock_guard<std::mutex> l(g_serverJobsMutex); if (g_serverJobs.empty()) return; job = std::move(g_serverJobs.front()); g_serverJobs.pop_front(); } job(); }
 }
 static uintptr_t kRva_GimmickFromSave = 0, g_scopeAttacherVt = 0;
+static volatile DWORD g_gameSpawnTick = 0;   // last spawn the game made itself (HookGimmickSpawn)
 static volatile uintptr_t g_serverFieldObj = 0;   // the ServerField whose slot 9 tick runs our server jobs
 static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uintptr_t* soOut, uintptr_t* actOut);   // below
 static void ProcessGimmickQueue() {   // server thread, one object per tick
@@ -1542,10 +1579,17 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     // Template-free first: the game's own "gimmick from save data" builder with the prefab's gimmickinfo key and the level spawn
     // reason. It needs no captured spawn (works right after loading, no walking) and none of the replay's patching; the template
     // replay stays as the fallback when the key is unknown or the builder fails.
-    // Attach gimmicks (airship parts etc.) go through the template: near the player the builder's field create waited forever on
-    // a lock while attaching gimmick_attach_airship_02_marni (user log, stuck stack ...278d6d3 -> 2af9d17 -> ... -> 1851084 wait).
-    const bool attachPart = r.prefab.find("/attach/") != std::string::npos;
-    const bool directWanted = !r.directTried && !attachPart && kRva_GimmickFromSave && g_serverFieldObj;
+    // Not while the world is still streaming in: the create path takes an exclusive lock (0x2791cd0 -> 0x2a997e0 -> 0x1851010) that
+    // the loading side holds while it waits for this server thread, so a spawn a few seconds after loading waited forever (user
+    // logs: tower and airship parts, stuck stack ...278d6d3 -> 2af9d17 -> 27a4a7c -> 2792ae4 -> 27a208f -> 2a99a95 -> 1851084).
+    // Wait until the player has been in the world for 10 s and the game spawned nothing of its own for 3 s.
+    const DWORD nowQ = GetTickCount();
+    const bool worldQuiet = g_worldSince && nowQ - g_worldSince >= 10000 && nowQ - g_gameSpawnTick >= 3000;
+    const bool directWanted = !r.directTried && kRva_GimmickFromSave && g_serverFieldObj;
+    if (directWanted && !worldQuiet) {
+        static DWORD s_lastWaitLog = 0; if (nowQ - s_lastWaitLog > 10000) { s_lastWaitLog = nowQ; Log("[gimmick] %zu interactive object%s waiting until the world has finished loading", pending, pending == 1 ? "" : "s"); }
+        return;
+    }
     if (const uint32_t gkey = directWanted ? thumbgen::GimmickKey(r.prefab) : 0) {
         { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid) return; g_gimmickQueue.pop_front(); }
         uintptr_t standin = 0;
@@ -1679,6 +1723,7 @@ static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uin
 }
 static void* __fastcall HookGimmickSpawn(void* param, void* out, void* mgr, void* owner, void* s5, void* s6, void* s7, void* s8, void* s9, void* s10, void* s11, void* s12) {
     g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount();
+    if (!g_directArmed && !g_inGimmickReplay) g_gameSpawnTick = GetTickCount();   // the game's own spawns: the world is still loading
     if (g_directArmed && GetCurrentThreadId() == g_directThread && s8) {   // our template-free spawn: transform block scale3 quat4 pos3
         g_directArmed = false;
         float was[10] = {}; ReadBytes((uintptr_t)s8, was, 40);

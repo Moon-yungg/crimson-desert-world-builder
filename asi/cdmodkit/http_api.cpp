@@ -253,6 +253,9 @@ static std::string Handle(const std::string& method, const std::string& path, co
         for (size_t i = 0; i < pat.size(); i++) pat[i] = (uint8_t)strtoul(it->second.substr(i * 2, 2).c_str(), nullptr, 16);
         float mx = 16; Number(arg, "max", mx); core::ResearchFind(pat, std::clamp((int)mx, 1, 256)); status = 202; return "{\"started\":true}";
     }
+    if (method == "POST" && path == "/api/research/fallwatch") {   // research: {"on":1}
+        core::SetFallWatch(Flag(arg, "on")); return "{\"ok\":true}";
+    }
     if (method == "POST" && path == "/api/research/vtscan") {   // research: {"class":".?AVhknpHeightFieldShape@@","max":8,"bytes":256}
         auto it = arg.find("class"); if (it == arg.end() || it->second.size() < 6 || it->second.size() > 200) { status = 400; return Error("class (mangled RTTI name) required"); }
         float mx = 8, by = 256; Number(arg, "max", mx); Number(arg, "bytes", by);

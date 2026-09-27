@@ -181,6 +181,34 @@ static DWORD WINAPI CamWatchThread(LPVOID arg) {
     Log("[camwatch] done: %d writing sites", n);
     return 0;
 }
+// Generic: hardware write breakpoints on up to four 4-byte fields for 'seconds', every writing instruction logged once with
+// its hit count and call chain (same machinery as camwatch; only one watch at a time).
+struct WwArgs { uintptr_t addr[4]; int seconds; char tag[32]; };
+static DWORD WINAPI WatchWritesThread(LPVOID p) {
+    WwArgs a = *(WwArgs*)p; delete (WwArgs*)p;
+    for (auto& s : g_cwSites) { s.rip = 0; s.hits = 0; s.slot = 0; memset(s.chain, 0, sizeof s.chain); }
+    for (int i = 0; i < 4; i++) g_cwAddr[i] = a.addr[i];
+    if (!g_cwVeh) g_cwVeh = AddVectoredExceptionHandler(1, CamWatchVeh);
+    CwSetAll(true); Sleep(a.seconds * 1000); CwSetAll(false);
+    InterlockedExchange(&g_cwActive, 0);
+    int n = 0;
+    for (const auto& s : g_cwSites) {
+        if (!s.rip) continue; n++;
+        char line[400]; int k = 0;
+        for (int i = 0; i < 8 && s.chain[i]; i++) k += snprintf(line + k, sizeof line - k, InImage(s.chain[i]) ? " %llx" : " ?%llx", (unsigned long long)(InImage(s.chain[i]) ? s.chain[i] - g_base : s.chain[i]));
+        Log("[%s] DR%ld (%p) written before rva 0x%llx, %ld hits, chain:%s", a.tag, s.slot, (void*)g_cwAddr[s.slot],
+            (unsigned long long)(InImage((uintptr_t)s.rip) ? (uintptr_t)s.rip - g_base : (uintptr_t)s.rip), s.hits, line);
+    }
+    Log("[%s] write watch done: %d writing sites", a.tag, n);
+    return 0;
+}
+bool WatchWrites(const uintptr_t addr[4], int seconds, const char* tag) {
+    if (InterlockedCompareExchange(&g_cwActive, 1, 0) != 0) return false;
+    WwArgs* a = new WwArgs{}; for (int i = 0; i < 4; i++) a->addr[i] = addr[i]; a->seconds = seconds < 1 ? 1 : seconds > 60 ? 60 : seconds;
+    strncpy_s(a->tag, tag ? tag : "watch", _TRUNCATE);
+    CreateThread(nullptr, 0, WatchWritesThread, a, 0, nullptr);
+    return true;
+}
 void CamWatch(int seconds, int mode) {
     if (InterlockedCompareExchange(&g_cwActive, 1, 0) != 0) { Log("[camwatch] already running"); return; }
     CreateThread(nullptr, 0, CamWatchThread, (LPVOID)(intptr_t)((seconds < 1 ? 1 : seconds > 30 ? 30 : seconds) + 100 * (mode == 1 ? 1 : 0)), 0, nullptr);
