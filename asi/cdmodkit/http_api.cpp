@@ -275,6 +275,12 @@ static std::string Handle(const std::string& method, const std::string& path, co
         auto fr = arg.find("fn"); if (fr != arg.end()) core::FnTraceInstall((uintptr_t)strtoull(fr->second.c_str(), nullptr, 0));
         return "{\"ok\":true}";
     }
+    if (method == "POST" && path == "/api/research/iotrace") {   // research: {"filter":"height"} logs matching game loads and their reads; "" = off
+        auto f = arg.find("filter"); if (f != arg.end()) core::IoTraceSet(f->second);
+        float hd = 0; if (Number(arg, "hdelta", hd)) core::IoHeightDelta((int)hd);
+        float sd = 0; if (Number(arg, "sdelta", sd)) core::IoStreamDelta((int)sd);   // research: the same for the streamed (GPU) copy   // research: {"hdelta":12000} lowers height DDS samples as they load
+        return "{\"ok\":true}";
+    }
     if (method == "POST" && path == "/api/research/points") {   // research: reload bin64\cdmodkit\debugpoints.txt ({"clear":1} removes them)
         return "{\"points\":" + Int(core::LoadDebugPoints(Flag(arg, "clear"))) + "}";
     }

@@ -322,6 +322,18 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   level = [0,0,0,0,65535,65535,65535,65535], shape AABB y widened to the same range, then write the heights. Character-style
   probes inside 3 m dips: 22/22 hit (0/22 before). A proper rebuild of the tree from the new heights would keep culling tight.
   Seen in game: walking into and out of 3 m dips and up and down 3 m hills works, no sinking, no fall.
+- RENDER SOURCE FOUND (seen in game): the height16f DDS is loaded twice. (1) ResourceLoader::load from the
+  TerrainHeightTextureCache (0x3518580, header + data, 699178 B): a CPU copy only - editing it (in memory or at load) changes
+  neither the picture nor collision. (2) The texture streamer reads only the pixel data (file offset +128, 699050 B, header from
+  the texture header collection) through the async worker path (stack 13f2628 -> 12d3a87 -> 12d1340 -> worker slot 12
+  0x13a5800 -> NtReadFile; normal / mask / region / color textures come the same way and never pass ResourceLoader::load).
+  Shifting the u16 samples of THAT read (NtReadFile hook, diag.cpp, /api/research/iotrace {"sdelta":12000}, ranges from
+  bin64\cdmodkit\ioranges.txt, traceio.flag) lowered the visible terrain ~30 m AND the collision followed by itself (the
+  heightfield patches are captured from the rendered terrain on the GPU: CaptureHeightFieldCollision /
+  _readbackHeightFieldCollisionTexture / TerrainHeightFieldCollision_%d_%d). Terrain paks: 0015\49.paz / 50.paz, uncompressed,
+  unencrypted, "partial" entries. The reads completed synchronously (file cache); a robust patch belongs after completion.
+- Open: live update (re-stream a tile after an edit instead of only at load), per-sample edits in DDS space (height =
+  offset + v / 65535 * range from heighttable/sector_X_Z.xml, 2 m per texel, all 10 mips), persistence per project.
 - Open: one grid run over 3 m hills showed 30 new holes in a cluster at the edge of the loaded 5x5 area (~60 m away); a restore
   did not bring them back (by then the player had moved and patches had streamed), so probably streaming - recheck.
 - Research overlay: /api/research/points draws world points from bin64\cdmodkit\debugpoints.txt ("x y z rrggbb") with the

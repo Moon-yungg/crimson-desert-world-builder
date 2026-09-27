@@ -428,10 +428,93 @@ extern volatile LONG g_queueCount;
 // The loader instance is captured from the game's own calls (hook on the same function), the path object is built like DoSpawn's.
 static uintptr_t kRva_ResLoad = 0;
 typedef void* (__fastcall* ResLoadFn)(void* self, void** out, void* path, uint32_t flags);
+static void ReleaseHookPiece();
 static ResLoadFn g_origResLoad = nullptr; static void* g_resLoader = nullptr;
+// Research (/api/research/iotrace {"filter":"height"}): log the game's loads whose path contains the filter, plus the load
+// worker's read calls (vtable slots 4 / 5, hooked on first use from the worker the game uses) for those handlers.
+static char g_ioFilter[64] = ""; static volatile LONG g_ioLines = 0; static std::mutex g_ioMx; static std::set<uintptr_t> g_ioHandlers;
+// research: u16 amount subtracted from every height sample of terrain height DDS files as the game reads them (0 = off)
+static volatile LONG g_ioHeightDelta = 0; static std::set<uintptr_t> g_ioHeightHandlers;
+typedef void* (__fastcall* IoGen8)(void*, void*, void*, void*, void*, void*, void*, void*);
+static IoGen8 g_origWRead[2] = {};
+static bool IoHandlerTraced(void* h) { std::lock_guard<std::mutex> l(g_ioMx); return g_ioHandlers.count((uintptr_t)h) != 0; }
+static uint32_t IoShiftHeights(uint8_t* buf, uint32_t off, uint32_t len, int dlt) {   // L16 DDS: 128-byte header, then every mip as u16
+    uint32_t n = 0;
+    CDK_GUARD_BEGIN
+        for (uint32_t fo = (off < 128 ? 128 : (off + 1) & ~1u); fo + 2 <= off + len; fo += 2) {
+            uint16_t* v = (uint16_t*)(buf + (fo - off)); int x = (int)*v - dlt; *v = (uint16_t)(x < 0 ? 0 : x > 65535 ? 65535 : x); n++; }
+    CDK_GUARD_FAIL
+    CDK_GUARD_END
+    return n;
+}
+template<int K> static void* __fastcall HookWorkerRead(void* w, void* h, void* a, void* b, void* c, void* d, void* e, void* f) {
+    void* r = g_origWRead[K](w, h, a, b, c, d, e, f);
+    if (K == 1 && r && g_ioHeightDelta) {   // slot 5: read(worker, handler, u8* buf, u32 cap, u32 offset, u32 length)
+        const uint32_t off = (uint32_t)(uintptr_t)c, cap = (uint32_t)(uintptr_t)b; uint32_t len = (uint32_t)(uintptr_t)d; if (!len) len = cap;
+        bool mine; { std::lock_guard<std::mutex> l(g_ioMx); mine = g_ioHeightHandlers.erase((uintptr_t)h) != 0; }   // one whole-file read per
+        if (mine && (off != 0 || len < 0x10000)) mine = false;                                                      // handler, then forgotten (addresses are reused)
+        if (mine && a && len) { const uint32_t n = IoShiftHeights((uint8_t*)a, off, len, (int)g_ioHeightDelta);
+            Log("[io] height patch: handler %p off %u len %u, %u samples shifted by %d", h, off, len, n, -(int)g_ioHeightDelta); }
+    }
+    if (g_ioFilter[0] && InterlockedIncrement(&g_ioLines) < 2000 && IoHandlerTraced(h)) {
+        const uintptr_t ret = (uintptr_t)_ReturnAddress();
+        Log("[io] slot %d read: handler %p args %p %p %p %p -> %p (from 0x%llx, thread %lu)", K ? 5 : 4, h, a, b, c, d, r,
+            InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull, GetCurrentThreadId());
+    }
+    return r;
+}
+static std::string PathText(void* path) {   // NormalizedPath: first field points at the text or at a pointer to it
+    char s[200] = { 0 }; uintptr_t p0 = 0;
+    if (!ReadPtr((uintptr_t)path, &p0) || !p0) return "";
+    for (int hop = 0; hop < 2; hop++) {
+        if (ReadBytes(p0, s, sizeof s - 1)) { size_t n = 0; while (n < sizeof s - 1 && s[n] >= 0x20 && s[n] < 0x7f) n++;
+            if (n >= 4 && (s[n] == 0)) return std::string(s, n); }
+        if (!ReadPtr(p0, &p0) || !p0) break;
+    }
+    return "";
+}
+static void __fastcall IoHookWorker(uintptr_t worker) {
+    static bool s_done = false; if (s_done || !worker) return;
+    uintptr_t vt = 0; if (!ReadPtr(worker, &vt) || !InImage(vt)) return;
+    s_done = true;
+    for (int k = 0; k < 2; k++) {
+        uintptr_t fn = 0; if (!ReadPtr(vt + (k ? 5 : 4) * 8, &fn) || !InImage(fn)) continue;
+        ReleaseHookPiece();
+        void* det = k ? (void*)&HookWorkerRead<1> : (void*)&HookWorkerRead<0>;
+        if (MH_CreateHook((void*)fn, det, (void**)&g_origWRead[k]) == MH_OK && MH_EnableHook((void*)fn) == MH_OK) Log("[io] worker slot %d hooked (rva 0x%llx)", k ? 5 : 4, (unsigned long long)(fn - g_base));
+        else Log("[io] hooking worker slot %d failed", k ? 5 : 4);
+    }
+}
 static void* __fastcall HookResLoad(void* self, void** out, void* path, uint32_t flags) {
     if (!g_resLoader && self) { g_resLoader = self; Log("resource loader captured %p (%s)", self, RttiName((uintptr_t)self) ? RttiName((uintptr_t)self) : "?"); }
-    return g_origResLoad(self, out, path, flags);
+    void* r = g_origResLoad(self, out, path, flags);
+    if (g_ioFilter[0] && g_ioLines < 2000) {
+        const std::string s = PathText(path);
+        if (!s.empty() && s.find(g_ioFilter) != std::string::npos) {
+            InterlockedIncrement(&g_ioLines);
+            uintptr_t h = 0, worker = 0; uint32_t s34 = 0, s38 = 0; uint8_t fl = 0; ReadPtr((uintptr_t)out, &h);
+            if (h) { ReadPtr(h + 0x20, &worker); ReadBytes(h + 0x34, &s34, 4); ReadBytes(h + 0x38, &s38, 4); ReadBytes(h + 0x3c, &fl, 1); }
+            const uintptr_t ret = (uintptr_t)_ReturnAddress();
+            Log("[io] load %s flags 0x%x -> handler %p (%s) worker %p sizes %u/%u fl 0x%02x (from 0x%llx, thread %lu)", s.c_str(), flags, (void*)h,
+                h && RttiName(h) ? RttiName(h) : "?", (void*)worker, s34, s38, fl, InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull, GetCurrentThreadId());
+            if (h) { std::lock_guard<std::mutex> l(g_ioMx); g_ioHandlers.insert(h); }
+            IoHookWorker(worker);
+        }
+    }
+    if (g_ioHeightDelta) {   // research: remember the handlers of terrain height files for the read patch above
+        const std::string s = PathText(path); uintptr_t h = 0; ReadPtr((uintptr_t)out, &h);
+        if (h && s.find("/height16f/") == std::string::npos) { std::lock_guard<std::mutex> l(g_ioMx); g_ioHeightHandlers.erase(h); }
+        if (h && s.find("/height16f/") != std::string::npos) { { std::lock_guard<std::mutex> l(g_ioMx); g_ioHeightHandlers.insert(h); }
+            uintptr_t worker = 0; ReadPtr(h + 0x20, &worker); IoHookWorker(worker);
+        }
+    }
+    return r;
+}
+void IoHeightDelta(int d) { g_ioHeightDelta = d; Log("[io] height read patch %d", d); }
+void IoTraceSet(const std::string& filter) {
+    strncpy_s(g_ioFilter, filter.c_str(), _TRUNCATE); g_ioLines = 0;
+    { std::lock_guard<std::mutex> l(g_ioMx); g_ioHandlers.clear(); }
+    Log("[io] load trace filter '%s'", g_ioFilter);
 }
 static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* rtti, size_t rttiLen, bool* notFound, uint32_t offset, uint32_t length, uint32_t* storedTotal) {
     // load() returns a ResourceHandler_Paz: +0x20 worker (ResourceLoadWorker_Package), +0x34 / +0x38 sizes, +0x3c flags

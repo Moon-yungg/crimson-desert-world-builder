@@ -3,14 +3,16 @@
 // (CaptureTemplate / RunGroundCast) deliberately stays in cdmodkit.cpp next to the cast hooks it belongs to.
 //   fovtrace  - which camera field changes while zooming
 //   camtrace  - which camera field follows the view direction
-//   traceio   - log the game's call chain when it reads from a .paz pack (hooks kernel32!ReadFile, opt-in only)
+//   traceio   - log the game's call chain when it reads from a .paz pack (hooks ntdll!NtReadFile, opt-in only)
 #include "core_internal.h"
+#include "guard.h"
 #include <tlhelp32.h>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
+#include <map>
 #include <algorithm>
 #include "MinHook.h"
 
@@ -74,33 +76,83 @@ static DWORD WINAPI CamTraceThread(LPVOID arg) {
 void CamTrace(int seconds) { CreateThread(nullptr, 0, CamTraceThread, (LPVOID)(intptr_t)seconds, 0, nullptr); }
 
 // ---- pack I/O tracing (reverse engineering aid): logs the game's call chain when it reads from a .paz archive.
-// Enabled by the file bin64\cdmodkit\traceio.flag or the console command "traceio on".
+// Enabled by the file bin64\cdmodkit\traceio.flag (hook installed at start) and the console command "traceio on".
+// Hooks ntdll!NtReadFile (every file API ends there). Only disk files are looked at (named pipes stall on name queries,
+// which upset NvMessageBus.dll with the old ReadFile hook). With bin64\cdmodkit\ioranges.txt ("0015\49.paz offset size label"
+// per line, re-read by "traceio on") only reads overlapping those ranges are logged, otherwise the first 60 pack reads.
 static bool g_traceIo = false; static volatile LONG g_ioLogged = 0;
-void SetIoTrace(bool on) { g_traceIo = on; g_ioLogged = 0; Log("[io] trace %s", on ? "on" : "off"); }
-static decltype(&ReadFile) g_origReadFile = nullptr;
-static BOOL WINAPI HookReadFile(HANDLE h, LPVOID buf, DWORD n, LPDWORD read, LPOVERLAPPED ov) {
-    const BOOL r = g_origReadFile(h, buf, n, read, ov);
-    if (g_traceIo && g_ioLogged < 60) {
-        char name[MAX_PATH] = { 0 };
-        if (GetFinalPathNameByHandleA(h, name, MAX_PATH, 0)) {
-            size_t l = strlen(name);
-            if (l > 4 && _stricmp(name + l - 4, ".paz") == 0) {
-                InterlockedIncrement(&g_ioLogged);
-                void* frames[28]; USHORT k = RtlCaptureStackBackTrace(1, 28, frames, nullptr);
-                std::string s; for (USHORT i = 0; i < k; i++) { uintptr_t a = (uintptr_t)frames[i]; if (InImage(a)) { char b[32]; snprintf(b, sizeof b, " %llx", (unsigned long long)(a - g_base)); s += b; } }
-                const char* fn = strrchr(name, '\\'); const char* dir = fn ? fn - 1 : name; while (dir > name && *dir != '\\') dir--;
-                Log("[io] ReadFile %lu B %s off=%lu thread=%lu stack:%s", n, dir + 1, ov ? ov->Offset : 0, GetCurrentThreadId(), s.c_str());
-            }
+struct IoRange { std::string paz; unsigned long long off, size; std::string label; };
+static std::vector<IoRange> g_ioRanges; static SRWLOCK g_ioLock = SRWLOCK_INIT; static std::map<HANDLE, int> g_ioHandles;   // handle -> 0 other, 1 pack
+static thread_local bool t_inIoHook = false;
+static volatile LONG g_ioStreamDelta = 0;   // research: u16 shift for streamed terrain height data (0 = off)
+void IoStreamDelta(int d) { g_ioStreamDelta = d; Log("[io] stream height patch %d", d); }
+static uint32_t IoShiftSamples(uint8_t* buf, uint32_t n, int dlt) {
+    uint32_t k = 0;
+    CDK_GUARD_BEGIN
+        for (uint32_t o = 0; o + 2 <= n; o += 2) { uint16_t* v = (uint16_t*)(buf + o); int x = (int)*v - dlt; *v = (uint16_t)(x < 0 ? 0 : x > 65535 ? 65535 : x); k++; }
+    CDK_GUARD_FAIL
+    CDK_GUARD_END
+    return k;
+}
+static void LoadIoRanges() {
+    std::vector<IoRange> v; FILE* f = fopen((ModDir() + "\\ioranges.txt").c_str(), "r");
+    if (f) { char line[512]; while (fgets(line, sizeof line, f)) { char paz[64], lab[256] = ""; unsigned long long o, n;
+        if (sscanf(line, "%63s %llu %llu %255s", paz, &o, &n, lab) >= 3) v.push_back({ paz, o, n, lab }); } fclose(f); }
+    AcquireSRWLockExclusive(&g_ioLock); g_ioRanges.swap(v); g_ioHandles.clear(); ReleaseSRWLockExclusive(&g_ioLock);
+    Log("[io] %zu watched ranges", g_ioRanges.size());
+}
+void SetIoTrace(bool on) { if (on) LoadIoRanges(); g_traceIo = on; g_ioLogged = 0; Log("[io] trace %s", on ? "on" : "off"); }
+typedef LONG(NTAPI* NtReadFileFn)(HANDLE, HANDLE, void*, void*, void*, void*, ULONG, PLARGE_INTEGER, PULONG);
+static NtReadFileFn g_origNtReadFile = nullptr;
+static LONG NTAPI HookNtReadFile(HANDLE h, HANDLE ev, void* apc, void* apcCtx, void* iosb, void* buf, ULONG n, PLARGE_INTEGER off, PULONG key) {
+    if (!g_traceIo || t_inIoHook || g_ioLogged >= 3000) return g_origNtReadFile(h, ev, apc, apcCtx, iosb, buf, n, off, key);
+    t_inIoHook = true;
+    int kind = -1; AcquireSRWLockShared(&g_ioLock); auto it = g_ioHandles.find(h); if (it != g_ioHandles.end()) kind = it->second; ReleaseSRWLockShared(&g_ioLock);
+    char name[MAX_PATH] = { 0 };
+    if (kind != 0) {   // first sight of this handle (or a pack): resolve its name once
+        kind = 0;
+        if (GetFileType(h) == FILE_TYPE_DISK && GetFinalPathNameByHandleA(h, name, MAX_PATH, 0)) { size_t l = strlen(name); if (l > 4 && _stricmp(name + l - 4, ".paz") == 0) kind = 1; }
+        AcquireSRWLockExclusive(&g_ioLock); g_ioHandles[h] = kind; ReleaseSRWLockExclusive(&g_ioLock);
+    }
+    unsigned long long pos = ~0ull;
+    if (kind == 1) {
+        if (off && off->QuadPart >= 0) pos = (unsigned long long)off->QuadPart;
+        else { LARGE_INTEGER z{}, cur{}; if (SetFilePointerEx(h, z, &cur, FILE_CURRENT)) pos = (unsigned long long)cur.QuadPart; }
+    }
+    const LONG r = g_origNtReadFile(h, ev, apc, apcCtx, iosb, buf, n, off, key);
+    if (kind == 1) {
+        if (!name[0]) GetFinalPathNameByHandleA(h, name, MAX_PATH, 0);
+        const char* fn = strrchr(name, '\\'); const char* dir = fn ? fn - 1 : name; while (dir > name && *dir != '\\') dir--; if (*dir == '\\') dir++;
+        std::string label; bool want = false, heightData = false;
+        AcquireSRWLockShared(&g_ioLock);
+        if (g_ioRanges.empty()) want = g_ioLogged < 60;
+        else for (const auto& rg : g_ioRanges) if (_stricmp(rg.paz.c_str(), dir) == 0 && pos != ~0ull && pos < rg.off + rg.size && pos + n > rg.off) {
+            want = true; char b[320]; snprintf(b, sizeof b, " %s+%lld", rg.label.c_str(), (long long)(pos - rg.off)); label += b;
+            if (pos == rg.off + 128 && n == rg.size - 128 && rg.label.find("height16f/") != std::string::npos) heightData = true; }
+        ReleaseSRWLockShared(&g_ioLock);
+        if (heightData && g_ioStreamDelta && buf) {   // research: wait for the async read, then shift the L16 samples (races the consumer)
+            volatile LONG* st = (volatile LONG*)iosb; int waited = 0;
+            if (r == 0x103 && st) while (*st == 0x103 && waited < 2000) { Sleep(1); waited++; }
+            const uint32_t k = IoShiftSamples((uint8_t*)buf, n, g_ioStreamDelta);
+            Log("[io] stream height patch: %lu B at %p, %u samples shifted by %d after %d ms (status now %lx)", n, buf, k, -(int)g_ioStreamDelta, waited, st ? (unsigned long)*st : 0ul);
+        }
+        if (want) {
+            InterlockedIncrement(&g_ioLogged);
+            void* frames[28]; USHORT k = RtlCaptureStackBackTrace(1, 28, frames, nullptr);
+            std::string s; for (USHORT i = 0; i < k; i++) { uintptr_t a = (uintptr_t)frames[i]; if (InImage(a)) { char b[32]; snprintf(b, sizeof b, " %llx", (unsigned long long)(a - g_base)); s += b; } }
+            Log("[io] read %lu B %s pos=%llu buf=%p status=%lx async=%d thread=%lu%s stack:%s", n, dir, pos, buf, (unsigned long)r, ev || apc ? 1 : 0, GetCurrentThreadId(), label.c_str(), s.c_str());
         }
     }
+    t_inIoHook = false;
     return r;
 }
 void InstallIoTrace() {
     g_traceIo = GetFileAttributesA((ModDir() + "\\traceio.flag").c_str()) != INVALID_FILE_ATTRIBUTES;
-    if (!g_traceIo) return;   // the ReadFile hook upsets NvMessageBus.dll; only installed for an explicit trace run
-    HMODULE k32 = GetModuleHandleA("kernel32.dll"); if (!k32) return;
-    void* t = (void*)GetProcAddress(k32, "ReadFile"); if (!t) return;
-    if (MH_CreateHook(t, (void*)HookReadFile, (void**)&g_origReadFile) == MH_OK && MH_EnableHook(t) == MH_OK) Log("[io] ReadFile hooked (trace %s)", g_traceIo ? "on" : "off");
+    if (!g_traceIo) return;   // only installed for an explicit trace run
+    LoadIoRanges();
+    HMODULE nt = GetModuleHandleA("ntdll.dll"); if (!nt) return;
+    void* t = (void*)GetProcAddress(nt, "NtReadFile"); if (!t) return;
+    if (MH_CreateHook(t, (void*)HookNtReadFile, (void**)&g_origNtReadFile) == MH_OK && MH_EnableHook(t) == MH_OK) Log("[io] NtReadFile hooked (trace %s)", g_traceIo ? "on" : "off");
 }
 
 // ---- camwatch: which code writes the renderer camera's pose (free-fly camera research) ----
