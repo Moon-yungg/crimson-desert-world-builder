@@ -3341,15 +3341,24 @@ namespace editor {
             if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("%d cards per row"), c);
         }
         ImGui::SameLine(); ImGui::TextDisabled(T("double-click places"));
-        const float footer = 330.0f * ui;
-        const float listH = std::max(80.0f, ImGui::GetContentRegionAvail().y - footer);
+        // The placement controls below the cards are collapsible. Do not reserve their
+        // old worst-case height when both sections are closed: remember the height they
+        // actually used last frame and give the rest back to the browser.
+        static float s_dockPlacementH = 92.0f;
+        const float availH = ImGui::GetContentRegionAvail().y;
+        const float footer = std::clamp(s_dockPlacementH + ImGui::GetStyle().ItemSpacing.y,
+                                        28.0f * ui, std::max(28.0f * ui, availH - 80.0f));
+        const float listH = std::max(80.0f, availH - footer);
         {   // tile size from the window width: inner width of the bordered, scrollable child divided by the columns
             const ImGuiStyle& st = ImGui::GetStyle();
             const float inner = ImGui::GetContentRegionAvail().x - 2 * st.WindowPadding.x - st.ScrollbarSize - 2.0f;
             const float tile = floorf((inner - (g_dockCols - 1) * st.ItemSpacing.x) / g_dockCols) - 2 * 4.0f * ui;
             DrawCards(p, havePos, listH, ui, g_dockCols, std::max(32.0f, tile));
         }
+        const float controlsY = ImGui::GetCursorPosY();
         DrawDockPlacementControls(p, havePos, ui);
+        const float measuredControlsH = ImGui::GetCursorPosY() - controlsY;
+        if (measuredControlsH > 1.0f) s_dockPlacementH = measuredControlsH;
         ProcessBrowserDrag();
         ImGui::End();
         if (playAlpha) ImGui::PopStyleVar();
