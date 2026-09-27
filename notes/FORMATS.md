@@ -285,6 +285,17 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   slots (+0x200, +0xE8, +0x1E8, +0x368, +0xF8). Next: the ray / shape cast hooks (console "raytrace", castRay 0x428d080,
   worldCastRay 0x42b0b50, castShape 0x428d260, worldCastShape 0x42b0c50) while walking into a dip, to see the query type and
   length (likely a short downward cast, or a cached / filtered ground source).
+- Ground probe (compact trace /api/research/groundtrace, caller rva 0x32554fa): a sphere cast starting 0.77 m above the feet,
+  0 / -2 / 0 displacement (2 m down), plus ~0.5 m step casts. Over a 3 m dip it misses more and more although the dipped ground
+  is within its reach, then the controller gives up.
+- Collision map (/api/research/groundgrid: the same cast replayed on a grid; scratchpad collision_map.py -> PNG): patches are
+  32 x 32 m (65 samples, 0.5 m apart), 5 x 5 loaded around the player; cast from above, every dip is found (no holes).
+- The failing case, reproduced with the grid tool: a cast starting 0.77 m above the DIPPED ground and 2 m down hits for dips up to
+  ~1.06 m and misses for every dip from ~1.3 m (start more than ~0.3-0.5 m below the ORIGINAL surface) - exactly like the same
+  casts against the restored original ground. So casts starting "inside" the old ground find nothing (one-sided heightfield),
+  and the inside test uses data we have not found: not the float heights, not the bounding-volume tree (lower levels or root),
+  not the in-memory height tile. Next: the hknpHeightFieldShape cast code (vtable rva 0x530ab48 slots) - where it decides
+  that the start lies below the surface and which data it reads.
 - Open: what drops the character 1-2 m below the original ground (a write breakpoint on the player's position during the drop
   / respawn would find the code), and the hknp body per patch (placement, broadphase AABB).
 - Pitfall: after a fall the game streams patches out; writing saved addresses then corrupts its heap (one crash). Check the

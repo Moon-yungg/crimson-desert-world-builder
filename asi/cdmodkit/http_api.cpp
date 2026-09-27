@@ -259,6 +259,19 @@ static std::string Handle(const std::string& method, const std::string& path, co
         float pl = 0x400, bp = 1; Number(arg, "bytes", pl); Number(arg, "breakpoints", bp);
         core::SetFallWatch(Flag(arg, "on"), a, bp != 0, pa, (unsigned)pl); return "{\"ok\":true}";
     }
+    if (method == "POST" && path == "/api/research/groundgrid") {   // research: {"x0","z0","nx","nz","step","top","len"} -> heights (null = no ground)
+        float x0 = 0, z0 = 0, nx = 64, nz = 64, st = 2, top = 700, len = 400;
+        if (!Number(arg, "x0", x0, true) || !Number(arg, "z0", z0, true)) { status = 400; return Error("x0/z0 required"); }
+        Number(arg, "nx", nx); Number(arg, "nz", nz); Number(arg, "step", st); Number(arg, "top", top); Number(arg, "len", len);
+        std::vector<float> h;
+        if (!core::GroundGrid(x0, z0, (int)nx, (int)nz, st, top, len, &h)) { status = 503; return Error("ground grid not available or timed out"); }
+        std::string out = "{\"h\":["; char t[24];
+        for (size_t i = 0; i < h.size(); i++) { if (i) out += ','; if (std::isfinite(h[i])) { snprintf(t, sizeof t, "%.2f", h[i]); out += t; } else out += "null"; }
+        return out + "]}";
+    }
+    if (method == "POST" && path == "/api/research/groundtrace") {   // research: {"seconds":15}
+        float sec = 15; Number(arg, "seconds", sec); core::GroundTrace((int)sec); return "{\"ok\":true}";
+    }
     if (method == "POST" && path == "/api/research/findpos") {   // research: log where the server actor keeps the player's position
         core::ResearchFindPos(); return "{\"done\":true}";
     }

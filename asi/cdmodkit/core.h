@@ -50,7 +50,8 @@ namespace core {
     void ResearchPeek(uintptr_t addr, int bytes, bool u16);   // research: log raw memory
     void ResearchFind(const std::vector<uint8_t>& pat, int maxHits);   // research: byte pattern search (logged)
     void SetFallWatch(bool on, uintptr_t addr = 0, bool breakpoints = true, uintptr_t probe = 0, unsigned probeLen = 0);   // research: log falls of the player, the code that moves it (addr: explicit field) and what changed in a probed object
-    void ResearchFindPos();   // research: search the player's server actor for its position
+    void ResearchFindPos();
+    void GroundTrace(int seconds);   // research: log the character's ground probe casts for a few seconds   // research: search the player's server actor for its position
     void ResearchVtScan(const std::string& mangled, int maxHits, int dumpBytes);   // research: live objects of an RTTI class (logged)
     void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)
@@ -75,7 +76,8 @@ namespace core {
     struct GroundHit { bool done = false, hit = false; float centerY = 0; float fraction = 0; Vec3 normal{}; };
     bool GroundProbeReady();                   // a cast template was captured (the character has to be in the world for a moment)
     int  GroundProbe(Vec3 start, float len);   // queues a cast from start straight down on the game thread; ticket (0 = not possible)
-    bool GroundResult(int ticket, GroundHit* out);   // true once the ticket finished (poll every frame)
+    bool GroundResult(int ticket, GroundHit* out);
+    bool GroundGrid(float x0, float z0, int nx, int nz, float step, float top, float len, std::vector<float>* out);   // research: collision heights on a grid (NAN = none)   // true once the ticket finished (poll every frame)
     extern float g_probeRadius;                // sphere radius of the template, calibrated at the player's feet (ground = centerY - radius)
 
     void RunOnGameThread(std::function<void()> f);

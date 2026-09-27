@@ -2589,9 +2589,31 @@ static void ResolveGimmickSpawn() {
     kRva_GimmickSpawn = f - g_base; kRva_GimmickSpawn_ = kRva_GimmickSpawn;
     Log("resolved %-20s rva 0x%llx (via signature)", "gimmick spawn", (unsigned long long)kRva_GimmickSpawn);
 }
+// Research: compact log of the character's own ground probes (sphere casts starting within 4 m of the player) for a few
+// seconds: caller, start y, displacement, length, hit count, fraction and the resulting hit height. Walking into an edited dip
+// shows whether the probe is too short or does not see the edited ground at all.
+static volatile ULONGLONG g_groundTraceUntil = 0;
+void GroundTrace(int seconds) { g_groundTraceUntil = GetTickCount64() + (ULONGLONG)std::clamp(seconds, 1, 60) * 1000; Log("[groundtrace] %d s", seconds); }
+static void LogGroundProbe(void* q, void* col, uintptr_t ret) {
+    uintptr_t shape = 0; float s[4] = {}, dv[8] = {};
+    if (!ReadBytes((uintptr_t)q + 0x28, &shape, 8) || !shape || !ReadBytes((uintptr_t)q + 0x30, s, 16) || !ReadBytes((uintptr_t)q + 0x40, dv, 32)) return;
+    const char* sn = RttiName(shape); if (!sn || !strstr(sn, "hknpSphereShape")) return;
+    PosInfo pi{}; if (!PlayerPosInfo(&pi)) return;
+    if (fabsf(s[0] - pi.tiled.x) > 1.0f || fabsf(s[2] - pi.tiled.z) > 1.0f || fabsf(s[1] - pi.tiled.y) > 6.0f) return;   // the player's own probe
+    if (fabsf(dv[0]) > 0.01f || fabsf(dv[2]) > 0.01f || dv[1] > -0.5f) return;   // only the straight-down ground cast (the sideways ones are step / wall checks)
+    uint32_t nh = 0; double frac = 0; ReadBytes((uintptr_t)col + 0x0C, &nh, 4); ReadBytes((uintptr_t)col + 0x10, &frac, 8);
+    const float hitY = nh ? s[1] + (float)frac * dv[1] : NAN;
+    Log("[groundtrace] from rva 0x%llx: start y %.2f (player %.2f) disp (%.2f %.2f %.2f %.2f) len %.2f | hits %u frac %.4f -> y %.2f",
+        InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull, s[1], pi.tiled.y, dv[0], dv[1], dv[2], dv[3], dv[7], nh, nh ? frac : 0.0, hitY);
+}
 static void* __fastcall HookWorldCastShape(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
     const bool trace = g_shapeTraceLeft > 0 && InterlockedDecrement(&g_shapeTraceLeft) >= 0;
     if (!g_tpl.have || g_tpl.world != a) { std::lock_guard<std::mutex> l(g_tplMutex); CaptureTemplate(a, b, c, d); }   // automatic, once per world
+    if (g_groundTraceUntil && GetTickCount64() < g_groundTraceUntil) {
+        void* r = g_origWorldCastShape(a, b, c, d, e, f, g, h);
+        LogGroundProbe(b, d, (uintptr_t)_ReturnAddress());
+        return r;
+    }
     if (!trace) return g_origWorldCastShape(a, b, c, d, e, f, g, h);
     std::lock_guard<std::recursive_mutex> lock(g_traceMutex);
     uintptr_t ret = (uintptr_t)_ReturnAddress();
@@ -2657,9 +2679,27 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
     for (const auto& rq : batch) {
         const int tx = (int)(rq.start.x * 0.001), tz = (int)(rq.start.z * 0.001);
         GroundHit h; if (!RunGroundCast(world, rq.start, rq.len, tx, tz, &h, rq.verbose)) { h.done = true; h.hit = false; }
-        std::lock_guard<std::mutex> l(g_groundMutex); g_groundResults[rq.id] = h; if (g_groundResults.size() > 200) g_groundResults.erase(g_groundResults.begin());
+        std::lock_guard<std::mutex> l(g_groundMutex); g_groundResults[rq.id] = h; if (g_groundResults.size() > 40000) g_groundResults.erase(g_groundResults.begin());
     }
     s_inside = false;
+}
+// Research: the collision height on a grid (the character's own sphere cast, replayed straight down from 'top' over 'len' m),
+// queued in one batch and served on the game thread like GroundProbe. Returns the sphere centre heights (NAN = nothing found).
+bool GroundGrid(float x0, float z0, int nx, int nz, float step, float top, float len, std::vector<float>* out) {
+    if (!GroundProbeReady() || !GameThreadReady() || nx < 1 || nz < 1 || nx * nz > 20000) return false;
+    std::vector<int> ids; ids.reserve((size_t)nx * nz);
+    for (int j = 0; j < nz; j++) for (int i = 0; i < nx; i++) ids.push_back(QueueGround({ x0 + i * step, top, z0 + j * step }, len, false));
+    RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });
+    out->assign(ids.size(), NAN);
+    const ULONGLONG until = GetTickCount64() + 20000; size_t done = 0;
+    while (done < ids.size() && GetTickCount64() < until) {
+        Sleep(20); done = 0;
+        for (size_t k = 0; k < ids.size(); k++) {
+            if (ids[k] == 0) { done++; continue; }
+            GroundHit h; if (GroundResult(ids[k], &h)) { (*out)[k] = h.hit ? h.centerY : NAN; ids[k] = 0; done++; }
+        }
+    }
+    return done == ids.size();
 }
 int GroundProbe(Vec3 start, float len) {
     if (!GroundProbeReady() || !GameThreadReady()) return 0;
