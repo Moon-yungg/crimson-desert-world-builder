@@ -45,7 +45,7 @@ static std::map<std::pair<int, int>, TileEdit> g_tiles;
 static std::map<uintptr_t, PendingRead> g_pending;   // completion event -> read waiting to be patched
 static bool g_ok = false; static std::string g_why = "not installed";
 static volatile LONG g_patched = 0, g_missed = 0;
-static volatile LONG g_watchNext = 0;   // research: arm a read watch on the next patched whole-tile buffer (who consumes it)
+static volatile LONG g_watchNext = 0; static volatile LONG g_retTraceOn = 0;   // research: arm a read watch on the next patched whole-tile buffer (who consumes it)
 void TerrainWatchNext() { InterlockedExchange(&g_watchNext, 1); }
 
 typedef uint8_t(__fastcall* StreamReqFn)(uintptr_t req); static StreamReqFn g_origReq = nullptr;
@@ -179,9 +179,106 @@ void TerrainReloadCall(uintptr_t obj, int slot, const std::string& name) {
             (unsigned long long)(g_lastFaultAddr >= g_base ? g_lastFaultAddr - g_base : 0), (void*)g_lastFaultInfo);
     });
 }
+// Research: the texture creation from streamed data (0x3770440 on 2976): r9 = SharedPtr<texture>*; logs the texture's name.
+static Gen10 g_origTexCreate = nullptr; static volatile LONG g_texNames = 0; static std::map<std::pair<int, int>, uintptr_t> g_texOf;
+static const char* TexNameGuarded(uintptr_t tex) {
+    const char* r = nullptr;
+    CDK_GUARD_BEGIN
+        const uintptr_t nameObj = *(uintptr_t*)(tex + 0x78);
+        if (nameObj) r = ((const char* (__fastcall*)(uintptr_t))(*(uintptr_t*)(*(uintptr_t*)nameObj + 8)))(nameObj);
+    CDK_GUARD_FAIL r = nullptr;
+    CDK_GUARD_END
+    return r;
+}
+static uintptr_t __fastcall HookTexCreate(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f, uintptr_t g, uintptr_t h, uintptr_t i, uintptr_t j) {
+    uintptr_t tex = 0; if (d) ReadBytes(d, &tex, 8);
+    const uintptr_t r = g_origTexCreate(a, b, c, d, e, f, g, h, i, j);
+    if (tex) { const char* n = TexNameGuarded(tex); char nm[200] = { 0 }; if (n) ReadBytes((uintptr_t)n, nm, sizeof nm - 1);
+        if (InterlockedIncrement(&g_texNames) <= 15 || strstr(nm, "height16f")) Log("[terrain] texture %p name '%s' (create returned %llx)", (void*)tex, nm, (unsigned long long)(r & 0xFF));
+        int tx = 0, tz = 0; if (ParseTilePath(nm, &tx, &tz)) { std::lock_guard<std::mutex> l(g_mx); g_texOf[{ tx, tz }] = tex; } }
+    return r;
+}
+void TerrainTexTrace(uintptr_t rva) {
+    static bool s_done = false; if (s_done || !rva) return; s_done = true;
+    if (InstallInternalHook((void*)(g_base + rva), (void*)HookTexCreate, (void**)&g_origTexCreate, "terrain texture create (research)")) Log("[terrain] texture trace on rva 0x%llx", (unsigned long long)rva);
+}
+// Research: the texture resource's synchronous reload (0x3772ee0 on 2976): (texture, [manager+0x10], 0, [manager+0x48]).
+static uint8_t CallTexReloadGuarded(uintptr_t fn, uintptr_t tex, uintptr_t dev, uintptr_t extra) {
+    uint8_t r = 0xEE;
+    CDK_GUARD_BEGIN
+        r = ((uint8_t(__fastcall*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t))fn)(tex, dev, 0, extra);
+    CDK_GUARD_FAIL r = 0xFF; g_lastFaultCode = cdk::t_fault.rec.ExceptionCode; g_lastFaultAddr = (uintptr_t)cdk::t_fault.rec.ExceptionAddress;
+    CDK_GUARD_END
+    return r;
+}
+void TerrainTexReload(int tx, int tz, uintptr_t mgr, uintptr_t rva) {
+    uintptr_t tex = 0; { std::lock_guard<std::mutex> l(g_mx); auto it = g_texOf.find({ tx, tz }); if (it != g_texOf.end()) tex = it->second; }
+    if (!tex || !mgr) { Log("[terrain] texreload: tile %d,%d texture %p manager %p", tx, tz, (void*)tex, (void*)mgr); return; }
+    RunOnGameThread([tex, mgr, rva, tx, tz]() {
+        uintptr_t dev = 0, extra = 0; ReadBytes(mgr + 0x10, &dev, 8); ReadBytes(mgr + 0x48, &extra, 8);
+        Log("[terrain] texreload tile %d,%d: texture %p, manager %p (+10 %p, +48 %p)", tx, tz, (void*)tex, (void*)mgr, (void*)dev, (void*)extra);
+        g_retTraceOn = 1; const uint8_t r = CallTexReloadGuarded(g_base + rva, tex, dev, extra); g_retTraceOn = 0;
+        Log("[terrain] texreload returned %u (fault %08lx at rva 0x%llx)", r, g_lastFaultCode, (unsigned long long)(g_lastFaultAddr >= g_base ? g_lastFaultAddr - g_base : 0));
+    });
+}
+// Research: log arguments and return value of up to 6 functions (rva given at runtime) while g_retTraceOn is set.
+static Gen10 g_retOrig[6] = {}; static uintptr_t g_retRva[6] = {};
+template<int K> static uintptr_t __fastcall RetThunk(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f, uintptr_t g, uintptr_t h, uintptr_t i, uintptr_t j) {
+    const uintptr_t r = g_retOrig[K](a, b, c, d, e, f, g, h, i, j);
+    if (g_retTraceOn) { const uintptr_t ret = (uintptr_t)_ReturnAddress();
+        Log("[terrain] fn 0x%llx(%llx, %llx, %llx, %llx, %llx, %llx) -> %llx (from 0x%llx)", (unsigned long long)g_retRva[K], (unsigned long long)a, (unsigned long long)b, (unsigned long long)c,
+            (unsigned long long)d, (unsigned long long)e, (unsigned long long)f, (unsigned long long)r, (unsigned long long)(ret - g_base)); }
+    return r;
+}
+void TerrainRetTrace(uintptr_t rva) {
+    static void* th[6] = { (void*)&RetThunk<0>, (void*)&RetThunk<1>, (void*)&RetThunk<2>, (void*)&RetThunk<3>, (void*)&RetThunk<4>, (void*)&RetThunk<5> };
+    for (int k = 0; k < 6; k++) if (!g_retRva[k]) {
+        if (InstallInternalHook((void*)(g_base + rva), th[k], (void**)&g_retOrig[k], "terrain ret trace (research)")) { g_retRva[k] = rva; Log("[terrain] ret trace %d on rva 0x%llx", k, (unsigned long long)rva); }
+        return;
+    }
+}
+void TerrainRetTraceOn(bool on) { g_retTraceOn = on ? 1 : 0; }
+// Research: the terrain tile load task (0x3518580 on 2976): logs its arguments, their RTTI and the first qwords.
+static Gen10 g_origTileTask = nullptr; static volatile LONG g_tileTaskLines = 0;
+static std::string DescribePtr(uintptr_t p) {
+    char b[200]; uint64_t q[6] = {}; ReadBytes(p, q, sizeof q); const char* rt = RttiName(p);
+    snprintf(b, sizeof b, "%llx(%s: %llx %llx %llx %llx %llx %llx)", (unsigned long long)p, rt ? rt : "-", q[0], q[1], q[2], q[3], q[4], q[5]); return b;
+}
+static uintptr_t __fastcall HookTileTask(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f, uintptr_t g, uintptr_t h, uintptr_t i, uintptr_t j) {
+    const bool log = InterlockedIncrement(&g_tileTaskLines) <= 30;
+    if (log) { uint64_t cq[6] = {}; ReadBytes(c, cq, sizeof cq);
+        Log("[terrain] tile task a=%llx c=%s", (unsigned long long)a, DescribePtr(c).c_str());
+        for (int k : { 2, 4 }) if (cq[k]) { uint64_t e[4] = {}; ReadBytes(cq[k], e, sizeof e);
+            Log("[terrain]   c[%d] -> %s", k, DescribePtr(cq[k]).c_str()); for (int m = 0; m < 4; m++) if (e[m] > 0x10000000000ull && e[m] < 0x7ff000000000ull) Log("[terrain]     [%d] -> %s", m, DescribePtr(e[m]).c_str()); } }
+    const uintptr_t r = g_origTileTask(a, b, c, d, e, f, g, h, i, j);
+    if (log) { uint8_t st = 0; ReadBytes(d, &st, 1); Log("[terrain] tile task done, status %u", st); }
+    return r;
+}
+void TerrainTileTaskTrace(uintptr_t rva) {
+    static bool s_done = false; if (s_done || !rva) return; s_done = true;
+    if (InstallInternalHook((void*)(g_base + rva), (void*)HookTileTask, (void**)&g_origTileTask, "terrain tile task (research)")) Log("[terrain] tile task trace on rva 0x%llx", (unsigned long long)rva);
+}
 void TerrainJobTrace(uintptr_t rva) {
     static bool s_done = false; if (s_done || !rva) return; s_done = true;
     if (InstallInternalHook((void*)(g_base + rva), (void*)HookJobExec, (void**)&g_origJobExec, "terrain job exec (research)")) Log("[terrain] job trace on rva 0x%llx", (unsigned long long)rva);
+}
+// BasicsResourceLoader slot 8: the synchronous read into a game buffer object {u8* data, u32 size, u32 capacity, ...}
+// (loader, const NormalizedPathA* path, buffer*, allocator, u32 a, u32 b, u32 flags). Used by the texture's own reload.
+typedef uint8_t(__fastcall* SyncLoadFn)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uint32_t, uint32_t, uint32_t);
+static SyncLoadFn g_origSyncLoad = nullptr;
+static uint8_t __fastcall HookSyncLoad(uintptr_t self, uintptr_t path, uintptr_t buf, uintptr_t alloc, uint32_t a, uint32_t b, uint32_t fl) {
+    const uint8_t r = g_origSyncLoad(self, path, buf, alloc, a, b, fl);
+    if (g_retTraceOn) { uint8_t pb[48] = {}; ReadBytes(path, pb, sizeof pb); uintptr_t data = 0; uint32_t sz[2] = {}; ReadBytes(buf, &data, 8); ReadBytes(buf + 8, sz, 8);
+        char hx[100]; for (int i = 0; i < 48; i++) snprintf(hx + 2 * i, 3, "%02x", pb[i]);
+        Log("[terrain] sync read during reload: path obj %s text '%s' a %u b %u -> %u, buffer %p size %u", hx, PathObjText((void*)path).c_str(), a, b, r, (void*)data, sz[0]); }
+    if (g_ok && path && buf) {
+        const std::string s = PathObjText((void*)path); int tx = 0, tz = 0;
+        if (!s.empty() && ParseTilePath(s, &tx, &tz)) {
+            uintptr_t data = 0; uint32_t sz[2] = {}; ReadBytes(buf, &data, 8); ReadBytes(buf + 8, sz, 8);
+            Log("[terrain] sync read tile %d,%d: a %u b %u flags %x -> %u, buffer %p size %u cap %u", tx, tz, a, b, fl, r, (void*)data, sz[0], sz[1]);
+        }
+    }
+    return r;
 }
 void TerrainInstall() {
     // the streamer's request: stores the path at +8 and hands buffer holder / length / offset / event to the async worker read
@@ -194,6 +291,8 @@ void TerrainInstall() {
     if (!ReadBytes(poll, code, sizeof code) || !std::search(code, code + sizeof code, want, want + sizeof want)) { g_why = "completion poll layout changed"; Log("[terrain] disabled: %s", g_why.c_str()); return; }
     if (!InstallInternalHook((void*)req, (void*)HookStreamReq, (void**)&g_origReq, "terrain stream request")) { g_why = "hook failed"; return; }
     if (!InstallInternalHook((void*)poll, (void*)HookEvPoll, (void**)&g_origPoll, "terrain read completion")) { g_why = "hook failed"; return; }
+    { const uintptr_t lvt = VtableByName(".?AVBasicsResourceLoader@pa@@"); uintptr_t sl = 0;
+      if (lvt && ReadBytes(lvt + 8 * 8, &sl, 8) && sl) InstallInternalHook((void*)sl, (void*)HookSyncLoad, (void**)&g_origSyncLoad, "terrain sync read"); }
     g_ok = true; g_why = "ready";
     Log("[terrain] ready: stream request rva 0x%llx, completion poll rva 0x%llx", (unsigned long long)(req - g_base), (unsigned long long)(poll - g_base));
 }

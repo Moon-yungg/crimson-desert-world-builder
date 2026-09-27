@@ -215,6 +215,8 @@ static std::string Handle(const std::string& method, const std::string& path, co
         if (!core::FreeCamAvailable()) { status = 503; return Error("free camera not available in this game build (see log)"); }
         core::SetFreeCam(Flag(arg, "on"));
         float ty = 0, tp = 0; Number(arg, "turnYaw", ty); Number(arg, "turnPitch", tp); if (ty != 0 || tp != 0) core::FreeCamTurn(ty, tp);
+        float fx = 0, fy = 0, fz = 0, fr = 10;   // {"fx","fy","fz","fr"}: jump to look at a point (research: does streaming follow the camera?)
+        if (arg.count("fx") && Number(arg, "fx", fx, true) && Number(arg, "fy", fy, true) && Number(arg, "fz", fz, true)) { Number(arg, "fr", fr); core::FreeCamFocus(Vec3{ fx, fy, fz }, fr); }
         return core::FreeCamActive() ? "{\"on\":true}" : "{\"on\":false}";
     }
     if (method == "POST" && path == "/api/time") {   // {"hour":18} sets the visual time (keeps running), {"freeze":1} holds it, {"native":1} back to the game clock
@@ -287,6 +289,11 @@ static std::string Handle(const std::string& method, const std::string& path, co
         { float ls = 0; if (arg.count("loadtrace") && Number(arg, "loadtrace", ls, true)) core::TerrainLoadTrace((int)ls); }   // research
         { auto ro = arg.find("reloadobj"), rn = arg.find("reloadname"); float sl = 78; Number(arg, "slot", sl);
           if (ro != arg.end() && rn != arg.end()) core::TerrainReloadCall((uintptr_t)strtoull(ro->second.c_str(), nullptr, 0), (int)sl, rn->second); }   // research
+        { auto mg = arg.find("texreload"); float tx = 0, tz = 0; auto rv = arg.find("rva");
+          if (mg != arg.end() && Number(arg, "tx", tx, true) && Number(arg, "tz", tz, true)) core::TerrainTexReload((int)tx, (int)tz, (uintptr_t)strtoull(mg->second.c_str(), nullptr, 0), rv == arg.end() ? 0x3772ee0 : (uintptr_t)strtoull(rv->second.c_str(), nullptr, 0)); }   // research
+        { auto rt = arg.find("rettrace"); if (rt != arg.end()) core::TerrainRetTrace((uintptr_t)strtoull(rt->second.c_str(), nullptr, 0)); }   // research
+        { auto tk = arg.find("tiletask"); if (tk != arg.end()) core::TerrainTileTaskTrace((uintptr_t)strtoull(tk->second.c_str(), nullptr, 0)); }   // research
+        { auto tt = arg.find("textrace"); if (tt != arg.end()) core::TerrainTexTrace((uintptr_t)strtoull(tt->second.c_str(), nullptr, 0)); }   // research
         { auto jt = arg.find("jobtrace"); if (jt != arg.end()) core::TerrainJobTrace((uintptr_t)strtoull(jt->second.c_str(), nullptr, 0)); }   // research   // research: read watch on the next patched tile buffer
         float x = 0, z = 0, r = 0, dm = 0, tx = 0, tz = 0;
         if (arg.count("tx") && Number(arg, "tx", tx, true) && Number(arg, "tz", tz, true) && Number(arg, "dm", dm, true)) return "{\"tiles\":" + Int(core::TerrainEditTile((int)tx, (int)tz, dm)) + "}";
