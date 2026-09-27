@@ -2609,6 +2609,19 @@ static void ResolveGimmickSpawn() {
 // seconds: caller, start y, displacement, length, hit count, fraction and the resulting hit height. Walking into an edited dip
 // shows whether the probe is too short or does not see the edited ground at all.
 static volatile ULONGLONG g_groundTraceUntil = 0;
+static std::mutex g_dbgMutex; static std::vector<DebugPt> g_dbgPts;
+std::vector<DebugPt> DebugPoints() { std::lock_guard<std::mutex> l(g_dbgMutex); return g_dbgPts; }
+size_t DebugPointCount() { std::lock_guard<std::mutex> l(g_dbgMutex); return g_dbgPts.size(); }
+int LoadDebugPoints(bool clear) {   // research overlay: world points (e.g. the collision map of an edited area) drawn in game
+    std::vector<DebugPt> v;
+    if (!clear) {
+        FILE* f = fopen((ModDir() + "\\debugpoints.txt").c_str(), "r");
+        if (f) { char line[128]; while (fgets(line, sizeof line, f) && v.size() < 50000) { DebugPt d{}; unsigned c = 0xFFFFFF;
+            if (sscanf(line, "%f %f %f %x", &d.p.x, &d.p.y, &d.p.z, &c) >= 3) { d.col = 0xFF000000u | ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF); v.push_back(d); } }   // rrggbb -> ImGui ABGR
+            fclose(f); }
+    }
+    std::lock_guard<std::mutex> l(g_dbgMutex); g_dbgPts.swap(v); Log("[points] %zu debug points", g_dbgPts.size()); return (int)g_dbgPts.size();
+}
 void GroundTrace(int seconds) { g_groundTraceUntil = GetTickCount64() + (ULONGLONG)std::clamp(seconds, 1, 60) * 1000; Log("[groundtrace] %d s", seconds); }
 static void LogGroundProbe(void* q, void* col, uintptr_t ret) {
     uintptr_t shape = 0; float s[4] = {}, dv[8] = {};

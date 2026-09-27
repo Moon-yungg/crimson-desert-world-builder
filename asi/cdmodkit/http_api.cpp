@@ -274,6 +274,9 @@ static std::string Handle(const std::string& method, const std::string& path, co
         if (Flag(arg, "arm")) core::GeoTraceArm();
         return "{\"ok\":true}";
     }
+    if (method == "POST" && path == "/api/research/points") {   // research: reload bin64\cdmodkit\debugpoints.txt ({"clear":1} removes them)
+        return "{\"points\":" + Int(core::LoadDebugPoints(Flag(arg, "clear"))) + "}";
+    }
     if (method == "POST" && path == "/api/research/groundtrace") {   // research: {"seconds":15}
         float sec = 15; Number(arg, "seconds", sec); core::GroundTrace((int)sec); return "{\"ok\":true}";
     }

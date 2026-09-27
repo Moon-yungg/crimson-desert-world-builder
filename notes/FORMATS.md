@@ -304,6 +304,14 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   0x428d5f2 <- worldCastShape 0x42b0d2d. After the quad fetch the triangle / sphere test (from 0x42d1731 / 0x42d14eb) rejects it.
 - Same xz points, different dip depths: 1 m dips always hit, 2-3 m dips always miss, the limit is ~1.35-1.5 m (varies per
   point) - depth, not the quad's material (6 vs 24 was a coincidence).
+- Raising has the same limit as lowering (character-style casts over hills: all hit up to 1 m, none from 2 m). Opening the
+  bounding-volume tree changes nothing at all (identical results with and without): it is not what culls.
+- The exact rule (start-height sweep over 3 m dips): a cast finds the NEW ground only if its start lies above roughly
+  (OLD ground - 0.5..0.7 m). So a "start inside the ground" pre-check still uses the old heights; its source is still unknown
+  (not the floats, the tree incl. root, the height tile cache, the shape AABB). The character starts 0.77 m above its feet,
+  hence ~1.3-1.5 m of change in either direction is the limit.
+- Research overlay: /api/research/points draws world points from bin64\cdmodkit\debugpoints.txt ("x y z rrggbb") with the
+  editor open or closed (scratchpad show_points.py: grey reference, blue lowered, red beyond the limit).
 - Open: what drops the character 1-2 m below the original ground (a write breakpoint on the player's position during the drop
   / respawn would find the code), and the hknp body per patch (placement, broadphase AABB).
 - Pitfall: after a fall the game streams patches out; writing saved addresses then corrupts its heap (one crash). Check the

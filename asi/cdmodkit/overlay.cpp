@@ -1095,8 +1095,7 @@ namespace overlay {
             core::g_uiWantsKeyboard = false;
             core::g_uiTextInput = false;
             core::g_uiMouseOverUi = false;
-            sc->Release();
-            return;
+            if (!core::DebugPointCount()) { sc->Release(); return; }   // research overlay points are drawn with the editor closed too
         }
 
         // per-buffer queues (ResizeBuffers1): our command list must run on the queue of the buffer presented now

@@ -2707,6 +2707,11 @@ namespace editor {
             DrawGizmo(g_place.center, one ? WrapYaw(g_place.m[0].rot0.yaw + g_place.yaw) : g_place.yaw, one ? WrapYaw(g_place.m[0].rot0.pitch + g_place.pitch) : g_place.pitch, GizmoScreenSize(cf, g_place.center, g_place.radius), g_place.drag ? g_place.drag : g_place.hover); }
         if (g_place.active && !g_open) ImGui::GetIO().MouseDrawCursor = true;
         DrawCalibrationMarker(p, havePos);
+        {   // research overlay: world points from /api/research/points (e.g. edited terrain), drawn under the editor windows
+            const auto pts = core::DebugPoints();
+            if (!pts.empty()) { const CamFrame cf = CurrentCam(); ImDrawList* dl = ImGui::GetBackgroundDrawList(); ImVec2 s;
+                for (const auto& d : pts) if (WorldToScreen(cf, d.p, &s)) dl->AddCircleFilled(s, 3.0f, d.col, 6); }
+        }
         if (!g_open) { if (g_cameraMode) StopCameraMode(); return; }
         if (g_numericEditId && g_numericEditLastSeenFrame >= 0 && ImGui::GetFrameCount() - g_numericEditLastSeenFrame > 1) CancelNumericEdit();
         ImGuiIO& io = ImGui::GetIO();
