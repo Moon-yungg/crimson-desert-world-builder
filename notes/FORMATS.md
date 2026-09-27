@@ -356,7 +356,24 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Terrain "apply": after an edit, reload stage 5 km away and back -> the edited tile streams again, gets patched and the dip is
   visible and walkable (seen in game; collision probe: centre within 0.3 m, depth -5.93 of -6). A reload in place does not
   re-stream. Next: resolve 0xa9a860 / key / b / c without a recording, find the smallest distance that re-streams.
-- Open: persistence per project, editor brush.
+- LIVE EDITING (seen in game): every streamed tile becomes its own GPU texture, 512x512 R16_TYPELESS, 10 mips, filled by
+  CopyTextureRegion from an upload buffer (row pitch 1024 for mip 0); the game never issues barriers for it (rests in COMMON).
+  Tile -> texture: a hash over four mip-0 rows of the completed read matched against the same rows in the upload buffer of
+  each such copy (terrain_live.cpp; the CopyTextureRegion implementation is hooked via a command list of the game's device).
+  Writing a new full mip chain into that texture with our own command list on the game's direct queue (COMMON -> COPY_DEST ->
+  COMMON) changes the picture at once - lighting, shadows and slope material follow; no derived buffer needed a nudge.
+  Two textures per tile appear on load (the later one is kept); the render uses it.
+- Live collision (terrain_physics.cpp): exactly one hknpHeightFieldShape per 32 m cell, collected by a hook on its
+  constructor (0x42b2ef0 on 2976, signature). heights[a * 65 + b] lies at world (I * 32 + a / 2, J * 32 + b / 2), cell (I, J)
+  found by matching the heights against the tile field (median deviation 0.1 - 0.3 m, clear margin; orientation a = +x,
+  b = +z for all 25). A live upload adds (new field - previous field) bilinear to each patch of the tile and rebuilds its tree +
+  AABB (open tree first, then heights, then exact tree). Probes over an 8 m live hill match the written heights within the
+  probe radius; where a probe still reports the old height, the heightfield quad is a hole under a placed rock / object
+  (the cast falls through the terrain to that object).
+- Pitfall: the ground-probe replay can crash on every call in a session (template captured right after loading); a restart
+  fixed it. Not caused by the shape constructor hook (tested with and without).
+- Open: persistence per project is in (strokes in .cdproj); two textures per tile (the first one may be used for another
+  purpose); strokes that span two tiles update both tiles separately.
 - Open: one grid run over 3 m hills showed 30 new holes in a cluster at the edge of the loaded 5x5 area (~60 m away); a restore
   did not bring them back (by then the player had moved and patches had streamed), so probably streaming - recheck.
 - Research overlay: /api/research/points draws world points from bin64\cdmodkit\debugpoints.txt ("x y z rrggbb") with the
