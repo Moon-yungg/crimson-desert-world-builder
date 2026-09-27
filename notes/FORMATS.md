@@ -254,6 +254,7 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   (base +0x30, quant scale +0x40 / inverse +0x44, rel-array +0x20 of 4 levels 8x8/4x4/2x2/1x1 of u16 min/max pairs) must
   cover the new heights too.
 - Bounding-volume tree cells are groups of 8 u16: the 4 children's minima, then their 4 maxima (quantized with base/scale);
+  (the next lines are superseded: the level size was misread, see "SOLVED" below)
   the last level (4 bytes) does not follow that scheme - leave it alone. Opening the three lower levels correctly (0 / 65535 per
   group) with base, scale and shape AABB unchanged is harmless (tested: nothing happens).
 - Result (seen in game): dips up to 1 m deep, within the patch's original range -> the character sinks in and walks on, no fall.
@@ -267,6 +268,122 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Rendering pre-computes its heights on the GPU (strings g_terrainHeightCachedHeightBuffer(UAV), PreComputeCacheTerrainHeight
   (SceneCapture/CollisionCapture), PreCalculateTerrainHeightMinMax, TerrainHeightFieldForVirtualTexturing): a visible change
   needs those buffers recomputed. TerrainHeightFieldCollision_%d_%d names the collision patches.
+- Fall watcher (/api/research/fallwatch, continuous hardware write breakpoints on the player's transform snapshot): before,
+  during and after a fall and at the respawn only two writers touch it, both from the CLIENT sync function 0x9ff500 (writes the
+  component's current transform block at +0x98 from a newly computed one, or reverts to the saved old one; 0x71a0d0 only compares
+  two tiled positions against a tolerance). The snapshot mirrors the server actor; the character's real movement (gravity,
+  ground contact) runs server-side. Next: watch the player's SERVER actor position (ServerChildOnlyInGameActor) instead.
+- Player server actor (ServerChildOnlyInGameActor, the MoveActorReq sender) keeps its position in the components list at
+  actor+0x68 (same list also at actor+0x78, other stride): ServerTransformSyncActorComponent (+0x1A0 of the list) +0xB4 tile-local
+  x/y/z (same layout as the client snapshot), +0x324 and +0x3D0 world x/y/z; copies in Knowledge (+0x2C8 world, +0x2F4 local),
+  Interaction (+0x2C8), QuestDialog (+0xC4), Wanted (+0x164), RemoteCatch (+0x188). Found with /api/research/findpos.
+  Player movement is probably client-authoritative (the client sends MoveActorReq), so the server copy may only mirror it.
+- Fall watcher on the server field: only two writers, both ending in the setter 0x2bc5420; one comes from
+  TrocTrMoveActorReq::execute (vtable slot 2, 0x2977e10). The server takes the position the client reports: player movement,
+  ground contact and falling are decided CLIENT-side. Candidates: hknpCharacterProxy (Havok character, shape-cast ground
+  support), ClientCharacterControlActorComponent, CharacterControlPhysicsListener.
+- Client character control (ClientCharacterControlActorComponent, client player component list +0x40): probing 0x800 bytes
+  every 50 ms around a fall shows the ground result block at +0x160..+0x1E8: +0x168/+0x16C/+0x170 position, +0x174 ground distance
+  (0 on the ground, FLT_MAX = no ground found), state words +0x15C 0->1, +0x1F8 1->2 (ground -> air), flags +0x298 / +0x304 /
+  +0x364 -> 0. So the character's own ground query finds NOTHING over a 3 m dip (1 m dips are found).
+- That block is written by 0x85ed00 (hardware watch on +0x174: rva 0x85eff9 / 0x85f006, chain 85fcd9 8b586d 8bcc0c 8b6931 8b6883):
+  it calls 0xa751c0 with the ground sensor object at component+0xE0 and copies the result. 0xa751c0 first compares the squared
+  distance to a cached position (a ground cache), then queries through 0xa75700, which calls the physics world through vtable
+  slots (+0x200, +0xE8, +0x1E8, +0x368, +0xF8). Next: the ray / shape cast hooks (console "raytrace", castRay 0x428d080,
+  worldCastRay 0x42b0b50, castShape 0x428d260, worldCastShape 0x42b0c50) while walking into a dip, to see the query type and
+  length (likely a short downward cast, or a cached / filtered ground source).
+- Ground probe (compact trace /api/research/groundtrace, caller rva 0x32554fa): a sphere cast starting 0.77 m above the feet,
+  0 / -2 / 0 displacement (2 m down), plus ~0.5 m step casts. Over a 3 m dip it misses more and more although the dipped ground
+  is within its reach, then the controller gives up.
+- Collision map (/api/research/groundgrid: the same cast replayed on a grid; scratchpad collision_map.py -> PNG): patches are
+  32 x 32 m (65 samples, 0.5 m apart), 5 x 5 loaded around the player; cast from above, every dip is found (no holes).
+- The failing case, reproduced with the grid tool: a cast starting 0.77 m above the DIPPED ground and 2 m down hits for dips up to
+  ~1.06 m and misses for every dip from ~1.3 m (start more than ~0.3-0.5 m below the ORIGINAL surface) - exactly like the same
+  casts against the restored original ground. So casts starting "inside" the old ground find nothing (one-sided heightfield),
+  and the inside test uses data we have not found: not the float heights, not the bounding-volume tree (lower levels or root),
+  not the in-memory height tile. Next: the hknpHeightFieldShape cast code (vtable rva 0x530ab48 slots) - where it decides
+  that the start lies below the surface and which data it reads.
+- Geometry tracer (/api/research/geotrace: class 5 of the vtable tracer on the terrain geometry vtable, logged only inside one
+  of our ground casts): a character-style cast makes exactly ONE geometry call, slot 4 (0x39f3390, the quad query), for one quad,
+  and gets the NEW (dipped) corner heights in both the hitting and the missing case. Chain: 0x42d0f90 (in 0x42d0e00, Havok's
+  heightfield-vs-shape cast: a traversal stack of 0x30-byte nodes {min, max, level, x, z}, quantized children from the
+  bounding-volume tree, leaf = quad fetch; flag 2 from the quad = hole) <- 0x42cede7 (0x42cebe0) <- 0x42c48fc <- castShape
+  0x428d5f2 <- worldCastShape 0x42b0d2d. After the quad fetch the triangle / sphere test (from 0x42d1731 / 0x42d14eb) rejects it.
+- Same xz points, different dip depths: 1 m dips always hit, 2-3 m dips always miss, the limit is ~1.35-1.5 m (varies per
+  point) - depth, not the quad's material (6 vs 24 was a coincidence).
+- Raising has the same limit as lowering (character-style casts over hills: all hit up to 1 m, none from 2 m). Opening the
+  bounding-volume tree changes nothing at all (identical results with and without): it is not what culls.
+- The exact rule (start-height sweep over 3 m dips): a cast finds the NEW ground only if its start lies above roughly
+  (OLD ground - 0.5..0.7 m). So a "start inside the ground" pre-check still uses the old heights; its source is still unknown
+  (not the floats, the tree incl. root, the height tile cache, the shape AABB). The character starts 0.77 m above its feet,
+  hence ~1.3-1.5 m of change in either direction is the limit.
+- SOLVED: the "old heights" come from the bounding-volume tree after all - every earlier "open" was incomplete. The level entry
+  (24 bytes: +0 rel ptr, +8 u32 count, +0x10 u16 width, +0x12 u16 height) counts u32s, not bytes: level data is count*4 bytes
+  (8x8 / 4x4 / 2x2 / 1x1 nodes of 16 bytes = 1024 / 256 / 64 / 16), so only a quarter of each level had been written.
+  Node decode 0x42b3a00(bv, level, x, z, outMin, outMax): entry = levels[level - [bv+0x50]], node = data + (x*width + z)*16,
+  8 u16 = 4 child minima then 4 child maxima, value = u16 * [bv+0x40] + [bv+0x30] (base is 4 equal floats, +0x44 = 1/scale).
+  The ROOT follows the same scheme. Base/scale span exactly the original min..max of the patch, so heights outside that range
+  also need a wider base/scale. The Havok cast clips its segment to the node range, hence the "start below old ground" miss.
+- Working recipe (scratchpad hf_tool2.py deep/tall): base = min - 50, scale = (max - min + 100) / 65535, every node of every
+  level = [0,0,0,0,65535,65535,65535,65535], shape AABB y widened to the same range, then write the heights. Character-style
+  probes inside 3 m dips: 22/22 hit (0/22 before). A proper rebuild of the tree from the new heights would keep culling tight.
+  Seen in game: walking into and out of 3 m dips and up and down 3 m hills works, no sinking, no fall.
+- RENDER SOURCE FOUND (seen in game): the height16f DDS is loaded twice. (1) ResourceLoader::load from the
+  TerrainHeightTextureCache (0x3518580, header + data, 699178 B): a CPU copy only - editing it (in memory or at load) changes
+  neither the picture nor collision. (2) The texture streamer reads only the pixel data (file offset +128, 699050 B, header from
+  the texture header collection) through the async worker path (stack 13f2628 -> 12d3a87 -> 12d1340 -> worker slot 12
+  0x13a5800 -> NtReadFile; normal / mask / region / color textures come the same way and never pass ResourceLoader::load).
+  Shifting the u16 samples of THAT read (NtReadFile hook, diag.cpp, /api/research/iotrace {"sdelta":12000}, ranges from
+  bin64\cdmodkit\ioranges.txt, traceio.flag) lowered the visible terrain ~30 m AND the collision followed by itself (the
+  heightfield patches are captured from the rendered terrain on the GPU: CaptureHeightFieldCollision /
+  _readbackHeightFieldCollisionTexture / TerrainHeightFieldCollision_%d_%d). Terrain paks: 0015\49.paz / 50.paz, uncompressed,
+  unencrypted, "partial" entries. The reads completed synchronously (file cache); a robust patch belongs after completion.
+- terrain.cpp (production path, no NtReadFile hook): the streamer's request function (unique signature "48 89 5C 24 18 48 89 74
+  24 20 55 57 41 54 41 56 41 57 48 8B EC 48 83 EC 70 48 8B D9 4C 8D 3D", rva 0x12d1340 on 2976) gets a request: +0x08 NormalizedPath,
+  +0x10 buffer holder (its +0 = the read buffer, filled during the call), +0x20 u32 length, +0x24 u32 file offset, +0x30 completion
+  event (BindableEventFileIO). Reads are whole (0xAAAAA at +0x80) or only the small mips (e.g. 0xAAA at +0xAA080). The consumer
+  learns of completion only through BindableEventFileIO slot 5 (poll, OVERLAPPED.Internal at event+0x40 != 0x103), so the
+  samples are shifted there, mip by mip. Verified: whole-tile shifts and discs change picture and collision.
+- Tile / texel mapping (verified with test dips measured through the collision, offsets <= 0.5 m): tile X,Z covers world
+  [X*1024, X*1024+1024) x [Z*1024, Z*1024+1024) - NOT centred on X*1024. Texel column c = +x, row r = -z (row 0 is the north
+  edge): texel centre x = X*1024 + 2c + 1, z = Z*1024 + 2(511 - r) + 1. Height = offset + v / 65535 * range (sector xml; tile -10,-5:
+  range 163, offset 465). NB the decoded DDS height is not exactly the collision height (captured terrain includes detail).
+- Tiles do not re-stream while walking, flying the free camera away (3-6 km) or on SetPlayerPos; the height texture resource is
+  freed after its data went to the terrain system (a remembered texture pointer was reused by another texture). The texture
+  manager (vtable rva 0x5ccaa40, slot 13 reload-by-name 0x3773a60; per-texture sync reload 0x3772ee0) does not know the tiles.
+  The tile load task is 0x3518580 (formats every terrain_%d_%d_* name; job-graph arguments, not replayable).
+- THE GAME'S TELEPORT (fast travel): client ClientSequencerStageManager "reload stage at transform" 0xa9a860(obj, key, b, c,
+  const float tf[10] {scale3, quat4, pos3}) posts the local loading event (loading screen) and sends TrocTrReloadStageStartReq
+  (packet id 0x08EB, sender 0xc04d20; payload u32 0, u32 b, u32 c, pos3, quat4, scale3, u8 1). Server: ReloadStageStartReq::execute
+  0x2a5f580 -> 0x2896120 -> 0x2bc4950 -> 0x2bbf510 stores the destination in ServerTransformSyncActorComponent +0x550.., and
+  GameLoadingStartReq::execute 0x29c59d0 -> 0x2bc9200 applies it once the client's loading starts. Recorded on a real fast travel
+  (obj = ClientSequencerStageManager, key 3, b 1, c 0) and replayed with any position: the player lands there after a loading
+  screen (seen in game). Calling the server side alone does nothing (the client starts the loading).
+- Terrain "apply": after an edit, reload stage 5 km away and back -> the edited tile streams again, gets patched and the dip is
+  visible and walkable (seen in game; collision probe: centre within 0.3 m, depth -5.93 of -6). A reload in place does not
+  re-stream. Next: resolve 0xa9a860 / key / b / c without a recording, find the smallest distance that re-streams.
+- LIVE EDITING (seen in game): every streamed tile becomes its own GPU texture, 512x512 R16_TYPELESS, 10 mips, filled by
+  CopyTextureRegion from an upload buffer (row pitch 1024 for mip 0); the game never issues barriers for it (rests in COMMON).
+  Tile -> texture: a hash over four mip-0 rows of the completed read matched against the same rows in the upload buffer of
+  each such copy (terrain_live.cpp; the CopyTextureRegion implementation is hooked via a command list of the game's device).
+  Writing a new full mip chain into that texture with our own command list on the game's direct queue (COMMON -> COPY_DEST ->
+  COMMON) changes the picture at once - lighting, shadows and slope material follow; no derived buffer needed a nudge.
+  Two textures per tile appear on load (the later one is kept); the render uses it.
+- Live collision (terrain_physics.cpp): exactly one hknpHeightFieldShape per 32 m cell, collected by a hook on its
+  constructor (0x42b2ef0 on 2976, signature). heights[a * 65 + b] lies at world (I * 32 + a / 2, J * 32 + b / 2), cell (I, J)
+  found by matching the heights against the tile field (median deviation 0.1 - 0.3 m, clear margin; orientation a = +x,
+  b = +z for all 25). A live upload adds (new field - previous field) bilinear to each patch of the tile and rebuilds its tree +
+  AABB (open tree first, then heights, then exact tree). Probes over an 8 m live hill match the written heights within the
+  probe radius; where a probe still reports the old height, the heightfield quad is a hole under a placed rock / object
+  (the cast falls through the terrain to that object).
+- Pitfall: the ground-probe replay can crash on every call in a session (template captured right after loading); a restart
+  fixed it. Not caused by the shape constructor hook (tested with and without).
+- Open: persistence per project is in (strokes in .cdproj); two textures per tile (the first one may be used for another
+  purpose); strokes that span two tiles update both tiles separately.
+- Open: one grid run over 3 m hills showed 30 new holes in a cluster at the edge of the loaded 5x5 area (~60 m away); a restore
+  did not bring them back (by then the player had moved and patches had streamed), so probably streaming - recheck.
+- Research overlay: /api/research/points draws world points from bin64\cdmodkit\debugpoints.txt ("x y z rrggbb") with the
+  editor open or closed (scratchpad show_points.py: grey reference, blue lowered, red beyond the limit).
 - Open: what drops the character 1-2 m below the original ground (a write breakpoint on the player's position during the drop
   / respawn would find the code), and the hknp body per patch (placement, broadphase AABB).
 - Pitfall: after a fall the game streams patches out; writing saved addresses then corrupts its heap (one crash). Check the

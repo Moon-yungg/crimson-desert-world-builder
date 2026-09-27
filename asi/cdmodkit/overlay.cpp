@@ -130,6 +130,8 @@ namespace overlay {
 
     static ID3D12CommandQueue* g_queue = nullptr;
     static ID3D12Device* g_device = nullptr;
+    void* D3DDevice() { return g_device; }
+    void* D3DQueue() { return g_queue; }
     static uintptr_t g_swapChainIdentity = 0;
     static std::atomic<IDXGISwapChain*> g_boundSwapChain{nullptr};   // identity-only (pointer compare), never dereferenced, no reference held
     static std::atomic<HWND> g_boundSwapChainWindow{nullptr};
@@ -1094,8 +1096,7 @@ namespace overlay {
             core::g_uiWantsKeyboard = false;
             core::g_uiTextInput = false;
             core::g_uiMouseOverUi = false;
-            sc->Release();
-            return;
+            if (!core::DebugPointCount()) { sc->Release(); return; }   // research overlay points are drawn with the editor closed too
         }
 
         // per-buffer queues (ResizeBuffers1): our command list must run on the queue of the buffer presented now

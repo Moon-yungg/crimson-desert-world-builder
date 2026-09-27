@@ -272,6 +272,8 @@ static std::string Handle(const std::string& method, const std::string& path, co
         if (!core::FreeCamAvailable()) { status = 503; return Error("free camera not available in this game build (see log)"); }
         core::SetFreeCam(Flag(arg, "on"));
         float ty = 0, tp = 0; Number(arg, "turnYaw", ty); Number(arg, "turnPitch", tp); if (ty != 0 || tp != 0) core::FreeCamTurn(ty, tp);
+        float fx = 0, fy = 0, fz = 0, fr = 10;   // {"fx","fy","fz","fr"}: jump to look at a point (research: does streaming follow the camera?)
+        if (arg.count("fx") && Number(arg, "fx", fx, true) && Number(arg, "fy", fy, true) && Number(arg, "fz", fz, true)) { Number(arg, "fr", fr); core::FreeCamFocus(Vec3{ fx, fy, fz }, fr); }
         return core::FreeCamActive() ? "{\"on\":true}" : "{\"on\":false}";
     }
     if (method == "POST" && path == "/api/time") {   // {"hour":18} sets the visual time (keeps running), {"freeze":1} holds it, {"native":1} back to the game clock
@@ -311,7 +313,89 @@ static std::string Handle(const std::string& method, const std::string& path, co
         float mx = 16; Number(arg, "max", mx); core::ResearchFind(pat, std::clamp((int)mx, 1, 256)); status = 202; return "{\"started\":true}";
     }
     if (method == "POST" && path == "/api/research/fallwatch") {   // research: {"on":1}
-        core::SetFallWatch(Flag(arg, "on")); return "{\"ok\":true}";
+        auto ad = arg.find("addr"); const uintptr_t a = ad == arg.end() ? 0 : (uintptr_t)strtoull(ad->second.c_str(), nullptr, 0);
+        auto pr = arg.find("probe"); const uintptr_t pa = pr == arg.end() ? 0 : (uintptr_t)strtoull(pr->second.c_str(), nullptr, 0);
+        float pl = 0x400, bp = 1; Number(arg, "bytes", pl); Number(arg, "breakpoints", bp);
+        core::SetFallWatch(Flag(arg, "on"), a, bp != 0, pa, (unsigned)pl); return "{\"ok\":true}";
+    }
+    if (method == "POST" && path == "/api/research/groundgrid") {   // research: {"x0","z0","nx","nz","step","top","len"} -> heights (null = no ground)
+        float x0 = 0, z0 = 0, nx = 64, nz = 64, st = 2, top = 700, len = 400;
+        if (!Number(arg, "x0", x0, true) || !Number(arg, "z0", z0, true)) { status = 400; return Error("x0/z0 required"); }
+        Number(arg, "nx", nx); Number(arg, "nz", nz); Number(arg, "step", st); Number(arg, "top", top); Number(arg, "len", len);
+        std::vector<float> h;
+        if (!core::GroundGrid(x0, z0, (int)nx, (int)nz, st, top, len, &h)) { status = 503; return Error("ground grid not available or timed out"); }
+        std::string out = "{\"h\":["; char t[24];
+        for (size_t i = 0; i < h.size(); i++) { if (i) out += ','; if (std::isfinite(h[i])) { snprintf(t, sizeof t, "%.2f", h[i]); out += t; } else out += "null"; }
+        return out + "]}";
+    }
+    if (method == "POST" && path == "/api/research/geotrace") {   // research: {"vt":"0x...","slots":40} installs; {"arm":1} traces the next ground cast
+        auto v = arg.find("vt"); if (v != arg.end()) { float sl = 40; Number(arg, "slots", sl); core::GeoTraceInstall((uintptr_t)strtoull(v->second.c_str(), nullptr, 0), (int)sl); }
+        if (Flag(arg, "arm")) core::GeoTraceArm();
+        auto fr = arg.find("fn"); if (fr != arg.end()) core::FnTraceInstall((uintptr_t)strtoull(fr->second.c_str(), nullptr, 0));
+        return "{\"ok\":true}";
+    }
+    if (method == "POST" && path == "/api/research/iotrace") {   // research: {"filter":"height"} logs matching game loads and their reads; "" = off
+        auto f = arg.find("filter"); if (f != arg.end()) core::IoTraceSet(f->second);
+        float hd = 0; if (Number(arg, "hdelta", hd)) core::IoHeightDelta((int)hd);
+        float sd = 0; if (Number(arg, "sdelta", sd)) core::IoStreamDelta((int)sd);
+        return "{\"ok\":true}";
+    }
+    if (method == "POST" && path == "/api/travel") {   // {"x","y","z","yaw"}: the game's own fast travel to that point (loading screen)
+        float x = 0, y = 0, z = 0, yaw = 0;
+        if (!Number(arg, "x", x, true) || !Number(arg, "y", y, true) || !Number(arg, "z", z, true)) { status = 400; return Error("x/y/z required"); }
+        Number(arg, "yaw", yaw);
+        if (!core::TravelAvailable()) { status = 503; return Error(core::TravelStatus().c_str()); }
+        const bool started = core::TravelTo(Vec3{ x, y, z }, yaw);
+        return std::string("{\"started\":") + (started ? "true" : "false") + ",\"status\":\"" + core::TravelStatus() + "\"}";
+    }
+    if (method == "POST" && path == "/api/research/gputrace") {   // research: {"seconds":20} logs copies into 16-bit textures
+        float sec = 20; Number(arg, "seconds", sec); core::GpuTrace((int)sec); return "{\"ok\":true}";
+    }
+    if (method == "POST" && path == "/api/research/terrain") {   // research: {"x","z","r","dm"} adds a smooth disc (dm metres, + up), {"clear":1}
+        if (Flag(arg, "clear")) core::TerrainEditClear();
+        if (Flag(arg, "synctrace")) core::TerrainSyncTrace();   // research
+        if (Flag(arg, "list")) { std::string o = "{\"strokes\":["; char t[200]; bool first = true;   // research: the strokes as painted
+            for (const auto& k : core::TerrainStrokes()) { snprintf(t, sizeof t, "%s[%d,%.2f,%.2f,%.2f,%.2f,%.3f,%.2f,%d]", first ? "" : ",", k.mode, k.x, k.z, k.r, k.y, k.amount, k.strength, k.proj); o += t; first = false; }
+            return o + "]}"; }
+        if (Flag(arg, "apply")) { PosInfo pp{}; if (core::PlayerPosInfo(&pp)) core::TerrainApply(pp.world); }   // fast travel away and back
+        { float ls = 0; if (arg.count("loadtrace") && Number(arg, "loadtrace", ls, true)) core::TerrainLoadTrace((int)ls); }   // research
+        { auto ro = arg.find("reloadobj"), rn = arg.find("reloadname"); float sl = 78; Number(arg, "slot", sl);
+          if (ro != arg.end() && rn != arg.end()) core::TerrainReloadCall((uintptr_t)strtoull(ro->second.c_str(), nullptr, 0), (int)sl, rn->second); }   // research
+        { auto mg = arg.find("texreload"); float tx = 0, tz = 0; auto rv = arg.find("rva");
+          if (mg != arg.end() && Number(arg, "tx", tx, true) && Number(arg, "tz", tz, true)) core::TerrainTexReload((int)tx, (int)tz, (uintptr_t)strtoull(mg->second.c_str(), nullptr, 0), rv == arg.end() ? 0 : (uintptr_t)strtoull(rv->second.c_str(), nullptr, 0)); }   // research
+        { auto rt = arg.find("rettrace"); if (rt != arg.end()) core::TerrainRetTrace((uintptr_t)strtoull(rt->second.c_str(), nullptr, 0)); }   // research
+        { auto tk = arg.find("tiletask"); if (tk != arg.end()) core::TerrainTileTaskTrace((uintptr_t)strtoull(tk->second.c_str(), nullptr, 0)); }   // research
+        { float rx = 0, ry = 0, rz = 0; if (arg.count("rsx") && Number(arg, "rsx", rx, true) && Number(arg, "rsy", ry, true) && Number(arg, "rsz", rz, true)) core::ReloadStageReplay(rx, ry, rz); }   // research
+        { auto cr = arg.find("crtrace"); if (cr != arg.end()) core::ClientReloadTrace((uintptr_t)strtoull(cr->second.c_str(), nullptr, 0)); }   // research
+        { float cx = 0, cy = 0, cz = 0; if (arg.count("crx") && Number(arg, "crx", cx, true) && Number(arg, "cry", cy, true) && Number(arg, "crz", cz, true)) core::ClientReloadReplay(cx, cy, cz); }   // research
+        { auto ss = arg.find("rssend"); if (ss != arg.end()) core::RsSendTrace((uintptr_t)strtoull(ss->second.c_str(), nullptr, 0)); }   // research
+        { auto rs = arg.find("rstrace"); if (rs != arg.end()) core::ReloadStageTrace((uintptr_t)strtoull(rs->second.c_str(), nullptr, 0)); }   // research
+        { auto te = arg.find("teletrace"); if (te != arg.end()) core::TeleTraceInstall((uintptr_t)strtoull(te->second.c_str(), nullptr, 0)); }   // research
+        { auto tt = arg.find("textrace"); if (tt != arg.end()) core::TerrainTexTrace((uintptr_t)strtoull(tt->second.c_str(), nullptr, 0)); }   // research
+        { auto jt = arg.find("jobtrace"); if (jt != arg.end()) core::TerrainJobTrace((uintptr_t)strtoull(jt->second.c_str(), nullptr, 0)); }   // research   // research: read watch on the next patched tile buffer
+        float x = 0, z = 0, r = 0, dm = 0;
+        if (arg.count("x") && Number(arg, "x", x, true) && Number(arg, "z", z, true) && Number(arg, "r", r, true) && Number(arg, "dm", dm, true)) return "{\"tiles\":" + Int(core::TerrainEditDisc(x, z, r, dm)) + "}";
+        return "{\"status\":\"" + core::TerrainStatus() + "\"}";
+    }
+    if (method == "POST" && path == "/api/research/teleport") {   // research: {"x","y","z"} writes the player position (SetPlayerPos)
+        float x = 0, y = 0, z = 0;
+        if (!Number(arg, "x", x, true) || !Number(arg, "y", y, true) || !Number(arg, "z", z, true)) { status = 400; return Error("x/y/z required"); }
+        return core::SetPlayerPos(Vec3{ x, y, z }) ? "{\"ok\":true}" : "{\"ok\":false}";
+    }
+    if (method == "POST" && path == "/api/research/watch") {   // research: {"a0":"0x..","a1":..,"seconds":20} hardware write watch, writers logged at the end
+        uintptr_t ad[4] = {}; const char* keys[4] = { "a0", "a1", "a2", "a3" };
+        for (int i = 0; i < 4; i++) { auto it = arg.find(keys[i]); if (it != arg.end()) ad[i] = (uintptr_t)strtoull(it->second.c_str(), nullptr, 0); }
+        float sec = 20; Number(arg, "seconds", sec);
+        return core::ResearchWatchWrites(ad, (int)sec) ? "{\"started\":true}" : "{\"started\":false}";
+    }
+    if (method == "POST" && path == "/api/research/points") {   // research: reload bin64\cdmodkit\debugpoints.txt ({"clear":1} removes them)
+        return "{\"points\":" + Int(core::LoadDebugPoints(Flag(arg, "clear"))) + "}";
+    }
+    if (method == "POST" && path == "/api/research/groundtrace") {   // research: {"seconds":15}
+        float sec = 15; Number(arg, "seconds", sec); core::GroundTrace((int)sec); return "{\"ok\":true}";
+    }
+    if (method == "POST" && path == "/api/research/findpos") {   // research: log where the server actor keeps the player's position
+        core::ResearchFindPos(); return "{\"done\":true}";
     }
     if (method == "POST" && path == "/api/research/vtscan") {   // research: {"class":".?AVhknpHeightFieldShape@@","max":8,"bytes":256}
         auto it = arg.find("class"); if (it == arg.end() || it->second.size() < 6 || it->second.size() > 200) { status = 400; return Error("class (mangled RTTI name) required"); }

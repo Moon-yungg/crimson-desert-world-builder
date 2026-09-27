@@ -131,7 +131,7 @@ namespace editor {
     static bool  g_favOnly = false; static bool g_meshOnly = true;
     enum MainTabId {
         TabBrowser = 0, TabScene = 1, TabProject = 2, TabTravel = 3, TabSettings = 4,
-        TabLog = 5, TabHistory = 6, TabNpcs = 7, TabEnvironment = 8
+        TabLog = 5, TabHistory = 6, TabNpcs = 7, TabEnvironment = 8, TabTerrain = 9
     };
     static bool  g_compact = false; static int g_dockCols = 2;   // narrow dock window; supported pages reuse the full editor functions
     static int g_mainTab = TabBrowser, g_compactPage = TabBrowser; static bool g_selectMainTab = false;
@@ -194,9 +194,10 @@ namespace editor {
 
     // ---- undo / redo ----
     struct Act {
-        enum Kind { Spawn, Move, Delete, SetGroup, NpcSpawn, NpcMove, NpcDelete, NpcControl, NpcGroup, ObjectNote, NpcNote, NpcLabel, GroupName } kind;
+        enum Kind { Spawn, Move, Delete, SetGroup, NpcSpawn, NpcMove, NpcDelete, NpcControl, NpcGroup, ObjectNote, NpcNote, NpcLabel, GroupName, TerrainBatch, TerrainClear } kind;
         int uid = 0; std::string prefab; Vec3 pos0{}, pos1{}; Rot rot0, rot1; float sc0 = 1, sc1 = 1;
         int group = 0, group1 = 0; int proj = 0; bool flag0 = false, flag1 = false; int behavior0 = 0, behavior1 = 0; std::string text0, text1;
+        std::vector<core::TerrainStroke> terrain;
     };   // object and managed-NPC committed edits share one chronological undo/redo stack
     struct HistoryEntry { unsigned long long serial = 0; std::vector<Act> acts; };
     static constexpr size_t kHistoryLimit = 1000;
@@ -210,6 +211,7 @@ namespace editor {
         if (a.kind == Act::NpcMove) return VecChanged(a.pos0, a.pos1);
         if (a.kind == Act::NpcControl) return a.flag0 != a.flag1 || a.behavior0 != a.behavior1;
         if (a.kind == Act::ObjectNote || a.kind == Act::NpcNote || a.kind == Act::NpcLabel || a.kind == Act::GroupName) return a.text0 != a.text1;
+        if (a.kind == Act::TerrainBatch || a.kind == Act::TerrainClear) return !a.terrain.empty();
         // History is intentionally exact: even a sub-millimetre move or a tiny typed rotation/scale change counts.
         return VecChanged(a.pos0, a.pos1) || RotChanged(a.rot0, a.rot1) || a.sc0 != a.sc1;
     }
@@ -349,6 +351,7 @@ namespace editor {
         std::set<int> ids;
         for (const auto& o : core::Spawned()) if (o.proj > 0) ids.insert(o.proj);
         for (const auto& n : core::ManagedNpcs()) if (n.proj > 0) ids.insert(n.proj);
+        for (const auto& t : core::TerrainStrokes()) if (t.proj > 0) ids.insert(t.proj);
         for (int id : ids) {
             if (!core::ProjectDirty(id)) continue;
             const std::string name = core::ProjectNameOf(id);
@@ -1152,6 +1155,8 @@ namespace editor {
             else if (a.kind == Act::NpcNote) core::SetManagedNpcNote(a.uid, a.text0);
             else if (a.kind == Act::NpcLabel) core::SetManagedNpcLabel(a.uid, a.text0);
             else if (a.kind == Act::GroupName) core::SetGroupName(a.group, a.text0);
+            else if (a.kind == Act::TerrainBatch) { for (size_t i = 0; i < a.terrain.size(); ++i) core::TerrainUndo(); }
+            else if (a.kind == Act::TerrainClear) { for (const auto& t : a.terrain) core::TerrainAddStroke(t); }
         }
         if (!moves.empty()) core::MoveMany(moves, true);
         g_redo.push_back(std::move(entry)); Note(T("undo"));
@@ -1180,6 +1185,8 @@ namespace editor {
             else if (a.kind == Act::NpcNote) core::SetManagedNpcNote(a.uid, a.text1);
             else if (a.kind == Act::NpcLabel) core::SetManagedNpcLabel(a.uid, a.text1);
             else if (a.kind == Act::GroupName) core::SetGroupName(a.group, a.text1);
+            else if (a.kind == Act::TerrainBatch) { for (const auto& t : a.terrain) core::TerrainAddStroke(t); }
+            else if (a.kind == Act::TerrainClear) core::TerrainClear();
         }
         if (!moves.empty()) core::MoveMany(moves, true);
         g_undo.push_back(std::move(entry)); Note(T("redo"));
@@ -1199,6 +1206,8 @@ namespace editor {
         if (k == Act::ObjectNote || k == Act::NpcNote) return T("Note");
         if (k == Act::NpcLabel) return T("Rename NPC");
         if (k == Act::GroupName) return T("Rename group");
+        if (k == Act::TerrainBatch) return T("Terrain");
+        if (k == Act::TerrainClear) return T("Clear all");
         bool pos = false, rot = false, scale = false;
         for (const auto& a : entry.acts) {
             pos |= VecChanged(a.pos0, a.pos1);
@@ -1211,6 +1220,11 @@ namespace editor {
         return T("Grab and move");
     }
     static void DrawHistoryAct(const Act& a) {
+        if (a.kind == Act::TerrainBatch || a.kind == Act::TerrainClear) {
+            ImGui::Text("%s", T("Terrain"));
+            ImGui::Indent(); ImGui::TextDisabled(T("%d strokes"), (int)a.terrain.size()); ImGui::Unindent();
+            return;
+        }
         const std::string name = a.prefab.empty() ? std::string() : ShortName(a.prefab);
         if (name.empty()) ImGui::Text("#%d", a.uid); else ImGui::Text("#%d  %s", a.uid, name.c_str());
         ImGui::Indent();
@@ -2686,7 +2700,8 @@ namespace editor {
         const int objectCount = (int)std::count_if(sceneObjects.begin(), sceneObjects.end(), [](const SpawnedObj& o) { return !o.hidden; });
         const auto managed = core::ManagedNpcs();
         const int npcCount = (int)std::count_if(managed.begin(), managed.end(), [](const ManagedNpc& n) { return !n.hidden; });
-        const int totalCount = objectCount + npcCount;
+        const int terrainCount = (int)core::TerrainStrokes().size();
+        const int totalCount = objectCount + npcCount + terrainCount;
         const int newCount = core::ProjectObjectCount(0);
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.09f, 0.11f, 0.55f));
@@ -2699,6 +2714,7 @@ namespace editor {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Only entities already belonging to a saved project are auto-saved. New unassigned entities are never attached automatically."));
         ImGui::Text(T("Scene: %d entities"), totalCount); ImGui::SameLine();
         ImGui::TextDisabled(T("%d objects, %d NPCs, %d unassigned"), objectCount, npcCount, newCount);
+        if (terrainCount) { ImGui::SameLine(); ImGui::TextDisabled(T("%d strokes"), terrainCount); }
         if (core::PendingSpawns()) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.3f, 1), T("%d pending spawns"), core::PendingSpawns()); }
         ImGui::EndChild(); ImGui::PopStyleColor();
 
@@ -2743,10 +2759,10 @@ namespace editor {
                 if (!inScene) ImGui::TextDisabled("%s", T("not loaded"));
                 else if (dirty) ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.3f, 1), T("%d entities, modified"), inScene);
                 else ImGui::TextDisabled(T("%d entities, saved"), inScene);
-                ImGui::BeginDisabled(inScene > 0); if (ImGui::SmallButton(T("Load"))) { core::LoadProject(pr, false); Note(T("loaded %s"), pr.c_str()); } ImGui::EndDisabled(); ImGui::SameLine();
+                ImGui::BeginDisabled(inScene > 0); if (ImGui::SmallButton(T("Load"))) { core::LoadProject(pr, false); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("loaded %s"), pr.c_str()); } ImGui::EndDisabled(); ImGui::SameLine();
                 ImGui::BeginDisabled(inScene == 0); if (ImGui::SmallButton(T("Reload"))) { core::UnloadProject(pid); core::LoadProject(pr, false); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("reloaded %s"), pr.c_str()); } ImGui::EndDisabled(); ImGui::SameLine();
                 ImGui::BeginDisabled(inScene == 0 || !dirty); if (ImGui::SmallButton(T("Save"))) { if (core::SaveProject(pr, core::SaveProjectOnly)) Note(T("saved %s"), pr.c_str()); else Note(T("save failed")); } ImGui::EndDisabled(); ImGui::SameLine();
-                ImGui::BeginDisabled(inScene == 0); if (ImGui::SmallButton(T("Unload"))) { core::UnloadProject(pid); ClearSceneSelection(); Note(T("unloaded %s"), pr.c_str()); } ImGui::EndDisabled();
+                ImGui::BeginDisabled(inScene == 0); if (ImGui::SmallButton(T("Unload"))) { core::UnloadProject(pid); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("unloaded %s"), pr.c_str()); } ImGui::EndDisabled();
                 ImGui::BeginDisabled(inScene == 0 || newCount == 0); if (ImGui::SmallButton(T("Add unassigned"))) { if (core::SaveProject(pr, core::SaveProjectAndNew)) Note(T("saved %s (%d entities)"), pr.c_str(), inScene + newCount); else Note(T("save failed")); } ImGui::EndDisabled();
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(T("Adds the %d unassigned scene entities to this project and saves it."), newCount);
                 bool isAuto = std::find(s_auto.begin(), s_auto.end(), pr) != s_auto.end(); ImGui::SameLine(); if (ImGui::Checkbox(T("Autoload"), &isAuto)) { core::SetAutoload(pr, isAuto); s_auto = core::Autoload(); }
@@ -2767,11 +2783,11 @@ namespace editor {
                 ImGui::PushID(pr.c_str()); ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0); if (dirty) ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.35f, 1), "%s *", pr.c_str()); else ImGui::TextUnformatted(pr.c_str());
                 ImGui::TableSetColumnIndex(1); if (!inScene) ImGui::TextDisabled("%s", T("not loaded")); else if (dirty) ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.3f, 1), T("%d entities, modified"), inScene); else ImGui::TextDisabled(T("%d entities, saved"), inScene);
-                ImGui::TableSetColumnIndex(2); ImGui::BeginDisabled(inScene > 0); if (ImGui::SmallButton(T("Load"))) { core::LoadProject(pr, false); Note(T("loaded %s"), pr.c_str()); } ImGui::EndDisabled();
+                ImGui::TableSetColumnIndex(2); ImGui::BeginDisabled(inScene > 0); if (ImGui::SmallButton(T("Load"))) { core::LoadProject(pr, false); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("loaded %s"), pr.c_str()); } ImGui::EndDisabled();
                 ImGui::TableSetColumnIndex(3); ImGui::BeginDisabled(inScene == 0); if (ImGui::SmallButton(T("Reload"))) { core::UnloadProject(pid); core::LoadProject(pr, false); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("reloaded %s"), pr.c_str()); } ImGui::EndDisabled();
                 ImGui::TableSetColumnIndex(4); ImGui::BeginDisabled(inScene == 0 || !dirty); if (ImGui::SmallButton(T("Save"))) { if (core::SaveProject(pr, core::SaveProjectOnly)) Note(T("saved %s"), pr.c_str()); else Note(T("save failed")); } ImGui::EndDisabled();
                 ImGui::TableSetColumnIndex(5); ImGui::BeginDisabled(inScene == 0 || newCount == 0); if (ImGui::SmallButton(T("Add unassigned"))) { if (core::SaveProject(pr, core::SaveProjectAndNew)) Note(T("saved %s (%d entities)"), pr.c_str(), inScene + newCount); else Note(T("save failed")); } ImGui::EndDisabled(); if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(T("Adds the %d unassigned scene entities to this project and saves it."), newCount);
-                ImGui::TableSetColumnIndex(6); ImGui::BeginDisabled(inScene == 0); if (ImGui::SmallButton(T("Unload"))) { core::UnloadProject(pid); ClearSceneSelection(); Note(T("unloaded %s"), pr.c_str()); } ImGui::EndDisabled();
+                ImGui::TableSetColumnIndex(6); ImGui::BeginDisabled(inScene == 0); if (ImGui::SmallButton(T("Unload"))) { core::UnloadProject(pid); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("unloaded %s"), pr.c_str()); } ImGui::EndDisabled();
                 ImGui::TableSetColumnIndex(7); bool isAuto = std::find(s_auto.begin(), s_auto.end(), pr) != s_auto.end(); if (ImGui::Checkbox("##autoload", &isAuto)) { core::SetAutoload(pr, isAuto); s_auto = core::Autoload(); }
                 ImGui::PopID();
             }
@@ -2788,27 +2804,44 @@ namespace editor {
     static void LoadTp() { if (g_tpLoaded) return; g_tpLoaded = true; FILE* f = fopen(TpPath().c_str(), "r"); if (!f) return; char line[512];
         while (fgets(line, sizeof line, f)) { char name[128] = { 0 }; Vec3 v{}; char* bar = strchr(line, '|'); if (!bar) continue; *bar = 0; strncpy_s(name, line, _TRUNCATE); if (sscanf(bar + 1, "%f|%f|%f", &v.x, &v.y, &v.z) == 3) g_tp.push_back({ name, v }); } fclose(f); }
     static void SaveTp() { FILE* f = fopen(TpPath().c_str(), "w"); if (!f) return; for (auto& t : g_tp) fprintf(f, "%s|%.2f|%.2f|%.2f\n", t.name.c_str(), t.pos.x, t.pos.y, t.pos.z); fclose(f); }
+    static Vec3 g_tpTarget{}; static bool g_tpTargetSet = false;
+    static void TravelGo(Vec3 pos, const char* what) {
+        pos.y += 0.5f;
+        if (core::TravelTo(pos, 0.0f)) Note(T("travelling to %s"), what);
+        else Note(T("preparing the fast travel (first use of a session, up to half a minute) - try again in a moment"));
+    }
     static void DrawTravel(const PosInfo& p, bool havePos) {
-        LoadTp();
-        ImGui::TextWrapped(T("Teleport writes the player's position directly. That works inside the loaded area (about 400 m); longer trips need the game's fast travel first, otherwise the world around you is not streamed in."));
+        LoadTp(); core::TravelPrepare();   // the first use of a session looks for the game's travel system in the background
+        ImGui::TextWrapped(T("Travel uses the game's own fast travel: a loading screen, then you stand at the destination. Any distance works, the world is streamed in there."));
+        ImGui::TextDisabled(T("status: %s"), core::TravelStatus().c_str());
+        ImGui::Separator();
+        if (!g_tpTargetSet && havePos) { g_tpTarget = p.world; g_tpTargetSet = true; }
+        ImGui::SetNextItemWidth(330); ImGui::InputFloat3(T("##tptarget"), &g_tpTarget.x, "%.1f"); ImGui::SameLine();
+        ImGui::BeginDisabled(!core::TravelAvailable());
+        if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Travel"))) TravelGo(g_tpTarget, T("the coordinates"));
+        ImGui::EndDisabled(); ImGui::SameLine();
+        ImGui::BeginDisabled(!havePos); if (ImGui::Button(T("current position"))) g_tpTarget = p.world; ImGui::EndDisabled();
+        ImGui::TextDisabled(T("x  y (height)  z - the height only needs to be roughly right, the game puts you on the ground"));
+        ImGui::Separator();
         ImGui::SetNextItemWidth(220); InputTextI18n("##tpname", T("name for the current spot"), g_tpName, sizeof g_tpName); ImGui::SameLine();
         ImGui::BeginDisabled(!havePos || !g_tpName[0]);
         if (ImGui::Button(T(ICON_LOCATION_DOT " Save current position"))) { g_tp.push_back({ g_tpName, p.world }); SaveTp(); g_tpName[0] = 0; }
         ImGui::EndDisabled();
-        ImGui::Separator();
-        if (ImGui::BeginTable("tp", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-            ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch); ImGui::TableSetupColumn(T("position"), ImGuiTableColumnFlags_WidthFixed, 240); ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70); ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70);
+        if (ImGui::BeginTable("tp", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+            ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch); ImGui::TableSetupColumn(T("position"), ImGuiTableColumnFlags_WidthFixed, 230);
+            ImGui::TableSetupColumn(T("distance"), ImGuiTableColumnFlags_WidthFixed, 80); ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 60); ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 60);
             for (int i = 0; i < (int)g_tp.size(); i++) {
                 ImGui::PushID(i); ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(g_tp[i].name.c_str());
                 ImGui::TableSetColumnIndex(1); ImGui::Text("%.1f  %.1f  %.1f", g_tp[i].pos.x, g_tp[i].pos.y, g_tp[i].pos.z);
                 ImGui::TableSetColumnIndex(2);
-                float dist = havePos ? sqrtf((g_tp[i].pos.x - p.world.x) * (g_tp[i].pos.x - p.world.x) + (g_tp[i].pos.z - p.world.z) * (g_tp[i].pos.z - p.world.z)) : 0;
-                ImGui::BeginDisabled(!havePos || dist > 400);
-                if (ImGui::SmallButton(T("Go"))) { Vec3 t = g_tp[i].pos; t.y += 0.5f; if (core::SetPlayerPos(t)) Note(T("teleport to %s"), g_tp[i].name.c_str()); else Note(T("teleport failed")); }
+                if (havePos) { const float dist = sqrtf((g_tp[i].pos.x - p.world.x) * (g_tp[i].pos.x - p.world.x) + (g_tp[i].pos.z - p.world.z) * (g_tp[i].pos.z - p.world.z));
+                    if (dist >= 1000.0f) ImGui::Text(T("%.1f km"), dist / 1000.0f); else ImGui::Text(T("%.0f m"), dist); }
+                ImGui::TableSetColumnIndex(3);
+                ImGui::BeginDisabled(!core::TravelAvailable());
+                if (ImGui::SmallButton(T("Go"))) TravelGo(g_tp[i].pos, g_tp[i].name.c_str());
                 ImGui::EndDisabled();
-                if (dist > 400 && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(T("%.0f m away: the direct write only works inside the loaded area (about 400 m). Use the game's fast travel to get close first."), dist);
-                ImGui::TableSetColumnIndex(3); if (ImGui::SmallButton(T("Delete"))) { g_tp.erase(g_tp.begin() + i); SaveTp(); ImGui::PopID(); break; }
+                ImGui::TableSetColumnIndex(4); if (ImGui::SmallButton(T("Delete"))) { g_tp.erase(g_tp.begin() + i); SaveTp(); ImGui::PopID(); break; }
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -2816,6 +2849,173 @@ namespace editor {
         if (g_tp.empty()) ImGui::TextDisabled(T("(no saved points yet)"));
         ImGui::Separator();
         ImGui::TextDisabled(T("Console: tp x y z"));
+    }
+
+    // ---- terrain brush (tab Terrain): strokes become core terrain edits; the ground changes once it streams again (Apply) ----
+    enum BrushMode { BrushRaise = 0, BrushLower = 1, BrushFlatten = 2 };
+    static bool g_brushOn = false; static int g_brushMode = BrushRaise;
+    static float g_brushRadius = 8.0f, g_brushAmount = 0.5f, g_brushFlat = 0.5f;
+    static Vec3 g_brushAt{}; static bool g_brushHave = false; static float g_brushY = 0; static bool g_brushYSet = false;
+    static int g_brushTicket = 0; static DWORD g_brushProbeTick = 0, g_brushHitTick = 0; static bool g_brushLastHit = false; static float g_brushLastHitY = 0;
+    static bool g_brushPainting = false; static size_t g_brushHistoryMark = 0; static Vec3 g_brushLast{}; static float g_brushAx = 0, g_brushAz = 0;
+    static bool TerrainTabShown() { return g_open && !g_compact && g_mainTab == TabTerrain; }
+    static bool g_shapePreview = false;   // with live editing the real ground changes at once; the preview is for builds without it
+    struct ShapeGrid { int gen = -1; float x0 = 0, z0 = 0; int nx = 0, nz = 0; std::vector<float> orig, edit; };
+    static ShapeGrid g_shape;
+    // The edited surface as a wire grid on the 2 m texel grid (where it differs from the original): orange above, blue below the
+    // current ground, stronger with the height change. Drawn over the picture, so dips hidden under the old ground show too.
+    static void DrawShapePreview(ImDrawList* dl, const CamFrame& cf) {
+        const auto strokes = core::TerrainStrokes(); if (strokes.empty()) return;
+        float mnx = 1e9f, mnz = 1e9f, mxx = -1e9f, mxz = -1e9f; bool any = false;
+        for (const auto& t : strokes) { const float dx = t.x - cf.pos.x, dz = t.z - cf.pos.z; if (dx * dx + dz * dz > 350.0f * 350.0f) continue;
+            mnx = std::min(mnx, t.x - t.r); mnz = std::min(mnz, t.z - t.r); mxx = std::max(mxx, t.x + t.r); mxz = std::max(mxz, t.z + t.r); any = true; }
+        if (!any) return;
+        mnx = std::max(mnx, cf.pos.x - 200.0f); mnz = std::max(mnz, cf.pos.z - 200.0f); mxx = std::min(mxx, cf.pos.x + 200.0f); mxz = std::min(mxz, cf.pos.z + 200.0f);
+        const float x0 = 2.0f * std::floor(mnx / 2.0f), z0 = 2.0f * std::floor(mnz / 2.0f);
+        const int nx = std::min(200, (int)((mxx - x0) / 2.0f) + 2), nz = std::min(200, (int)((mxz - z0) / 2.0f) + 2); if (nx < 2 || nz < 2) return;
+        const int gen = core::TerrainPreviewGen();
+        if (gen != g_shape.gen || x0 != g_shape.x0 || z0 != g_shape.z0 || nx != g_shape.nx || nz != g_shape.nz) {
+            g_shape.gen = gen; g_shape.x0 = x0; g_shape.z0 = z0; g_shape.nx = nx; g_shape.nz = nz;
+            core::TerrainPreviewGrid(x0, z0, nx, nz, &g_shape.orig, &g_shape.edit);
+        }
+        if ((int)g_shape.edit.size() != nx * nz) return;
+        // a shaded clay surface of the new ground: every 2 m cell that changes (plus the ring around it) as a lit quad, painted far
+        // to near so nearer slopes cover farther ones; slightly orange where it rises, blue where it sinks
+        auto H = [&](int i, int j) -> float { return g_shape.edit[(size_t)j * nx + i]; };
+        auto D = [&](int i, int j) -> float { const size_t k = (size_t)j * nx + i; return g_shape.edit[k] - g_shape.orig[k]; };
+        struct Quad { float depth; ImVec2 p[4]; ImU32 col; };
+        static std::vector<Quad> quads; quads.clear();
+        const float lx = 0.45f, ly = 0.80f, lz = 0.40f;   // light from above, slightly from the side (normalised below)
+        const float ll = sqrtf(lx * lx + ly * ly + lz * lz);
+        for (int j = 0; j + 1 < nz; j++) for (int i = 0; i + 1 < nx; i++) {
+            const float h00 = H(i, j), h10 = H(i + 1, j), h01 = H(i, j + 1), h11 = H(i + 1, j + 1);
+            if (std::isnan(h00) || std::isnan(h10) || std::isnan(h01) || std::isnan(h11)) continue;
+            float dmax = 0, dsum = 0;   // changed here or next to a change (the ring keeps the edge of an edit visible)
+            for (int jj = std::max(0, j - 1); jj <= std::min(nz - 1, j + 2); jj++) for (int ii = std::max(0, i - 1); ii <= std::min(nx - 1, i + 2); ii++) {
+                const float d = D(ii, jj); if (std::isnan(d)) continue; dmax = std::max(dmax, std::fabs(d)); }
+            if (dmax < 0.03f) continue;
+            dsum = 0.25f * (D(i, j) + D(i + 1, j) + D(i, j + 1) + D(i + 1, j + 1));
+            const float wx = x0 + 2.0f * i + 1.0f, wz = z0 + 2.0f * j + 1.0f;
+            const Vec3 c[4] = { { wx, h00 + 0.05f, wz }, { wx + 2.0f, h10 + 0.05f, wz }, { wx + 2.0f, h11 + 0.05f, wz + 2.0f }, { wx, h01 + 0.05f, wz + 2.0f } };
+            Quad q; bool ok = true; float dep = 0;
+            for (int k = 0; k < 4 && ok; k++) {
+                const float d = (c[k].x - cf.pos.x) * cf.fwd.x + (c[k].y - cf.pos.y) * cf.fwd.y + (c[k].z - cf.pos.z) * cf.fwd.z;
+                ok = d > 1.0f && WorldToScreen(cf, c[k], &q.p[k]); dep += d;
+            }
+            if (!ok) continue;
+            // normal of the cell from its height differences (x and z spacing 2 m), Lambert shading
+            const float nxv = -((h10 + h11) - (h00 + h01)) * 0.25f, nzv = -((h01 + h11) - (h00 + h10)) * 0.25f, nyv = 1.0f;
+            const float nl = sqrtf(nxv * nxv + nyv * nyv + nzv * nzv);
+            const float lit = 0.30f + 0.70f * std::max(0.0f, (nxv * lx + nyv * ly + nzv * lz) / (nl * ll));
+            const float tint = std::min(1.0f, std::fabs(dsum) / 3.0f) * (std::fabs(dsum) >= 0.03f ? 1.0f : 0.0f);
+            float r = 205, g = 190, b = 165;   // clay
+            if (dsum > 0) { r += (255 - r) * tint * 0.5f; g += (170 - g) * tint * 0.5f; b += (90 - b) * tint * 0.5f; }
+            else          { r += (110 - r) * tint * 0.5f; g += (170 - g) * tint * 0.5f; b += (255 - b) * tint * 0.5f; }
+            const float edge = dmax < 0.3f ? dmax / 0.3f : 1.0f;   // the untouched ring fades out
+            q.col = IM_COL32((int)(r * lit), (int)(g * lit), (int)(b * lit), (int)(60 + 170 * edge));
+            q.depth = dep; quads.push_back(q);
+        }
+        std::sort(quads.begin(), quads.end(), [](const Quad& a, const Quad& b) { return a.depth > b.depth; });
+        for (const auto& q : quads) dl->AddQuadFilled(q.p[0], q.p[1], q.p[2], q.p[3], q.col);
+    }
+    static bool BrushActive() { return TerrainTabShown() && g_brushOn && core::TerrainAvailable() && !g_playMode; }
+    static void AddBrushStroke() {
+        core::TerrainStroke t{};
+        t.mode = g_brushMode == BrushFlatten ? core::TerrainFlatten : core::TerrainRaise;
+        t.x = g_brushAt.x; t.z = g_brushAt.z; t.r = g_brushRadius; t.y = g_brushAt.y;
+        t.amount = g_brushMode == BrushLower ? -g_brushAmount : g_brushAmount; t.strength = g_brushFlat;
+        t.ax = g_brushAx; t.az = g_brushAz; t.proj = 0;
+        core::TerrainAddStroke(t); g_brushLast = g_brushAt;
+    }
+    static void CommitBrushHistory() {
+        if (!g_brushPainting) return;
+        const auto strokes = core::TerrainStrokes();
+        if (g_brushHistoryMark < strokes.size()) {
+            Act a{}; a.kind = Act::TerrainBatch;
+            a.terrain.assign(strokes.begin() + g_brushHistoryMark, strokes.end());
+            Push({ std::move(a) });
+        }
+        g_brushPainting = false;
+    }
+    static void DrawGroundRing(ImDrawList* dl, const CamFrame& cf, float x, float y, float z, float r, ImU32 col, int seg, float th) {
+        ImVec2 prev{}; bool havePrev = false;   // points closer than 1 m to the camera plane would project far off screen: the ring breaks there
+        for (int i = 0; i <= seg; i++) {
+            const float a = 6.2831853f * i / seg; const Vec3 w{ x + r * cosf(a), y + 0.1f, z + r * sinf(a) };
+            const float depth = (w.x - cf.pos.x) * cf.fwd.x + (w.y - cf.pos.y) * cf.fwd.y + (w.z - cf.pos.z) * cf.fwd.z;
+            ImVec2 sp; const bool ok = depth > 1.0f && WorldToScreen(cf, w, &sp);
+            if (ok && havePrev) dl->AddLine(prev, sp, col, th);
+            prev = sp; havePrev = ok;
+        }
+    }
+    static void BrushTick(const PosInfo& p, bool havePos) {
+        if (!TerrainTabShown()) { CommitBrushHistory(); return; }
+        const CamFrame cf = CurrentCam(); if (!cf.ok) return;
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        if (g_shapePreview) DrawShapePreview(dl, cf);
+        else {   // painted strokes, newest on top (only the ones near the camera)
+            const auto strokes = core::TerrainStrokes(); int drawn = 0;
+            for (int i = (int)strokes.size() - 1; i >= 0 && drawn < 600; i--) {
+                const auto& t = strokes[i]; const float dx = t.x - cf.pos.x, dz = t.z - cf.pos.z; if (dx * dx + dz * dz > 400.0f * 400.0f) continue;
+                const ImU32 col = t.mode == core::TerrainFlatten ? IM_COL32(120, 230, 140, 150) : t.amount >= 0 ? IM_COL32(255, 170, 80, 150) : IM_COL32(90, 170, 255, 150);
+                DrawGroundRing(dl, cf, t.x, t.y, t.z, t.r, col, 20, 1.0f); drawn++;
+            }
+        }
+        if (!BrushActive()) { CommitBrushHistory(); return; }
+        ImGuiIO& io = ImGui::GetIO();
+        (void)p; (void)havePos;
+        // the brush sits where a cast from the camera along the mouse ray hits (the game's own sphere cast, one per frame at most);
+        // the last hit stays shown while the next cast is on its way, a miss (sky, beyond the loaded collision) hides the brush
+        if (g_brushTicket) { core::GroundHit gh; if (core::GroundResult(g_brushTicket, &gh)) {
+            g_brushLastHit = gh.hit; g_brushTicket = 0;
+            if (gh.hit && gh.fraction >= 0.0f) { g_brushAt = { gh.center.x, gh.center.y - core::g_probeRadius, gh.center.z }; g_brushY = g_brushAt.y; g_brushLastHitY = g_brushAt.y; g_brushHitTick = GetTickCount(); } } }
+        const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
+        const Vec3 rd = MouseRay(cf, io.MousePos);
+        if (!overUi && !g_brushTicket && core::GroundProbeReady()) g_brushTicket = core::RayProbe(cf.pos, rd, 300.0f);
+        g_brushHave = !overUi && g_brushLastHit && GetTickCount() - g_brushHitTick < 500;
+        if (g_brushHave && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { g_brushHistoryMark = core::TerrainStrokes().size(); g_brushPainting = true; g_brushAx = g_brushAt.x; g_brushAz = g_brushAt.z; AddBrushStroke(); }
+        else if (g_brushPainting && g_brushHave && io.MouseDown[ImGuiMouseButton_Left]) {   // dragging paints a stroke every 40 % of the radius
+            const float dx = g_brushAt.x - g_brushLast.x, dz = g_brushAt.z - g_brushLast.z, sp = std::max(0.5f, g_brushRadius * 0.4f);
+            if (dx * dx + dz * dz >= sp * sp) AddBrushStroke();
+        }
+        if (!io.MouseDown[ImGuiMouseButton_Left]) CommitBrushHistory();
+        if (g_brushHave) {
+            const ImU32 col = g_brushMode == BrushFlatten ? IM_COL32(150, 255, 170, 255) : g_brushMode == BrushLower ? IM_COL32(120, 190, 255, 255) : IM_COL32(255, 190, 100, 255);
+            DrawGroundRing(dl, cf, g_brushAt.x, g_brushAt.y, g_brushAt.z, g_brushRadius, col, 48, 2.0f);
+            ImVec2 c; if (WorldToScreen(cf, g_brushAt, &c)) dl->AddCircleFilled(c, 3.0f, col);
+        }
+    }
+    static void DrawTerrain(const PosInfo& p, bool havePos) {
+        if (!core::TerrainAvailable()) { ImGui::TextWrapped(T("Terrain editing is not available in this game build: %s"), core::TerrainStatus().c_str()); return; }
+        core::TravelPrepare();
+        ImGui::Checkbox(T("Brush active (left mouse paints in the world)"), &g_brushOn); ImGui::SameLine();
+        ImGui::Checkbox(T("Shape preview"), &g_shapePreview);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("The ground as it will be after Apply, as a shaded surface: orange tint = higher, blue tint = lower than now."));
+        ImGui::RadioButton(T("Raise"), &g_brushMode, BrushRaise); ImGui::SameLine();
+        ImGui::RadioButton(T("Lower"), &g_brushMode, BrushLower); ImGui::SameLine();
+        ImGui::RadioButton(T("Flatten"), &g_brushMode, BrushFlatten);
+        ImGui::SetNextItemWidth(260); ImGui::SliderFloat(T("radius (m)"), &g_brushRadius, 2.0f, 60.0f, "%.1f");
+        ImGui::SetNextItemWidth(260);
+        if (g_brushMode == BrushFlatten) ImGui::SliderFloat(T("strength"), &g_brushFlat, 0.05f, 1.0f, "%.2f");
+        else ImGui::SliderFloat(T("height per stroke (m)"), &g_brushAmount, 0.05f, 5.0f, "%.2f");
+        ImGui::TextDisabled(g_brushMode == BrushFlatten ? T("Flatten pulls the ground toward the height where the drag started.") : T("Dragging paints a stroke every 40 percent of the radius; strokes add up."));
+        const auto strokes = core::TerrainStrokes();
+        ImGui::Text(T("%d strokes"), (int)strokes.size()); ImGui::SameLine();
+        ImGui::BeginDisabled(g_undo.empty());
+        if (ImGui::SmallButton(T("Undo"))) Undo();
+        ImGui::EndDisabled(); ImGui::SameLine();
+        ImGui::BeginDisabled(strokes.empty());
+        if (ImGui::SmallButton(T("Clear all"))) { Act a{}; a.kind = Act::TerrainClear; a.terrain = strokes; core::TerrainClear(); Push({ std::move(a) }); }
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        const std::string st = core::TerrainApplyState();
+        if (!st.empty()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Applying: %s"), st.c_str());
+        else if (core::TerrainNeedsApply()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Not applied yet: the shaded surface shows the new shape."));
+        else ImGui::TextDisabled(T("The ground shows every stroke."));
+        ImGui::BeginDisabled(!st.empty() || !havePos || !core::TravelAvailable() || strokes.empty() && !core::TerrainNeedsApply());
+        if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Apply (two loading screens)"))) { if (core::TerrainApply(p.world)) Note(T("applying the terrain: fast travel away and back")); }
+        ImGui::EndDisabled();
+        ImGui::TextWrapped(T("Strokes change the ground and its collision right away. Apply (a fast travel 5 km away and back, about half a minute) is only needed when a stroke could not be shown live. Strokes are saved with the project and are there right away when the project is autoloaded."));
+        ImGui::TextDisabled(T("travel: %s"), core::TravelStatus().c_str());
     }
 
     // screen rectangle of a placed object's (yaw-rotated) bounding box; depth = distance along the view direction
@@ -2854,7 +3054,7 @@ namespace editor {
         if(ImGui::IsMouseReleased(ImGuiMouseButton_Left)){if(!g_boxMoved&&!g_boxAdd)ClearSceneSelection();g_boxSelecting=g_boxMoved=g_boxAdd=false;g_boxBase.clear();g_boxNpcBase.clear();}
     }
     static void ClickSelect(const PosInfo& p, bool havePos) {
-        (void)p;(void)havePos;g_hoverUid=g_hoverNpcUid=0;ImGuiIO&io=ImGui::GetIO();if(g_browserDragPrefab>=0||g_npcDragIndex>=0)return;
+        (void)p;(void)havePos;g_hoverUid=g_hoverNpcUid=0;ImGuiIO&io=ImGui::GetIO();if(g_browserDragPrefab>=0||g_npcDragIndex>=0)return;if(BrushActive())return;
         const bool overUi=ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)||ImGui::IsAnyItemHovered(),addSelect=CtrlHeld(io),addBox=CtrlHeld(io)||ShiftHeld(io),placing=g_place.active;if(g_playMode)return;
         auto objects=core::Spawned();auto npcs=core::ManagedNpcs();const int leftClicks=ImGui::GetMouseClickedCount(ImGuiMouseButton_Left);
         if(g_rightGesture){if(io.MouseDown[ImGuiMouseButton_Right]){float dx=io.MousePos.x-g_rightStart.x,dy=io.MousePos.y-g_rightStart.y;if(dx*dx+dy*dy>16)g_rightMoved=true;}if(ImGui::IsMouseReleased(ImGuiMouseButton_Right)){if(!g_rightMoved&&g_rightUid){if(g_rightUid>0){if(IsCarried(g_rightUid)){ClearSceneSelection();for(const auto&m:g_place.m)g_sel.insert(m.uid);g_primary=g_lastClicked=g_rightUid;g_sceneLastEntity=g_rightUid;}else if(!g_sel.count(g_rightUid))SelectUid(g_rightUid,false,objects);}else{const int uid=-g_rightUid;if(!g_managedNpcSel.count(uid))SelectManagedNpc(uid,false);}g_worldPopupRequested=true;g_worldPopupPos=io.MousePos;}g_rightGesture=g_rightMoved=false;g_rightUid=0;}}
@@ -2868,6 +3068,7 @@ namespace editor {
         if(!bestKey){if(placing){if(ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))DropCarried();return;}if(ImGui::IsMouseClicked(ImGuiMouseButton_Left)){g_boxSelecting=true;g_boxMoved=false;g_boxAdd=addBox;g_boxStart=g_boxCurrent=io.MousePos;g_boxBase=g_boxAdd?g_sel:std::set<int>{};g_boxNpcBase=g_boxAdd?g_managedNpcSel:std::set<int>{};}return;}
         if(leftClicks>=2){if(bestKey>0){SelectSingleUid(bestKey);StartGrab({bestKey},false,ShortName(Find(objects,bestKey)->prefab));}else{SelectManagedNpc(-bestKey,false);FocusSelection();}return;}
         if(ImGui::IsMouseClicked(ImGuiMouseButton_Left)){if(bestKey>0)SelectUid(bestKey,addSelect,objects);else SelectManagedNpc(-bestKey,addSelect);g_editUid=0;}
+
     }
     static bool BrowserDropPoint(const core::PrefabInfo& pi, ImVec2 mouse, Vec3* center, bool* onGroundPlane) {
         CamFrame cf = CurrentCam(); if (!cf.ok) return false;
@@ -3227,10 +3428,16 @@ namespace editor {
             DrawGizmo(g_place.center, one ? WrapYaw(g_place.m[0].rot0.yaw + g_place.yaw) : g_place.yaw, one ? WrapYaw(g_place.m[0].rot0.pitch + g_place.pitch) : g_place.pitch, GizmoScreenSize(cf, g_place.center, g_place.radius), g_place.drag ? g_place.drag : g_place.hover); }
         if (g_place.active && !g_open) ImGui::GetIO().MouseDrawCursor = MouseMode();
         DrawCalibrationMarker(p, havePos);
+        {   // research overlay: world points from /api/research/points (e.g. edited terrain), drawn under the editor windows
+            const auto pts = core::DebugPoints();
+            if (!pts.empty()) { const CamFrame cf = CurrentCam(); ImDrawList* dl = ImGui::GetBackgroundDrawList(); ImVec2 s;
+                for (const auto& d : pts) if (WorldToScreen(cf, d.p, &s)) dl->AddCircleFilled(s, 3.0f, d.col, 6); }
+        }
         if (!g_open) { if (g_cameraMode) StopCameraMode(); return; }
         if (g_numericEditId && g_numericEditLastSeenFrame >= 0 && ImGui::GetFrameCount() - g_numericEditLastSeenFrame > 1) CancelNumericEdit();
         ImGuiIO& io = ImGui::GetIO();
         io.MouseDrawCursor = !g_playMode;
+        BrushTick(p, havePos);
         ClickSelect(p, havePos); DrawWorldContextPopup(havePos); DrawSelectionOutlines();
         if (g_compact) { DrawCompact(p, havePos); DrawMetadataPopups(); CameraTick(); return; }
         {   // initial size follows the UI scale (style is scaled by screen height / 1080) and stays inside the screen
@@ -3303,8 +3510,8 @@ namespace editor {
             if (ImGui::BeginTabItem(TStable(ICON_CLOCK_ROTATE_LEFT " Time & Weather"), nullptr, environmentFlags)) { g_mainTab = TabEnvironment; DrawEnvironment(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(TStable(ICON_CLOCK_ROTATE_LEFT " History"))) { g_mainTab = TabHistory; DrawHistory(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(TStable(ICON_FLOPPY_DISK " Project"))) { g_mainTab = TabProject; DrawProject(); ImGui::EndTabItem(); }
-            static const bool s_showTravel = false;   // hidden until the game's own teleport path is found
-            if (s_showTravel && ImGui::BeginTabItem(TStable(ICON_LOCATION_CROSSHAIRS " Travel"))) { g_mainTab = TabTravel; DrawTravel(p, havePos); ImGui::EndTabItem(); }
+            if (core::TravelAvailable() && ImGui::BeginTabItem(TStable(ICON_LOCATION_CROSSHAIRS " Travel"))) { g_mainTab = TabTravel; DrawTravel(p, havePos); ImGui::EndTabItem(); }
+            if (core::TerrainAvailable() && ImGui::BeginTabItem(TStable(ICON_CUBE " Terrain"))) { g_mainTab = TabTerrain; DrawTerrain(p, havePos); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(TStable(ICON_LIST " Settings"))) {
                 g_mainTab = TabSettings;
                 int languageCount = 0; const auto* languageOptions = i18n::Languages(&languageCount); int languageIndex = 0;

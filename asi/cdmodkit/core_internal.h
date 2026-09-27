@@ -18,11 +18,22 @@ namespace core {
     void ExpandCameraManager(std::vector<std::pair<std::string, uintptr_t>>& out);
 
     // the renderer camera through its own object (cdmodkit.cpp); false when unresolved or the block does not validate
-    bool WatchWrites(const uintptr_t addr[4], int seconds, const char* tag);   // diag.cpp: hardware write breakpoints, writers logged
+    bool WatchWrites(const uintptr_t addr[4], int seconds, const char* tag);
+    bool WatchAccessSync(const uintptr_t addr[4], int seconds, const char* tag);   // read/write watch armed before returning (the caller's own next access is caught)
+    bool StartWatch(const uintptr_t addr[4]); void RefreshWatch(); void StopWatch(); void DumpWatch(const char* tag, uint64_t from, uint64_t to);   // continuous write watch   // diag.cpp: hardware write breakpoints, writers logged
     uintptr_t CameraSceneObject();    // the camera manager's scene object (the pose the game's camera logic produces), 0 if unknown
     uintptr_t NativeCameraObject();   // the renderer camera object itself (0 when unresolved or its type does not match)
 
     // pack I/O tracing (diag.cpp): installed once at startup, switched by the console command "traceio on|off"
     void InstallIoTrace();
     void SetIoTrace(bool on);
+
+    // helpers for optional modules (cdmodkit.cpp)
+    uintptr_t SigScanUnique(const char* pat); uintptr_t VtableByName(const char* mangled); std::string PathObjText(void* path);
+    void TerrainInstall(); void TravelInstall();
+    // live terrain (terrain_live.cpp)
+    void TerrainLiveInstall(); bool TerrainLiveAvailable(); bool TerrainLiveHasTexture(int tx, int tz);
+    void TerrainLiveNoteRead(int tx, int tz, const uint8_t* data, uint32_t len);
+    bool TerrainLiveUpload(int tx, int tz, const uint8_t* chain, size_t len);
+    void TerrainPhysInstall(); int TerrainPhysSync(int tx, int tz, const float* prev, const float* next);   // terrain_physics.cpp
 }

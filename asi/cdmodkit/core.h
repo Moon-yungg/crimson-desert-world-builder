@@ -53,7 +53,39 @@ namespace core {
     bool ReadMem(uintptr_t addr, void* out, size_t n); bool WriteMem(uintptr_t addr, const void* in, size_t n);   // research: guarded raw access
     void ResearchPeek(uintptr_t addr, int bytes, bool u16);   // research: log raw memory
     void ResearchFind(const std::vector<uint8_t>& pat, int maxHits);   // research: byte pattern search (logged)
-    void SetFallWatch(bool on);   // research: log falls of the player and the code that moves it
+    void SetFallWatch(bool on, uintptr_t addr = 0, bool breakpoints = true, uintptr_t probe = 0, unsigned probeLen = 0);   // research: log falls of the player, the code that moves it (addr: explicit field) and what changed in a probed object
+    void ResearchFindPos();
+    void GroundTrace(int seconds);
+    struct DebugPt { Vec3 p; uint32_t col; };   // research overlay: world points drawn by the editor
+    std::vector<DebugPt> DebugPoints(); size_t DebugPointCount(); int LoadDebugPoints(bool clear);   // file bin64\cdmodkit\debugpoints.txt: "x y z rrggbb" per line
+    void GeoTraceInstall(uintptr_t vt, int slots); void GeoTraceArm(); void FnTraceInstall(uintptr_t rva); void IoTraceSet(const std::string& filter); void IoHeightDelta(int d); void IoStreamDelta(int d);
+    // Terrain editing (terrain.cpp): brush strokes applied to the terrain height textures as the game streams them in;
+    // collision is captured from the rendered terrain and follows. Tiles already loaded change after TerrainApply.
+    enum { TerrainRaise = 0, TerrainFlatten = 1 };
+    struct TerrainStroke {           // world metres; raise: amount (+ up / - down) at the centre, cosine falloff to r
+        int mode; float x, z, r;     // flatten: pulls toward the height at (ax, az) by strength (0..1) at the centre
+        float amount, strength, ax, az;
+        float y;                     // ground height when painted (display only)
+        int proj;                    // project the stroke belongs to (0 = painted since the last save), like SpawnedObj::proj
+    };
+    bool TerrainAvailable(); std::string TerrainStatus();
+    void TerrainAddStroke(const TerrainStroke& s); bool TerrainUndo(); void TerrainClear();
+    std::vector<TerrainStroke> TerrainStrokes();
+    void TerrainSetProject(int from, int to);                                     // strokes saved into a project become its members
+    void TerrainReplaceProject(int proj, const std::vector<TerrainStroke>& strokes); // a project's strokes as loaded from its file
+    bool TerrainNeedsApply(); void TerrainMarkApplied();
+    bool TerrainApply(Vec3 back);        // fast travel 5 km away and back to 'back': the edited tiles stream again (async)
+    std::string TerrainApplyState();     // "" when idle
+    int TerrainPreviewGen();             // changes whenever the preview heights change
+    bool TerrainPreviewGrid(float x0, float z0, int nx, int nz, std::vector<float>* orig, std::vector<float>* edit);   // 2 m texel grid, NaN = not loaded
+    // Travel (travel.cpp): the game's own fast travel to any position (loading screen; the world streams at the destination).
+    bool TravelAvailable(); bool TravelPrepared(); void TravelPrepare(); std::string TravelStatus();
+    bool TravelTo(Vec3 pos, float yawDeg);   // false while the travel system is still being found (TravelPrepare runs then)
+    void MarkProjectDirty(int proj);
+    void GpuTrace(int seconds);   // research (gpu_research.cpp): log the game's copies into 16-bit textures for a while
+    // research (terrain_research.cpp, rvas given at runtime)
+    int TerrainEditDisc(float x, float z, float radius, float metres); void TerrainEditClear(); void TerrainSyncTrace();
+    void TerrainJobTrace(uintptr_t rva); void TerrainLoadTrace(int slot); void TerrainTexTrace(uintptr_t rva); void TeleTraceInstall(uintptr_t rva); void ReloadStageTrace(uintptr_t rva); void RsSendTrace(uintptr_t rva); void ClientReloadTrace(uintptr_t rva); void ClientReloadReplay(float x, float y, float z); void ReloadStageReplay(float x, float y, float z); bool ResearchWatchWrites(const uintptr_t addr[4], int seconds); void TerrainTileTaskTrace(uintptr_t rva); void TerrainRetTrace(uintptr_t rva); void TerrainTexReload(int tx, int tz, uintptr_t mgr, uintptr_t rva); void TerrainReloadCall(uintptr_t obj, int slot, const std::string& name);
     void ResearchVtScan(const std::string& mangled, int maxHits, int dumpBytes);   // research: live objects of an RTTI class (logged)
     void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)
@@ -75,10 +107,12 @@ namespace core {
     void RayTrace(int calls);                  // logs the next N ray casts of the game (reverse engineering aid)
     void ProbeGround(float above, float len);  // dev: logs three replayed casts from above the player
     // Ground queries: a sphere cast of the game (captured automatically from its own character probe) replayed downward.
-    struct GroundHit { bool done = false, hit = false; float centerY = 0; float fraction = 0; Vec3 normal{}; };
+    struct GroundHit { bool done = false, hit = false; float centerY = 0; float fraction = 0; Vec3 normal{}; Vec3 center{}; };   // center: sphere centre at the hit
     bool GroundProbeReady();                   // a cast template was captured (the character has to be in the world for a moment)
     int  GroundProbe(Vec3 start, float len);   // queues a cast from start straight down on the game thread; ticket (0 = not possible)
-    bool GroundResult(int ticket, GroundHit* out);   // true once the ticket finished (poll every frame)
+    int  RayProbe(Vec3 start, Vec3 dir, float len);   // the same cast along any direction (result: GroundResult, center = hit sphere centre)
+    bool GroundResult(int ticket, GroundHit* out);
+    bool GroundGrid(float x0, float z0, int nx, int nz, float step, float top, float len, std::vector<float>* out);   // research: collision heights on a grid (NAN = none)   // true once the ticket finished (poll every frame)
     extern float g_probeRadius;                // sphere radius of the template, calibrated at the player's feet (ground = centerY - radius)
 
     void RunOnGameThread(std::function<void()> f);

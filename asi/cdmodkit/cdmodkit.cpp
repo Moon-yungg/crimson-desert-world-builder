@@ -233,20 +233,52 @@ bool PlayerPosInfo(PosInfo* out) { uintptr_t a = PlayerActor(); return a && Read
 // Research: fall watcher. Polls the player every 50 ms; a drop of more than 3 m below the last stable height counts as a fall
 // (logged with position), then hardware write breakpoints on the transform snapshot's local x/y/z and tile words show which code
 // moves the character (physics integration vs. a rescue teleport). A jump of more than 20 m afterwards is logged as a respawn.
-static volatile bool g_fallWatch = false;
-void SetFallWatch(bool on) {
+static volatile bool g_fallWatch = false; static volatile uintptr_t g_fallWatchAddr = 0;   // 0: the client transform snapshot
+static volatile bool g_fallBreak = true; static volatile uintptr_t g_fallProbe = 0; static volatile unsigned g_fallProbeLen = 0;   // probe: sampled every poll
+void SetFallWatch(bool on, uintptr_t addr, bool breakpoints, uintptr_t probe, unsigned probeLen) {
+    if (on && g_fallWatch) { g_fallWatch = false; Sleep(200); }   // restart with the new settings
     if (on == g_fallWatch) return;
-    g_fallWatch = on; Log("[fallwatch] %s", on ? "on" : "off");
+    g_fallWatchAddr = addr; g_fallBreak = breakpoints; g_fallProbe = probe; g_fallProbeLen = probe ? std::min(probeLen ? probeLen : 0x400u, 0x1000u) & ~3u : 0;
+    g_fallWatch = on; Log("[fallwatch] %s%s%s", on ? "on" : "off", on && addr ? " (explicit address)" : "", on && !breakpoints ? " (no breakpoints)" : "");
+    if (on && probe) Log("[fallwatch] probe %p, 0x%x bytes (%s)", (void*)probe, g_fallProbeLen, RttiName(probe) ? RttiName(probe) : "-");
     if (!on) return;
     std::thread([]() {
         float stableY = NAN; DWORD stableTick = 0; bool falling = false; PosInfo last{}; bool haveLast = false;
+        uintptr_t watchedTf = 0; DWORD lastRefresh = 0;
+        static const int kRing = 48; std::vector<std::vector<uint8_t>> ring(kRing); int ringPos = 0, ringFill = 0;   // ~2.4 s of probe samples
+        auto dumpProbe = [&](const char* why) {   // every dword that differs between the oldest kept sample and the newest
+            if (!g_fallProbe || ringFill < 2) return;
+            const auto& oldS = ring[(ringPos - ringFill + kRing) % kRing]; const auto& newS = ring[(ringPos - 1 + kRing) % kRing];
+            int n = 0;
+            for (size_t o = 0; o + 4 <= oldS.size() && o + 4 <= newS.size() && n < 120; o += 4) {
+                uint32_t a, b; memcpy(&a, &oldS[o], 4); memcpy(&b, &newS[o], 4); if (a == b) continue;
+                float fa, fb; memcpy(&fa, &a, 4); memcpy(&fb, &b, 4);
+                Log("[fallwatch] probe %s +0x%03zX: %08x -> %08x (%g -> %g)", why, o, a, b, fa, fb); n++;
+            }
+            Log("[fallwatch] probe %s: %d changed dwords over %d samples", why, n, ringFill);
+        };
         while (g_fallWatch) {
             Sleep(50);
+            if (g_fallProbe) {
+                auto& slot = ring[ringPos]; slot.resize(g_fallProbeLen);
+                if (ReadBytes(g_fallProbe, slot.data(), slot.size())) { ringPos = (ringPos + 1) % kRing; ringFill = std::min(ringFill + 1, kRing); }
+            }
             const uintptr_t actor = PlayerActor(); PosInfo p{};
             if (!actor || !ReadPos(actor, &p)) continue;
             const DWORD now = GetTickCount();
+            {   // keep the write watch on the current player's transform snapshot (x, y, z, tile), re-armed for new threads
+                uintptr_t comps = Deref(actor, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) + kOff_Tf_Pos : 0;
+                if (g_fallWatchAddr) tf = g_fallWatchAddr;   // an explicit field (x, y, z, next dword)
+                if (!g_fallBreak) tf = 0;
+                if (tf && tf != watchedTf) {
+                    if (watchedTf) StopWatch();
+                    const uintptr_t a[4] = { tf, tf + 4, tf + 8, tf + 0x0C };
+                    if (StartWatch(a)) { watchedTf = tf; Log("[fallwatch] watching writes to %p (%s)", (void*)tf, g_fallWatchAddr ? "explicit" : "client transform snapshot"); }
+                } else if (now - lastRefresh > 2000) { RefreshWatch(); lastRefresh = now; }
+            }
             if (haveLast && (fabsf(p.world.x - last.world.x) > 20.0f || fabsf(p.world.z - last.world.z) > 20.0f || p.world.y - last.world.y > 20.0f)) {
-                Log("[fallwatch] RESPAWN / teleport: (%.2f %.2f %.2f) -> (%.2f %.2f %.2f)", last.world.x, last.world.y, last.world.z, p.world.x, p.world.y, p.world.z);
+                Log("[fallwatch] RESPAWN / teleport: (%.2f %.2f %.2f) -> (%.2f %.2f %.2f); writers in the last 1.5 s:", last.world.x, last.world.y, last.world.z, p.world.x, p.world.y, p.world.z);
+                DumpWatch("fallwatch", GetTickCount64() - 1500, GetTickCount64()); dumpProbe("at respawn");
                 falling = false; stableY = p.world.y; stableTick = now;
             }
             if (!falling) {
@@ -254,16 +286,13 @@ void SetFallWatch(bool on) {
                 else if (p.world.y > stableY) { stableY = p.world.y; stableTick = now; }   // walking up: follow
                 if (p.world.y < stableY - 3.0f) {
                     falling = true;
-                    Log("[fallwatch] FALL: y %.2f is %.2f m below the last stable %.2f at (%.2f %.2f), falling for %lu ms", p.world.y, stableY - p.world.y, stableY, p.world.x, p.world.z, now - stableTick);
-                    uintptr_t comps = Deref(actor, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
-                    if (tf) {
-                        const uintptr_t a[4] = { tf + kOff_Tf_Pos, tf + kOff_Tf_Pos + 4, tf + kOff_Tf_Pos + 8, tf + kOff_Tf_Pos + 0x0C };
-                        if (!WatchWrites(a, 15, "fallwatch")) Log("[fallwatch] a write watch is already running");
-                    }
+                    Log("[fallwatch] FALL: y %.2f is %.2f m below the last stable %.2f at (%.2f %.2f), falling for %lu ms; writers in the 2.5 s before:", p.world.y, stableY - p.world.y, stableY, p.world.x, p.world.z, now - stableTick);
+                    DumpWatch("fallwatch", GetTickCount64() - 2500, GetTickCount64()); dumpProbe("before the fall");
                 }
             } else if (p.world.y < -2000.0f || now - stableTick > 60000) { falling = false; stableY = NAN; }
             last = p; haveLast = true;
         }
+        StopWatch();
     }).detach();
 }
 bool PlayerWorldPos(Vec3* out) { PosInfo p; if (!PlayerPosInfo(&p)) return false; *out = p.world; return true; }
@@ -419,10 +448,97 @@ extern volatile LONG g_queueCount;
 // The loader instance is captured from the game's own calls (hook on the same function), the path object is built like DoSpawn's.
 static uintptr_t kRva_ResLoad = 0;
 typedef void* (__fastcall* ResLoadFn)(void* self, void** out, void* path, uint32_t flags);
+static void ReleaseHookPiece(); static uintptr_t FindVtableByName(const char* mangled); static uintptr_t FindPatternCount(const char* pat, int* count);
 static ResLoadFn g_origResLoad = nullptr; static void* g_resLoader = nullptr;
+// Research (/api/research/iotrace {"filter":"height"}): log the game's loads whose path contains the filter, plus the load
+// worker's read calls (vtable slots 4 / 5, hooked on first use from the worker the game uses) for those handlers.
+static char g_ioFilter[64] = ""; static volatile LONG g_ioLines = 0; static std::mutex g_ioMx; static std::set<uintptr_t> g_ioHandlers;
+// research: u16 amount subtracted from every height sample of terrain height DDS files as the game reads them (0 = off)
+static volatile LONG g_ioHeightDelta = 0; static std::set<uintptr_t> g_ioHeightHandlers;
+typedef void* (__fastcall* IoGen8)(void*, void*, void*, void*, void*, void*, void*, void*);
+static IoGen8 g_origWRead[2] = {};
+static bool IoHandlerTraced(void* h) { std::lock_guard<std::mutex> l(g_ioMx); return g_ioHandlers.count((uintptr_t)h) != 0; }
+static uint32_t IoShiftHeights(uint8_t* buf, uint32_t off, uint32_t len, int dlt) {   // L16 DDS: 128-byte header, then every mip as u16
+    uint32_t n = 0;
+    CDK_GUARD_BEGIN
+        for (uint32_t fo = (off < 128 ? 128 : (off + 1) & ~1u); fo + 2 <= off + len; fo += 2) {
+            uint16_t* v = (uint16_t*)(buf + (fo - off)); int x = (int)*v - dlt; *v = (uint16_t)(x < 0 ? 0 : x > 65535 ? 65535 : x); n++; }
+    CDK_GUARD_FAIL
+    CDK_GUARD_END
+    return n;
+}
+template<int K> static void* __fastcall HookWorkerRead(void* w, void* h, void* a, void* b, void* c, void* d, void* e, void* f) {
+    void* r = g_origWRead[K](w, h, a, b, c, d, e, f);
+    if (K == 1 && r && g_ioHeightDelta) {   // slot 5: read(worker, handler, u8* buf, u32 cap, u32 offset, u32 length)
+        const uint32_t off = (uint32_t)(uintptr_t)c, cap = (uint32_t)(uintptr_t)b; uint32_t len = (uint32_t)(uintptr_t)d; if (!len) len = cap;
+        bool mine; { std::lock_guard<std::mutex> l(g_ioMx); mine = g_ioHeightHandlers.erase((uintptr_t)h) != 0; }   // one whole-file read per
+        if (mine && (off != 0 || len < 0x10000)) mine = false;                                                      // handler, then forgotten (addresses are reused)
+        if (mine && a && len) { const uint32_t n = IoShiftHeights((uint8_t*)a, off, len, (int)g_ioHeightDelta);
+            Log("[io] height patch: handler %p off %u len %u, %u samples shifted by %d", h, off, len, n, -(int)g_ioHeightDelta); }
+    }
+    if (g_ioFilter[0] && InterlockedIncrement(&g_ioLines) < 2000 && IoHandlerTraced(h)) {
+        const uintptr_t ret = (uintptr_t)_ReturnAddress();
+        Log("[io] slot %d read: handler %p args %p %p %p %p -> %p (from 0x%llx, thread %lu)", K ? 5 : 4, h, a, b, c, d, r,
+            InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull, GetCurrentThreadId());
+    }
+    return r;
+}
+static std::string PathText(void* path) {   // NormalizedPath: first field points at the text or at a pointer to it
+    char s[200] = { 0 }; uintptr_t p0 = 0;
+    if (!ReadPtr((uintptr_t)path, &p0) || !p0) return "";
+    for (int hop = 0; hop < 2; hop++) {
+        if (ReadBytes(p0, s, sizeof s - 1)) { size_t n = 0; while (n < sizeof s - 1 && s[n] >= 0x20 && s[n] < 0x7f) n++;
+            if (n >= 4 && (s[n] == 0)) return std::string(s, n); }
+        if (!ReadPtr(p0, &p0) || !p0) break;
+    }
+    return "";
+}
+static void __fastcall IoHookWorker(uintptr_t worker) {
+    static bool s_done = false; if (s_done || !worker) return;
+    uintptr_t vt = 0; if (!ReadPtr(worker, &vt) || !InImage(vt)) return;
+    s_done = true;
+    for (int k = 0; k < 2; k++) {
+        uintptr_t fn = 0; if (!ReadPtr(vt + (k ? 5 : 4) * 8, &fn) || !InImage(fn)) continue;
+        ReleaseHookPiece();
+        void* det = k ? (void*)&HookWorkerRead<1> : (void*)&HookWorkerRead<0>;
+        if (MH_CreateHook((void*)fn, det, (void**)&g_origWRead[k]) == MH_OK && MH_EnableHook((void*)fn) == MH_OK) Log("[io] worker slot %d hooked (rva 0x%llx)", k ? 5 : 4, (unsigned long long)(fn - g_base));
+        else Log("[io] hooking worker slot %d failed", k ? 5 : 4);
+    }
+}
 static void* __fastcall HookResLoad(void* self, void** out, void* path, uint32_t flags) {
     if (!g_resLoader && self) { g_resLoader = self; Log("resource loader captured %p (%s)", self, RttiName((uintptr_t)self) ? RttiName((uintptr_t)self) : "?"); }
-    return g_origResLoad(self, out, path, flags);
+    void* r = g_origResLoad(self, out, path, flags);
+    if (g_ioFilter[0] && g_ioLines < 2000) {
+        const std::string s = PathText(path);
+        if (!s.empty() && s.find(g_ioFilter) != std::string::npos) {
+            InterlockedIncrement(&g_ioLines);
+            uintptr_t h = 0, worker = 0; uint32_t s34 = 0, s38 = 0; uint8_t fl = 0; ReadPtr((uintptr_t)out, &h);
+            if (h) { ReadPtr(h + 0x20, &worker); ReadBytes(h + 0x34, &s34, 4); ReadBytes(h + 0x38, &s38, 4); ReadBytes(h + 0x3c, &fl, 1); }
+            const uintptr_t ret = (uintptr_t)_ReturnAddress();
+            Log("[io] load %s flags 0x%x -> handler %p (%s) worker %p sizes %u/%u fl 0x%02x (from 0x%llx, thread %lu)", s.c_str(), flags, (void*)h,
+                h && RttiName(h) ? RttiName(h) : "?", (void*)worker, s34, s38, fl, InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull, GetCurrentThreadId());
+            if (h) { std::lock_guard<std::mutex> l(g_ioMx); g_ioHandlers.insert(h); }
+            IoHookWorker(worker);
+        }
+    }
+    if (g_ioHeightDelta) {   // research: remember the handlers of terrain height files for the read patch above
+        const std::string s = PathText(path); uintptr_t h = 0; ReadPtr((uintptr_t)out, &h);
+        if (h && s.find("/height16f/") == std::string::npos) { std::lock_guard<std::mutex> l(g_ioMx); g_ioHeightHandlers.erase(h); }
+        if (h && s.find("/height16f/") != std::string::npos) { { std::lock_guard<std::mutex> l(g_ioMx); g_ioHeightHandlers.insert(h); }
+            uintptr_t worker = 0; ReadPtr(h + 0x20, &worker); IoHookWorker(worker);
+        }
+    }
+    return r;
+}
+// Helpers for the optional modules (terrain.cpp): unique signature scan, RTTI vtable lookup, NormalizedPath text.
+uintptr_t SigScanUnique(const char* pat) { int n = 0; const uintptr_t f = FindPatternCount(pat, &n); return n == 1 ? f : 0; }
+uintptr_t VtableByName(const char* mangled) { return FindVtableByName(mangled); }
+std::string PathObjText(void* path) { return PathText(path); }
+void IoHeightDelta(int d) { g_ioHeightDelta = d; Log("[io] height read patch %d", d); }
+void IoTraceSet(const std::string& filter) {
+    strncpy_s(g_ioFilter, filter.c_str(), _TRUNCATE); g_ioLines = 0;
+    { std::lock_guard<std::mutex> l(g_ioMx); g_ioHandlers.clear(); }
+    Log("[io] load trace filter '%s'", g_ioFilter);
 }
 static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* rtti, size_t rttiLen, bool* notFound, uint32_t offset, uint32_t length, uint32_t* storedTotal) {
     // load() returns a ResourceHandler_Paz: +0x20 worker (ResourceLoadWorker_Package), +0x34 / +0x38 sizes, +0x3c flags
@@ -886,12 +1002,17 @@ std::string ProjectNameOf(int id) {
     return (id > 0 && id < (int)g_projNames.size()) ? g_projNames[id] : std::string();
 }
 int ProjectObjectCount(int id) {
-    std::lock_guard<std::mutex> l(g_regMutex);
-    int n = 0; for (auto& o : g_reg) if (!o.hidden && o.proj == id) n++;
-    for (auto& npc : g_npcReg) if (!npc.hidden && npc.proj == id) n++;
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex);
+        for (auto& o : g_reg) if (!o.hidden && o.proj == id) n++;
+        for (auto& npc : g_npcReg) if (!npc.hidden && npc.proj == id) n++;
+    }
+    for (const auto& t : TerrainStrokes()) if (t.proj == id) n++;
     return n;
 }
 bool ProjectDirty(int id) { std::lock_guard<std::mutex> l(g_regMutex); return g_projDirty.count(id) != 0; }
+void MarkProjectDirty(int proj) { if (proj) { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.insert(proj); } }
 void AssignProject(int uid, int proj) {
     std::lock_guard<std::mutex> l(g_regMutex);
     int i = IndexOfUidLocked(uid); if (i >= 0) g_reg[i].proj = proj;
@@ -926,7 +1047,7 @@ bool SaveProject(const std::string& rawName, int scope) {
     CreateDirectoryA(ProjDir().c_str(), nullptr);
     FILE* f = fopen(ProjPath(name).c_str(), "w");
     if (!f) { Log("save: cannot write %s", ProjPath(name).c_str()); return false; }
-    fprintf(f, "# cdmodkit project v4: object rows remain v3-compatible; optional note hex, named groups and managed NPCs are comment records\n");
+    fprintf(f, "# cdmodkit project v4: object rows remain v3-compatible; optional note hex, named groups, managed NPCs and terrain strokes are comment records\n");
     auto l = Spawned(); auto npcs = ManagedNpcs(); int n = 0, nn = 0; std::vector<int> written, writtenNpcs; std::set<int> usedGroups;
     auto inScope = [&](int proj) {
         if (scope == SaveProjectAndNew) return proj == pid || proj == 0;
@@ -949,17 +1070,29 @@ bool SaveProject(const std::string& rawName, int scope) {
             npc.aiEnabled ? 1 : 0, npc.behavior, npc.group, HexText(npc.label).c_str(), HexText(npc.note).c_str());
         writtenNpcs.push_back(npc.uid); nn++;
     }
+    int ns = 0;   // terrain strokes, same scope rules as the objects; '#' lines, so older versions simply skip them
+    for (const auto& t : TerrainStrokes()) {
+        if (scope == SaveProjectAndNew && !(t.proj == pid || t.proj == 0)) continue;
+        if (scope == SaveNewOnly && t.proj != 0) continue;
+        if (scope == SaveProjectOnly && t.proj != pid) continue;
+        fprintf(f, "#terrain|%d|%.3f|%.3f|%.3f|%.4f|%.3f|%.3f|%.3f|%.3f\n", t.mode, t.x, t.z, t.r, t.amount, t.strength, t.ax, t.az, t.y); ns++;
+
+    }
     fclose(f);
+    if (scope == SaveWholeScene) { for (const auto& t : TerrainStrokes()) if (t.proj != pid) TerrainSetProject(t.proj, pid); }
+    else if (scope != SaveProjectOnly) TerrainSetProject(0, pid);   // written strokes join the project, like the objects
     for (int uid : written) AssignProject(uid, pid);   // what was written is now part of that project
     for (int uid : writtenNpcs) AssignNpcProject(uid, pid);
     { std::lock_guard<std::mutex> l(g_regMutex); if (scope == SaveWholeScene) g_projDirty.clear(); else g_projDirty.erase(pid); }
-    Log("save: %d objects, %d NPCs (scope %d) -> %s", n, nn, scope, ProjPath(name).c_str());
+    Log("save: %d objects, %d NPCs, %d terrain strokes (scope %d) -> %s", n, nn, ns, scope, ProjPath(name).c_str());
+
     return true;
 }
 void DeleteAllSpawned() {
-    { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.clear(); }   // nothing left that could differ from a file
+    TerrainClear();   // the terrain strokes belong to the scene as well (loaded tiles keep the old shape until an apply)
     std::vector<uintptr_t> objs, actors;
     { std::lock_guard<std::mutex> l(g_regMutex);
+      g_projDirty.clear();   // TerrainClear marks affected projects dirty; the whole scene is gone, so clear that bookkeeping again
       for (auto& o : g_reg) if (!o.hidden) { if (o.gimmick && !o.standin) { if (o.actor) actors.push_back(o.actor); } else if (o.obj) objs.push_back(o.obj); }
       for (auto& npc : g_npcReg) if (!npc.hidden && npc.actor) actors.push_back(npc.actor);
       g_reg.clear(); g_npcReg.clear(); g_groupNames.clear(); }
@@ -971,7 +1104,8 @@ void DeleteAllSpawned() {
 bool UnloadProject(int id) {
     if (id <= 0) return false;
     std::vector<uintptr_t> objs, actors;
-    int objectCount = 0, npcCount = 0;
+    int objectCount = 0, npcCount = 0, terrainCount = 0;
+    for (const auto& t : TerrainStrokes()) if (t.proj == id) terrainCount++;
     {
         std::lock_guard<std::mutex> l(g_regMutex);
         for (auto it = g_reg.begin(); it != g_reg.end();) {
@@ -989,12 +1123,19 @@ bool UnloadProject(int id) {
         }
         g_projDirty.erase(id);
     }
+    if (terrainCount) TerrainReplaceProject(id, {});
     for (uintptr_t actor : actors) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
     for (uintptr_t obj : objs) RunOnGameThread([obj]() { DoRemove(obj); });
-    Log("unload project %d: %d objects, %d NPCs", id, objectCount, npcCount);
-    return objectCount || npcCount;
+    Log("unload project %d: %d objects, %d NPCs, %d terrain strokes", id, objectCount, npcCount, terrainCount);
+    return objectCount || npcCount || terrainCount;
 }
 static bool g_autoDone = false; static DWORD g_worldSince = 0, g_worldLast = 0;
+// "#terrain|mode|x|z|r|amount|strength|ax|az|y": one terrain brush stroke of the project (see TerrainStroke)
+static bool ParseTerrainLine(const char* line, TerrainStroke* t) {
+    if (strncmp(line, "#terrain|", 9) != 0) return false;
+    *t = TerrainStroke{};
+    return sscanf(line + 9, "%d|%f|%f|%f|%f|%f|%f|%f|%f", &t->mode, &t->x, &t->z, &t->r, &t->amount, &t->strength, &t->ax, &t->az, &t->y) >= 6;
+}
 bool LoadProject(const std::string& name, bool clearFirst) {
     FILE* f = fopen(ProjPath(name).c_str(), "r");
     if (!f) { Log("load: cannot open %s", ProjPath(name).c_str()); return false; }
@@ -1003,11 +1144,13 @@ bool LoadProject(const std::string& name, bool clearFirst) {
     const int pid = ProjectId(name);   // the objects remember where they came from, so this project can be overwritten on its own
     g_loading = true;
     char line[2048]; int n = 0, nn = 0; std::map<int, int> groups;   // file group ids -> fresh ids
+    std::vector<TerrainStroke> strokes;
     auto mapGroup = [&](int fileGroup) {
         if (fileGroup <= 0) return 0;
         auto it = groups.find(fileGroup); if (it == groups.end()) it = groups.emplace(fileGroup, NewGroupId()).first; return it->second;
     };
     while (fgets(line, sizeof line, f)) {
+        TerrainStroke t{}; if (ParseTerrainLine(line, &t)) { strokes.push_back(t); continue; }
         if (line[0] == '\n') continue;
         const std::vector<std::string> p = SplitPipe(line); if (p.empty()) continue;
         if (p[0] == "#group") {
@@ -1028,8 +1171,10 @@ bool LoadProject(const std::string& name, bool clearFirst) {
         const int grp = p.size() > 6 ? atoi(p[6].c_str()) : 0; const float pitch = p.size() > 7 ? (float)atof(p[7].c_str()) : 0.0f, roll = p.size() > 8 ? (float)atof(p[8].c_str()) : 0.0f;
         const int g = mapGroup(grp); const int uid = SpawnAt(p[0], { x, y, z }, Rot{ yaw, pitch, roll }, sc, g, pid);
         if (uid && p.size() > 9) SetObjectNote(uid, UnhexText(p[9])); if (uid) n++;
+
     }
     fclose(f);
+    TerrainReplaceProject(pid, strokes);   // a tile that is already loaded shows them after an apply
     g_loading = false;
     { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.erase(pid); }   // freshly loaded = in sync with the file
     Log("load: %d objects, %d NPCs queued from %s", n, nn, ProjPath(name).c_str());
@@ -1067,6 +1212,22 @@ std::vector<std::string> Autoload() {
     }
     fclose(f);
     return out;
+}
+// At startup, before the world streams: the terrain strokes of the autoload projects, so the first load of the world already
+// carries them. The autoload later loads the same strokes again, which TerrainReplaceProject recognises as unchanged.
+static bool ParseTerrainLine(const char* line, TerrainStroke* t);
+static void PreloadAutoloadTerrain() {
+    if (!TerrainAvailable()) return;
+    int total = 0;
+    for (const auto& name : Autoload()) {
+        FILE* f = fopen(ProjPath(name).c_str(), "r"); if (!f) continue;
+        std::vector<TerrainStroke> strokes; char line[1024];
+        while (fgets(line, sizeof line, f)) { TerrainStroke t{}; if (ParseTerrainLine(line, &t)) strokes.push_back(t); }
+        fclose(f);
+        if (!strokes.empty()) { TerrainReplaceProject(ProjectId(name), strokes); total += (int)strokes.size(); }
+    }
+    TerrainMarkApplied();
+    if (total) Log("terrain: %d strokes of the autoload projects preloaded", total);
 }
 static void WriteAutoload(const std::vector<std::string>& list) {
     if (list.empty()) { DeleteFileA(AutoloadPath().c_str()); return; }
@@ -1184,7 +1345,7 @@ static void* __fastcall HookCastShape(void* ctx, void* world, void* query, void*
 struct CastTemplate { bool have = false; void* world = nullptr; uint8_t query[0x200], xform[0x100], collector[0x200], hits[0x100], shape[0x200]; uintptr_t collAddr = 0, hitsAddr = 0, shapeAddr = 0; };
 static CastTemplate g_tpl;
 static std::mutex g_tplMutex;
-struct GroundReq { int id; Vec3 start; float len; bool verbose; };
+struct GroundReq { int id; Vec3 start; float len; bool verbose; Vec3 dir; };   // dir: unit direction of the cast (straight down for ground probes)
 static std::mutex g_groundMutex; static std::vector<GroundReq> g_groundQueue; static std::map<int, GroundHit> g_groundResults; static int g_groundNext = 0;
 static volatile LONG g_groundQueued = 0;
 static void ServiceGroundQueue(void* world);
@@ -2135,8 +2296,11 @@ void ResearchFind(const std::vector<uint8_t>& pat, int maxHits) {
         Log("[find] %zu-byte pattern: %d hits in %.1f GB, %lu ms", pat.size(), hits, scanned / 1e9, GetTickCount() - t0);
     }).detach();
 }
-static const int kVtMax = 160; static const int kVtClasses = 5;
-static void* g_vtOrig[kVtClasses][kVtMax] = {}; static const char* g_vtClass[kVtClasses] = { "", "", "", "", "" };
+static const int kVtMax = 160; static const int kVtClasses = 6;
+static void* g_vtOrig[kVtClasses][kVtMax] = {}; static const char* g_vtClass[kVtClasses] = { "", "", "", "", "", "" };
+// class 5: the game's terrain heightfield geometry (no RTTI name; vtable given at runtime), logged only on a thread that is
+// inside one of our traced ground casts (research: which geometry calls a character-style cast makes and what they return)
+static thread_local bool t_geoTracing = false; static volatile LONG g_geoTraceArm = 0;
 // class 4 (TrocTrSpawnCharacterCheatReq, a static handler object): slot 2 = execute(handler, &result, packet). Always logged with
 // the packet object, its sender and its buffer, to learn the request format from a mod that uses it (NPC spawn research).
 // class 3 (ServerNormalInGameActor): the first actor whose method runs during one of our replays is the actor the replay created
@@ -2159,6 +2323,19 @@ static std::string ArgText(void* a) {   // what an argument might be: an object 
 }
 template<int C, int N> static void* __fastcall VtThunk(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
     typedef void* (__fastcall* Fn)(void*, void*, void*, void*, void*, void*, void*, void*);
+    if (C == 5) {
+        if (!t_geoTracing) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h);
+        Log("[geo] slot %d: this=%p rdx=%s r8=%s r9=%s s5=%s s6=%s", N, a, ArgText(b).c_str(), ArgText(c).c_str(), ArgText(d).c_str(), ArgText(e).c_str(), ArgText(f).c_str());
+        void* r = ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h);
+        float q[4] = {}; uint16_t mat = 0; uint8_t flag = 0;
+        if (N == 4) { ReadBytes((uintptr_t)d, q, 16); ReadBytes((uintptr_t)e, &mat, 2); ReadBytes((uintptr_t)f, &flag, 1); }
+        if (N == 4) Log("[geo] slot 4 (%lld, %lld) -> corners %.3f %.3f %.3f %.3f material %u flag %u", (long long)(intptr_t)b, (long long)(intptr_t)c, q[0], q[1], q[2], q[3], mat, flag);
+        { void* fr[10] = {}; const USHORT n = RtlCaptureStackBackTrace(1, 10, fr, nullptr); char chain[240]; int k = 0;
+          for (USHORT i = 0; i < n && k < (int)sizeof chain - 16; i++) { const uintptr_t v = (uintptr_t)fr[i]; k += snprintf(chain + k, sizeof chain - k, InImage(v) ? " %llx" : " ?", InImage(v) ? (unsigned long long)(v - g_base) : 0ull); }
+          Log("[geo] slot %d chain:%s", N, chain); }
+        if (N != 4) Log("[geo] slot %d returned %s", N, ArgText(r).c_str());
+        return r;
+    }
     if (C == 4) {
         Log("[troc] %s slot %d: handler=%p result=%p packet=%p thread %lu", g_vtClass[C], N, a, b, c, GetCurrentThreadId());
         if (N == 2 && c) { DumpBlock("troc packet", (uintptr_t)c, 0x60); uintptr_t sess = 0, buf = 0; uint16_t len = 0; ReadBytes((uintptr_t)c, &sess, 8); ReadBytes((uintptr_t)c + 0x10, &len, 2); ReadBytes((uintptr_t)c + 0x18, &buf, 8);
@@ -2188,9 +2365,9 @@ static bool SharedStub(uintptr_t f) {   // pure-virtual placeholders and tiny th
     if (!rf) return true;
     return (rf->EndAddress - rf->BeginAddress) < 32 || base + rf->BeginAddress != f;
 }
-static void InstallVtableTracer(int cls, const char* mangled, const char* shortName, int slots) {
-    const uintptr_t vt = FindVtableByName(mangled); if (!vt) { Log("[vt] %s: vtable not found", shortName); return; }
-    void* thunks[kVtMax]; if (cls == 0) VtThunkTable<0, kVtMax - 1>::fill(thunks); else if (cls == 1) VtThunkTable<1, kVtMax - 1>::fill(thunks); else if (cls == 2) VtThunkTable<2, kVtMax - 1>::fill(thunks); else if (cls == 3) VtThunkTable<3, kVtMax - 1>::fill(thunks); else VtThunkTable<4, kVtMax - 1>::fill(thunks);
+static void InstallVtableTracer(int cls, const char* mangled, const char* shortName, int slots, uintptr_t vtGiven = 0) {
+    const uintptr_t vt = vtGiven ? vtGiven : FindVtableByName(mangled); if (!vt) { Log("[vt] %s: vtable not found", shortName); return; }
+    void* thunks[kVtMax]; if (cls == 0) VtThunkTable<0, kVtMax - 1>::fill(thunks); else if (cls == 1) VtThunkTable<1, kVtMax - 1>::fill(thunks); else if (cls == 2) VtThunkTable<2, kVtMax - 1>::fill(thunks); else if (cls == 3) VtThunkTable<3, kVtMax - 1>::fill(thunks); else if (cls == 4) VtThunkTable<4, kVtMax - 1>::fill(thunks); else VtThunkTable<5, kVtMax - 1>::fill(thunks);
     g_vtClass[cls] = shortName; int ok = 0, skipped = 0;
     for (int i = 0; i < slots && i < kVtMax; i++) {
         uintptr_t f = 0; if (!ReadPtr(vt + (uintptr_t)i * 8, &f) || !InImage(f)) continue;
@@ -2661,6 +2838,49 @@ static bool SpawnNpcNow(uint32_t key, Vec3 pos, int type, uint32_t extra, uintpt
         key, pos.x, pos.y, pos.z, type, ok ? "executed" : "FAULTED", res, DecodeErr((uint32_t)res).c_str(), (void*)actor, actorId);
     return ok && res == 0;
 }
+// Research: where the player's SERVER actor keeps its position. Takes the client snapshot's tile-local x/y/z (and the world
+// position) and searches the server actor, every object it points to and every object those point to (0x800 bytes each) for
+// three consecutive floats within 0.5 m; hits are logged with their pointer path and RTTI.
+void ResearchFindPos() {
+    uintptr_t s = 0; AcquireSRWLockShared(&g_npcLock); s = g_serverSession; ReleaseSRWLockShared(&g_npcLock);
+    const uintptr_t cl = PlayerActor(); PosInfo p{};
+    if (!s || !cl || !ReadPos(cl, &p)) { Log("[findpos] no server actor yet (walk a few steps) or no player"); return; }
+    uintptr_t comps = Deref(cl, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
+    float loc[3] = {}; if (!tf || !ReadBytes(tf + kOff_Tf_Pos, loc, 12)) return;
+    const float want[2][3] = { { loc[0], loc[1], loc[2] }, { p.world.x, p.world.y, p.world.z } };
+    Log("[findpos] server actor %p (%s); client local (%.2f %.2f %.2f) world (%.2f %.2f %.2f)", (void*)s, RttiName(s) ? RttiName(s) : "?", loc[0], loc[1], loc[2], p.world.x, p.world.y, p.world.z);
+    int hits = 0;
+    auto scan = [&](uintptr_t obj, const char* path) {
+        uint8_t b[0x800]; if (!ReadBytes(obj, b, sizeof b)) return;
+        for (unsigned o = 0; o + 12 <= sizeof b && hits < 80; o += 4) {
+            float f[3]; memcpy(f, b + o, 12);
+            for (int w = 0; w < 2; w++)
+                if (fabsf(f[0] - want[w][0]) < 0.5f && fabsf(f[1] - want[w][1]) < 0.5f && fabsf(f[2] - want[w][2]) < 0.5f) {
+                    Log("[findpos] %s %p (%s) +0x%X = %s (%.3f %.3f %.3f) -> field %p", path, (void*)obj, RttiName(obj) ? RttiName(obj) : "-", o, w ? "world" : "local", f[0], f[1], f[2], (void*)(obj + o)); hits++;
+                }
+        }
+    };
+    auto heapPtr = [](uintptr_t q) { return q > 0x10000 && !(q >> 47) && !InImage(q) && !(q & 7); };
+    scan(s, "actor");
+    uint8_t a1[0x800]; if (!ReadBytes(s, a1, sizeof a1)) return;
+    for (unsigned i = 0; i < sizeof a1; i += 8) {
+        uintptr_t q; memcpy(&q, a1 + i, 8); if (!heapPtr(q)) continue;
+        char path[64]; snprintf(path, sizeof path, "actor+%X", i); scan(q, path);
+        uint8_t a2[0x400]; if (!ReadBytes(q, a2, sizeof a2)) continue;
+        for (unsigned k = 0; k < sizeof a2; k += 8) {
+            uintptr_t r; memcpy(&r, a2 + k, 8); if (!heapPtr(r) || r == s) continue;
+            char p2[64]; snprintf(p2, sizeof p2, "actor+%X+%X", i, k); scan(r, p2);
+        }
+    }
+    Log("[findpos] %d hits", hits);
+    if (comps) {   // the client player's components (the character control component is the next research target)
+        for (unsigned i = 0; i < 0x400; i += 8) {
+            uintptr_t c = 0; if (!ReadPtr(comps + i, &c) || !c || InImage(c)) continue;
+            if (const char* rn = RttiName(c)) if (strstr(rn, "Component")) Log("[findpos] client component list+0x%X %p %s", i, (void*)c, rn);
+        }
+    }
+
+}
 bool SpawnNpc(uint32_t key, Vec3 pos, int type, uint32_t extra) {
     if (!g_npcExecute) { Log("[npc] not available (handler not resolved)"); return false; }
     if (NpcState() < 2) { Log("[npc] player actor not known yet: walk a few steps"); return false; }
@@ -2863,9 +3083,44 @@ static void ResolveGimmickSpawn() {
     kRva_GimmickSpawn = f - g_base; kRva_GimmickSpawn_ = kRva_GimmickSpawn;
     Log("resolved %-20s rva 0x%llx (via signature)", "gimmick spawn", (unsigned long long)kRva_GimmickSpawn);
 }
+// Research: compact log of the character's own ground probes (sphere casts starting within 4 m of the player) for a few
+// seconds: caller, start y, displacement, length, hit count, fraction and the resulting hit height. Walking into an edited dip
+// shows whether the probe is too short or does not see the edited ground at all.
+static volatile ULONGLONG g_groundTraceUntil = 0;
+static std::mutex g_dbgMutex; static std::vector<DebugPt> g_dbgPts;
+std::vector<DebugPt> DebugPoints() { std::lock_guard<std::mutex> l(g_dbgMutex); return g_dbgPts; }
+size_t DebugPointCount() { std::lock_guard<std::mutex> l(g_dbgMutex); return g_dbgPts.size(); }
+int LoadDebugPoints(bool clear) {   // research overlay: world points (e.g. the collision map of an edited area) drawn in game
+    std::vector<DebugPt> v;
+    if (!clear) {
+        FILE* f = fopen((ModDir() + "\\debugpoints.txt").c_str(), "r");
+        if (f) { char line[128]; while (fgets(line, sizeof line, f) && v.size() < 50000) { DebugPt d{}; unsigned c = 0xFFFFFF;
+            if (sscanf(line, "%f %f %f %x", &d.p.x, &d.p.y, &d.p.z, &c) >= 3) { d.col = 0xFF000000u | ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF); v.push_back(d); } }   // rrggbb -> ImGui ABGR
+            fclose(f); }
+    }
+    std::lock_guard<std::mutex> l(g_dbgMutex); g_dbgPts.swap(v); Log("[points] %zu debug points", g_dbgPts.size()); return (int)g_dbgPts.size();
+}
+void GroundTrace(int seconds) { g_groundTraceUntil = GetTickCount64() + (ULONGLONG)std::clamp(seconds, 1, 60) * 1000; Log("[groundtrace] %d s", seconds); }
+static void LogGroundProbe(void* q, void* col, uintptr_t ret) {
+    uintptr_t shape = 0; float s[4] = {}, dv[8] = {};
+    if (!ReadBytes((uintptr_t)q + 0x28, &shape, 8) || !shape || !ReadBytes((uintptr_t)q + 0x30, s, 16) || !ReadBytes((uintptr_t)q + 0x40, dv, 32)) return;
+    const char* sn = RttiName(shape); if (!sn || !strstr(sn, "hknpSphereShape")) return;
+    PosInfo pi{}; if (!PlayerPosInfo(&pi)) return;
+    if (fabsf(s[0] - pi.tiled.x) > 1.0f || fabsf(s[2] - pi.tiled.z) > 1.0f || fabsf(s[1] - pi.tiled.y) > 6.0f) return;   // the player's own probe
+    if (fabsf(dv[0]) > 0.01f || fabsf(dv[2]) > 0.01f || dv[1] > -0.5f) return;   // only the straight-down ground cast (the sideways ones are step / wall checks)
+    uint32_t nh = 0; double frac = 0; ReadBytes((uintptr_t)col + 0x0C, &nh, 4); ReadBytes((uintptr_t)col + 0x10, &frac, 8);
+    const float hitY = nh ? s[1] + (float)frac * dv[1] : NAN;
+    Log("[groundtrace] from rva 0x%llx: start y %.2f (player %.2f) disp (%.2f %.2f %.2f %.2f) len %.2f | hits %u frac %.4f -> y %.2f",
+        InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull, s[1], pi.tiled.y, dv[0], dv[1], dv[2], dv[3], dv[7], nh, nh ? frac : 0.0, hitY);
+}
 static void* __fastcall HookWorldCastShape(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
     const bool trace = g_shapeTraceLeft > 0 && InterlockedDecrement(&g_shapeTraceLeft) >= 0;
     if (!g_tpl.have || g_tpl.world != a) { std::lock_guard<std::mutex> l(g_tplMutex); CaptureTemplate(a, b, c, d); }   // automatic, once per world
+    if (g_groundTraceUntil && GetTickCount64() < g_groundTraceUntil) {
+        void* r = g_origWorldCastShape(a, b, c, d, e, f, g, h);
+        LogGroundProbe(b, d, (uintptr_t)_ReturnAddress());
+        return r;
+    }
     if (!trace) return g_origWorldCastShape(a, b, c, d, e, f, g, h);
     std::lock_guard<std::recursive_mutex> lock(g_traceMutex);
     uintptr_t ret = (uintptr_t)_ReturnAddress();
@@ -2888,7 +3143,7 @@ static bool CallCastGuarded(void* world, void* q, void* xf, void* col, void** r)
     CDK_GUARD_END
     return false;
 }
-static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int tileZ, GroundHit* out, bool verbose) {
+static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int tileZ, GroundHit* out, bool verbose, Vec3 dir = Vec3{ 0, -1, 0 }) {
     if (!g_tpl.have || !g_origWorldCastShape) { if (verbose) Log("[probe] no template yet (the character has to be in the world for a moment)"); return false; }
     alignas(16) uint8_t q[0x200], xf[0x100], col[0x300], shp[0x200];
     memset(col, 0, sizeof col);
@@ -2896,22 +3151,23 @@ static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int til
     uintptr_t pShape = (uintptr_t)shp, pHits = (uintptr_t)col + 0x30; memcpy(q + 0x28, &pShape, 8); memcpy(col + 0x20, &pHits, 8);   // inline hit buffer at +0x30, as in the original object
     float* fq = (float*)q;
     fq[0x30 / 4] = start.x - tileX * 1000.0f; fq[0x34 / 4] = start.y; fq[0x38 / 4] = start.z - tileZ * 1000.0f; fq[0x3C / 4] = 0;
-    fq[0x40 / 4] = 0; fq[0x44 / 4] = -len; fq[0x48 / 4] = 0; fq[0x4C / 4] = 1.0f;
-    fq[0x50 / 4] = 0; fq[0x54 / 4] = g_probeZeroVel ? 0.0f : -len; fq[0x58 / 4] = 0; fq[0x5C / 4] = len;
+    fq[0x40 / 4] = dir.x * len; fq[0x44 / 4] = dir.y * len; fq[0x48 / 4] = dir.z * len; fq[0x4C / 4] = 1.0f;   // displacement
+    fq[0x50 / 4] = g_probeZeroVel ? 0.0f : dir.x * len; fq[0x54 / 4] = g_probeZeroVel ? 0.0f : dir.y * len; fq[0x58 / 4] = g_probeZeroVel ? 0.0f : dir.z * len; fq[0x5C / 4] = len;
     { const double big = 1e19; memcpy(col + 0x10, &big, 8); uint32_t zero = 0; memcpy(col + 0x0C, &zero, 4); }   // reset: no hit, early-out far away
     if (verbose) { Log("[probe] cast: start (%.2f %.2f %.2f) tile %d,%d local (%.2f %.2f %.2f) down %.1f m", start.x, start.y, start.z, tileX, tileZ, fq[0x30 / 4], fq[0x34 / 4], fq[0x38 / 4], len); }
     void* r = nullptr;
-    if (!CallCastGuarded(world, q, xf, col, &r)) { Log("[probe] replay crashed (caught)"); return false; }
+    if (!CallCastGuarded(world, q, xf, col, &r)) { const uintptr_t fa = (uintptr_t)cdk::t_fault.rec.ExceptionAddress; Log("[probe] replay crashed (caught): %08lx at %p (rva 0x%llx), address %p", cdk::t_fault.rec.ExceptionCode, (void*)fa, (unsigned long long)(InImage(fa) ? fa - g_base : 0), cdk::t_fault.rec.NumberParameters > 1 ? (void*)cdk::t_fault.rec.ExceptionInformation[1] : nullptr); return false; }
     uint32_t nh = 0; double frac = 0; memcpy(&nh, col + 0x0C, 4); memcpy(&frac, col + 0x10, 8);
     const float* fc = (const float*)col;
     out->done = true; out->hit = nh > 0 && std::isfinite(frac) && frac <= 1.0; out->fraction = (float)frac;   // negative fraction = the cast started inside a body (penetration), reported as a hit so the caller can step lower
-    out->centerY = start.y - (float)frac * len; out->normal = { fc[0x80 / 4], fc[0x84 / 4], fc[0x88 / 4] };
+    out->centerY = start.y + dir.y * (float)frac * len; out->normal = { fc[0x80 / 4], fc[0x84 / 4], fc[0x88 / 4] };
+    out->center = { start.x + dir.x * (float)frac * len, out->centerY, start.z + dir.z * (float)frac * len };
     if (verbose) Log("[probe] RESULT hits %u fraction %.4f -> sphere center y %.3f (%.2f m below start), normal (%.3f %.3f %.3f), returned %p", nh, frac, out->centerY, (float)frac * len, out->normal.x, out->normal.y, out->normal.z, r);
     return true;
 }
-static int QueueGround(Vec3 start, float len, bool verbose) {
+static int QueueGround(Vec3 start, float len, bool verbose, Vec3 dir = Vec3{ 0, -1, 0 }) {
     std::lock_guard<std::mutex> l(g_groundMutex); const int id = ++g_groundNext;
-    g_groundQueue.push_back({ id, start, len, verbose }); InterlockedExchange(&g_groundQueued, 1); return id;
+    g_groundQueue.push_back({ id, start, len, verbose, dir }); InterlockedExchange(&g_groundQueued, 1); return id;
 }
 // ---- ground queries for the editor
 float g_probeRadius = 0.0f; static bool g_probeCalibrated = false;
@@ -2930,15 +3186,43 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
     if (!g_probeCalibrated && !batch.empty()) CalibrateProbe(world);
     for (const auto& rq : batch) {
         const int tx = (int)(rq.start.x * 0.001), tz = (int)(rq.start.z * 0.001);
-        GroundHit h; if (!RunGroundCast(world, rq.start, rq.len, tx, tz, &h, rq.verbose)) { h.done = true; h.hit = false; }
-        std::lock_guard<std::mutex> l(g_groundMutex); g_groundResults[rq.id] = h; if (g_groundResults.size() > 200) g_groundResults.erase(g_groundResults.begin());
+        t_geoTracing = InterlockedExchange(&g_geoTraceArm, 0) != 0;   // research: log the geometry calls of this one cast
+        if (t_geoTracing) Log("[geo] ---- traced cast from (%.2f %.2f %.2f) %.2f m down", rq.start.x, rq.start.y, rq.start.z, rq.len);
+        GroundHit h; if (!RunGroundCast(world, rq.start, rq.len, tx, tz, &h, rq.verbose, rq.dir)) { h.done = true; h.hit = false; }
+        if (t_geoTracing) { Log("[geo] ---- result: %s y %.2f", h.hit ? "hit" : "MISS", h.centerY); t_geoTracing = false; }
+        std::lock_guard<std::mutex> l(g_groundMutex); g_groundResults[rq.id] = h; if (g_groundResults.size() > 40000) g_groundResults.erase(g_groundResults.begin());
     }
     s_inside = false;
+}
+// Research: the collision height on a grid (the character's own sphere cast, replayed straight down from 'top' over 'len' m),
+// queued in one batch and served on the game thread like GroundProbe. Returns the sphere centre heights (NAN = nothing found).
+bool GroundGrid(float x0, float z0, int nx, int nz, float step, float top, float len, std::vector<float>* out) {
+    if (!GroundProbeReady() || !GameThreadReady() || nx < 1 || nz < 1 || nx * nz > 20000) return false;
+    std::vector<int> ids; ids.reserve((size_t)nx * nz);
+    for (int j = 0; j < nz; j++) for (int i = 0; i < nx; i++) ids.push_back(QueueGround({ x0 + i * step, top, z0 + j * step }, len, false));
+    RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });
+    out->assign(ids.size(), NAN);
+    const ULONGLONG until = GetTickCount64() + 20000; size_t done = 0;
+    while (done < ids.size() && GetTickCount64() < until) {
+        Sleep(20); done = 0;
+        for (size_t k = 0; k < ids.size(); k++) {
+            if (ids[k] == 0) { done++; continue; }
+            GroundHit h; if (GroundResult(ids[k], &h)) { (*out)[k] = h.hit ? h.centerY : NAN; ids[k] = 0; done++; }
+        }
+    }
+    return done == ids.size();
 }
 int GroundProbe(Vec3 start, float len) {
     if (!GroundProbeReady() || !GameThreadReady()) return 0;
     const int id = QueueGround(start, len, false);
     RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });   // game thread, between the game's own casts (the only context that worked so far)
+    return id;
+}
+int RayProbe(Vec3 start, Vec3 dir, float len) {   // the same cast along any direction (the terrain brush: from the camera along the mouse ray)
+    if (!GroundProbeReady() || !GameThreadReady()) return 0;
+    const float l = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z); if (l < 1e-6f) return 0;
+    const int id = QueueGround(start, len, false, Vec3{ dir.x / l, dir.y / l, dir.z / l });
+    RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });
     return id;
 }
 bool GroundResult(int ticket, GroundHit* out) {
@@ -2955,6 +3239,38 @@ void ProbeGround(float above, float len) {
     QueueGround(start, len, true); Vec3 s2 = { start.x, start.y + 3.0f, start.z }; QueueGround(s2, len, true); QueueGround(s2, 30.0f, true);
     if (GameThreadReady()) RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });
 }
+// Research: up to 6 arbitrary functions hooked by rva; a call is logged (integer args, return value, caller) only on a thread
+// that is inside one of our traced ground casts. Nothing is logged before the original returns, so float / vector arguments
+// in xmm registers reach the original untouched.
+static const int kFnTraces = 6; static void* g_fnOrig[kFnTraces] = {}; static uintptr_t g_fnRva[kFnTraces] = {};
+template<int K> static void* __fastcall FnTraceThunk(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
+    typedef void* (__fastcall* Fn)(void*, void*, void*, void*, void*, void*, void*, void*);
+    void* r = ((Fn)g_fnOrig[K])(a, b, c, d, e, f, g, h);
+    if (t_geoTracing) { const uintptr_t ret = (uintptr_t)_ReturnAddress();
+        Log("[fn] rva 0x%llx from 0x%llx: a=%p b=%p c=%p d=%p e=%p f=%p -> %p", (unsigned long long)g_fnRva[K], InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull, a, b, c, d, e, f, r);
+        float fe[8] = {}, ff[8] = {};   // output blocks behind the 5th / 6th argument (e.g. decoded node bounds), as floats
+        if (ReadBytes((uintptr_t)e, fe, 32) && ReadBytes((uintptr_t)f, ff, 32))
+            Log("[fn]   e: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f   f: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f", fe[0], fe[1], fe[2], fe[3], fe[4], fe[5], fe[6], fe[7], ff[0], ff[1], ff[2], ff[3], ff[4], ff[5], ff[6], ff[7]); }
+    return r;
+}
+void FnTraceInstall(uintptr_t rva) {
+    static void* thunks[kFnTraces] = { (void*)&FnTraceThunk<0>, (void*)&FnTraceThunk<1>, (void*)&FnTraceThunk<2>, (void*)&FnTraceThunk<3>, (void*)&FnTraceThunk<4>, (void*)&FnTraceThunk<5> };
+    for (int k = 0; k < kFnTraces; k++) if (g_fnRva[k] == rva) { Log("[fn] rva 0x%llx already hooked", (unsigned long long)rva); return; }
+    for (int k = 0; k < kFnTraces; k++) if (!g_fnRva[k]) {
+        const uintptr_t f = g_base + rva; if (!InImage(f)) return;
+        ReleaseHookPiece();
+        if (MH_CreateHook((void*)f, thunks[k], &g_fnOrig[k]) == MH_OK && MH_EnableHook((void*)f) == MH_OK) { g_fnRva[k] = rva; Log("[fn] hooked rva 0x%llx", (unsigned long long)rva); }
+        else Log("[fn] hooking rva 0x%llx failed", (unsigned long long)rva);
+        return;
+    }
+    Log("[fn] no free trace slot");
+}
+void GeoTraceInstall(uintptr_t vt, int slots) {
+    static bool s_done = false; if (s_done) { Log("[geo] already installed"); return; }
+    if (!InImage(vt)) { Log("[geo] %p is not a vtable in the image", (void*)vt); return; }
+    s_done = true; InstallVtableTracer(5, "", "TerrainHeightFieldGeometry", std::clamp(slots, 1, kVtMax), vt);
+}
+void GeoTraceArm() { InterlockedExchange(&g_geoTraceArm, 1); }
 void RayTrace(int calls) { InterlockedExchange(&g_rayTraceLeft, calls); InterlockedExchange(&g_shapeTraceLeft, calls);
     Log("[ray] tracing the next %d ray casts and %d shape casts (walk a few steps for the ground probe, then aim / interact for ray casts)", calls, calls); }
 
@@ -3306,6 +3622,10 @@ static DWORD WINAPI InitThread(LPVOID) {
         ResolveSetCamPose(); if (kRva_SetCamPose && g_natCamGlobal) { void* t14 = (void*)(g_base + kRva_SetCamPose); HookFn(t14, (void*)HookSetCamPose, (void**)&g_origSetCamPose, "camera pose (free camera)"); }
         InstallNpcSpawn();   // NPC spawn research: the game's spawn-character cheat request
         EnvironmentInstall(); // optional time-of-day / weather bridge; failures do not affect the editor or spawning
+        TerrainInstall();     // optional terrain editing through the streamed height textures; failures only disable it
+        TravelInstall();      // optional: the game's own fast travel to any position (travel tab, terrain apply)
+        TerrainPhysInstall(); // optional: live terrain edits reach the collision patches (before the world streams: every patch is seen)
+        PreloadAutoloadTerrain();   // strokes of the autoload projects before the world streams: no apply needed at startup
         if (g_traceHooks && kRva_UuidLookup) { void* t10 = (void*)(g_base + kRva_UuidLookup); HookFn(t10, (void*)HookUuidLookup, (void**)&g_origUuidLookup, "uuid lookup (trace)"); }
         if (kRva_SoServerCreate) { void* t9 = (void*)(g_base + kRva_SoServerCreate); HookFn(t9, (void*)HookSoServerCreate, (void**)&g_origSoServerCreate, "SceneObjectServer new (trace)"); }
         if (kRva_ActorCtor) { void* t13 = (void*)(g_base + kRva_ActorCtor); HookFn(t13, (void*)HookActorCtor, (void**)&g_origActorCtor, "actor constructor (trace)"); }
