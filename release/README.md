@@ -116,7 +116,8 @@ werden beim Laden wiederhergestellt. Ist die Server-Figur des Spielers nach eine
 NPC kurz als "pending" eingetragen und wird automatisch erzeugt, sobald das Spiel wieder eine gültige Server-Session liefert.
 
 Der NPC-Browser funktioniert auch im Dock. Dort wird die Trefferliste automatisch als kompakte Kachelansicht gezeigt; Suche,
-Kategorie, Abstand, Anzahl, Formation, KI beim Spawn und SPAWN bleiben verfügbar.
+Kategorie, Abstand, Anzahl, Formation, KI beim Spawn und SPAWN bleiben verfügbar. Der NPC-Tab bleibt dabei bewusst ein
+Browser/Spawner; bereits erzeugte, verwaltete NPCs werden ausschließlich im **Scene**-Tab bearbeitet.
 
 Beim Schließen des World-Builder-Fensters – per Hotkey oder über das X in der Titelleiste – wird ein aktiver Freikamera-/Flugmodus
 sofort beendet und die Steuerung vollständig an das Spiel zurückgegeben.

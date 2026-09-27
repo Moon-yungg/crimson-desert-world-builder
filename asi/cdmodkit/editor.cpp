@@ -1567,6 +1567,17 @@ namespace editor {
         }
         Push(std::move(acts));
     }
+    static void SpawnNpcFormationGrounded(uint32_t key, Vec3 center, int count, int formation, float spacing, float radius, float fx, float fz, bool ai, int behavior) {
+        if (core::GroundProbeReady()) {
+            const float startY = center.y + 150.0f;
+            const int ticket = core::GroundProbe({ center.x, startY, center.z }, 400.0f);
+            if (ticket) {
+                g_npcDropJobs.push_back({ key, ticket, center, count, formation, spacing, radius, fx, fz, ai, behavior });
+                return;
+            }
+        }
+        SpawnNpcFormation(key, center, count, formation, spacing, radius, fx, fz, ai, behavior);
+    }
     static int NpcCategory(const std::string& n) {   // from the internal name's first token: NHM_ = human male, NGW_ = goblin female, ...
         const std::string t = n.substr(0, n.find('_'));
         if (t == "Animal" || t == "Riding" || t == "NatureCreature") return 2;
@@ -1578,8 +1589,7 @@ namespace editor {
     static bool g_npcCards = false;
     static void SpawnNpcInFront(const thumbgen::CharInfo& c) {
         Vec3 at = { g_lastPlayer.x + g_fx * g_npcDist, g_lastPlayer.y, g_lastPlayer.z + g_fz * g_npcDist };
-        const int uid = core::SpawnManagedNpc(c.key, at, 1, 0, g_npcSpawnAi, g_npcSpawnBehavior);
-        if (uid) { Act a; a.kind = Act::NpcSpawn; a.uid = uid; a.prefab = c.name.empty() ? c.internal : c.name; a.pos1 = at; a.flag1 = g_npcSpawnAi; a.behavior1 = g_npcSpawnBehavior; Push({ a }); }
+        SpawnNpcFormationGrounded(c.key, at, 1, 0, g_npcSpacing, g_npcRadius, g_fx, g_fz, g_npcSpawnAi, g_npcSpawnBehavior);
         Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str());
     }
     static const ManagedNpc* FindManagedNpc(const std::vector<ManagedNpc>& list, int uid) {
@@ -1865,10 +1875,7 @@ namespace editor {
         const int st = core::NpcState();
         if (st == 0) { ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), T("NPC spawning is not available in this game build (see the log).")); }
         else if (st == 1) { ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), T("walk a few steps first: the game's spawn request needs your character's server actor")); }
-        else if (!compact) ImGui::TextDisabled(T("NPCs spawned here are managed scene entities: select, move, group, annotate, control AI, delete, and save them with projects."));
-        DrawManagedNpcs(chars ? chars.get() : nullptr, compact, ui);
         if (!chars) { ImGui::TextDisabled(T("reading the character list from the game files...")); return; }
-        ImGui::SeparatorText(T("Character catalog"));
         if (!compact) {   // view switch: list or tiles (tile size shared with the browser)
             const ImVec4 on = ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive), off = ImGui::GetStyleColorVec4(ImGuiCol_Button);
             ImGui::PushStyleColor(ImGuiCol_Button, g_npcCards ? off : on); if (ImGui::Button(T(ICON_LIST " list"))) g_npcCards = false; ImGui::PopStyleColor();
@@ -1882,7 +1889,8 @@ namespace editor {
         ImGui::SetNextItemWidth(compact ? -1.0f : 180 * ui); ComboT("##npccat", &g_npcCat, kNpcCats, 6);
         const std::string key = std::string(g_npcFilter) + "|" + std::to_string(g_npcCat) + "|" + std::to_string((uintptr_t)chars.get());
         if (key != g_npcKey) {
-            g_npcKey = key; g_npcRows.clear(); g_npcSel = -1;
+            const int oldSel = g_npcSel;
+            g_npcKey = key; g_npcRows.clear();
             std::vector<std::string> words; { std::string w; for (const char* c = g_npcFilter;; c++) { if (!*c || *c == ' ') { if (!w.empty()) words.push_back(w); w.clear(); if (!*c) break; } else w += (char)SearchFold((unsigned char)*c); } }
             for (int i = 0; i < (int)chars->size(); i++) {
                 const auto& c = (*chars)[i];
@@ -1892,9 +1900,12 @@ namespace editor {
                 if (ok) g_npcRows.push_back(i);
             }
             std::stable_sort(g_npcRows.begin(), g_npcRows.end(), [&](int a, int b) { const auto& x = (*chars)[a]; const auto& y = (*chars)[b]; if (x.name.empty() != y.name.empty()) return !x.name.empty(); return (x.name.empty() ? x.internal : x.name) < (y.name.empty() ? y.internal : y.name); });
+            g_npcSel = std::find(g_npcRows.begin(), g_npcRows.end(), oldSel) != g_npcRows.end() ? oldSel : -1;
         }
         ImGui::TextDisabled(T("%d characters"), (int)g_npcRows.size());
-        const float detailsH = (compact ? 220.0f : 156.0f) * ui;
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", T("double-click = one NPC; SPAWN/drag = current count and formation"));
+        const float detailsH = (compact ? 265.0f : 205.0f) * ui;
         float listH = ImGui::GetContentRegionAvail().y - detailsH - ImGui::GetStyle().ItemSpacing.y; if (listH < 80 * ui) listH = 80 * ui;
         const bool useCards = compact || g_npcCards;
         if (useCards) DrawNpcCards(*chars, listH, ui, havePos && st == 2);
@@ -1937,6 +1948,14 @@ namespace editor {
             ImGui::Text("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str()); ImGui::SameLine(); ImGui::TextDisabled("  %s   ID %u", c.internal.c_str(), c.key);
             ImGui::SetNextItemWidth(compact ? 120 * ui : 150 * ui); ImGui::DragFloat(T("distance"), &g_npcDist, 1.0f, 1.0f, kNpcMaxDist, "%.0f m"); g_npcDist = std::clamp(g_npcDist, 1.0f, kNpcMaxDist); SameLineOrWrap(compact, 90 * ui);
             ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, kNpcMaxCount);
+            SameLineOrWrap(compact, 250 * ui);
+            ImGui::TextDisabled("%s", T("presets")); ImGui::SameLine(0, 3);
+            static const int countPresets[] = { 1, 5, 10, 25, 50, 100, 250, 500 };
+            for (int pi = 0; pi < (int)(sizeof(countPresets) / sizeof(countPresets[0])); ++pi) {
+                if (pi) ImGui::SameLine(0, 2);
+                char pl[16]; snprintf(pl, sizeof pl, "%d##np%d", countPresets[pi], countPresets[pi]);
+                if (ImGui::SmallButton(pl)) g_npcCount = countPresets[pi];
+            }
             SameLineOrWrap(compact, 130 * ui);
             ImGui::TextDisabled("%s", T("formation")); ImGui::SameLine(); ImGui::SetNextItemWidth(120 * ui); ComboT("##npcformation", &g_npcFormation, kNpcFormations, 3);
             SameLineOrWrap(compact, 130 * ui);
@@ -1947,6 +1966,15 @@ namespace editor {
             } else {
                 ImGui::DragFloat(T("spacing"), &g_npcSpacing, 0.1f, 0.25f, 50.0f, "%.1f m");
                 g_npcSpacing = std::clamp(g_npcSpacing, 0.25f, 50.0f);
+            }
+            SameLineOrWrap(compact, 230 * ui);
+            if (g_npcFormation == 0) {
+                ImGui::TextDisabled(T("footprint: %.1f m"), (g_npcCount - 1) * g_npcSpacing);
+            } else if (g_npcFormation == 1) {
+                const int cols = std::max(1, (int)ceilf(sqrtf((float)g_npcCount))), rows = std::max(1, (g_npcCount + cols - 1) / cols);
+                ImGui::TextDisabled(T("grid: %d x %d, %.1f x %.1f m"), cols, rows, (cols - 1) * g_npcSpacing, (rows - 1) * g_npcSpacing);
+            } else {
+                ImGui::TextDisabled(T("diameter: %.1f m"), g_npcRadius * 2.0f);
             }
             SameLineOrWrap(compact, 160 * ui);
             ImGui::BeginDisabled(!core::NpcAiControlAvailable());
@@ -1960,11 +1988,13 @@ namespace editor {
                 g_npcSpawnAi = true; g_npcSpawnBehavior = 0;
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", T("The native AI-control request was not resolved in this game build; NPCs will spawn with normal AI."));
             }
+            if (g_npcCount > 100) ImGui::TextDisabled("%s", T("large batches are queued over multiple server ticks"));
             ImGui::BeginDisabled(!havePos || st != 2);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
-            if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS "   SPAWN   "), ImVec2(150 * ui, 0))) {
+            char spawnLabel[96]; snprintf(spawnLabel, sizeof spawnLabel, "%s  x%d", T(ICON_LOCATION_CROSSHAIRS "   SPAWN   "), g_npcCount);
+            if (ImGui::Button(spawnLabel, ImVec2(175 * ui, 0))) {
                 const Vec3 center{ g_lastPlayer.x + g_fx * g_npcDist, g_lastPlayer.y, g_lastPlayer.z + g_fz * g_npcDist };
-                SpawnNpcFormation(c.key, center, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, g_fx, g_fz, g_npcSpawnAi, g_npcSpawnBehavior);
+                SpawnNpcFormationGrounded(c.key, center, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, g_fx, g_fz, g_npcSpawnAi, g_npcSpawnBehavior);
                 Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str());
             }
             ImGui::PopStyleColor(2); ImGui::EndDisabled();
@@ -3004,7 +3034,7 @@ namespace editor {
         ImGuiIO& io = ImGui::GetIO(); const auto& c = (*chars)[g_npcDragIndex];
         if (!io.MouseDown[ImGuiMouseButton_Left] && !ImGui::IsMouseReleased(ImGuiMouseButton_Left)) { g_npcDragIndex = -1; return; }
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
-        Vec3 at{}; bool groundPlane = false; const bool projected = NpcDropPoint(io.MousePos, &at, &groundPlane);
+        Vec3 at{}; const bool projected = NpcDropPoint(io.MousePos, &at, nullptr);
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         const char* shown = c.name.empty() ? c.internal.c_str() : c.name.c_str();
         dl->AddText({ io.MousePos.x + 16.0f, io.MousePos.y + 14.0f }, IM_COL32(255, 220, 150, 255), shown);
@@ -3017,12 +3047,7 @@ namespace editor {
         if (overUi || !projected || core::NpcState() != 2) return;
         CamFrame cf = CurrentCam(); float fx = cf.ok ? cf.fwd.x : g_fx, fz = cf.ok ? cf.fwd.z : g_fz;
         const float fl = sqrtf(fx * fx + fz * fz); if (fl > 1e-4f) { fx /= fl; fz /= fl; } else { fx = g_fx; fz = g_fz; }
-        if (groundPlane && core::GroundProbeReady()) {
-            const float startY = at.y + 150.0f;
-            const int ticket = core::GroundProbe({ at.x, startY, at.z }, 400.0f);
-            if (ticket) { g_npcDropJobs.push_back({ key, ticket, at, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, fx, fz, g_npcSpawnAi, g_npcSpawnBehavior }); return; }
-        }
-        SpawnNpcFormation(key, at, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, fx, fz, g_npcSpawnAi, g_npcSpawnBehavior);
+        SpawnNpcFormationGrounded(key, at, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, fx, fz, g_npcSpawnAi, g_npcSpawnBehavior);
     }
     static void DrawWorldContextPopup(bool havePos) {
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
