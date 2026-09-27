@@ -987,6 +987,7 @@ int ProjectObjectCount(int id) {
     return n;
 }
 bool ProjectDirty(int id) { std::lock_guard<std::mutex> l(g_regMutex); return g_projDirty.count(id) != 0; }
+void MarkProjectDirty(int proj) { if (proj) { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.insert(proj); } }
 void AssignProject(int uid, int proj) {
     std::lock_guard<std::mutex> l(g_regMutex);
     int i = IndexOfUidLocked(uid); if (i >= 0) g_reg[i].proj = proj;
@@ -1012,14 +1013,24 @@ bool SaveProject(const std::string& rawName, int scope) {
         fprintf(f, "%s|%.3f|%.3f|%.3f|%.2f|%.3f|%d|%.2f|%.2f\n", o.prefab.c_str(), o.pos.x, o.pos.y, o.pos.z, o.rot.yaw, o.scale, o.group, o.rot.pitch, o.rot.roll);
         written.push_back(o.uid); n++;
     }
+    int ns = 0;   // terrain strokes, same scope rules as the objects; '#' lines, so older versions simply skip them
+    for (const auto& t : TerrainStrokes()) {
+        if (scope == SaveProjectAndNew && !(t.proj == pid || t.proj == 0)) continue;
+        if (scope == SaveNewOnly && t.proj != 0) continue;
+        if (scope == SaveProjectOnly && t.proj != pid) continue;
+        fprintf(f, "#terrain|%d|%.3f|%.3f|%.3f|%.4f|%.3f|%.3f|%.3f|%.3f\n", t.mode, t.x, t.z, t.r, t.amount, t.strength, t.ax, t.az, t.y); ns++;
+    }
     fclose(f);
+    if (scope == SaveWholeScene) { for (const auto& t : TerrainStrokes()) if (t.proj != pid) TerrainSetProject(t.proj, pid); }
+    else if (scope != SaveProjectOnly) TerrainSetProject(0, pid);   // written strokes join the project, like the objects
     for (int uid : written) AssignProject(uid, pid);   // what was written is now part of that project
     { std::lock_guard<std::mutex> l(g_regMutex); if (scope == SaveWholeScene) g_projDirty.clear(); else g_projDirty.erase(pid); }
-    Log("save: %d objects (scope %d) -> %s", n, scope, ProjPath(name).c_str());
+    Log("save: %d objects, %d terrain strokes (scope %d) -> %s", n, ns, scope, ProjPath(name).c_str());
     return true;
 }
 void DeleteAllSpawned() {
     { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.clear(); }   // nothing left that could differ from a file
+    TerrainClear();   // the terrain strokes belong to the scene as well (loaded tiles keep the old shape until an apply)
     std::vector<uintptr_t> objs, actors;
     { std::lock_guard<std::mutex> l(g_regMutex); for (auto& o : g_reg) if (!o.hidden) { if (o.gimmick && !o.standin) { if (o.actor) actors.push_back(o.actor); } else if (o.obj) objs.push_back(o.obj); } g_reg.clear(); }
     for (auto actor : actors) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
@@ -1028,6 +1039,12 @@ void DeleteAllSpawned() {
     Log("delete all: %zu objects", objs.size());
 }
 static bool g_autoDone = false; static DWORD g_worldSince = 0, g_worldLast = 0;
+// "#terrain|mode|x|z|r|amount|strength|ax|az|y": one terrain brush stroke of the project (see TerrainStroke)
+static bool ParseTerrainLine(const char* line, TerrainStroke* t) {
+    if (strncmp(line, "#terrain|", 9) != 0) return false;
+    *t = TerrainStroke{};
+    return sscanf(line + 9, "%d|%f|%f|%f|%f|%f|%f|%f|%f", &t->mode, &t->x, &t->z, &t->r, &t->amount, &t->strength, &t->ax, &t->az, &t->y) >= 6;
+}
 bool LoadProject(const std::string& name, bool clearFirst) {
     FILE* f = fopen(ProjPath(name).c_str(), "r");
     if (!f) { Log("load: cannot open %s", ProjPath(name).c_str()); return false; }
@@ -1036,7 +1053,9 @@ bool LoadProject(const std::string& name, bool clearFirst) {
     const int pid = ProjectId(name);   // the objects remember where they came from, so this project can be overwritten on its own
     g_loading = true;
     char line[1024]; int n = 0; std::map<int, int> groups;   // file group ids -> fresh ids
+    std::vector<TerrainStroke> strokes;
     while (fgets(line, sizeof line, f)) {
+        TerrainStroke t{}; if (ParseTerrainLine(line, &t)) { strokes.push_back(t); continue; }
         if (line[0] == '#' || line[0] == '\n') continue;
         char prefab[600] = {0}; float x, y, z, yaw = 0, sc = 1, pitch = 0, roll = 0; int grp = 0;
         char* bar = strchr(line, '|'); if (!bar) continue;
@@ -1046,6 +1065,7 @@ bool LoadProject(const std::string& name, bool clearFirst) {
         SpawnAt(prefab, { x, y, z }, Rot{ yaw, pitch, roll }, sc, g, pid); n++;
     }
     fclose(f);
+    TerrainReplaceProject(pid, strokes);   // a tile that is already loaded shows them after an apply
     g_loading = false;
     { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.erase(pid); }   // freshly loaded = in sync with the file
     Log("load: %d objects queued from %s", n, ProjPath(name).c_str());
@@ -1083,6 +1103,22 @@ std::vector<std::string> Autoload() {
     }
     fclose(f);
     return out;
+}
+// At startup, before the world streams: the terrain strokes of the autoload projects, so the first load of the world already
+// carries them. The autoload later loads the same strokes again, which TerrainReplaceProject recognises as unchanged.
+static bool ParseTerrainLine(const char* line, TerrainStroke* t);
+static void PreloadAutoloadTerrain() {
+    if (!TerrainAvailable()) return;
+    int total = 0;
+    for (const auto& name : Autoload()) {
+        FILE* f = fopen(ProjPath(name).c_str(), "r"); if (!f) continue;
+        std::vector<TerrainStroke> strokes; char line[1024];
+        while (fgets(line, sizeof line, f)) { TerrainStroke t{}; if (ParseTerrainLine(line, &t)) strokes.push_back(t); }
+        fclose(f);
+        if (!strokes.empty()) { TerrainReplaceProject(ProjectId(name), strokes); total += (int)strokes.size(); }
+    }
+    TerrainMarkApplied();
+    if (total) Log("terrain: %d strokes of the autoload projects preloaded", total);
 }
 static void WriteAutoload(const std::vector<std::string>& list) {
     if (list.empty()) { DeleteFileA(AutoloadPath().c_str()); return; }
@@ -3202,6 +3238,8 @@ static DWORD WINAPI InitThread(LPVOID) {
         InstallNpcSpawn();   // NPC spawn research: the game's spawn-character cheat request
         EnvironmentInstall(); // optional time-of-day / weather bridge; failures do not affect the editor or spawning
         TerrainInstall();     // optional terrain editing through the streamed height textures; failures only disable it
+        TravelInstall();      // optional: the game's own fast travel to any position (travel tab, terrain apply)
+        PreloadAutoloadTerrain();   // strokes of the autoload projects before the world streams: no apply needed at startup
         if (g_traceHooks && kRva_UuidLookup) { void* t10 = (void*)(g_base + kRva_UuidLookup); HookFn(t10, (void*)HookUuidLookup, (void**)&g_origUuidLookup, "uuid lookup (trace)"); }
         if (kRva_SoServerCreate) { void* t9 = (void*)(g_base + kRva_SoServerCreate); HookFn(t9, (void*)HookSoServerCreate, (void**)&g_origSoServerCreate, "SceneObjectServer new (trace)"); }
         if (kRva_ActorCtor) { void* t13 = (void*)(g_base + kRva_ActorCtor); HookFn(t13, (void*)HookActorCtor, (void**)&g_origActorCtor, "actor constructor (trace)"); }

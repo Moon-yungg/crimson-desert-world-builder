@@ -30,5 +30,5 @@ namespace core {
 
     // helpers for optional modules (cdmodkit.cpp)
     uintptr_t SigScanUnique(const char* pat); uintptr_t VtableByName(const char* mangled); std::string PathObjText(void* path);
-    void TerrainInstall();
+    void TerrainInstall(); void TravelInstall();
 }

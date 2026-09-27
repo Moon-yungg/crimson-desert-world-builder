@@ -283,9 +283,18 @@ static std::string Handle(const std::string& method, const std::string& path, co
         float sd = 0; if (Number(arg, "sdelta", sd)) core::IoStreamDelta((int)sd);
         return "{\"ok\":true}";
     }
+    if (method == "POST" && path == "/api/travel") {   // {"x","y","z","yaw"}: the game's own fast travel to that point (loading screen)
+        float x = 0, y = 0, z = 0, yaw = 0;
+        if (!Number(arg, "x", x, true) || !Number(arg, "y", y, true) || !Number(arg, "z", z, true)) { status = 400; return Error("x/y/z required"); }
+        Number(arg, "yaw", yaw);
+        if (!core::TravelAvailable()) { status = 503; return Error(core::TravelStatus().c_str()); }
+        const bool started = core::TravelTo(Vec3{ x, y, z }, yaw);
+        return std::string("{\"started\":") + (started ? "true" : "false") + ",\"status\":\"" + core::TravelStatus() + "\"}";
+    }
     if (method == "POST" && path == "/api/research/terrain") {   // research: {"x","z","r","dm"} adds a smooth disc (dm metres, + up), {"clear":1}
         if (Flag(arg, "clear")) core::TerrainEditClear();
-        if (Flag(arg, "watch")) core::TerrainWatchNext();
+        if (Flag(arg, "synctrace")) core::TerrainSyncTrace();   // research
+        if (Flag(arg, "apply")) { PosInfo pp{}; if (core::PlayerPosInfo(&pp)) core::TerrainApply(pp.world); }   // fast travel away and back
         { float ls = 0; if (arg.count("loadtrace") && Number(arg, "loadtrace", ls, true)) core::TerrainLoadTrace((int)ls); }   // research
         { auto ro = arg.find("reloadobj"), rn = arg.find("reloadname"); float sl = 78; Number(arg, "slot", sl);
           if (ro != arg.end() && rn != arg.end()) core::TerrainReloadCall((uintptr_t)strtoull(ro->second.c_str(), nullptr, 0), (int)sl, rn->second); }   // research
@@ -301,8 +310,7 @@ static std::string Handle(const std::string& method, const std::string& path, co
         { auto te = arg.find("teletrace"); if (te != arg.end()) core::TeleTraceInstall((uintptr_t)strtoull(te->second.c_str(), nullptr, 0)); }   // research
         { auto tt = arg.find("textrace"); if (tt != arg.end()) core::TerrainTexTrace((uintptr_t)strtoull(tt->second.c_str(), nullptr, 0)); }   // research
         { auto jt = arg.find("jobtrace"); if (jt != arg.end()) core::TerrainJobTrace((uintptr_t)strtoull(jt->second.c_str(), nullptr, 0)); }   // research   // research: read watch on the next patched tile buffer
-        float x = 0, z = 0, r = 0, dm = 0, tx = 0, tz = 0;
-        if (arg.count("tx") && Number(arg, "tx", tx, true) && Number(arg, "tz", tz, true) && Number(arg, "dm", dm, true)) return "{\"tiles\":" + Int(core::TerrainEditTile((int)tx, (int)tz, dm)) + "}";
+        float x = 0, z = 0, r = 0, dm = 0;
         if (arg.count("x") && Number(arg, "x", x, true) && Number(arg, "z", z, true) && Number(arg, "r", r, true) && Number(arg, "dm", dm, true)) return "{\"tiles\":" + Int(core::TerrainEditDisc(x, z, r, dm)) + "}";
         return "{\"status\":\"" + core::TerrainStatus() + "\"}";
     }

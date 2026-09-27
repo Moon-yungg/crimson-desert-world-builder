@@ -131,7 +131,7 @@ namespace editor {
     static bool  g_favOnly = false; static bool g_meshOnly = true;
     enum MainTabId {
         TabBrowser = 0, TabScene = 1, TabProject = 2, TabTravel = 3, TabSettings = 4,
-        TabLog = 5, TabHistory = 6, TabNpcs = 7, TabEnvironment = 8
+        TabLog = 5, TabHistory = 6, TabNpcs = 7, TabEnvironment = 8, TabTerrain = 9
     };
     static bool  g_compact = false; static int g_dockCols = 2;   // narrow dock window; supported pages reuse the full editor functions
     static int g_mainTab = TabBrowser, g_compactPage = TabBrowser; static bool g_selectMainTab = false;
@@ -2185,27 +2185,44 @@ namespace editor {
     static void LoadTp() { if (g_tpLoaded) return; g_tpLoaded = true; FILE* f = fopen(TpPath().c_str(), "r"); if (!f) return; char line[512];
         while (fgets(line, sizeof line, f)) { char name[128] = { 0 }; Vec3 v{}; char* bar = strchr(line, '|'); if (!bar) continue; *bar = 0; strncpy_s(name, line, _TRUNCATE); if (sscanf(bar + 1, "%f|%f|%f", &v.x, &v.y, &v.z) == 3) g_tp.push_back({ name, v }); } fclose(f); }
     static void SaveTp() { FILE* f = fopen(TpPath().c_str(), "w"); if (!f) return; for (auto& t : g_tp) fprintf(f, "%s|%.2f|%.2f|%.2f\n", t.name.c_str(), t.pos.x, t.pos.y, t.pos.z); fclose(f); }
+    static Vec3 g_tpTarget{}; static bool g_tpTargetSet = false;
+    static void TravelGo(Vec3 pos, const char* what) {
+        pos.y += 0.5f;
+        if (core::TravelTo(pos, 0.0f)) Note(T("travelling to %s"), what);
+        else Note(T("preparing the fast travel (first use of a session, up to half a minute) - try again in a moment"));
+    }
     static void DrawTravel(const PosInfo& p, bool havePos) {
-        LoadTp();
-        ImGui::TextWrapped(T("Teleport writes the player's position directly. That works inside the loaded area (about 400 m); longer trips need the game's fast travel first, otherwise the world around you is not streamed in."));
+        LoadTp(); core::TravelPrepare();   // the first use of a session looks for the game's travel system in the background
+        ImGui::TextWrapped(T("Travel uses the game's own fast travel: a loading screen, then you stand at the destination. Any distance works, the world is streamed in there."));
+        ImGui::TextDisabled(T("status: %s"), core::TravelStatus().c_str());
+        ImGui::Separator();
+        if (!g_tpTargetSet && havePos) { g_tpTarget = p.world; g_tpTargetSet = true; }
+        ImGui::SetNextItemWidth(330); ImGui::InputFloat3(T("##tptarget"), &g_tpTarget.x, "%.1f"); ImGui::SameLine();
+        ImGui::BeginDisabled(!core::TravelAvailable());
+        if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Travel"))) TravelGo(g_tpTarget, T("the coordinates"));
+        ImGui::EndDisabled(); ImGui::SameLine();
+        ImGui::BeginDisabled(!havePos); if (ImGui::Button(T("current position"))) g_tpTarget = p.world; ImGui::EndDisabled();
+        ImGui::TextDisabled(T("x  y (height)  z - the height only needs to be roughly right, the game puts you on the ground"));
+        ImGui::Separator();
         ImGui::SetNextItemWidth(220); InputTextI18n("##tpname", T("name for the current spot"), g_tpName, sizeof g_tpName); ImGui::SameLine();
         ImGui::BeginDisabled(!havePos || !g_tpName[0]);
         if (ImGui::Button(T(ICON_LOCATION_DOT " Save current position"))) { g_tp.push_back({ g_tpName, p.world }); SaveTp(); g_tpName[0] = 0; }
         ImGui::EndDisabled();
-        ImGui::Separator();
-        if (ImGui::BeginTable("tp", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-            ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch); ImGui::TableSetupColumn(T("position"), ImGuiTableColumnFlags_WidthFixed, 240); ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70); ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70);
+        if (ImGui::BeginTable("tp", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+            ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch); ImGui::TableSetupColumn(T("position"), ImGuiTableColumnFlags_WidthFixed, 230);
+            ImGui::TableSetupColumn(T("distance"), ImGuiTableColumnFlags_WidthFixed, 80); ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 60); ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 60);
             for (int i = 0; i < (int)g_tp.size(); i++) {
                 ImGui::PushID(i); ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(g_tp[i].name.c_str());
                 ImGui::TableSetColumnIndex(1); ImGui::Text("%.1f  %.1f  %.1f", g_tp[i].pos.x, g_tp[i].pos.y, g_tp[i].pos.z);
                 ImGui::TableSetColumnIndex(2);
-                float dist = havePos ? sqrtf((g_tp[i].pos.x - p.world.x) * (g_tp[i].pos.x - p.world.x) + (g_tp[i].pos.z - p.world.z) * (g_tp[i].pos.z - p.world.z)) : 0;
-                ImGui::BeginDisabled(!havePos || dist > 400);
-                if (ImGui::SmallButton(T("Go"))) { Vec3 t = g_tp[i].pos; t.y += 0.5f; if (core::SetPlayerPos(t)) Note(T("teleport to %s"), g_tp[i].name.c_str()); else Note(T("teleport failed")); }
+                if (havePos) { const float dist = sqrtf((g_tp[i].pos.x - p.world.x) * (g_tp[i].pos.x - p.world.x) + (g_tp[i].pos.z - p.world.z) * (g_tp[i].pos.z - p.world.z));
+                    if (dist >= 1000.0f) ImGui::Text(T("%.1f km"), dist / 1000.0f); else ImGui::Text(T("%.0f m"), dist); }
+                ImGui::TableSetColumnIndex(3);
+                ImGui::BeginDisabled(!core::TravelAvailable());
+                if (ImGui::SmallButton(T("Go"))) TravelGo(g_tp[i].pos, g_tp[i].name.c_str());
                 ImGui::EndDisabled();
-                if (dist > 400 && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(T("%.0f m away: the direct write only works inside the loaded area (about 400 m). Use the game's fast travel to get close first."), dist);
-                ImGui::TableSetColumnIndex(3); if (ImGui::SmallButton(T("Delete"))) { g_tp.erase(g_tp.begin() + i); SaveTp(); ImGui::PopID(); break; }
+                ImGui::TableSetColumnIndex(4); if (ImGui::SmallButton(T("Delete"))) { g_tp.erase(g_tp.begin() + i); SaveTp(); ImGui::PopID(); break; }
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -2213,6 +2230,97 @@ namespace editor {
         if (g_tp.empty()) ImGui::TextDisabled(T("(no saved points yet)"));
         ImGui::Separator();
         ImGui::TextDisabled(T("Console: tp x y z"));
+    }
+
+    // ---- terrain brush (tab Terrain): strokes become core terrain edits; the ground changes once it streams again (Apply) ----
+    enum BrushMode { BrushRaise = 0, BrushLower = 1, BrushFlatten = 2 };
+    static bool g_brushOn = false; static int g_brushMode = BrushRaise;
+    static float g_brushRadius = 8.0f, g_brushAmount = 0.5f, g_brushFlat = 0.5f;
+    static Vec3 g_brushAt{}; static bool g_brushHave = false; static float g_brushY = 0; static bool g_brushYSet = false;
+    static int g_brushTicket = 0; static DWORD g_brushProbeTick = 0;
+    static bool g_brushPainting = false; static Vec3 g_brushLast{}; static float g_brushAx = 0, g_brushAz = 0;
+    static bool TerrainTabShown() { return g_open && !g_compact && g_mainTab == TabTerrain; }
+    static bool BrushActive() { return TerrainTabShown() && g_brushOn && core::TerrainAvailable() && !g_playMode; }
+    static void AddBrushStroke() {
+        core::TerrainStroke t{};
+        t.mode = g_brushMode == BrushFlatten ? core::TerrainFlatten : core::TerrainRaise;
+        t.x = g_brushAt.x; t.z = g_brushAt.z; t.r = g_brushRadius; t.y = g_brushAt.y;
+        t.amount = g_brushMode == BrushLower ? -g_brushAmount : g_brushAmount; t.strength = g_brushFlat;
+        t.ax = g_brushAx; t.az = g_brushAz; t.proj = 0;
+        core::TerrainAddStroke(t); g_brushLast = g_brushAt;
+    }
+    static void DrawGroundRing(ImDrawList* dl, const CamFrame& cf, float x, float y, float z, float r, ImU32 col, int seg, float th) {
+        ImVec2 prev{}; bool havePrev = false;
+        for (int i = 0; i <= seg; i++) {
+            const float a = 6.2831853f * i / seg; ImVec2 sp;
+            const bool ok = WorldToScreen(cf, Vec3{ x + r * cosf(a), y + 0.1f, z + r * sinf(a) }, &sp);
+            if (ok && havePrev) dl->AddLine(prev, sp, col, th);
+            prev = sp; havePrev = ok;
+        }
+    }
+    static void BrushTick(const PosInfo& p, bool havePos) {
+        if (!TerrainTabShown()) { g_brushPainting = false; return; }
+        const CamFrame cf = CurrentCam(); if (!cf.ok) return;
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        {   // painted strokes, newest on top (only the ones near the camera)
+            const auto strokes = core::TerrainStrokes(); int drawn = 0;
+            for (int i = (int)strokes.size() - 1; i >= 0 && drawn < 600; i--) {
+                const auto& t = strokes[i]; const float dx = t.x - cf.pos.x, dz = t.z - cf.pos.z; if (dx * dx + dz * dz > 400.0f * 400.0f) continue;
+                const ImU32 col = t.mode == core::TerrainFlatten ? IM_COL32(120, 230, 140, 150) : t.amount >= 0 ? IM_COL32(255, 170, 80, 150) : IM_COL32(90, 170, 255, 150);
+                DrawGroundRing(dl, cf, t.x, t.y, t.z, t.r, col, 20, 1.0f); drawn++;
+            }
+        }
+        if (!BrushActive()) { g_brushPainting = false; return; }
+        ImGuiIO& io = ImGui::GetIO();
+        if (!g_brushYSet && havePos) { g_brushY = p.world.y; g_brushYSet = true; }
+        if (g_brushTicket) { core::GroundHit gh; if (core::GroundResult(g_brushTicket, &gh)) { if (gh.hit) g_brushY = gh.centerY - core::g_probeRadius; g_brushTicket = 0; } }
+        const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
+        const Vec3 rd = MouseRay(cf, io.MousePos);
+        g_brushHave = false;   // the cursor ray against the ground height found under the brush last time (converges while hovering)
+        if (!overUi && fabsf(rd.y) > 1e-4f) { const float t = (g_brushY - cf.pos.y) / rd.y; if (t > 0.5f && t < 600.0f) { g_brushAt = { cf.pos.x + rd.x * t, g_brushY, cf.pos.z + rd.z * t }; g_brushHave = true; } }
+        if (g_brushHave && !g_brushTicket && core::GroundProbeReady() && GetTickCount() - g_brushProbeTick > 80) {
+            g_brushProbeTick = GetTickCount(); g_brushTicket = core::GroundProbe({ g_brushAt.x, g_brushAt.y + 150.0f, g_brushAt.z }, 400.0f);
+        }
+        if (g_brushHave && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { g_brushPainting = true; g_brushAx = g_brushAt.x; g_brushAz = g_brushAt.z; AddBrushStroke(); }
+        else if (g_brushPainting && g_brushHave && io.MouseDown[ImGuiMouseButton_Left]) {   // dragging paints a stroke every 40 % of the radius
+            const float dx = g_brushAt.x - g_brushLast.x, dz = g_brushAt.z - g_brushLast.z, sp = std::max(0.5f, g_brushRadius * 0.4f);
+            if (dx * dx + dz * dz >= sp * sp) AddBrushStroke();
+        }
+        if (!io.MouseDown[ImGuiMouseButton_Left]) g_brushPainting = false;
+        if (g_brushHave) {
+            const ImU32 col = g_brushMode == BrushFlatten ? IM_COL32(150, 255, 170, 255) : g_brushMode == BrushLower ? IM_COL32(120, 190, 255, 255) : IM_COL32(255, 190, 100, 255);
+            DrawGroundRing(dl, cf, g_brushAt.x, g_brushAt.y, g_brushAt.z, g_brushRadius, col, 48, 2.0f);
+            ImVec2 c; if (WorldToScreen(cf, g_brushAt, &c)) dl->AddCircleFilled(c, 3.0f, col);
+        }
+    }
+    static void DrawTerrain(const PosInfo& p, bool havePos) {
+        if (!core::TerrainAvailable()) { ImGui::TextWrapped(T("Terrain editing is not available in this game build: %s"), core::TerrainStatus().c_str()); return; }
+        core::TravelPrepare();
+        ImGui::Checkbox(T("Brush active (left mouse paints in the world)"), &g_brushOn);
+        ImGui::RadioButton(T("Raise"), &g_brushMode, BrushRaise); ImGui::SameLine();
+        ImGui::RadioButton(T("Lower"), &g_brushMode, BrushLower); ImGui::SameLine();
+        ImGui::RadioButton(T("Flatten"), &g_brushMode, BrushFlatten);
+        ImGui::SetNextItemWidth(260); ImGui::SliderFloat(T("radius (m)"), &g_brushRadius, 2.0f, 60.0f, "%.1f");
+        ImGui::SetNextItemWidth(260);
+        if (g_brushMode == BrushFlatten) ImGui::SliderFloat(T("strength"), &g_brushFlat, 0.05f, 1.0f, "%.2f");
+        else ImGui::SliderFloat(T("height per stroke (m)"), &g_brushAmount, 0.05f, 5.0f, "%.2f");
+        ImGui::TextDisabled(g_brushMode == BrushFlatten ? T("Flatten pulls the ground toward the height where the drag started.") : T("Dragging paints a stroke every 40 percent of the radius; strokes add up."));
+        const auto strokes = core::TerrainStrokes();
+        ImGui::Text(T("%d strokes"), (int)strokes.size()); ImGui::SameLine();
+        ImGui::BeginDisabled(strokes.empty());
+        if (ImGui::SmallButton(T("Undo"))) core::TerrainUndo(); ImGui::SameLine();
+        if (ImGui::SmallButton(T("Clear all"))) core::TerrainClear();
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        const std::string st = core::TerrainApplyState();
+        if (!st.empty()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Applying: %s"), st.c_str());
+        else if (core::TerrainNeedsApply()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Not applied yet: the rings show where you painted."));
+        else ImGui::TextDisabled(T("The ground shows every stroke."));
+        ImGui::BeginDisabled(!st.empty() || !havePos || !core::TravelAvailable() || strokes.empty() && !core::TerrainNeedsApply());
+        if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Apply (two loading screens)"))) { if (core::TerrainApply(p.world)) Note(T("applying the terrain: fast travel away and back")); }
+        ImGui::EndDisabled();
+        ImGui::TextWrapped(T("The game only reads the ground when it streams in. Apply makes that happen with a fast travel 5 km away and back to where you stand (about half a minute). Strokes are saved with the project and are there right away when the project is autoloaded."));
+        ImGui::TextDisabled(T("travel: %s"), core::TravelStatus().c_str());
     }
 
     // screen rectangle of a placed object's (yaw-rotated) bounding box; depth = distance along the view direction
@@ -2268,6 +2376,7 @@ namespace editor {
         g_hoverUid = 0;
         ImGuiIO& io = ImGui::GetIO();
         if (g_browserDragPrefab >= 0 || g_npcDragIndex >= 0) return;   // a browser/NPC drag owns LMB until it is dropped or cancelled
+        if (BrushActive()) return;                                       // the terrain brush owns LMB while it is on
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
         const bool addSelect = g_cameraMode ? ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) : io.KeyCtrl;
         const bool addBox = g_cameraMode ? (((GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT)) & 0x8000) != 0) : (io.KeyCtrl || io.KeyShift);
@@ -2716,6 +2825,7 @@ namespace editor {
         if (g_numericEditId && g_numericEditLastSeenFrame >= 0 && ImGui::GetFrameCount() - g_numericEditLastSeenFrame > 1) CancelNumericEdit();
         ImGuiIO& io = ImGui::GetIO();
         io.MouseDrawCursor = !g_playMode;
+        BrushTick(p, havePos);
         ClickSelect(p, havePos); DrawWorldContextPopup(havePos); DrawSelectionOutlines();
         if (g_compact) { DrawCompact(p, havePos); CameraTick(); return; }
         {   // initial size follows the UI scale (style is scaled by screen height / 1080) and stays inside the screen
@@ -2788,8 +2898,8 @@ namespace editor {
             if (ImGui::BeginTabItem(TStable(ICON_CLOCK_ROTATE_LEFT " Time & Weather"), nullptr, environmentFlags)) { g_mainTab = TabEnvironment; DrawEnvironment(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(TStable(ICON_CLOCK_ROTATE_LEFT " History"))) { g_mainTab = TabHistory; DrawHistory(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(TStable(ICON_FLOPPY_DISK " Project"))) { g_mainTab = TabProject; DrawProject(); ImGui::EndTabItem(); }
-            static const bool s_showTravel = false;   // hidden until the game's own teleport path is found
-            if (s_showTravel && ImGui::BeginTabItem(TStable(ICON_LOCATION_CROSSHAIRS " Travel"))) { g_mainTab = TabTravel; DrawTravel(p, havePos); ImGui::EndTabItem(); }
+            if (core::TravelAvailable() && ImGui::BeginTabItem(TStable(ICON_LOCATION_CROSSHAIRS " Travel"))) { g_mainTab = TabTravel; DrawTravel(p, havePos); ImGui::EndTabItem(); }
+            if (core::TerrainAvailable() && ImGui::BeginTabItem(TStable(ICON_CUBE " Terrain"))) { g_mainTab = TabTerrain; DrawTerrain(p, havePos); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem(TStable(ICON_LIST " Settings"))) {
                 g_mainTab = TabSettings;
                 int languageCount = 0; const auto* languageOptions = i18n::Languages(&languageCount); int languageIndex = 0;

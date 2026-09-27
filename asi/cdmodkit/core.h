@@ -55,9 +55,30 @@ namespace core {
     struct DebugPt { Vec3 p; uint32_t col; };   // research overlay: world points drawn by the editor
     std::vector<DebugPt> DebugPoints(); size_t DebugPointCount(); int LoadDebugPoints(bool clear);   // file bin64\cdmodkit\debugpoints.txt: "x y z rrggbb" per line
     void GeoTraceInstall(uintptr_t vt, int slots); void GeoTraceArm(); void FnTraceInstall(uintptr_t rva); void IoTraceSet(const std::string& filter); void IoHeightDelta(int d); void IoStreamDelta(int d);
-    // terrain editing (terrain.cpp): height changes applied to the terrain height textures as the game streams them in;
-    // collision is captured from the rendered terrain and follows. Tiles already on screen change when they stream again.
-    bool TerrainAvailable(); int TerrainEditDisc(float x, float z, float radius, float metres); int TerrainEditTile(int tx, int tz, float metres); void TerrainWatchNext(); void TerrainJobTrace(uintptr_t rva); void TerrainLoadTrace(int slot); void TerrainTexTrace(uintptr_t rva); void TeleTraceInstall(uintptr_t rva); void ReloadStageTrace(uintptr_t rva); void RsSendTrace(uintptr_t rva); void ClientReloadTrace(uintptr_t rva); void ClientReloadReplay(float x, float y, float z); void ReloadStageReplay(float x, float y, float z); bool ResearchWatchWrites(const uintptr_t addr[4], int seconds); void TerrainTileTaskTrace(uintptr_t rva); void TerrainRetTrace(uintptr_t rva); void TerrainTexReload(int tx, int tz, uintptr_t mgr, uintptr_t rva); void TerrainReloadCall(uintptr_t obj, int slot, const std::string& name); void TerrainEditClear(); std::string TerrainStatus();   // research: trace the terrain geometry calls of the next ground cast   // research: log the character's ground probe casts for a few seconds   // research: search the player's server actor for its position
+    // Terrain editing (terrain.cpp): brush strokes applied to the terrain height textures as the game streams them in;
+    // collision is captured from the rendered terrain and follows. Tiles already loaded change after TerrainApply.
+    enum { TerrainRaise = 0, TerrainFlatten = 1 };
+    struct TerrainStroke {           // world metres; raise: amount (+ up / - down) at the centre, cosine falloff to r
+        int mode; float x, z, r;     // flatten: pulls toward the height at (ax, az) by strength (0..1) at the centre
+        float amount, strength, ax, az;
+        float y;                     // ground height when painted (display only)
+        int proj;                    // project the stroke belongs to (0 = painted since the last save), like SpawnedObj::proj
+    };
+    bool TerrainAvailable(); std::string TerrainStatus();
+    void TerrainAddStroke(const TerrainStroke& s); bool TerrainUndo(); void TerrainClear();
+    std::vector<TerrainStroke> TerrainStrokes();
+    void TerrainSetProject(int from, int to);                                     // strokes saved into a project become its members
+    void TerrainReplaceProject(int proj, const std::vector<TerrainStroke>& strokes); // a project's strokes as loaded from its file
+    bool TerrainNeedsApply(); void TerrainMarkApplied();
+    bool TerrainApply(Vec3 back);        // fast travel 5 km away and back to 'back': the edited tiles stream again (async)
+    std::string TerrainApplyState();     // "" when idle
+    // Travel (travel.cpp): the game's own fast travel to any position (loading screen; the world streams at the destination).
+    bool TravelAvailable(); bool TravelPrepared(); void TravelPrepare(); std::string TravelStatus();
+    bool TravelTo(Vec3 pos, float yawDeg);   // false while the travel system is still being found (TravelPrepare runs then)
+    void MarkProjectDirty(int proj);
+    // research (terrain_research.cpp, rvas given at runtime)
+    int TerrainEditDisc(float x, float z, float radius, float metres); void TerrainEditClear(); void TerrainSyncTrace();
+    void TerrainJobTrace(uintptr_t rva); void TerrainLoadTrace(int slot); void TerrainTexTrace(uintptr_t rva); void TeleTraceInstall(uintptr_t rva); void ReloadStageTrace(uintptr_t rva); void RsSendTrace(uintptr_t rva); void ClientReloadTrace(uintptr_t rva); void ClientReloadReplay(float x, float y, float z); void ReloadStageReplay(float x, float y, float z); bool ResearchWatchWrites(const uintptr_t addr[4], int seconds); void TerrainTileTaskTrace(uintptr_t rva); void TerrainRetTrace(uintptr_t rva); void TerrainTexReload(int tx, int tz, uintptr_t mgr, uintptr_t rva); void TerrainReloadCall(uintptr_t obj, int slot, const std::string& name);
     void ResearchVtScan(const std::string& mangled, int maxHits, int dumpBytes);   // research: live objects of an RTTI class (logged)
     void CamWatch(int seconds, int mode = 0);  // research: logs which code writes the camera pose (hardware write breakpoints); mode 0 renderer camera, 1 camera scene object
     // research: the game's server gimmick spawns are captured in a ring; one of them can be issued again at 'at' (the next spawn the game makes triggers it)
