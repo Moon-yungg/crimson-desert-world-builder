@@ -294,6 +294,9 @@ static std::string Handle(const std::string& method, const std::string& path, co
     if (method == "POST" && path == "/api/research/terrain") {   // research: {"x","z","r","dm"} adds a smooth disc (dm metres, + up), {"clear":1}
         if (Flag(arg, "clear")) core::TerrainEditClear();
         if (Flag(arg, "synctrace")) core::TerrainSyncTrace();   // research
+        if (Flag(arg, "list")) { std::string o = "{\"strokes\":["; char t[200]; bool first = true;   // research: the strokes as painted
+            for (const auto& k : core::TerrainStrokes()) { snprintf(t, sizeof t, "%s[%d,%.2f,%.2f,%.2f,%.2f,%.3f,%.2f,%d]", first ? "" : ",", k.mode, k.x, k.z, k.r, k.y, k.amount, k.strength, k.proj); o += t; first = false; }
+            return o + "]}"; }
         if (Flag(arg, "apply")) { PosInfo pp{}; if (core::PlayerPosInfo(&pp)) core::TerrainApply(pp.world); }   // fast travel away and back
         { float ls = 0; if (arg.count("loadtrace") && Number(arg, "loadtrace", ls, true)) core::TerrainLoadTrace((int)ls); }   // research
         { auto ro = arg.find("reloadobj"), rn = arg.find("reloadname"); float sl = 78; Number(arg, "slot", sl);

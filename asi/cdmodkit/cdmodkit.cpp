@@ -1236,7 +1236,7 @@ static void* __fastcall HookCastShape(void* ctx, void* world, void* query, void*
 struct CastTemplate { bool have = false; void* world = nullptr; uint8_t query[0x200], xform[0x100], collector[0x200], hits[0x100], shape[0x200]; uintptr_t collAddr = 0, hitsAddr = 0, shapeAddr = 0; };
 static CastTemplate g_tpl;
 static std::mutex g_tplMutex;
-struct GroundReq { int id; Vec3 start; float len; bool verbose; };
+struct GroundReq { int id; Vec3 start; float len; bool verbose; Vec3 dir; };   // dir: unit direction of the cast (straight down for ground probes)
 static std::mutex g_groundMutex; static std::vector<GroundReq> g_groundQueue; static std::map<int, GroundHit> g_groundResults; static int g_groundNext = 0;
 static volatile LONG g_groundQueued = 0;
 static void ServiceGroundQueue(void* world);
@@ -2788,7 +2788,7 @@ static bool CallCastGuarded(void* world, void* q, void* xf, void* col, void** r)
     CDK_GUARD_END
     return false;
 }
-static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int tileZ, GroundHit* out, bool verbose) {
+static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int tileZ, GroundHit* out, bool verbose, Vec3 dir = Vec3{ 0, -1, 0 }) {
     if (!g_tpl.have || !g_origWorldCastShape) { if (verbose) Log("[probe] no template yet (the character has to be in the world for a moment)"); return false; }
     alignas(16) uint8_t q[0x200], xf[0x100], col[0x300], shp[0x200];
     memset(col, 0, sizeof col);
@@ -2796,8 +2796,8 @@ static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int til
     uintptr_t pShape = (uintptr_t)shp, pHits = (uintptr_t)col + 0x30; memcpy(q + 0x28, &pShape, 8); memcpy(col + 0x20, &pHits, 8);   // inline hit buffer at +0x30, as in the original object
     float* fq = (float*)q;
     fq[0x30 / 4] = start.x - tileX * 1000.0f; fq[0x34 / 4] = start.y; fq[0x38 / 4] = start.z - tileZ * 1000.0f; fq[0x3C / 4] = 0;
-    fq[0x40 / 4] = 0; fq[0x44 / 4] = -len; fq[0x48 / 4] = 0; fq[0x4C / 4] = 1.0f;
-    fq[0x50 / 4] = 0; fq[0x54 / 4] = g_probeZeroVel ? 0.0f : -len; fq[0x58 / 4] = 0; fq[0x5C / 4] = len;
+    fq[0x40 / 4] = dir.x * len; fq[0x44 / 4] = dir.y * len; fq[0x48 / 4] = dir.z * len; fq[0x4C / 4] = 1.0f;   // displacement
+    fq[0x50 / 4] = g_probeZeroVel ? 0.0f : dir.x * len; fq[0x54 / 4] = g_probeZeroVel ? 0.0f : dir.y * len; fq[0x58 / 4] = g_probeZeroVel ? 0.0f : dir.z * len; fq[0x5C / 4] = len;
     { const double big = 1e19; memcpy(col + 0x10, &big, 8); uint32_t zero = 0; memcpy(col + 0x0C, &zero, 4); }   // reset: no hit, early-out far away
     if (verbose) { Log("[probe] cast: start (%.2f %.2f %.2f) tile %d,%d local (%.2f %.2f %.2f) down %.1f m", start.x, start.y, start.z, tileX, tileZ, fq[0x30 / 4], fq[0x34 / 4], fq[0x38 / 4], len); }
     void* r = nullptr;
@@ -2805,13 +2805,14 @@ static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int til
     uint32_t nh = 0; double frac = 0; memcpy(&nh, col + 0x0C, 4); memcpy(&frac, col + 0x10, 8);
     const float* fc = (const float*)col;
     out->done = true; out->hit = nh > 0 && std::isfinite(frac) && frac <= 1.0; out->fraction = (float)frac;   // negative fraction = the cast started inside a body (penetration), reported as a hit so the caller can step lower
-    out->centerY = start.y - (float)frac * len; out->normal = { fc[0x80 / 4], fc[0x84 / 4], fc[0x88 / 4] };
+    out->centerY = start.y + dir.y * (float)frac * len; out->normal = { fc[0x80 / 4], fc[0x84 / 4], fc[0x88 / 4] };
+    out->center = { start.x + dir.x * (float)frac * len, out->centerY, start.z + dir.z * (float)frac * len };
     if (verbose) Log("[probe] RESULT hits %u fraction %.4f -> sphere center y %.3f (%.2f m below start), normal (%.3f %.3f %.3f), returned %p", nh, frac, out->centerY, (float)frac * len, out->normal.x, out->normal.y, out->normal.z, r);
     return true;
 }
-static int QueueGround(Vec3 start, float len, bool verbose) {
+static int QueueGround(Vec3 start, float len, bool verbose, Vec3 dir = Vec3{ 0, -1, 0 }) {
     std::lock_guard<std::mutex> l(g_groundMutex); const int id = ++g_groundNext;
-    g_groundQueue.push_back({ id, start, len, verbose }); InterlockedExchange(&g_groundQueued, 1); return id;
+    g_groundQueue.push_back({ id, start, len, verbose, dir }); InterlockedExchange(&g_groundQueued, 1); return id;
 }
 // ---- ground queries for the editor
 float g_probeRadius = 0.0f; static bool g_probeCalibrated = false;
@@ -2832,7 +2833,7 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
         const int tx = (int)(rq.start.x * 0.001), tz = (int)(rq.start.z * 0.001);
         t_geoTracing = InterlockedExchange(&g_geoTraceArm, 0) != 0;   // research: log the geometry calls of this one cast
         if (t_geoTracing) Log("[geo] ---- traced cast from (%.2f %.2f %.2f) %.2f m down", rq.start.x, rq.start.y, rq.start.z, rq.len);
-        GroundHit h; if (!RunGroundCast(world, rq.start, rq.len, tx, tz, &h, rq.verbose)) { h.done = true; h.hit = false; }
+        GroundHit h; if (!RunGroundCast(world, rq.start, rq.len, tx, tz, &h, rq.verbose, rq.dir)) { h.done = true; h.hit = false; }
         if (t_geoTracing) { Log("[geo] ---- result: %s y %.2f", h.hit ? "hit" : "MISS", h.centerY); t_geoTracing = false; }
         std::lock_guard<std::mutex> l(g_groundMutex); g_groundResults[rq.id] = h; if (g_groundResults.size() > 40000) g_groundResults.erase(g_groundResults.begin());
     }
@@ -2860,6 +2861,13 @@ int GroundProbe(Vec3 start, float len) {
     if (!GroundProbeReady() || !GameThreadReady()) return 0;
     const int id = QueueGround(start, len, false);
     RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });   // game thread, between the game's own casts (the only context that worked so far)
+    return id;
+}
+int RayProbe(Vec3 start, Vec3 dir, float len) {   // the same cast along any direction (the terrain brush: from the camera along the mouse ray)
+    if (!GroundProbeReady() || !GameThreadReady()) return 0;
+    const float l = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z); if (l < 1e-6f) return 0;
+    const int id = QueueGround(start, len, false, Vec3{ dir.x / l, dir.y / l, dir.z / l });
+    RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });
     return id;
 }
 bool GroundResult(int ticket, GroundHit* out) {

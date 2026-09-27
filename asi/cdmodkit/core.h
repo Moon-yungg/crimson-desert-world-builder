@@ -72,6 +72,8 @@ namespace core {
     bool TerrainNeedsApply(); void TerrainMarkApplied();
     bool TerrainApply(Vec3 back);        // fast travel 5 km away and back to 'back': the edited tiles stream again (async)
     std::string TerrainApplyState();     // "" when idle
+    int TerrainPreviewGen();             // changes whenever the preview heights change
+    bool TerrainPreviewGrid(float x0, float z0, int nx, int nz, std::vector<float>* orig, std::vector<float>* edit);   // 2 m texel grid, NaN = not loaded
     // Travel (travel.cpp): the game's own fast travel to any position (loading screen; the world streams at the destination).
     bool TravelAvailable(); bool TravelPrepared(); void TravelPrepare(); std::string TravelStatus();
     bool TravelTo(Vec3 pos, float yawDeg);   // false while the travel system is still being found (TravelPrepare runs then)
@@ -100,9 +102,10 @@ namespace core {
     void RayTrace(int calls);                  // logs the next N ray casts of the game (reverse engineering aid)
     void ProbeGround(float above, float len);  // dev: logs three replayed casts from above the player
     // Ground queries: a sphere cast of the game (captured automatically from its own character probe) replayed downward.
-    struct GroundHit { bool done = false, hit = false; float centerY = 0; float fraction = 0; Vec3 normal{}; };
+    struct GroundHit { bool done = false, hit = false; float centerY = 0; float fraction = 0; Vec3 normal{}; Vec3 center{}; };   // center: sphere centre at the hit
     bool GroundProbeReady();                   // a cast template was captured (the character has to be in the world for a moment)
     int  GroundProbe(Vec3 start, float len);   // queues a cast from start straight down on the game thread; ticket (0 = not possible)
+    int  RayProbe(Vec3 start, Vec3 dir, float len);   // the same cast along any direction (result: GroundResult, center = hit sphere centre)
     bool GroundResult(int ticket, GroundHit* out);
     bool GroundGrid(float x0, float z0, int nx, int nz, float step, float top, float len, std::vector<float>* out);   // research: collision heights on a grid (NAN = none)   // true once the ticket finished (poll every frame)
     extern float g_probeRadius;                // sphere radius of the template, calibrated at the player's feet (ground = centerY - radius)

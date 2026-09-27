@@ -38,6 +38,9 @@ static const int kMips = 10;
 static const uint32_t kHeader = 128;           // DDS header in front of the pixel data (these files carry no DX10 block)
 
 struct TileInfo { float range = 0, offset = 0; bool tried = false; };
+// CPU copy of a tile's mip 0 (metres) for the editor's shape preview: the original from the game's own file and the same
+// strokes applied the way the stream patch applies them, so the preview shows what the ground will look like after Apply.
+struct TileCpu { std::vector<float> orig, edit; bool ok = false, tried = false; };
 struct PendingRead { int tx, tz; uintptr_t holder; uint32_t off, len; };
 
 static std::mutex g_mx;                                   // guards everything below
@@ -45,6 +48,8 @@ static std::vector<TerrainStroke> g_strokes;              // in painting order; 
 static std::set<std::pair<int, int>> g_edited;            // tiles touched by at least one stroke
 static std::map<std::pair<int, int>, TileInfo> g_info;    // height table per tile
 static std::map<uintptr_t, PendingRead> g_pending;        // completion event -> read waiting to be patched
+static std::map<std::pair<int, int>, TileCpu> g_cpu;      // preview copies of edited tiles
+static std::atomic<int> g_gen{ 0 };                       // bumped whenever a preview copy changes
 static bool g_ok = false, g_needsApply = false; static std::string g_why = "not installed";
 static volatile LONG g_patched = 0, g_missed = 0;
 static std::atomic<int> g_applyStep{ 0 }; static std::string g_applyText;   // 0 idle; text guarded by g_mx
@@ -70,6 +75,35 @@ static void TilesOf(const TerrainStroke& s, std::vector<std::pair<int, int>>* ou
     const int tz0 = (int)std::floor((s.z - s.r) / 1024.0f), tz1 = (int)std::floor((s.z + s.r) / 1024.0f);
     for (int tx = tx0; tx <= tx1; tx++) for (int tz = tz0; tz <= tz1; tz++) out->push_back({ tx, tz });
 }
+static bool StrokeTouchesTile(const TerrainStroke& s, int tx, int tz) {
+    const float x0 = tx * 1024.0f, z0 = tz * 1024.0f;
+    return s.x + s.r >= x0 && s.x - s.r < x0 + 1024.0f && s.z + s.r >= z0 && s.z - s.r < z0 + 1024.0f;
+}
+// One stroke on a mip 0 copy in metres: the same falloff, anchor and order as ApplyGuarded does on the streamed samples.
+static void ApplyStrokeCpu(std::vector<float>& e, int tx, int tz, const TerrainStroke& s) {
+    if (s.r <= 0 || e.size() != (size_t)kTile * kTile) return;
+    const float ox = tx * 1024.0f, oz = tz * 1024.0f, size = 2.0f; const int dim = kTile;
+    float target = 0;
+    if (s.mode == TerrainFlatten) {
+        int ac = (int)std::floor((s.ax - ox) / size), ar = dim - 1 - (int)std::floor((s.az - oz) / size);
+        if (ar < 0 || ac < 0 || ar >= dim || ac >= dim) { ac = (int)std::floor((s.x - ox) / size); ar = dim - 1 - (int)std::floor((s.z - oz) / size); }
+        if (ar < 0 || ac < 0 || ar >= dim || ac >= dim) return;
+        target = e[(size_t)ar * dim + ac];
+    }
+    const int c0 = std::max(0, (int)std::floor((s.x - s.r - ox) / size)), c1 = std::min(dim - 1, (int)std::floor((s.x + s.r - ox) / size));
+    const int r0 = std::max(0, dim - 1 - (int)std::floor((s.z + s.r - oz) / size)), r1 = std::min(dim - 1, dim - 1 - (int)std::floor((s.z - s.r - oz) / size));
+    for (int r = r0; r <= r1; r++) for (int c = c0; c <= c1; c++) {
+        const float wx = ox + (c + 0.5f) * size, wz = oz + (dim - 1 - r + 0.5f) * size;
+        const float q = std::sqrt((wx - s.x) * (wx - s.x) + (wz - s.z) * (wz - s.z)) / s.r; if (q >= 1.0f) continue;
+        const float f = 0.5f * (1.0f + std::cos(3.14159265f * q)); float& h = e[(size_t)r * dim + c];
+        if (s.mode == TerrainFlatten) h += (target - h) * f * std::min(1.0f, std::max(0.0f, s.strength)); else h += s.amount * f;
+    }
+}
+static void RecomputeCpuLocked() {   // after undo / clear / replace: every loaded copy from its original again
+    for (auto& kv : g_cpu) { if (!kv.second.ok) continue; kv.second.edit = kv.second.orig;
+        for (const auto& s : g_strokes) if (StrokeTouchesTile(s, kv.first.first, kv.first.second)) ApplyStrokeCpu(kv.second.edit, kv.first.first, kv.first.second, s); }
+    g_gen++;
+}
 static void RebuildEditedLocked() {
     g_edited.clear(); std::vector<std::pair<int, int>> t;
     for (const auto& s : g_strokes) { t.clear(); TilesOf(s, &t); for (auto& k : t) g_edited.insert(k); }
@@ -82,12 +116,23 @@ static void FetchTables() {
     std::thread([]() {
         for (int wait = 0; wait < 1200 && !GameReadAvailable(); wait++) Sleep(250);
         for (;;) {
-            std::pair<int, int> want{}; bool any = false;
-            { std::lock_guard<std::mutex> l(g_mx); for (auto& k : g_edited) { auto& ti = g_info[k]; if (!ti.tried) { ti.tried = true; want = k; any = true; break; } } }
+            std::pair<int, int> want{}; bool any = false, needRange = false;
+            { std::lock_guard<std::mutex> l(g_mx);
+              for (auto& k : g_edited) { auto& ti = g_info[k]; auto& tc = g_cpu[k]; if (!ti.tried || !tc.tried) { needRange = !ti.tried; ti.tried = true; tc.tried = true; want = k; any = true; break; } } }
             if (!any) break;
-            float range = 0, offset = 0; const bool ok = TileRange(want.first, want.second, &range, &offset);
-            std::lock_guard<std::mutex> l(g_mx); auto& ti = g_info[want]; if (ok) { ti.range = range; ti.offset = offset; }
-            if (!ok) Log("[terrain] tile %d,%d: no height table", want.first, want.second);
+            float range = 0, offset = 0;
+            if (needRange) { const bool ok = TileRange(want.first, want.second, &range, &offset);
+                std::lock_guard<std::mutex> l(g_mx); auto& ti = g_info[want]; if (ok) { ti.range = range; ti.offset = offset; } else Log("[terrain] tile %d,%d: no height table", want.first, want.second); }
+            { std::lock_guard<std::mutex> l(g_mx); range = g_info[want].range; offset = g_info[want].offset; }
+            if (range <= 0) continue;
+            char path[128]; snprintf(path, sizeof path, "leveldata/rootlevel/terrain/height16f/terrain_%d_%d_height_h.dds", want.first, want.second);
+            std::vector<uint8_t> dds;   // header + mip 0 is all the preview needs; the game's own loader, the original file
+            if (!GameReadFile(path, dds) || dds.size() < kHeader + (size_t)kTile * kTile * 2) { Log("[terrain] tile %d,%d: no height texture for the preview", want.first, want.second); continue; }
+            std::vector<float> orig((size_t)kTile * kTile); const float k = range / 65535.0f;
+            for (size_t i = 0; i < orig.size(); i++) { uint16_t v; memcpy(&v, dds.data() + kHeader + i * 2, 2); orig[i] = offset + v * k; }
+            std::lock_guard<std::mutex> l(g_mx); auto& tc = g_cpu[want]; tc.orig.swap(orig); tc.edit = tc.orig; tc.ok = true;
+            for (const auto& s : g_strokes) if (StrokeTouchesTile(s, want.first, want.second)) ApplyStrokeCpu(tc.edit, want.first, want.second, s);
+            g_gen++;
         }
         g_fetchRunning = false;
     }).detach();
@@ -199,17 +244,18 @@ void TerrainInstall() {
 bool TerrainAvailable() { return g_ok; }
 
 void TerrainAddStroke(const TerrainStroke& s) {
-    { std::lock_guard<std::mutex> l(g_mx); g_strokes.push_back(s); std::vector<std::pair<int, int>> t; TilesOf(s, &t); for (auto& k : t) g_edited.insert(k); g_needsApply = true; }
+    { std::lock_guard<std::mutex> l(g_mx); g_strokes.push_back(s); std::vector<std::pair<int, int>> t; TilesOf(s, &t); for (auto& k : t) g_edited.insert(k); g_needsApply = true;
+      for (auto& k : t) { auto it = g_cpu.find(k); if (it != g_cpu.end() && it->second.ok) ApplyStrokeCpu(it->second.edit, k.first, k.second, s); } g_gen++; }
     if (s.proj) MarkProjectDirty(s.proj);
     FetchTables();
 }
 bool TerrainUndo() {
     int proj = 0;
-    { std::lock_guard<std::mutex> l(g_mx); if (g_strokes.empty()) return false; proj = g_strokes.back().proj; g_strokes.pop_back(); RebuildEditedLocked(); g_needsApply = true; }
+    { std::lock_guard<std::mutex> l(g_mx); if (g_strokes.empty()) return false; proj = g_strokes.back().proj; g_strokes.pop_back(); RebuildEditedLocked(); RecomputeCpuLocked(); g_needsApply = true; }
     if (proj) MarkProjectDirty(proj);
     return true;
 }
-void TerrainClear() { std::lock_guard<std::mutex> l(g_mx); if (!g_strokes.empty()) g_needsApply = true; g_strokes.clear(); RebuildEditedLocked(); Log("[terrain] strokes cleared"); }
+void TerrainClear() { std::lock_guard<std::mutex> l(g_mx); if (!g_strokes.empty()) g_needsApply = true; g_strokes.clear(); RebuildEditedLocked(); RecomputeCpuLocked(); Log("[terrain] strokes cleared"); }
 std::vector<TerrainStroke> TerrainStrokes() { std::lock_guard<std::mutex> l(g_mx); return g_strokes; }
 void TerrainSetProject(int from, int to) { std::lock_guard<std::mutex> l(g_mx); for (auto& s : g_strokes) if (s.proj == from) s.proj = to; }
 // A project's strokes as loaded from its file: replaces what that project had. Identical strokes (the startup preload followed
@@ -223,7 +269,7 @@ void TerrainReplaceProject(int proj, const std::vector<TerrainStroke>& strokes) 
         if (same) return;
         g_strokes.erase(std::remove_if(g_strokes.begin(), g_strokes.end(), [proj](const TerrainStroke& s) { return s.proj == proj; }), g_strokes.end());
         for (auto s : strokes) { s.proj = proj; g_strokes.push_back(s); }
-        RebuildEditedLocked(); g_needsApply = true;
+        RebuildEditedLocked(); RecomputeCpuLocked(); g_needsApply = true;
     }
     FetchTables();
 }
@@ -268,6 +314,23 @@ bool TerrainApply(Vec3 back) {
     return true;
 }
 
+int TerrainPreviewGen() { return g_gen; }
+// Heights on the 2 m texel grid for the preview: sample (i, j) is the texel containing (x0 + 2i, z0 + 2j); NaN where the tile's
+// copy is not loaded. x0 / z0 should be even (texel edges) so the samples are the texel centres at x0 + 2i + 1.
+bool TerrainPreviewGrid(float x0, float z0, int nx, int nz, std::vector<float>* orig, std::vector<float>* edit) {
+    if (nx <= 0 || nz <= 0 || nx * nz > 250000) return false;
+    orig->assign((size_t)nx * nz, NAN); edit->assign((size_t)nx * nz, NAN);
+    std::lock_guard<std::mutex> l(g_mx); bool any = false;
+    for (int j = 0; j < nz; j++) for (int i = 0; i < nx; i++) {
+        const float x = x0 + 2.0f * i + 1.0f, z = z0 + 2.0f * j + 1.0f;
+        const int tx = (int)std::floor(x / 1024.0f), tz = (int)std::floor(z / 1024.0f);
+        auto it = g_cpu.find({ tx, tz }); if (it == g_cpu.end() || !it->second.ok) continue;
+        const int c = (int)std::floor((x - tx * 1024.0f) / 2.0f), r = kTile - 1 - (int)std::floor((z - tz * 1024.0f) / 2.0f);
+        if (c < 0 || r < 0 || c >= kTile || r >= kTile) continue;
+        const size_t k = (size_t)r * kTile + c; (*orig)[(size_t)j * nx + i] = it->second.orig[k]; (*edit)[(size_t)j * nx + i] = it->second.edit[k]; any = true;
+    }
+    return any;
+}
 std::string TerrainStatus() {
     std::lock_guard<std::mutex> l(g_mx); char b[200];
     snprintf(b, sizeof b, "%s, %zu strokes on %zu tiles, %ld reads patched, %ld missed", g_why.c_str(), g_strokes.size(), g_edited.size(), (long)g_patched, (long)g_missed);

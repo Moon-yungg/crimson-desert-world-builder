@@ -2237,9 +2237,48 @@ namespace editor {
     static bool g_brushOn = false; static int g_brushMode = BrushRaise;
     static float g_brushRadius = 8.0f, g_brushAmount = 0.5f, g_brushFlat = 0.5f;
     static Vec3 g_brushAt{}; static bool g_brushHave = false; static float g_brushY = 0; static bool g_brushYSet = false;
-    static int g_brushTicket = 0; static DWORD g_brushProbeTick = 0;
+    static int g_brushTicket = 0; static DWORD g_brushProbeTick = 0, g_brushHitTick = 0; static bool g_brushLastHit = false; static float g_brushLastHitY = 0;
     static bool g_brushPainting = false; static Vec3 g_brushLast{}; static float g_brushAx = 0, g_brushAz = 0;
     static bool TerrainTabShown() { return g_open && !g_compact && g_mainTab == TabTerrain; }
+    static bool g_shapePreview = true;
+    struct ShapeGrid { int gen = -1; float x0 = 0, z0 = 0; int nx = 0, nz = 0; std::vector<float> orig, edit; };
+    static ShapeGrid g_shape;
+    // The edited surface as a wire grid on the 2 m texel grid (where it differs from the original): orange above, blue below the
+    // current ground, stronger with the height change. Drawn over the picture, so dips hidden under the old ground show too.
+    static void DrawShapePreview(ImDrawList* dl, const CamFrame& cf) {
+        const auto strokes = core::TerrainStrokes(); if (strokes.empty()) return;
+        float mnx = 1e9f, mnz = 1e9f, mxx = -1e9f, mxz = -1e9f; bool any = false;
+        for (const auto& t : strokes) { const float dx = t.x - cf.pos.x, dz = t.z - cf.pos.z; if (dx * dx + dz * dz > 350.0f * 350.0f) continue;
+            mnx = std::min(mnx, t.x - t.r); mnz = std::min(mnz, t.z - t.r); mxx = std::max(mxx, t.x + t.r); mxz = std::max(mxz, t.z + t.r); any = true; }
+        if (!any) return;
+        mnx = std::max(mnx, cf.pos.x - 200.0f); mnz = std::max(mnz, cf.pos.z - 200.0f); mxx = std::min(mxx, cf.pos.x + 200.0f); mxz = std::min(mxz, cf.pos.z + 200.0f);
+        const float x0 = 2.0f * std::floor(mnx / 2.0f), z0 = 2.0f * std::floor(mnz / 2.0f);
+        const int nx = std::min(200, (int)((mxx - x0) / 2.0f) + 2), nz = std::min(200, (int)((mxz - z0) / 2.0f) + 2); if (nx < 2 || nz < 2) return;
+        const int gen = core::TerrainPreviewGen();
+        if (gen != g_shape.gen || x0 != g_shape.x0 || z0 != g_shape.z0 || nx != g_shape.nx || nz != g_shape.nz) {
+            g_shape.gen = gen; g_shape.x0 = x0; g_shape.z0 = z0; g_shape.nx = nx; g_shape.nz = nz;
+            core::TerrainPreviewGrid(x0, z0, nx, nz, &g_shape.orig, &g_shape.edit);
+        }
+        if ((int)g_shape.edit.size() != nx * nz) return;
+        auto at = [&](int i, int j, Vec3* w, float* d) -> bool {
+            const size_t k = (size_t)j * nx + i; const float e = g_shape.edit[k], o = g_shape.orig[k]; if (std::isnan(e)) return false;
+            *w = { x0 + 2.0f * i + 1.0f, e + 0.15f, z0 + 2.0f * j + 1.0f }; *d = e - o; return true; };
+        auto colOf = [](float d) -> ImU32 { const float a = std::min(1.0f, std::fabs(d) / 3.0f);
+            return d >= 0 ? IM_COL32(255, (int)(210 - 90 * a), 80, (int)(90 + 150 * a)) : IM_COL32(80, (int)(200 - 60 * a), 255, (int)(90 + 150 * a)); };
+        for (int j = 0; j < nz; j++) for (int i = 0; i < nx; i++) {
+            Vec3 a; float da; if (!at(i, j, &a, &da)) continue;
+            const float depth = (a.x - cf.pos.x) * cf.fwd.x + (a.y - cf.pos.y) * cf.fwd.y + (a.z - cf.pos.z) * cf.fwd.z; if (depth < 1.0f) continue;
+            ImVec2 sa; if (!WorldToScreen(cf, a, &sa)) continue;
+            for (int n = 0; n < 2; n++) {
+                const int i2 = i + (n == 0), j2 = j + (n == 1); if (i2 >= nx || j2 >= nz) continue;
+                Vec3 b; float db; if (!at(i2, j2, &b, &db)) continue;
+                if (std::fabs(da) < 0.03f && std::fabs(db) < 0.03f) continue;
+                const float depthB = (b.x - cf.pos.x) * cf.fwd.x + (b.y - cf.pos.y) * cf.fwd.y + (b.z - cf.pos.z) * cf.fwd.z; if (depthB < 1.0f) continue;
+                ImVec2 sb; if (!WorldToScreen(cf, b, &sb)) continue;
+                dl->AddLine(sa, sb, colOf(0.5f * (da + db)), 1.0f);
+            }
+        }
+    }
     static bool BrushActive() { return TerrainTabShown() && g_brushOn && core::TerrainAvailable() && !g_playMode; }
     static void AddBrushStroke() {
         core::TerrainStroke t{};
@@ -2250,10 +2289,11 @@ namespace editor {
         core::TerrainAddStroke(t); g_brushLast = g_brushAt;
     }
     static void DrawGroundRing(ImDrawList* dl, const CamFrame& cf, float x, float y, float z, float r, ImU32 col, int seg, float th) {
-        ImVec2 prev{}; bool havePrev = false;
+        ImVec2 prev{}; bool havePrev = false;   // points closer than 1 m to the camera plane would project far off screen: the ring breaks there
         for (int i = 0; i <= seg; i++) {
-            const float a = 6.2831853f * i / seg; ImVec2 sp;
-            const bool ok = WorldToScreen(cf, Vec3{ x + r * cosf(a), y + 0.1f, z + r * sinf(a) }, &sp);
+            const float a = 6.2831853f * i / seg; const Vec3 w{ x + r * cosf(a), y + 0.1f, z + r * sinf(a) };
+            const float depth = (w.x - cf.pos.x) * cf.fwd.x + (w.y - cf.pos.y) * cf.fwd.y + (w.z - cf.pos.z) * cf.fwd.z;
+            ImVec2 sp; const bool ok = depth > 1.0f && WorldToScreen(cf, w, &sp);
             if (ok && havePrev) dl->AddLine(prev, sp, col, th);
             prev = sp; havePrev = ok;
         }
@@ -2262,7 +2302,8 @@ namespace editor {
         if (!TerrainTabShown()) { g_brushPainting = false; return; }
         const CamFrame cf = CurrentCam(); if (!cf.ok) return;
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
-        {   // painted strokes, newest on top (only the ones near the camera)
+        if (g_shapePreview) DrawShapePreview(dl, cf);
+        else {   // painted strokes, newest on top (only the ones near the camera)
             const auto strokes = core::TerrainStrokes(); int drawn = 0;
             for (int i = (int)strokes.size() - 1; i >= 0 && drawn < 600; i--) {
                 const auto& t = strokes[i]; const float dx = t.x - cf.pos.x, dz = t.z - cf.pos.z; if (dx * dx + dz * dz > 400.0f * 400.0f) continue;
@@ -2272,15 +2313,16 @@ namespace editor {
         }
         if (!BrushActive()) { g_brushPainting = false; return; }
         ImGuiIO& io = ImGui::GetIO();
-        if (!g_brushYSet && havePos) { g_brushY = p.world.y; g_brushYSet = true; }
-        if (g_brushTicket) { core::GroundHit gh; if (core::GroundResult(g_brushTicket, &gh)) { if (gh.hit) g_brushY = gh.centerY - core::g_probeRadius; g_brushTicket = 0; } }
+        (void)p; (void)havePos;
+        // the brush sits where a cast from the camera along the mouse ray hits (the game's own sphere cast, one per frame at most);
+        // the last hit stays shown while the next cast is on its way, a miss (sky, beyond the loaded collision) hides the brush
+        if (g_brushTicket) { core::GroundHit gh; if (core::GroundResult(g_brushTicket, &gh)) {
+            g_brushLastHit = gh.hit; g_brushTicket = 0;
+            if (gh.hit && gh.fraction >= 0.0f) { g_brushAt = { gh.center.x, gh.center.y - core::g_probeRadius, gh.center.z }; g_brushY = g_brushAt.y; g_brushLastHitY = g_brushAt.y; g_brushHitTick = GetTickCount(); } } }
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
         const Vec3 rd = MouseRay(cf, io.MousePos);
-        g_brushHave = false;   // the cursor ray against the ground height found under the brush last time (converges while hovering)
-        if (!overUi && fabsf(rd.y) > 1e-4f) { const float t = (g_brushY - cf.pos.y) / rd.y; if (t > 0.5f && t < 600.0f) { g_brushAt = { cf.pos.x + rd.x * t, g_brushY, cf.pos.z + rd.z * t }; g_brushHave = true; } }
-        if (g_brushHave && !g_brushTicket && core::GroundProbeReady() && GetTickCount() - g_brushProbeTick > 80) {
-            g_brushProbeTick = GetTickCount(); g_brushTicket = core::GroundProbe({ g_brushAt.x, g_brushAt.y + 150.0f, g_brushAt.z }, 400.0f);
-        }
+        if (!overUi && !g_brushTicket && core::GroundProbeReady()) g_brushTicket = core::RayProbe(cf.pos, rd, 300.0f);
+        g_brushHave = !overUi && g_brushLastHit && GetTickCount() - g_brushHitTick < 500;
         if (g_brushHave && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { g_brushPainting = true; g_brushAx = g_brushAt.x; g_brushAz = g_brushAt.z; AddBrushStroke(); }
         else if (g_brushPainting && g_brushHave && io.MouseDown[ImGuiMouseButton_Left]) {   // dragging paints a stroke every 40 % of the radius
             const float dx = g_brushAt.x - g_brushLast.x, dz = g_brushAt.z - g_brushLast.z, sp = std::max(0.5f, g_brushRadius * 0.4f);
@@ -2296,7 +2338,9 @@ namespace editor {
     static void DrawTerrain(const PosInfo& p, bool havePos) {
         if (!core::TerrainAvailable()) { ImGui::TextWrapped(T("Terrain editing is not available in this game build: %s"), core::TerrainStatus().c_str()); return; }
         core::TravelPrepare();
-        ImGui::Checkbox(T("Brush active (left mouse paints in the world)"), &g_brushOn);
+        ImGui::Checkbox(T("Brush active (left mouse paints in the world)"), &g_brushOn); ImGui::SameLine();
+        ImGui::Checkbox(T("Shape preview"), &g_shapePreview);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Grid of the ground as it will be after Apply: orange = higher, blue = lower than now."));
         ImGui::RadioButton(T("Raise"), &g_brushMode, BrushRaise); ImGui::SameLine();
         ImGui::RadioButton(T("Lower"), &g_brushMode, BrushLower); ImGui::SameLine();
         ImGui::RadioButton(T("Flatten"), &g_brushMode, BrushFlatten);
@@ -2314,13 +2358,15 @@ namespace editor {
         ImGui::Separator();
         const std::string st = core::TerrainApplyState();
         if (!st.empty()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Applying: %s"), st.c_str());
-        else if (core::TerrainNeedsApply()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Not applied yet: the rings show where you painted."));
+        else if (core::TerrainNeedsApply()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Not applied yet: the grid shows the new shape."));
         else ImGui::TextDisabled(T("The ground shows every stroke."));
         ImGui::BeginDisabled(!st.empty() || !havePos || !core::TravelAvailable() || strokes.empty() && !core::TerrainNeedsApply());
         if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Apply (two loading screens)"))) { if (core::TerrainApply(p.world)) Note(T("applying the terrain: fast travel away and back")); }
         ImGui::EndDisabled();
         ImGui::TextWrapped(T("The game only reads the ground when it streams in. Apply makes that happen with a fast travel 5 km away and back to where you stand (about half a minute). Strokes are saved with the project and are there right away when the project is autoloaded."));
         ImGui::TextDisabled(T("travel: %s"), core::TravelStatus().c_str());
+        ImGui::TextDisabled("brush %s at %.1f %.1f %.1f, ground %.1f, probe %s, last hit %s %.1f", g_brushHave ? "on ground" : "-", g_brushAt.x, g_brushAt.y, g_brushAt.z, g_brushY,
+            g_brushTicket ? "waiting" : "idle", g_brushLastHit ? "yes" : "no", g_brushLastHitY);   // diagnostics while the brush is new
     }
 
     // screen rectangle of a placed object's (yaw-rotated) bounding box; depth = distance along the view direction
