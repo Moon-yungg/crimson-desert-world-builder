@@ -26,6 +26,7 @@ namespace core {
     extern bool      g_menuOpen;      // set by the editor UI
     extern bool      g_uiWantsMouse;  // cursor is over a World Builder window (ImGui WantCaptureMouse), updated every frame
     extern bool      g_uiWantsKeyboard; // a text field is active (ImGui WantTextInput)
+    extern bool      g_placing;       // an editor object/group is currently carried
 
     void Log(const char* fmt, ...);
     std::string ModDir();             // bin64\cdmodkit
@@ -105,6 +106,14 @@ namespace core {
     extern int  g_liveMode;                     // live-drag method, see DoLiveMove
     extern bool g_uiTextInput, g_uiMouseOverUi;  // a text field is active / the cursor is over a World Builder window (finer than g_uiWants*: edit mode claims all input)
     extern int  g_keyToggle, g_keyMode;         // configurable hotkeys (virtual key codes), settings.txt in the mod folder
+    extern bool g_keyboardPlacement;             // optional legacy keyboard placement controls; off by default
+    extern bool g_projectAutoSave;               // periodically writes dirty loaded projects back to their own .cdproj files
+    extern int  g_projectAutoSaveSeconds;        // configurable 10..3600 s interval
+    extern bool g_autoFreeCamOnOpen;             // start free camera automatically when the editor opens
+    extern bool g_showSelectionDetails;          // Browser selected-item information panel
+    enum PlaceKey { PK_FWD, PK_BACK, PK_LEFT, PK_RIGHT, PK_UP, PK_DOWN, PK_ROT_L, PK_ROT_R, PK_SCALE_UP, PK_SCALE_DOWN, PK_FETCH, PK_SNAP, PK_MOUSE, PK_LEVEL, PK_GROUND, PK_DROP, PK_CANCEL, PK_FAST, PK_COUNT };
+    extern int g_placeKeys[PK_COUNT];
+    const char* PlaceKeyId(int i); const char* PlaceKeyLabel(int i); void ApplyPlaceKeys();
     extern float g_fcSpeed, g_fcSens;           // free camera: m/s and degrees per mouse count
     bool FreeCamAvailable();                    // the camera pose function and the renderer camera were found
     bool FreeCamActive();
@@ -115,6 +124,8 @@ namespace core {
     void FreeCamViewPreset(int preset);          // 1 level, 2 straight down, 3 straight up; position is unchanged
     void FreeCamDolly(float meters);            // move along the view (mouse wheel)
     void FreeCamTurn(float dyaw, float dpitch);  // degrees, as the mouse would (tests without a mouse)
+    bool FreeCamSetPosition(Vec3 pos);           // exact free-camera world position; false until the free camera initialized
+    bool FreeCamMove(float forward, float right, float up); // relative movement in the current camera frame
     extern volatile bool g_fcHoldMove;          // editor: no key movement now (context menu open, a field being edited)
     extern bool g_showConsole;                  // settings.txt console=0 hides the console window (takes effect on the next start)
 

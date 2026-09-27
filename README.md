@@ -16,9 +16,9 @@ interactive (a torch placed that way can be lit and put out); see `notes/GIMMICK
 1. Install **Ultimate ASI Loader** if you do not have it: download `Ultimate-ASI-Loader_x64.zip` from
    https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases and copy the contained `dinput8.dll` to
    `<game>\bin64\winmm.dll` (renamed). Mod managers for Crimson Desert usually install it already.
-2. Copy `cdmodkit.asi` and the folder `cdmodkit\` from the release zip into `<game>\bin64\`.
-3. Start the game through Steam. Press **Insert** in the world to open the editor, **Home** to switch between edit and
-   play mode. The log is `bin64\cdmodkit\cdmodkit.log`.
+2. Copy `cdmodkit.asi` from the release zip into `<game>\bin64\`. The `cdmodkit\` runtime folder and `settings.txt` are created automatically on first start.
+3. Start the game through Steam. Press **Insert** in the world to open the editor, **Home** to switch between editing and
+   transparent player-control mode. The log is `bin64\cdmodkit\cdmodkit.log`.
 
 ## Interface language
 
@@ -47,7 +47,7 @@ Without Visual Studio, `asi/cdmodkit/build-mingw.bat` builds the same sources wi
 PATH; the fault guards use the plugin's exception handler there instead of MSVC's `__try`).
 
 The plugin lands in `asi/cdmodkit/build/cdmodkit.asi`. The prefab index, error-name table, and localization table are
-embedded RCDATA resources; copy the ASI and `asi/cdmodkit/data/settings.txt` (to `bin64\cdmodkit\settings.txt`) while the game is not running.
+embedded RCDATA resources; copy only the ASI while the game is not running. The runtime folder and default settings are generated automatically.
 `python scripts/make_release.py <version>` bumps the version strings, builds, and assembles the release zip.
 
 ## Repository layout

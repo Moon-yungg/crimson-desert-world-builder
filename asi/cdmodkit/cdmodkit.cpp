@@ -35,6 +35,7 @@ bool      g_menuOpen = false;
 bool      g_uiWantsMouse = false;
 bool      g_uiWantsKeyboard = false;
 bool      g_uiTextInput = false, g_uiMouseOverUi = false;
+bool      g_placing = false;
 static HMODULE g_self = nullptr;
 static FILE*   g_log = nullptr;
 static bool    g_console = false;
@@ -2330,6 +2331,16 @@ void FreeCamFocus(Vec3 target, float radius) {
 }
 void FreeCamViewPreset(int preset) { if (preset >= 1 && preset <= 3) g_fcViewPresetPending = preset; }
 void FreeCamTurn(float dyaw, float dpitch) { g_fcYaw += dyaw; g_fcPitch += dpitch; }   // tests without a mouse
+bool FreeCamSetPosition(Vec3 pos) {
+    if (!g_fcOn || !g_fcInit || !std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) return false;
+    g_fcPos[0] = pos.x; g_fcPos[1] = pos.y; g_fcPos[2] = pos.z; return true;
+}
+bool FreeCamMove(float forward, float right, float up) {
+    if (!g_fcOn || !g_fcInit || !std::isfinite(forward) || !std::isfinite(right) || !std::isfinite(up)) return false;
+    float r[3], u[3], f[3]; FcBasis(r, u, f);
+    for (int i = 0; i < 3; i++) g_fcPos[i] += f[i] * forward + r[i] * right + u[i] * up;
+    return true;
+}
 bool FreeCamPose(Vec3* pos, Vec3* fwd) {
     if (!g_fcOn || !g_fcInit) return false;
     float r[3], u[3], f[3]; FcBasis(r, u, f);
@@ -2737,6 +2748,11 @@ bool CameraPose(Vec3* fwd, Vec3* pos) {
 
 // ---- configurable hotkeys (bin64\cdmodkit\settings.txt: key_toggle=INSERT, key_mode=HOME) ----
 int g_keyToggle = VK_INSERT, g_keyMode = VK_HOME; bool g_showConsole = false;
+bool g_keyboardPlacement = false;
+bool g_projectAutoSave = false;
+int  g_projectAutoSaveSeconds = 60;
+bool g_autoFreeCamOnOpen = false;
+bool g_showSelectionDetails = true;
 float g_fovDeg = 55.0f; bool g_camMirror = false; bool g_fovAuto = true;
 struct KeyEntry { const char* name; int vk; };
 static const KeyEntry kKeyNames[] = {
@@ -2751,6 +2767,12 @@ static const KeyEntry kKeyNames[] = {
     { "N", 'N' }, { "O", 'O' }, { "P", 'P' }, { "Q", 'Q' }, { "R", 'R' }, { "S", 'S' }, { "T", 'T' }, { "U", 'U' }, { "V", 'V' }, { "W", 'W' }, { "X", 'X' }, { "Y", 'Y' }, { "Z", 'Z' },
     { "0", '0' }, { "1", '1' }, { "2", '2' }, { "3", '3' }, { "4", '4' }, { "5", '5' }, { "6", '6' }, { "7", '7' }, { "8", '8' }, { "9", '9' },
     { nullptr, 0 } };
+int g_placeKeys[PK_COUNT] = { VK_NUMPAD8, VK_NUMPAD2, VK_NUMPAD4, VK_NUMPAD6, VK_NUMPAD9, VK_NUMPAD3, VK_NUMPAD7, VK_NUMPAD1, VK_ADD, VK_SUBTRACT, VK_NUMPAD0, VK_DECIMAL, VK_NUMPAD5, VK_MULTIPLY, VK_DIVIDE, VK_RETURN, VK_BACK, VK_SHIFT };
+static const char* kPlaceKeyIds[PK_COUNT] = { "move_fwd", "move_back", "move_left", "move_right", "move_up", "move_down", "rotate_left", "rotate_right", "scale_up", "scale_down", "fetch", "snap", "mouse", "level", "ground", "drop", "cancel", "fast" };
+static const char* kPlaceKeyLabels[PK_COUNT] = { "move away from me", "move closer", "move left", "move right", "move up", "move down", "rotate left", "rotate right", "scale up", "scale down", "bring it in front of me", "snapping on / off", "mouse to gizmo / camera", "level (remove the tilt)", "snap to ground", "drop", "cancel / put back", "fast (hold)" };
+const char* PlaceKeyId(int i) { return (i >= 0 && i < PK_COUNT) ? kPlaceKeyIds[i] : ""; }
+const char* PlaceKeyLabel(int i) { return (i >= 0 && i < PK_COUNT) ? kPlaceKeyLabels[i] : ""; }
+void ApplyPlaceKeys() { input::SetPlaceVks(g_placeKeys, PK_COUNT); }
 int KeyCount() { int n = 0; while (kKeyNames[n].name) n++; return n; }
 const char* KeyNameAt(int i) { return kKeyNames[i].name; }
 int KeyVkAt(int i) { return kKeyNames[i].vk; }
@@ -2758,7 +2780,7 @@ const char* KeyName(int vk) { for (int i = 0; kKeyNames[i].name; i++) if (kKeyNa
 static int KeyFromName(const std::string& n) { for (int i = 0; kKeyNames[i].name; i++) if (_stricmp(kKeyNames[i].name, n.c_str()) == 0) return kKeyNames[i].vk; if (n.size() == 1 && isalnum((unsigned char)n[0])) return toupper((unsigned char)n[0]); return 0; }
 static std::string SettingsPath() { return g_modDir + "\\settings.txt"; }
 static void LoadSettings() {
-    std::ifstream f(SettingsPath()); std::string line;
+    std::ifstream f(SettingsPath()); const bool missing = !f.good(); std::string line;
     while (std::getline(f, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
         size_t eq = line.find('='); if (eq == std::string::npos) continue;
@@ -2775,6 +2797,11 @@ static void LoadSettings() {
         if (k == "preview_quality") { thumbgen::SetQuality(atoi(v.c_str())); continue; }
         if (k == "freecam_speed") { const float s = (float)atof(v.c_str()); if (s >= 0.5f && s <= 200.0f) g_fcSpeed = s; continue; }
         if (k == "freecam_sens") { const float s = (float)atof(v.c_str()); if (s >= 0.01f && s <= 2.0f) g_fcSens = s; continue; }
+        if (k == "keyboard_placement") { g_keyboardPlacement = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "project_autosave") { g_projectAutoSave = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "project_autosave_seconds") { const int n = atoi(v.c_str()); if (n >= 10 && n <= 3600) g_projectAutoSaveSeconds = n; continue; }
+        if (k == "auto_freecam_on_open") { g_autoFreeCamOnOpen = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "show_selection_details") { g_showSelectionDetails = v != "0" && v != "off" && v != "false"; continue; }
         // manual fallback for snap to ground if the collector vtable cannot be resolved after a game patch; deliberately
         // never written back by SaveSettings, otherwise a stale value would outrank the signature on the next build
         if (k == "probe_vtable") { g_probeVtableOverride = (uintptr_t)strtoull(v.c_str(), nullptr, 0); continue; }
@@ -2782,8 +2809,11 @@ static void LoadSettings() {
         int vk = KeyFromName(v);
         if (!vk) continue;
         if (k == "key_toggle") g_keyToggle = vk; else if (k == "key_mode") g_keyMode = vk;
+        else if (k.rfind("key_", 0) == 0) { for (int i = 0; i < PK_COUNT; i++) if (k == std::string("key_") + kPlaceKeyIds[i]) g_placeKeys[i] = vk; }
     }
-    Log("settings: toggle %s, mode %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off");
+    ApplyPlaceKeys();
+    if (missing) SaveSettings();
+    Log("settings: toggle %s, mode %s, keyboard placement %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_keyboardPlacement ? "on" : "off", g_showConsole ? "on" : "off");
 }
 void SaveSettings() {
     FILE* f = fopen(SettingsPath().c_str(), "w"); if (!f) return;
@@ -2792,9 +2822,13 @@ void SaveSettings() {
     fprintf(f, "# preview_quality: 0 base colour, 1 + dye colours, 2 + normal maps, 3 + specular/emissive. Lower renders the background pass faster\npreview_quality=%d\n", thumbgen::Quality());
     fprintf(f, "# gimmick_spawn=0: place gimmick prefabs (/object/cd_gimmick/...) as plain objects instead of through the game spawn path\ngimmick_spawn=%d\n", g_gimmickSpawn ? 1 : 0);
     fprintf(f, "# free camera (camera mode, key_mode in the editor): speed in m/s, mouse sensitivity in degrees per count\nfreecam_speed=%.1f\nfreecam_sens=%.3f\n", g_fcSpeed, g_fcSens);
+    fprintf(f, "# Optional keyboard object placement. Off by default; enable in Settings or set keyboard_placement=1.\nkeyboard_placement=%d\n", g_keyboardPlacement ? 1 : 0);
+    fprintf(f, "# Automatically save dirty loaded projects. New/unassigned objects are not attached to a project automatically.\nproject_autosave=%d\nproject_autosave_seconds=%d\n", g_projectAutoSave ? 1 : 0, g_projectAutoSaveSeconds);
+    fprintf(f, "# Editor UI behavior.\nauto_freecam_on_open=%d\nshow_selection_details=%d\n", g_autoFreeCamOnOpen ? 1 : 0, g_showSelectionDetails ? 1 : 0);
+    for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
     fprintf(f, "# Interface language: auto, en, zh-CN, zh-TW, de, fr, ko, ja, es, pt-BR, ru, tr\nlanguage=%s\n", i18n::Preference());
     fprintf(f, "# HTTP API for programs on this PC (127.0.0.1 only, see HTTP_API.md): http_api=1 runs it, http_port= its port. The Settings tab switches it at once\nhttp_api=%d\nhttp_port=%d\n", g_httpEnabled ? 1 : 0, g_httpPort);
-    fclose(f);
+    ApplyPlaceKeys(); fclose(f);
     Log("settings saved: toggle %s, mode %s, console %s", KeyName(g_keyToggle), KeyName(g_keyMode), g_showConsole ? "on" : "off");
 }
 

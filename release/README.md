@@ -14,8 +14,8 @@ im Log steht `RESOLVE FAILED`, und nichts wird gehookt.
    die enthaltene `dinput8.dll` nach `bin64\winmm.dll` kopieren (umbenennen).
 2. Aus diesem Zip nach `<Spiel>\bin64\` kopieren:
    - `cdmodkit.asi`
-   - `cdmodkit\settings.txt` (bei einem Update kannst du deine eigene `settings.txt` behalten)
-3. Spiel normal über Steam starten. Das Log liegt in `bin64\cdmodkit\cdmodkit.log`; ein Konsolenfenster gibt es nur mit `console=1` in der `settings.txt`.
+   Der Ordner `cdmodkit\` und `settings.txt` werden beim ersten Start automatisch erzeugt.
+3. Spiel normal über Steam starten. Das Log liegt in `bin64\cdmodkit\cdmodkit.log`; ein Konsolenfenster gibt es nur mit `console=1` in der automatisch erzeugten `settings.txt`.
 
 Prefab-Index, Fehlernamen und Übersetzungen sind direkt in `cdmodkit.asi` eingebettet und werden nicht als separate Dateien installiert oder erzeugt.
 
@@ -36,8 +36,8 @@ Zum Neuaufbau einfach den Ordner `thumbs` und die Datei `prefab_size.tsv` lösch
 
 - Spielstand laden, dann **Einfg** (Insert) drücken: Fenster "World Builder" erscheint im **Bearbeitungsmodus**. Die Welt läuft
   weiter, aber Maus und Tastatur gehören komplett dem Menü (die Figur reagiert nicht, der Cursor ist sichtbar).
-- **Pos1** (Home) schaltet in den **Kameramodus**: eine frei fliegende Kamera, der Editor bleibt offen (siehe „Freie
-  Kamera“). Nochmal Pos1 schaltet zurück, Einfg blendet das Fenster aus und gibt die Steuerung ans Spiel zurück. Beide Tasten sind im Tab "Settings" umbelegbar, dort lässt sich auch das Konsolenfenster abschalten
+- **Pos1** (Home) schaltet zwischen **Bearbeiten** und **Spielsteuerung**. In Spielsteuerung bleibt der Editor transparent sichtbar,
+  fängt aber weder Tastatur noch Maus ab. Die freie Kamera wird über den Button im Editor eingeschaltet; in Settings kann sie optional beim Öffnen des Editors automatisch starten. Beide Tasten sind im Tab "Settings" umbelegbar, dort lässt sich auch das Konsolenfenster abschalten
   (gespeichert in `bin64\cdmodkit\settings.txt`).
 - **Browser:** Kategorien links (Breite ziehbar), Suche und Tag-Filter oben, Favoriten mit dem Stern. Eintrag anklicken zeigt
   Vorschau, Größe in Metern und Tags. Versatz zum Spieler, Yaw und Scale einstellen, dann "SPAWN" oder Doppelklick.
@@ -133,11 +133,11 @@ per Signatur aufgelöst; wenn ein Patch sie verändert, wird nur der betroffene 
 
 ## Freie Kamera
 
-**Home** (oder der Button „free camera“ oben im Editor) schaltet den Kameramodus ein: eine frei fliegende Kamera, während
+Der Button **free camera** oben im Editor schaltet den Kameramodus ein: eine frei fliegende Kamera, während
 der Editor offen bleibt. W/A/S/D bewegen, E oder Leertaste hoch, Q oder Strg runter, Shift schneller, das Mausrad fährt
 vorwärts. Mit gedrückter rechter Maustaste über der Welt ziehen dreht den Blick; ein Rechtsklick ohne Bewegung öffnet das
 Kontextmenü. Editor-Kürzel wie Strg+Z bleiben aktiv. Deine Figur bleibt stehen, neue Objekte erscheinen vor der Kamera,
-Gizmo und Rahmen folgen ihr. Home noch einmal (oder den Editor schließen) beendet den Kameramodus. Tempo und
+Gizmo und Rahmen folgen ihr. Home wechselt direkt zur Spielsteuerung und beendet dabei den Kameramodus. Tempo und
 Mausempfindlichkeit stehen im Tab Settings. Die Welt lädt Details weiterhin rund um deine Figur, bei sehr weiten Flügen wird es daher gröber.
 
 ## Bekannte Einschränkungen

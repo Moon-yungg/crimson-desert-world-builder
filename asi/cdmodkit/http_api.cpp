@@ -181,6 +181,63 @@ static std::string Handle(const std::string& method, const std::string& path, co
             if (l > 0.3f) view = "{\"x\":" + Num(vx / l) + ",\"z\":" + Num(vz / l) + "}"; }
         return "{\"x\":" + Num(cam.x) + ",\"y\":" + Num(cam.y) + ",\"z\":" + Num(cam.z) + ",\"axis\":{\"x\":" + Num(fwd.x) + ",\"y\":" + Num(fwd.y) + ",\"z\":" + Num(fwd.z) + "},\"view\":" + view + "}";
     }
+    if (method == "POST" && path == "/api/camera") {
+        if (!core::FreeCamAvailable()) { status = 503; return Error("free camera not available in this game build (see log)"); }
+        const auto onIt = arg.find("on");
+        if (onIt != arg.end()) {
+            if (onIt->second != "true" && onIt->second != "false" && onIt->second != "1" && onIt->second != "0") {
+                status = 400; return Error("on must be true or false");
+            }
+            const bool on = onIt->second == "true" || onIt->second == "1";
+            core::SetFreeCam(on);
+            if (!on) return "{\"on\":false}";
+        }
+        if (!core::FreeCamActive()) { status = 409; return Error("free camera is off; send on=true first"); }
+
+        const bool hasCommand = arg.count("x") || arg.count("y") || arg.count("z") ||
+            arg.count("forward") || arg.count("right") || arg.count("up") || arg.count("turnYaw") || arg.count("turnPitch") ||
+            arg.count("dolly") || arg.count("focusX") || arg.count("focusY") || arg.count("focusZ") || arg.count("focusRadius") || arg.count("view");
+        Vec3 readyPos{}, readyDir{};
+        if (hasCommand && !core::FreeCamPose(&readyPos, &readyDir)) {
+            status = 409; return Error("free camera is still initializing; retry");
+        }
+
+        float turnYaw = 0, turnPitch = 0, dolly = 0, forward = 0, right = 0, up = 0;
+        if (!Number(arg, "turnYaw", turnYaw) || !Number(arg, "turnPitch", turnPitch) || !Number(arg, "dolly", dolly) ||
+            !Number(arg, "forward", forward) || !Number(arg, "right", right) || !Number(arg, "up", up)) {
+            status = 400; return Error("invalid camera movement");
+        }
+        if (turnYaw != 0 || turnPitch != 0) core::FreeCamTurn(turnYaw, turnPitch);
+        if (dolly != 0) core::FreeCamDolly(dolly);
+
+        const bool hasPos = arg.count("x") || arg.count("y") || arg.count("z");
+        if (hasPos) {
+            float x = 0, y = 0, z = 0;
+            if (!Number(arg, "x", x, true) || !Number(arg, "y", y, true) || !Number(arg, "z", z, true)) { status = 400; return Error("x/y/z must be supplied together"); }
+            if (!core::FreeCamSetPosition({ x, y, z })) { status = 409; return Error("free camera is still initializing; retry"); }
+        }
+        if ((forward != 0 || right != 0 || up != 0) && !core::FreeCamMove(forward, right, up)) { status = 409; return Error("free camera is still initializing; retry"); }
+
+        const bool hasFocus = arg.count("focusX") || arg.count("focusY") || arg.count("focusZ");
+        if (hasFocus) {
+            float x = 0, y = 0, z = 0, radius = 1;
+            if (!Number(arg, "focusX", x, true) || !Number(arg, "focusY", y, true) || !Number(arg, "focusZ", z, true) || !Number(arg, "focusRadius", radius)) {
+                status = 400; return Error("focusX/focusY/focusZ must be supplied together");
+            }
+            core::FreeCamFocus({ x, y, z }, radius);
+        }
+        auto viewIt = arg.find("view");
+        if (viewIt != arg.end()) {
+            int preset = viewIt->second == "level" ? 1 : viewIt->second == "down" ? 2 : viewIt->second == "up" ? 3 : 0;
+            if (!preset) { status = 400; return Error("view must be level, down or up"); }
+            core::FreeCamViewPreset(preset);
+        }
+
+        Vec3 pos{}, dir{};
+        if (!core::FreeCamPose(&pos, &dir)) return "{\"on\":true,\"ready\":false}";
+        return "{\"on\":true,\"ready\":true,\"x\":" + Num(pos.x) + ",\"y\":" + Num(pos.y) + ",\"z\":" + Num(pos.z) +
+            ",\"view\":{\"x\":" + Num(dir.x) + ",\"y\":" + Num(dir.y) + ",\"z\":" + Num(dir.z) + "}}";
+    }
     if (method == "GET" && path == "/api/prefabs") {
         int offset = 0, limit = 100;
         if (!Page(arg, offset, limit)) { status = 400; return Error("invalid offset or limit (page size 1..500)"); }
@@ -279,7 +336,7 @@ static std::string Handle(const std::string& method, const std::string& path, co
         float x = 0, y = 0, z = 0, yaw = 0, pitch = 0, roll = 0, scale = 1;
         if (prefab.empty() || prefab.size() > 600 || prefab[0] != '/' || prefab.find("..") != std::string::npos ||
             !Number(arg, "x", x, true) || !Number(arg, "y", y, true) || !Number(arg, "z", z, true) ||
-            !Number(arg, "yaw", yaw) || !Number(arg, "pitch", pitch) || !Number(arg, "roll", roll) || !Number(arg, "scale", scale) || scale <= 0) {
+            !Number(arg, "yaw", yaw) || !Number(arg, "pitch", pitch) || !Number(arg, "roll", roll) || !Number(arg, "scale", scale) || scale <= 0 || scale > 20.0f) {
             status = 400; return Error("invalid prefab or transform");
         }
         std::string out; if (!Ready(status, out)) return out;
@@ -300,7 +357,7 @@ static std::string Handle(const std::string& method, const std::string& path, co
             Vec3 p = o.pos; Rot r = o.rot; float scale = o.scale;
             if (!Number(arg, "x", p.x) || !Number(arg, "y", p.y) || !Number(arg, "z", p.z) ||
                 !Number(arg, "yaw", r.yaw) || !Number(arg, "pitch", r.pitch) || !Number(arg, "roll", r.roll) ||
-                !Number(arg, "scale", scale) || scale <= 0) { status = 400; return Error("invalid transform"); }
+                !Number(arg, "scale", scale) || scale <= 0 || scale > 20.0f) { status = 400; return Error("invalid transform"); }
             if (!core::MoveMany({ core::MoveReq{ uid, p, r, scale } }, true)) { status = 409; return Error("move failed"); }
             status = 202; return "{\"uid\":" + Int(uid) + ",\"queued\":true}";
         }

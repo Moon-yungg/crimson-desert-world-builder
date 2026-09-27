@@ -25,6 +25,7 @@ Both list endpoints return `total`, `offset`, `limit`, `nextOffset` and `items`.
 
 | Request | JSON body | Result |
 | --- | --- | --- |
+| `POST /api/camera` | Any of `on`, exact `x/y/z`, relative `forward/right/up`, `turnYaw/turnPitch`, `dolly`, `focusX/focusY/focusZ/focusRadius`, or `view` = `level` / `down` / `up` | Controls the free camera. Turn it on with `{"on":true}` first; movement/position requests return 409 until the free camera has initialized. `{"on":false}` restores the game camera. |
 | `POST /api/objects` | `{"prefab":"/object/...prefab","x":1,"y":2,"z":3,"yaw":0,"scale":1}` | Queue a spawn; returns a stable `uid` |
 | `PATCH /api/objects/{uid}` | Any of `x`, `y`, `z`, `yaw`, `pitch`, `roll`, `scale` | Move/rotate/scale; omitted values stay unchanged |
 | `POST /api/objects/{uid}/hide` | `{}` | Hide the instance but keep its record |
@@ -40,6 +41,8 @@ Both list endpoints return `total`, `offset`, `limit`, `nextOffset` and `items`.
 | `POST /api/log` | `{"text":"hello"}` | Write a line to `cdmodkit.log` |
 
 Spawns, moves and removals run on the next game simulation tick. These requests return HTTP 202 when queued; `GET /api/status` reports the remaining job count. The ASI must be installed and running in Crimson Desert, and the game must be in a state where its simulation tick runs. `GET /api/status` remains available while the game is still loading.
+
+Object scale accepted by the editor and HTTP object endpoints is 0.05–20.0.
 
 The HTTP `uid` is stable while the instance remains in the scene. The older C API uses scene-list indices, which may shift after an object is forgotten.
 

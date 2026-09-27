@@ -13,8 +13,8 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 1. Press **Insert** in the game world. The editor opens in edit mode: the mouse belongs to the menu, the world keeps running.
 2. Type a word into the search box, pick a card or a row, press **PLACE** (or double-click).
 3. The object appears in front of your character with the mouse gizmo active. Drag the arrows, rings, center point or scale handles to position it. Use the placement HUD to Drop, Cancel, level or snap it to the ground; placing/selecting something else or double-clicking into the open also finishes the placement.
-4. Prefer a small panel? Click **dock**: the narrow side window can switch between Browser, Scene, NPCs and Time & Weather, and stays open while you work.
-5. **Home** switches camera mode on and off: a free-flying camera (WASD, right-drag to look, mouse wheel forward) while the editor stays open. **Insert** hides the editor and hands the controls back to the game. Save your build in the Project tab.
+4. Prefer a small panel? Click **dock**: the narrow side window can switch between Browser, Scene, NPCs, Project and Time & Weather, and stays open while you work.
+5. **Home** switches between editing and transparent click-through player control; keyboard and mouse go fully to the game. Use the **free camera** button for flight, or enable automatic free camera on editor open in Settings. **Insert** hides the editor.
 
 ## Features
 
@@ -43,7 +43,7 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 | Key | Action |
 | --- | --- |
 | Insert | show / hide the editor |
-| Home | camera mode on / off (free-flying camera, the editor stays open) |
+| Home | edit / player-control mode; the transparent editor does not capture keyboard or mouse |
 | Placement HUD | Drop / Cancel / To ground / level / snapping |
 | Mouse gizmo | move / rotate / tilt / scale the carried object or selection |
 | Placing or selecting something else, or double-click into the open | finish the current placement |
@@ -57,7 +57,7 @@ No game files are modified. Nothing is written into the game's own save data. Ev
 ## Installation
 
 1. Install Ultimate ASI Loader if you do not have it: download Ultimate-ASI-Loader_x64.zip, copy the included dinput8.dll into `<game>\bin64\` and rename it to winmm.dll.
-2. Copy `cdmodkit.asi` and the `cdmodkit` folder from this archive into `<game>\bin64\`. Mod managers (DMM, Vortex) work too: the prefab list is built into the plugin and written out if the folder is missing.
+2. Copy `cdmodkit.asi` from this archive into `<game>\bin64\`. The `cdmodkit` runtime folder and `settings.txt` are created automatically on first start.
 3. Start the game through Steam. The log is written to `bin64\cdmodkit\cdmodkit.log` (set `console=1` in settings.txt if you want a console window).
 
 On the first start the mod renders preview images for all prefabs in the background (low priority, about 20 minutes). The prefab you select is always rendered first.
