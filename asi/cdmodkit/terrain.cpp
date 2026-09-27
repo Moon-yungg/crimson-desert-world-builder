@@ -45,6 +45,8 @@ static std::map<std::pair<int, int>, TileEdit> g_tiles;
 static std::map<uintptr_t, PendingRead> g_pending;   // completion event -> read waiting to be patched
 static bool g_ok = false; static std::string g_why = "not installed";
 static volatile LONG g_patched = 0, g_missed = 0;
+static volatile LONG g_watchNext = 0;   // research: arm a read watch on the next patched whole-tile buffer (who consumes it)
+void TerrainWatchNext() { InterlockedExchange(&g_watchNext, 1); }
 
 typedef uint8_t(__fastcall* StreamReqFn)(uintptr_t req); static StreamReqFn g_origReq = nullptr;
 typedef uint8_t(__fastcall* EvPollFn)(uintptr_t ev); static EvPollFn g_origPoll = nullptr;
@@ -112,12 +114,75 @@ static uint8_t __fastcall HookEvPoll(uintptr_t ev) {
                 const uint32_t n = ApplyGuarded((uint8_t*)buf, pr.off, pr.len, t->second.units.data());
                 InterlockedIncrement(&g_patched);
                 Log("[terrain] tile %d,%d: read of %u bytes at +%u patched (%u samples)", pr.tx, pr.tz, pr.len, pr.off, n);
+                if (pr.off == kHeader && pr.len > 0x80000 && InterlockedExchange(&g_watchNext, 0)) {   // mip 0 middle, mip 1, last mips
+                    const uintptr_t w[4] = { buf + 0x40000, buf + 0x80000 + 0x100, buf + 0xA0000, buf + pr.len - 8 };
+                    Log("[terrain] watching buffer %p", (void*)buf); WatchAccessSync(w, 5, "texwatch"); }
             } else { InterlockedIncrement(&g_missed); Log("[terrain] tile %d,%d: read at +%u not patched (status %llx, buffer %p)", pr.tx, pr.tz, pr.off, (unsigned long long)st, (void*)buf); }
         }
     }
     return g_origPoll(ev);
 }
 
+// Research: the resource job's execute function (0x13f2570 on 2976): job +0 -> the request (+8 path), +0x170 / +0x1a0 state.
+typedef void(__fastcall* JobExecFn)(uintptr_t job, uint8_t* result); static JobExecFn g_origJobExec = nullptr;
+static void __fastcall HookJobExec(uintptr_t job, uint8_t* result) {
+    uintptr_t req = 0; ReadBytes(job, &req, 8); std::string s; int tx = 0, tz = 0;
+    static volatile LONG s_probe = 0;
+    if (req && InterlockedIncrement(&s_probe) <= 40) {   // where does the job keep its path? probe the loader object's fields
+        std::string hit; for (int o = 0; o < 0x100; o += 8) { const std::string t = PathObjText((void*)(req + o)); if (!t.empty()) { char b[300]; snprintf(b, sizeof b, " +%x '%s'", o, t.c_str()); hit += b; } }
+        Log("[terrain] job %p obj %p (%s):%s", (void*)job, (void*)req, RttiName(req) ? RttiName(req) : "?", hit.c_str());
+    }
+    for (int o = 0; o < 0x100 && s.empty(); o += 8) { const std::string t = PathObjText((void*)(req + o)); if (t.find("height16f/") != std::string::npos) s = t; }
+    const bool mine = !s.empty() && ParseTilePath(s, &tx, &tz);
+    uint32_t st0 = 0; uint8_t f0[2] = {}; if (mine) { ReadBytes(job + 0x170, &st0, 4); ReadBytes(job + 0x1a0, f0, 2); }
+    g_origJobExec(job, result);
+    if (mine) { uint32_t st1 = 0; uint8_t f1[2] = {}; ReadBytes(job + 0x170, &st1, 4); ReadBytes(job + 0x1a0, f1, 2);
+        Log("[terrain] job %p tile %d,%d exec: state %u -> %u, +1a0 %u/%02x -> %u/%02x, result %u, thread %lu", (void*)job, tx, tz, st0, st1, f0[0], f0[1], f1[0], f1[1], result ? *result : 255, GetCurrentThreadId()); }
+}
+// Research: BasicsResourceLoader vtable slots given at runtime; logs calls whose 4th argument is a height tile path, with the stack.
+typedef uintptr_t(__fastcall* Gen10)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+static Gen10 g_origLoadAsync = nullptr;
+static uintptr_t __fastcall HookLoadAsync(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f, uintptr_t g, uintptr_t h, uintptr_t i, uintptr_t j) {
+    std::string s; int tx = 0, tz = 0;
+    for (uintptr_t cand : { d, c, b }) { if (!cand) continue; s = PathObjText((void*)cand); if (!s.empty()) break; }
+    if (!s.empty() && ParseTilePath(s, &tx, &tz)) {
+        void* fr[24]; const USHORT k = RtlCaptureStackBackTrace(1, 24, fr, nullptr); std::string st;
+        for (USHORT q = 0; q < k; q++) { const uintptr_t x = (uintptr_t)fr[q]; if (x >= g_base && x < g_base + 0x8000000) { char t[24]; snprintf(t, sizeof t, " %llx", (unsigned long long)(x - g_base)); st += t; } }
+        Log("[terrain] loadAsync tile %d,%d args %llx %llx %llx off/len %llx %llx mode %llx, thread %lu, stack:%s", tx, tz, (unsigned long long)e, (unsigned long long)f,
+            (unsigned long long)g, (unsigned long long)g, (unsigned long long)h, (unsigned long long)i, GetCurrentThreadId(), st.c_str());
+    }
+    return g_origLoadAsync(a, b, c, d, e, f, g, h, i, j);
+}
+void TerrainLoadTrace(int slot) {
+    static bool s_done = false; if (s_done) return; s_done = true;
+    const uintptr_t vt = VtableByName(".?AVBasicsResourceLoader@pa@@"); uintptr_t fn = 0;
+    if (!vt || !ReadBytes(vt + slot * 8, &fn, 8) || !fn) { Log("[terrain] loader vtable not found"); return; }
+    if (InstallInternalHook((void*)fn, (void*)HookLoadAsync, (void**)&g_origLoadAsync, "terrain loadAsync (research)")) Log("[terrain] load trace on slot %d (rva 0x%llx)", slot, (unsigned long long)(fn - g_base));
+}
+// Research: call a texture manager's reload-by-name (vtable slot 78 of the manager objects found by their vtable) on the game thread.
+static DWORD g_lastFaultCode = 0; static uintptr_t g_lastFaultAddr = 0, g_lastFaultInfo = 0;
+static uint8_t CallReloadGuarded(uintptr_t fn, uintptr_t obj, const char* name) {
+    uint8_t r = 0xEE;
+    CDK_GUARD_BEGIN
+        r = ((uint8_t(__fastcall*)(uintptr_t, const char*))fn)(obj, name);
+    CDK_GUARD_FAIL r = 0xFF; g_lastFaultCode = cdk::t_fault.rec.ExceptionCode; g_lastFaultAddr = (uintptr_t)cdk::t_fault.rec.ExceptionAddress;
+        g_lastFaultInfo = cdk::t_fault.rec.NumberParameters > 1 ? (uintptr_t)cdk::t_fault.rec.ExceptionInformation[1] : 0;
+    CDK_GUARD_END
+    return r;
+}
+void TerrainReloadCall(uintptr_t obj, int slot, const std::string& name) {
+    RunOnGameThread([obj, slot, name]() {
+        uintptr_t vt = 0, fn = 0; if (!ReadBytes(obj, &vt, 8) || !ReadBytes(vt + slot * 8, &fn, 8) || !fn) { Log("[terrain] reload: bad object %p", (void*)obj); return; }
+        Log("[terrain] reload: calling rva 0x%llx on %p with '%s'", (unsigned long long)(fn - g_base), (void*)obj, name.c_str());
+        const uint8_t r = CallReloadGuarded(fn, obj, name.c_str());
+        Log("[terrain] reload returned %u (fault %08lx at %p = rva 0x%llx, address %p)", r, g_lastFaultCode, (void*)g_lastFaultAddr,
+            (unsigned long long)(g_lastFaultAddr >= g_base ? g_lastFaultAddr - g_base : 0), (void*)g_lastFaultInfo);
+    });
+}
+void TerrainJobTrace(uintptr_t rva) {
+    static bool s_done = false; if (s_done || !rva) return; s_done = true;
+    if (InstallInternalHook((void*)(g_base + rva), (void*)HookJobExec, (void**)&g_origJobExec, "terrain job exec (research)")) Log("[terrain] job trace on rva 0x%llx", (unsigned long long)rva);
+}
 void TerrainInstall() {
     // the streamer's request: stores the path at +8 and hands buffer holder / length / offset / event to the async worker read
     const uintptr_t req = SigScanUnique("48 89 5C 24 18 48 89 74 24 20 55 57 41 54 41 56 41 57 48 8B EC 48 83 EC 70 48 8B D9 4C 8D 3D");

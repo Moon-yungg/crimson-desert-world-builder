@@ -160,7 +160,7 @@ void InstallIoTrace() {
 // a vectored handler counts each writing instruction (the RIP after the write) with its call chain. Removed after the time.
 struct CwSite { volatile LONG64 rip; volatile LONG hits; volatile LONG slot; uintptr_t chain[8]; volatile LONG64 firstTick, lastTick; };
 static CwSite g_cwSites[48]; static volatile LONG g_cwActive = 0; static uintptr_t g_cwAddr[4] = {};
-static PVOID g_cwVeh = nullptr;
+static PVOID g_cwVeh = nullptr; static bool g_cwRw = false;   // g_cwRw: break on reads too (WatchAccessSync)
 static LONG CALLBACK CamWatchVeh(EXCEPTION_POINTERS* ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !g_cwActive) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = ep->ContextRecord; const DWORD64 dr6 = c->Dr6;
@@ -195,7 +195,7 @@ static void CwSetAll(bool on, bool quiet = false) {   // debug registers on ever
             if (GetThreadContext(t, &c)) {
                 c.Dr0 = on ? g_cwAddr[0] : 0; c.Dr1 = on ? g_cwAddr[1] : 0; c.Dr2 = on ? g_cwAddr[2] : 0; c.Dr3 = on ? g_cwAddr[3] : 0;
                 DWORD64 dr7 = 0;
-                if (on) for (int i = 0; i < 4; i++) if (g_cwAddr[i]) dr7 |= (1ull << (i * 2)) | (1ull << (16 + i * 4)) | (3ull << (18 + i * 4));   // local enable, break on write, length 4 (LEN 11)
+                if (on) for (int i = 0; i < 4; i++) if (g_cwAddr[i]) dr7 |= (1ull << (i * 2)) | ((g_cwRw ? 3ull : 1ull) << (16 + i * 4)) | (3ull << (18 + i * 4));   // local enable, break on write (or read/write), length 4 (LEN 11)
                 c.Dr7 = dr7; c.Dr6 = 0;
                 if (SetThreadContext(t, &c)) n++;
             }
@@ -275,6 +275,36 @@ void DumpWatch(const char* tag, uint64_t from, uint64_t to) {
             (unsigned long long)(InImage((uintptr_t)s.rip) ? (uintptr_t)s.rip - g_base : (uintptr_t)s.rip), s.hits, (long long)(to - s.firstTick), (long long)(to - s.lastTick), line);
     }
     Log("[%s]   %d writing sites in the window", tag, n);
+}
+// Read/write watch armed synchronously: a helper thread sets the debug registers on every other thread - including the caller,
+// which waits until they are set - so the very next access from the caller's own code is caught (who consumes a buffer).
+struct WaArgs { uintptr_t addr[4]; int seconds; char tag[32]; HANDLE armed; };
+static DWORD WINAPI WatchAccessThread(LPVOID p) {
+    WaArgs a = *(WaArgs*)p; delete (WaArgs*)p;
+    for (auto& s : g_cwSites) { s.rip = 0; s.hits = 0; s.slot = 0; memset(s.chain, 0, sizeof s.chain); }
+    for (int i = 0; i < 4; i++) g_cwAddr[i] = a.addr[i];
+    if (!g_cwVeh) g_cwVeh = AddVectoredExceptionHandler(1, CamWatchVeh);
+    g_cwRw = true; CwSetAll(true, true); SetEvent(a.armed);
+    Sleep(a.seconds * 1000); CwSetAll(false, true); g_cwRw = false;
+    InterlockedExchange(&g_cwActive, 0);
+    int n = 0;
+    for (const auto& s : g_cwSites) {
+        if (!s.rip) continue; n++;
+        char line[400]; int k = 0;
+        for (int i = 0; i < 8 && s.chain[i]; i++) k += snprintf(line + k, sizeof line - k, InImage(s.chain[i]) ? " %llx" : " ?%llx", (unsigned long long)(InImage(s.chain[i]) ? s.chain[i] - g_base : s.chain[i]));
+        Log("[%s] DR%ld (%p) accessed before rva 0x%llx, %ld hits, chain:%s", a.tag, s.slot, (void*)g_cwAddr[s.slot],
+            (unsigned long long)(InImage((uintptr_t)s.rip) ? (uintptr_t)s.rip - g_base : (uintptr_t)s.rip), s.hits, line);
+    }
+    Log("[%s] access watch done: %d sites", a.tag, n);
+    return 0;
+}
+bool WatchAccessSync(const uintptr_t addr[4], int seconds, const char* tag) {
+    if (InterlockedCompareExchange(&g_cwActive, 1, 0) != 0) return false;
+    WaArgs* a = new WaArgs{}; for (int i = 0; i < 4; i++) a->addr[i] = addr[i]; a->seconds = seconds < 1 ? 1 : seconds > 30 ? 30 : seconds;
+    strncpy_s(a->tag, tag ? tag : "access", _TRUNCATE); a->armed = CreateEventA(nullptr, TRUE, FALSE, nullptr); HANDLE ev = a->armed;
+    HANDLE t = CreateThread(nullptr, 0, WatchAccessThread, a, 0, nullptr);
+    if (t) { WaitForSingleObject(ev, 2000); CloseHandle(t); }
+    CloseHandle(ev); return t != nullptr;
 }
 bool WatchWrites(const uintptr_t addr[4], int seconds, const char* tag) {
     if (InterlockedCompareExchange(&g_cwActive, 1, 0) != 0) return false;

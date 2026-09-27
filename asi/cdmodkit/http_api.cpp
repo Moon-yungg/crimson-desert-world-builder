@@ -283,10 +283,20 @@ static std::string Handle(const std::string& method, const std::string& path, co
     }
     if (method == "POST" && path == "/api/research/terrain") {   // research: {"x","z","r","dm"} adds a smooth disc (dm metres, + up), {"clear":1}
         if (Flag(arg, "clear")) core::TerrainEditClear();
+        if (Flag(arg, "watch")) core::TerrainWatchNext();
+        { float ls = 0; if (arg.count("loadtrace") && Number(arg, "loadtrace", ls, true)) core::TerrainLoadTrace((int)ls); }   // research
+        { auto ro = arg.find("reloadobj"), rn = arg.find("reloadname"); float sl = 78; Number(arg, "slot", sl);
+          if (ro != arg.end() && rn != arg.end()) core::TerrainReloadCall((uintptr_t)strtoull(ro->second.c_str(), nullptr, 0), (int)sl, rn->second); }   // research
+        { auto jt = arg.find("jobtrace"); if (jt != arg.end()) core::TerrainJobTrace((uintptr_t)strtoull(jt->second.c_str(), nullptr, 0)); }   // research   // research: read watch on the next patched tile buffer
         float x = 0, z = 0, r = 0, dm = 0, tx = 0, tz = 0;
         if (arg.count("tx") && Number(arg, "tx", tx, true) && Number(arg, "tz", tz, true) && Number(arg, "dm", dm, true)) return "{\"tiles\":" + Int(core::TerrainEditTile((int)tx, (int)tz, dm)) + "}";
         if (arg.count("x") && Number(arg, "x", x, true) && Number(arg, "z", z, true) && Number(arg, "r", r, true) && Number(arg, "dm", dm, true)) return "{\"tiles\":" + Int(core::TerrainEditDisc(x, z, r, dm)) + "}";
         return "{\"status\":\"" + core::TerrainStatus() + "\"}";
+    }
+    if (method == "POST" && path == "/api/research/teleport") {   // research: {"x","y","z"} writes the player position (SetPlayerPos)
+        float x = 0, y = 0, z = 0;
+        if (!Number(arg, "x", x, true) || !Number(arg, "y", y, true) || !Number(arg, "z", z, true)) { status = 400; return Error("x/y/z required"); }
+        return core::SetPlayerPos(Vec3{ x, y, z }) ? "{\"ok\":true}" : "{\"ok\":false}";
     }
     if (method == "POST" && path == "/api/research/points") {   // research: reload bin64\cdmodkit\debugpoints.txt ({"clear":1} removes them)
         return "{\"points\":" + Int(core::LoadDebugPoints(Flag(arg, "clear"))) + "}";

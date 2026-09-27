@@ -19,6 +19,7 @@ namespace core {
 
     // the renderer camera through its own object (cdmodkit.cpp); false when unresolved or the block does not validate
     bool WatchWrites(const uintptr_t addr[4], int seconds, const char* tag);
+    bool WatchAccessSync(const uintptr_t addr[4], int seconds, const char* tag);   // read/write watch armed before returning (the caller's own next access is caught)
     bool StartWatch(const uintptr_t addr[4]); void RefreshWatch(); void StopWatch(); void DumpWatch(const char* tag, uint64_t from, uint64_t to);   // continuous write watch   // diag.cpp: hardware write breakpoints, writers logged
     uintptr_t CameraSceneObject();    // the camera manager's scene object (the pose the game's camera logic produces), 0 if unknown
     uintptr_t NativeCameraObject();   // the renderer camera object itself (0 when unresolved or its type does not match)
