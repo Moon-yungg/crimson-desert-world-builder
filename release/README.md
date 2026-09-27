@@ -134,7 +134,7 @@ per Signatur aufgelöst; wenn ein Patch sie verändert, wird nur der betroffene 
 ## Freie Kamera
 
 Der Button **free camera** oben im Editor schaltet den Kameramodus ein: eine frei fliegende Kamera, während
-der Editor offen bleibt. W/A/S/D bewegen, E oder Leertaste hoch, Q oder Strg runter, Shift schneller, das Mausrad fährt
+der Editor offen bleibt. W/A/S/D bewegen, E oder Leertaste hoch, Q runter, Shift schneller, das Mausrad fährt
 vorwärts. Mit gedrückter rechter Maustaste über der Welt ziehen dreht den Blick; ein Rechtsklick ohne Bewegung öffnet das
 Kontextmenü. Editor-Kürzel wie Strg+Z bleiben aktiv. Deine Figur bleibt stehen, neue Objekte erscheinen vor der Kamera,
 Gizmo und Rahmen folgen ihr. Home wechselt direkt zur Spielsteuerung und beendet dabei den Kameramodus. Tempo und

@@ -2228,11 +2228,11 @@ static void FcStep() {
     const bool ctrl = input::ScanDown(0x1D, false) || input::ScanDown(0x1D, true);
     const bool ctrlCommand = ctrl && (input::ScanDown(0x2C, false) || input::ScanDown(0x15, false) || input::ScanDown(0x2E, false) || input::ScanDown(0x2D, false) ||
                                       input::ScanDown(0x2F, false) || input::ScanDown(0x20, false) || input::ScanDown(0x22, false) || input::ScanDown(0x1E, false));
-    if (!g_uiTextInput && !g_fcHoldMove && !ctrlCommand) {   // W/S along the view, A/D sideways, E/Space up, Q/Ctrl down; Shift x4
+    if (!g_uiTextInput && !g_fcHoldMove && !ctrlCommand) {   // W/S along the view, A/D sideways, E/Space up, Q down; Shift x4. Ctrl stays free for editor multi-select/shortcuts.
         float v = g_fcSpeed * dt * (input::ScanDown(0x2A, false) ? 4.0f : 1.0f);
         const float fw = (input::ScanDown(0x11, false) ? 1.0f : 0.0f) - (input::ScanDown(0x1F, false) ? 1.0f : 0.0f);
         const float sd = (input::ScanDown(0x20, false) ? 1.0f : 0.0f) - (input::ScanDown(0x1E, false) ? 1.0f : 0.0f);
-        const float up = (input::ScanDown(0x12, false) || input::ScanDown(0x39, false) ? 1.0f : 0.0f) - (input::ScanDown(0x10, false) || input::ScanDown(0x1D, false) ? 1.0f : 0.0f);
+        const float up = (input::ScanDown(0x12, false) || input::ScanDown(0x39, false) ? 1.0f : 0.0f) - (input::ScanDown(0x10, false) ? 1.0f : 0.0f);
         for (int i = 0; i < 3; i++) g_fcPos[i] += v * (f[i] * fw + r[i] * sd) + (i == 1 ? v * up : 0.0f);
     }
 }
@@ -2750,7 +2750,6 @@ bool CameraPose(Vec3* fwd, Vec3* pos) {
 int g_keyToggle = VK_INSERT, g_keyMode = VK_HOME; bool g_showConsole = false;
 bool g_keyboardPlacement = false;
 bool g_projectAutoSave = false;
-int  g_projectAutoSaveSeconds = 60;
 bool g_autoFreeCamOnOpen = false;
 bool g_showSelectionDetails = true;
 float g_fovDeg = 55.0f; bool g_camMirror = false; bool g_fovAuto = true;
@@ -2799,7 +2798,7 @@ static void LoadSettings() {
         if (k == "freecam_sens") { const float s = (float)atof(v.c_str()); if (s >= 0.01f && s <= 2.0f) g_fcSens = s; continue; }
         if (k == "keyboard_placement") { g_keyboardPlacement = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "project_autosave") { g_projectAutoSave = v == "1" || v == "on" || v == "true"; continue; }
-        if (k == "project_autosave_seconds") { const int n = atoi(v.c_str()); if (n >= 10 && n <= 3600) g_projectAutoSaveSeconds = n; continue; }
+        if (k == "project_autosave_seconds") continue;   // legacy timed-auto-save setting; real-time auto-save no longer uses an interval
         if (k == "auto_freecam_on_open") { g_autoFreeCamOnOpen = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "show_selection_details") { g_showSelectionDetails = v != "0" && v != "off" && v != "false"; continue; }
         // manual fallback for snap to ground if the collector vtable cannot be resolved after a game patch; deliberately
@@ -2823,7 +2822,7 @@ void SaveSettings() {
     fprintf(f, "# gimmick_spawn=0: place gimmick prefabs (/object/cd_gimmick/...) as plain objects instead of through the game spawn path\ngimmick_spawn=%d\n", g_gimmickSpawn ? 1 : 0);
     fprintf(f, "# free camera (camera mode, key_mode in the editor): speed in m/s, mouse sensitivity in degrees per count\nfreecam_speed=%.1f\nfreecam_sens=%.3f\n", g_fcSpeed, g_fcSens);
     fprintf(f, "# Optional keyboard object placement. Off by default; enable in Settings or set keyboard_placement=1.\nkeyboard_placement=%d\n", g_keyboardPlacement ? 1 : 0);
-    fprintf(f, "# Automatically save dirty loaded projects. New/unassigned objects are not attached to a project automatically.\nproject_autosave=%d\nproject_autosave_seconds=%d\n", g_projectAutoSave ? 1 : 0, g_projectAutoSaveSeconds);
+    fprintf(f, "# Save dirty loaded projects immediately after each committed edit. New/unassigned objects are not attached to a project automatically.\nproject_autosave=%d\n", g_projectAutoSave ? 1 : 0);
     fprintf(f, "# Editor UI behavior.\nauto_freecam_on_open=%d\nshow_selection_details=%d\n", g_autoFreeCamOnOpen ? 1 : 0, g_showSelectionDetails ? 1 : 0);
     for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
     fprintf(f, "# Interface language: auto, en, zh-CN, zh-TW, de, fr, ko, ja, es, pt-BR, ru, tr\nlanguage=%s\n", i18n::Preference());

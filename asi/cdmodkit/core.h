@@ -107,8 +107,7 @@ namespace core {
     extern bool g_uiTextInput, g_uiMouseOverUi;  // a text field is active / the cursor is over a World Builder window (finer than g_uiWants*: edit mode claims all input)
     extern int  g_keyToggle, g_keyMode;         // configurable hotkeys (virtual key codes), settings.txt in the mod folder
     extern bool g_keyboardPlacement;             // optional legacy keyboard placement controls; off by default
-    extern bool g_projectAutoSave;               // periodically writes dirty loaded projects back to their own .cdproj files
-    extern int  g_projectAutoSaveSeconds;        // configurable 10..3600 s interval
+    extern bool g_projectAutoSave;               // saves dirty loaded projects as soon as an edit gesture/command is committed
     extern bool g_autoFreeCamOnOpen;             // start free camera automatically when the editor opens
     extern bool g_showSelectionDetails;          // Browser selected-item information panel
     enum PlaceKey { PK_FWD, PK_BACK, PK_LEFT, PK_RIGHT, PK_UP, PK_DOWN, PK_ROT_L, PK_ROT_R, PK_SCALE_UP, PK_SCALE_DOWN, PK_FETCH, PK_SNAP, PK_MOUSE, PK_LEVEL, PK_GROUND, PK_DROP, PK_CANCEL, PK_FAST, PK_COUNT };
