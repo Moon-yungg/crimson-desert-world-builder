@@ -2753,6 +2753,32 @@ void ProbeGround(float above, float len) {
     QueueGround(start, len, true); Vec3 s2 = { start.x, start.y + 3.0f, start.z }; QueueGround(s2, len, true); QueueGround(s2, 30.0f, true);
     if (GameThreadReady()) RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });
 }
+// Research: up to 6 arbitrary functions hooked by rva; a call is logged (integer args, return value, caller) only on a thread
+// that is inside one of our traced ground casts. Nothing is logged before the original returns, so float / vector arguments
+// in xmm registers reach the original untouched.
+static const int kFnTraces = 6; static void* g_fnOrig[kFnTraces] = {}; static uintptr_t g_fnRva[kFnTraces] = {};
+template<int K> static void* __fastcall FnTraceThunk(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
+    typedef void* (__fastcall* Fn)(void*, void*, void*, void*, void*, void*, void*, void*);
+    void* r = ((Fn)g_fnOrig[K])(a, b, c, d, e, f, g, h);
+    if (t_geoTracing) { const uintptr_t ret = (uintptr_t)_ReturnAddress();
+        Log("[fn] rva 0x%llx from 0x%llx: a=%p b=%p c=%p d=%p e=%p f=%p -> %p", (unsigned long long)g_fnRva[K], InImage(ret) ? (unsigned long long)(ret - g_base) : 0ull, a, b, c, d, e, f, r);
+        float fe[8] = {}, ff[8] = {};   // output blocks behind the 5th / 6th argument (e.g. decoded node bounds), as floats
+        if (ReadBytes((uintptr_t)e, fe, 32) && ReadBytes((uintptr_t)f, ff, 32))
+            Log("[fn]   e: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f   f: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f", fe[0], fe[1], fe[2], fe[3], fe[4], fe[5], fe[6], fe[7], ff[0], ff[1], ff[2], ff[3], ff[4], ff[5], ff[6], ff[7]); }
+    return r;
+}
+void FnTraceInstall(uintptr_t rva) {
+    static void* thunks[kFnTraces] = { (void*)&FnTraceThunk<0>, (void*)&FnTraceThunk<1>, (void*)&FnTraceThunk<2>, (void*)&FnTraceThunk<3>, (void*)&FnTraceThunk<4>, (void*)&FnTraceThunk<5> };
+    for (int k = 0; k < kFnTraces; k++) if (g_fnRva[k] == rva) { Log("[fn] rva 0x%llx already hooked", (unsigned long long)rva); return; }
+    for (int k = 0; k < kFnTraces; k++) if (!g_fnRva[k]) {
+        const uintptr_t f = g_base + rva; if (!InImage(f)) return;
+        ReleaseHookPiece();
+        if (MH_CreateHook((void*)f, thunks[k], &g_fnOrig[k]) == MH_OK && MH_EnableHook((void*)f) == MH_OK) { g_fnRva[k] = rva; Log("[fn] hooked rva 0x%llx", (unsigned long long)rva); }
+        else Log("[fn] hooking rva 0x%llx failed", (unsigned long long)rva);
+        return;
+    }
+    Log("[fn] no free trace slot");
+}
 void GeoTraceInstall(uintptr_t vt, int slots) {
     static bool s_done = false; if (s_done) { Log("[geo] already installed"); return; }
     if (!InImage(vt)) { Log("[geo] %p is not a vtable in the image", (void*)vt); return; }

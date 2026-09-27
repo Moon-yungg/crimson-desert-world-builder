@@ -272,6 +272,7 @@ static std::string Handle(const std::string& method, const std::string& path, co
     if (method == "POST" && path == "/api/research/geotrace") {   // research: {"vt":"0x...","slots":40} installs; {"arm":1} traces the next ground cast
         auto v = arg.find("vt"); if (v != arg.end()) { float sl = 40; Number(arg, "slots", sl); core::GeoTraceInstall((uintptr_t)strtoull(v->second.c_str(), nullptr, 0), (int)sl); }
         if (Flag(arg, "arm")) core::GeoTraceArm();
+        auto fr = arg.find("fn"); if (fr != arg.end()) core::FnTraceInstall((uintptr_t)strtoull(fr->second.c_str(), nullptr, 0));
         return "{\"ok\":true}";
     }
     if (method == "POST" && path == "/api/research/points") {   // research: reload bin64\cdmodkit\debugpoints.txt ({"clear":1} removes them)

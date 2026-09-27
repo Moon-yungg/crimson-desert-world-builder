@@ -248,6 +248,7 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   (base +0x30, quant scale +0x40 / inverse +0x44, rel-array +0x20 of 4 levels 8x8/4x4/2x2/1x1 of u16 min/max pairs) must
   cover the new heights too.
 - Bounding-volume tree cells are groups of 8 u16: the 4 children's minima, then their 4 maxima (quantized with base/scale);
+  (the next lines are superseded: the level size was misread, see "SOLVED" below)
   the last level (4 bytes) does not follow that scheme - leave it alone. Opening the three lower levels correctly (0 / 65535 per
   group) with base, scale and shape AABB unchanged is harmless (tested: nothing happens).
 - Result (seen in game): dips up to 1 m deep, within the patch's original range -> the character sinks in and walks on, no fall.
@@ -310,6 +311,16 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   (OLD ground - 0.5..0.7 m). So a "start inside the ground" pre-check still uses the old heights; its source is still unknown
   (not the floats, the tree incl. root, the height tile cache, the shape AABB). The character starts 0.77 m above its feet,
   hence ~1.3-1.5 m of change in either direction is the limit.
+- SOLVED: the "old heights" come from the bounding-volume tree after all - every earlier "open" was incomplete. The level entry
+  (24 bytes: +0 rel ptr, +8 u32 count, +0x10 u16 width, +0x12 u16 height) counts u32s, not bytes: level data is count*4 bytes
+  (8x8 / 4x4 / 2x2 / 1x1 nodes of 16 bytes = 1024 / 256 / 64 / 16), so only a quarter of each level had been written.
+  Node decode 0x42b3a00(bv, level, x, z, outMin, outMax): entry = levels[level - [bv+0x50]], node = data + (x*width + z)*16,
+  8 u16 = 4 child minima then 4 child maxima, value = u16 * [bv+0x40] + [bv+0x30] (base is 4 equal floats, +0x44 = 1/scale).
+  The ROOT follows the same scheme. Base/scale span exactly the original min..max of the patch, so heights outside that range
+  also need a wider base/scale. The Havok cast clips its segment to the node range, hence the "start below old ground" miss.
+- Working recipe (scratchpad hf_tool2.py deep/tall): base = min - 50, scale = (max - min + 100) / 65535, every node of every
+  level = [0,0,0,0,65535,65535,65535,65535], shape AABB y widened to the same range, then write the heights. Character-style
+  probes inside 3 m dips: 22/22 hit (0/22 before). A proper rebuild of the tree from the new heights would keep culling tight.
 - Research overlay: /api/research/points draws world points from bin64\cdmodkit\debugpoints.txt ("x y z rrggbb") with the
   editor open or closed (scratchpad show_points.py: grey reference, blue lowered, red beyond the limit).
 - Open: what drops the character 1-2 m below the original ground (a write breakpoint on the player's position during the drop
