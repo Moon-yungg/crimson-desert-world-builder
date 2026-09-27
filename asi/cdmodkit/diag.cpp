@@ -106,7 +106,7 @@ void InstallIoTrace() {
 // ---- camwatch: which code writes the renderer camera's pose (free-fly camera research) ----
 // Hardware write breakpoints (DR0..DR3) on the camera object's fields, set on every thread of the process except our own;
 // a vectored handler counts each writing instruction (the RIP after the write) with its call chain. Removed after the time.
-struct CwSite { volatile LONG64 rip; volatile LONG hits; volatile LONG slot; uintptr_t chain[8]; };
+struct CwSite { volatile LONG64 rip; volatile LONG hits; volatile LONG slot; uintptr_t chain[8]; volatile LONG64 firstTick, lastTick; };
 static CwSite g_cwSites[48]; static volatile LONG g_cwActive = 0; static uintptr_t g_cwAddr[4] = {};
 static PVOID g_cwVeh = nullptr;
 static LONG CALLBACK CamWatchVeh(EXCEPTION_POINTERS* ep) {
@@ -116,9 +116,9 @@ static LONG CALLBACK CamWatchVeh(EXCEPTION_POINTERS* ep) {
     int slot = 0; while (slot < 4 && !(dr6 & (1ull << slot))) slot++;
     const LONG64 rip = (LONG64)c->Rip;
     for (auto& s : g_cwSites) {
-        if (s.rip == rip && s.slot == slot) { InterlockedIncrement(&s.hits); break; }
+        if (s.rip == rip && s.slot == slot) { InterlockedIncrement(&s.hits); s.lastTick = (LONG64)GetTickCount64(); break; }
         if (s.rip == 0 && InterlockedCompareExchange64(&s.rip, rip, 0) == 0) {
-            s.slot = slot; s.hits = 1;
+            s.slot = slot; s.hits = 1; s.firstTick = s.lastTick = (LONG64)GetTickCount64();
             CONTEXT u = *c;   // call chain via the unwind tables
             for (int i = 0; i < 8 && u.Rip; i++) {
                 s.chain[i] = (uintptr_t)u.Rip;
@@ -132,7 +132,7 @@ static LONG CALLBACK CamWatchVeh(EXCEPTION_POINTERS* ep) {
     c->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
-static void CwSetAll(bool on) {   // debug registers on every other thread of this process
+static void CwSetAll(bool on, bool quiet = false) {   // debug registers on every other thread of this process
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); if (snap == INVALID_HANDLE_VALUE) return;
     THREADENTRY32 te{ sizeof te }; const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId(); int n = 0;
     for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
@@ -152,7 +152,7 @@ static void CwSetAll(bool on) {   // debug registers on every other thread of th
         CloseHandle(t);
     }
     CloseHandle(snap);
-    Log("[camwatch] debug registers %s on %d threads", on ? "set" : "cleared", n);
+    if (!quiet) Log("[camwatch] debug registers %s on %d threads", on ? "set" : "cleared", n);
 }
 static DWORD WINAPI CamWatchThread(LPVOID arg) {
     const int seconds = (int)(intptr_t)arg % 100, mode = (int)(intptr_t)arg / 100; const uintptr_t rcam = NativeCameraObject();
@@ -201,6 +201,28 @@ static DWORD WINAPI WatchWritesThread(LPVOID p) {
     }
     Log("[%s] write watch done: %d writing sites", a.tag, n);
     return 0;
+}
+// Continuous variant for the fall watcher: breakpoints stay armed (re-applied to new threads by RefreshWatch), every site keeps
+// its first / last write time, DumpWatch logs the sites written inside a time window.
+bool StartWatch(const uintptr_t addr[4]) {
+    if (InterlockedCompareExchange(&g_cwActive, 1, 0) != 0) return false;
+    for (auto& s : g_cwSites) { s.rip = 0; s.hits = 0; s.slot = 0; s.firstTick = s.lastTick = 0; memset(s.chain, 0, sizeof s.chain); }
+    for (int i = 0; i < 4; i++) g_cwAddr[i] = addr[i];
+    if (!g_cwVeh) g_cwVeh = AddVectoredExceptionHandler(1, CamWatchVeh);
+    CwSetAll(true); return true;
+}
+void RefreshWatch() { if (g_cwActive) CwSetAll(true, true); }
+void StopWatch() { if (!g_cwActive) return; CwSetAll(false); InterlockedExchange(&g_cwActive, 0); }
+void DumpWatch(const char* tag, uint64_t from, uint64_t to) {
+    int n = 0;
+    for (const auto& s : g_cwSites) {
+        if (!s.rip || (uint64_t)s.lastTick < from || (uint64_t)s.firstTick > to) continue; n++;
+        char line[400]; int k = 0;
+        for (int i = 0; i < 8 && s.chain[i]; i++) k += snprintf(line + k, sizeof line - k, InImage(s.chain[i]) ? " %llx" : " ?%llx", (unsigned long long)(InImage(s.chain[i]) ? s.chain[i] - g_base : s.chain[i]));
+        Log("[%s]   DR%ld written before rva 0x%llx, %ld hits total, first %lld ms / last %lld ms before, chain:%s", tag, s.slot,
+            (unsigned long long)(InImage((uintptr_t)s.rip) ? (uintptr_t)s.rip - g_base : (uintptr_t)s.rip), s.hits, (long long)(to - s.firstTick), (long long)(to - s.lastTick), line);
+    }
+    Log("[%s]   %d writing sites in the window", tag, n);
 }
 bool WatchWrites(const uintptr_t addr[4], int seconds, const char* tag) {
     if (InterlockedCompareExchange(&g_cwActive, 1, 0) != 0) return false;

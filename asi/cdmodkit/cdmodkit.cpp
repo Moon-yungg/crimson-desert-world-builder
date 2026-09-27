@@ -239,13 +239,23 @@ void SetFallWatch(bool on) {
     if (!on) return;
     std::thread([]() {
         float stableY = NAN; DWORD stableTick = 0; bool falling = false; PosInfo last{}; bool haveLast = false;
+        uintptr_t watchedTf = 0; DWORD lastRefresh = 0;
         while (g_fallWatch) {
             Sleep(50);
             const uintptr_t actor = PlayerActor(); PosInfo p{};
             if (!actor || !ReadPos(actor, &p)) continue;
             const DWORD now = GetTickCount();
+            {   // keep the write watch on the current player's transform snapshot (x, y, z, tile), re-armed for new threads
+                uintptr_t comps = Deref(actor, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
+                if (tf && tf != watchedTf) {
+                    if (watchedTf) StopWatch();
+                    const uintptr_t a[4] = { tf + kOff_Tf_Pos, tf + kOff_Tf_Pos + 4, tf + kOff_Tf_Pos + 8, tf + kOff_Tf_Pos + 0x0C };
+                    if (StartWatch(a)) { watchedTf = tf; Log("[fallwatch] watching writes to the player transform %p", (void*)tf); }
+                } else if (now - lastRefresh > 2000) { RefreshWatch(); lastRefresh = now; }
+            }
             if (haveLast && (fabsf(p.world.x - last.world.x) > 20.0f || fabsf(p.world.z - last.world.z) > 20.0f || p.world.y - last.world.y > 20.0f)) {
-                Log("[fallwatch] RESPAWN / teleport: (%.2f %.2f %.2f) -> (%.2f %.2f %.2f)", last.world.x, last.world.y, last.world.z, p.world.x, p.world.y, p.world.z);
+                Log("[fallwatch] RESPAWN / teleport: (%.2f %.2f %.2f) -> (%.2f %.2f %.2f); writers in the last 1.5 s:", last.world.x, last.world.y, last.world.z, p.world.x, p.world.y, p.world.z);
+                DumpWatch("fallwatch", GetTickCount64() - 1500, GetTickCount64());
                 falling = false; stableY = p.world.y; stableTick = now;
             }
             if (!falling) {
@@ -253,16 +263,13 @@ void SetFallWatch(bool on) {
                 else if (p.world.y > stableY) { stableY = p.world.y; stableTick = now; }   // walking up: follow
                 if (p.world.y < stableY - 3.0f) {
                     falling = true;
-                    Log("[fallwatch] FALL: y %.2f is %.2f m below the last stable %.2f at (%.2f %.2f), falling for %lu ms", p.world.y, stableY - p.world.y, stableY, p.world.x, p.world.z, now - stableTick);
-                    uintptr_t comps = Deref(actor, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
-                    if (tf) {
-                        const uintptr_t a[4] = { tf + kOff_Tf_Pos, tf + kOff_Tf_Pos + 4, tf + kOff_Tf_Pos + 8, tf + kOff_Tf_Pos + 0x0C };
-                        if (!WatchWrites(a, 15, "fallwatch")) Log("[fallwatch] a write watch is already running");
-                    }
+                    Log("[fallwatch] FALL: y %.2f is %.2f m below the last stable %.2f at (%.2f %.2f), falling for %lu ms; writers in the 2.5 s before:", p.world.y, stableY - p.world.y, stableY, p.world.x, p.world.z, now - stableTick);
+                    DumpWatch("fallwatch", GetTickCount64() - 2500, GetTickCount64());
                 }
             } else if (p.world.y < -2000.0f || now - stableTick > 60000) { falling = false; stableY = NAN; }
             last = p; haveLast = true;
         }
+        StopWatch();
     }).detach();
 }
 bool PlayerWorldPos(Vec3* out) { PosInfo p; if (!PlayerPosInfo(&p)) return false; *out = p.world; return true; }

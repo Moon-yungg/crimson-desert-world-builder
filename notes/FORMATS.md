@@ -261,6 +261,11 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Rendering pre-computes its heights on the GPU (strings g_terrainHeightCachedHeightBuffer(UAV), PreComputeCacheTerrainHeight
   (SceneCapture/CollisionCapture), PreCalculateTerrainHeightMinMax, TerrainHeightFieldForVirtualTexturing): a visible change
   needs those buffers recomputed. TerrainHeightFieldCollision_%d_%d names the collision patches.
+- Fall watcher (/api/research/fallwatch, continuous hardware write breakpoints on the player's transform snapshot): before,
+  during and after a fall and at the respawn only two writers touch it, both from the CLIENT sync function 0x9ff500 (writes the
+  component's current transform block at +0x98 from a newly computed one, or reverts to the saved old one; 0x71a0d0 only compares
+  two tiled positions against a tolerance). The snapshot mirrors the server actor; the character's real movement (gravity,
+  ground contact) runs server-side. Next: watch the player's SERVER actor position (ServerChildOnlyInGameActor) instead.
 - Open: what drops the character 1-2 m below the original ground (a write breakpoint on the player's position during the drop
   / respawn would find the code), and the hknp body per patch (placement, broadphase AABB).
 - Pitfall: after a fall the game streams patches out; writing saved addresses then corrupts its heap (one crash). Check the
