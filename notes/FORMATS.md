@@ -254,6 +254,15 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   3 m deep -> it stands 2-3 m under the visible ground, then drops after a few steps: a game-side "below the terrain" safety check
   (not Havok) against another height source, threshold roughly 1-2 m. Editing that height source (and the render texture) is
   the next step for real terraforming.
+- The game keeps every loaded height tile in memory, byte-identical to the DDS: a 0x28-byte header (vtable rva 0x5B40DE0,
+  ..., +0x18 tile x, +0x1C tile z, +0x20 range, +0x24 offset) followed by 512x512 u16, rows of 1024 bytes, inside a large
+  (~320 MB) block - likely "TerrainHeightTextureCache". Found with /api/research/find on a row of the DDS.
+  Lowering this whole tile by 3 m changed nothing: not the source of the "below the terrain" drop, and not what is drawn.
+- Rendering pre-computes its heights on the GPU (strings g_terrainHeightCachedHeightBuffer(UAV), PreComputeCacheTerrainHeight
+  (SceneCapture/CollisionCapture), PreCalculateTerrainHeightMinMax, TerrainHeightFieldForVirtualTexturing): a visible change
+  needs those buffers recomputed. TerrainHeightFieldCollision_%d_%d names the collision patches.
+- Open: what drops the character 1-2 m below the original ground (a write breakpoint on the player's position during the drop
+  / respawn would find the code), and the hknp body per patch (placement, broadphase AABB).
 - Pitfall: after a fall the game streams patches out; writing saved addresses then corrupts its heap (one crash). Check the
   shape vtable and the heights pointer before every write. A rescan after a fall saves already-modified heights as "original".
 - Next steps: find the hknp body of each patch (world placement + broadphase AABB, then a proper AABB update so edits may leave
