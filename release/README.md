@@ -128,6 +128,25 @@ Nach dem Laden eines Spielstands zeigt der Tab "walk a few steps first", bis du 
 die Server-Figur deines Charakters, und die liefert das Spiel beim Laufen. Ein Spiel-Update kann den Weg blockieren; dann sagt
 der Tab das, alles andere läuft weiter.
 
+## Terrain
+
+Der Tab **Terrain** (auch im Dock) formt den Boden mit einem Pinsel: **Raise** hebt an, **Lower** senkt ab, **Flatten** zieht den
+Boden auf die Höhe, an der du angefangen hast. Radius 2 bis 60 m, bis zu 5 m pro Strich; Striche addieren sich. Mit
+"Brush active" malt die linke Maustaste in der Welt, der Ring zeigt, wo der Pinsel trifft. Boden und Kollision ändern sich
+sofort, ohne Neuladen: In eine gerade gemalte Mulde kann man hineinlaufen, auf einen Hügel hinauf. Undo, Redo und
+"Clear all" stehen im Tab. Die Striche werden mit dem Projekt gespeichert und sind beim Autoload sofort wieder da.
+
+**Apply** (Schnellreise 5 km weg und wieder zurück, zwei Ladebildschirme, etwa eine halbe Minute) ist nur nötig, wenn ein
+Strich einmal nicht live angezeigt werden konnte; der Tab sagt das dann. Die Spieldateien werden nicht verändert: Die
+Änderung wird beim Einlesen der Höhenkarten im Speicher angewendet.
+
+## Reisen
+
+Der Tab **Travel** nutzt die Schnellreise des Spiels: Koordinaten eingeben (x, Höhe, z; die Höhe muss nur ungefähr
+stimmen) oder einen gespeicherten Punkt wählen, dann folgt ein Ladebildschirm und du stehst am Ziel. Eigene Punkte speicherst
+du unter einem Namen an der aktuellen Position; sie liegen in `bin64\cdmodkit\`. Die erste Reise einer Sitzung braucht bis zu
+einer halben Minute Vorbereitung, danach geht es sofort. In der Konsole: `tp x y z`.
+
 ## Zeit und Wetter
 
 Der Tab **Time & Weather** steuert die visuelle Tageszeit und grundlegende Wetterwerte. Die Uhrzeit lässt sich frei einstellen
@@ -155,6 +174,7 @@ Mausempfindlichkeit stehen im Tab Settings. Die Welt lädt Details weiterhin run
 - Objekte existieren nur für die laufende Sitzung. Projekte müssen nach einem Neustart geladen werden (oder Autoload nutzen).
 - Mit DLSS Frame Generation ist das Overlay unter Umständen nicht sichtbar. Dann FG kurz abschalten.
 - Andere Overlays (CrimsonRoute, ReShade, Master Looter) sollten funktionieren, sind aber nicht getestet.
+- Terrain-Striche über eine Kachelgrenze (alle 1024 m) werden pro Kachel angewendet; in seltenen Fällen ist dort ein Apply nötig.
 - Steam-Integritätsprüfung entfernt `cdmodkit.asi` wieder. Danach einfach erneut kopieren.
 
 ## Für Mod-Entwickler

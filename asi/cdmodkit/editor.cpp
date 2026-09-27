@@ -122,7 +122,7 @@ namespace editor {
         const float right = ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
         if (ImGui::GetItemRectMax().x + gap + nextWidth <= right) ImGui::SameLine(0, spacing);
     }
-    static constexpr const char* kEditorVersion = "0.96";
+    static constexpr const char* kEditorVersion = "0.97";
 
     static bool g_open = false;
     // browser state

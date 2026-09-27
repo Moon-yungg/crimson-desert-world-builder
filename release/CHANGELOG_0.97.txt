@@ -1,0 +1,26 @@
+World Builder 0.97
+
+Added
+- Terrain tab (also in the dock): raise, lower and flatten the ground with a brush in the world (radius 2 to 60 m, up to
+  5 m per stroke, strokes add up). The ground and its collision change right away, no reload needed: you can walk into
+  a dip or onto a hill you just painted. Undo, redo and clear all; strokes are saved with the project and are back as
+  soon as the project is autoloaded. Apply (a fast travel away and back) is only needed if a stroke could not be shown live.
+- Travel tab: travel to any coordinates or to your own saved spots with the game's own fast travel (a loading screen,
+  then you stand there, the world streams in). The first travel of a session takes up to half a minute to prepare.
+
+Added (from dofo7777)
+- Managed NPCs: spawned NPCs appear in the Scene tab next to your objects and can be selected, moved, grouped, named,
+  noted, switched between normal AI and Hold, undone and redone, and are saved with the project.
+- Projects: Load, Reload, Save and Unload; unassigned objects and NPCs can be attached to an existing project.
+  Optional real-time auto-save of projects. Older project files still load.
+- Longer history (up to 1000 steps), scaling up to 20x, more actions in the right-click menu, a fuller dock mode.
+- Optional keyboard placement keys (off by default, configurable in Settings).
+
+Changed
+- Home switches between editing and player control (the editor stays visible and transparent). The free camera has its
+  own button and can optionally start when the editor opens. In the free camera, Q moves down (Ctrl no longer does).
+- NPC formations spawn up to 500 NPCs per click.
+
+Fixed
+- Ground probing no longer falls through small holes in the terrain.
+- The mouse position is correct in windowed mode.
