@@ -27,7 +27,7 @@ struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float 
                                                        // replaced (restore, re-create) or invalidated (hide/forget) so that engine work queued for an older incarnation can
                                                        // never attach to a newer one; the record keeps its uid, project, group and pose across all of them.
 struct ManagedNpc { int uid = 0; uint32_t key = 0; Vec3 pos{}; int type = 1; uint32_t extra = 0; uintptr_t actor = 0; uint32_t actorId = 0;
-                    uintptr_t transform = 0; DWORD spawnRequestTick = 0; bool bindTimeoutLogged = false; bool editMoving = false; Vec3 liveMoveTarget{}; bool liveMovePending = false;   // runtime-only live binding/edit state; not serialized
+                    uintptr_t transform = 0; DWORD spawnRequestTick = 0; bool bindTimeoutLogged = false; bool editMoving = false; Vec3 liveMoveTarget{}; Vec3 editMoveStart{}; bool liveMovePending = false;   // runtime-only live binding/edit state; not serialized
                     bool aiEnabled = true; bool aiApplied = true; int behavior = 0; bool hidden = false; bool spawnPending = false; DWORD tick = 0;
                     int group = 0; int proj = 0; std::string label, note; uint64_t gen = 0; };
 

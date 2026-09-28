@@ -3539,7 +3539,7 @@ static void LogSpawnTransforms(const char* what, uintptr_t save, uintptr_t s8, u
 // SpawnAt queues them here; the ServerField tick (slot 9, server thread) spawns one per tick from the newest usable capture
 // (a level streaming spawn, else a housing placement) with the prefab, position, rotation and scale swapped in. A refused replay
 // keeps a plain client stand-in visible while newer/different captures are retried. Moves remove + respawn (final only), deletes remove the actor.
-struct GimmickReq { int uid; uint64_t gen; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; bool noDirect = false; MoveCompletion done; };
+struct GimmickReq { int uid; uint64_t gen; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; bool noDirect = false; MoveCompletion done; bool standinQueued = false; bool finalPlain = false; };
 static const size_t kGimmickMaxTries = 3;   // refusals with different templates before an interactive prefab becomes a plain object
 static std::deque<GimmickReq> g_gimmickQueue; static std::mutex g_gimmickQueueMutex;
 static std::deque<std::function<void()>> g_serverJobs; static std::mutex g_serverJobsMutex;
@@ -3866,14 +3866,36 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
         return;
     }
     auto nativeWork = TrackProjectNativeWork(proj);
+    if (r.finalPlain) {
+        if (!GameThreadReady()) return;
+        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
+          if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid || g_gimmickQueue.front().gen != r.gen) return;
+          g_gimmickQueue.pop_front(); }
+        RunOnGameThread([uid = r.uid, gen = r.gen, done = r.done, target = MoveReq{ r.uid, r.pos, r.rot, r.scale }]() {
+            DoSpawn(uid, gen, PlaceLanePlain, done, done ? &target : nullptr, false);
+        });
+        return;
+    }
     // A refused replay queued a plain stand-in on the game thread. Until it exists, a retry would spawn a second stand-in whose
     // registration overwrites the first one (left in the world, no longer selectable or deletable): wait for it.
     bool standinPending = false;
     { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
       standinPending = i >= 0 && !g_reg[(size_t)i].hidden && g_reg[(size_t)i].gen == r.gen && g_reg[(size_t)i].standin && !g_reg[(size_t)i].obj && !r.triedTemplates.empty(); }
     if (standinPending) {
-        std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
-        if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid && g_gimmickQueue.front().gen == r.gen) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); }
+        const bool queueStandin = !r.standinQueued && GameThreadReady();
+        const int standinUid = r.uid; const uint64_t standinGen = r.gen;
+        const MoveCompletion standinDone = r.done;
+        const MoveReq standinTarget{ r.uid, r.pos, r.rot, r.scale };
+        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
+          if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid || g_gimmickQueue.front().gen != r.gen) return;
+          if (queueStandin) r.standinQueued = true;
+          g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); }
+        if (queueStandin) {
+            RunOnGameThread([uid = standinUid, gen = standinGen, done = standinDone, target = standinTarget]() {
+                DoSpawn(uid, gen, PlaceLaneStandin, done, done ? &target : nullptr, true);
+            });
+            Log("[gimmick] object %d: deferred stand-in queued after the game thread became ready", standinUid);
+        }
         return;
     }
     // Template-free first: the game's own "gimmick from save data" builder with the prefab's gimmickinfo key and the level spawn
@@ -4077,8 +4099,10 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
         { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
           if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].gen != r.gen) return;
           SpawnedObj& e = g_reg[(size_t)i]; e.standin = !giveUp; e.obj = 0; e.actor = 0; if (giveUp) e.gimmick = false; }
-        if (GameThreadReady()) RunOnGameThread([uid = r.uid, gen = r.gen, lane = giveUp ? PlaceLanePlain : PlaceLaneStandin, retry = !giveUp, done = r.done, target = MoveReq{ r.uid, r.pos, r.rot, r.scale }]() { DoSpawn(uid, gen, lane, done, done ? &target : nullptr, retry); });   // the plain stand-in (retry) or the accepted plain-object fallback (budget spent)
-        if (!giveUp) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); }
+        const bool queuePlain = GameThreadReady();
+        if (queuePlain) RunOnGameThread([uid = r.uid, gen = r.gen, lane = giveUp ? PlaceLanePlain : PlaceLaneStandin, retry = !giveUp, done = r.done, target = MoveReq{ r.uid, r.pos, r.rot, r.scale }]() { DoSpawn(uid, gen, lane, done, done ? &target : nullptr, retry); });   // the plain stand-in (retry) or the accepted plain-object fallback (budget spent)
+        r.standinQueued = queuePlain;
+        if (!giveUp || !queuePlain) { r.finalPlain = giveUp; std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); }
     }
 }
 // ---- template-free gimmick spawn (research) ----
@@ -5429,7 +5453,7 @@ bool BeginManagedNpcMove(int uid) {
         if (queuePause) {
             if (!NpcAiControlAvailable()) { Log("[npc] managed #%d live move: AI control is not available to pause the actor", uid); return false; }
         }
-        n.editMoving = true; n.liveMoveTarget = n.pos; n.liveMovePending = false; gen = n.gen;
+        n.editMoving = true; n.editMoveStart = n.pos; n.liveMoveTarget = n.pos; n.liveMovePending = false; gen = n.gen;
     }
     if (queuePause) RunOnServerTick([uid, gen]() { SetManagedNpcRuntimeAiNow(uid, false, gen); });
     return true;
@@ -5492,7 +5516,14 @@ bool EndManagedNpcMove(int uid, Vec3 world) {
             proj = g_npcReg[i].proj;
         }
         auto work = TrackProjectNativeWork(proj);
-        const bool moved = WriteManagedNpcTransformNow(tf, world);
+        // A TransformSync write may succeed while the actor's simulation keeps the old position.
+        // Recreate a changed NPC at the committed pose on release; the live write is only a preview.
+        bool changed = false;
+        { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+          if (!NpcGenCurrentLocked(uid, gen) || !g_npcReg[i].editMoving || g_npcReg[i].transform != tf) return;
+          const Vec3 start = g_npcReg[i].editMoveStart;
+          changed = fabsf(start.x - world.x) > 0.001f || fabsf(start.y - world.y) > 0.001f || fabsf(start.z - world.z) > 0.001f; }
+        const bool moved = !changed && WriteManagedNpcTransformNow(tf, world);
         bool desired = true; uintptr_t actor = 0; uint64_t nextGen = gen;
         {
             std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
@@ -5506,7 +5537,7 @@ bool EndManagedNpcMove(int uid, Vec3 world) {
             }
         }
         if (!moved) {
-            Log("[npc] managed #%d final live move write failed; respawning at the committed position", uid);
+            Log(changed ? "[npc] managed #%d move committed; respawning at the new position" : "[npc] managed #%d final live move write failed; respawning at the committed position", uid);
             if (actor) RemoveSpawnedActor(actor);
             SpawnManagedNpcNow(uid, nextGen);
             return;
