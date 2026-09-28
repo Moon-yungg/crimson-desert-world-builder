@@ -66,6 +66,25 @@ bool unhex(std::string_view s, std::string& out) {
     out = std::move(value); return true;
 }
 
+// Windows ordinal casefold for the extension-kind gate: exactly the policy core::FileNameEqual applies to
+// library file admission (cdmodkit.cpp FileWide + CompareStringOrdinal with casefold). Only the comparison
+// folds case; the caller's path text is never rewritten or lowercased. Mirrored here (not linked from core)
+// so the isolated Codec suite keeps compiling this TU alone with no engine/registry surface.
+bool extensionKindMatches(const std::string& path, std::string_view ext) {
+    const size_t n = ext.size();
+    if (path.size() < n || n == 0) return false;
+    const auto wide = [](const char* s, size_t bytes) {
+        const int count = MultiByteToWideChar(CP_ACP, 0, s, (int)bytes, nullptr, 0);
+        std::wstring w(count > 0 ? (size_t)count : 0, L'\0');
+        if (count > 0) MultiByteToWideChar(CP_ACP, 0, s, (int)bytes, &w[0], count);
+        return w;
+    };
+    const std::wstring tail = wide(path.c_str() + path.size() - n, n);
+    const std::wstring kind = wide(ext.data(), n);
+    if (tail.empty() || kind.empty()) return path.compare(path.size() - n, n, ext.data(), n) == 0; // FileNameEqual's exact-bytes fallback
+    return CompareStringOrdinal(tail.data(), (int)tail.size(), kind.data(), (int)kind.size(), TRUE) == CSTR_EQUAL;
+}
+
 bool terrainValid(const TerrainRecord& t) {
     if ((t.mode != 0 && t.mode != 1) || t.r <= 0) return false;
     for (double v : {t.x, t.z, t.r, t.amount, t.strength, t.ax, t.az, t.y})
@@ -198,8 +217,7 @@ bool Validate(const Document& d, std::string& error) {
 
 bool Parse(const std::string& text, const std::string& path, Kind kind, Document& out, std::string& error) {
     error.clear();
-    std::string ext = kind == Kind::Project ? ".cdproj" : ".cdgroup";
-    if (path.size() < ext.size() || path.compare(path.size() - ext.size(), ext.size(), ext) != 0) return bad(error, 0, "wrong extension for kind");
+    if (!extensionKindMatches(path, kind == Kind::Project ? ".cdproj" : ".cdgroup")) return bad(error, 0, "wrong extension for kind");
     Document d; d.kind = kind; bool header = false, modern = false, v4 = false, hasNote = false;
     int legacyWidth = 0, pending = 0; std::string pendingNote;
     std::map<int, int> members; std::set<int> ids; std::istringstream input(text); std::string line;
@@ -431,8 +449,7 @@ bool WriteTransactional(const std::string& path, Kind kind, const std::string& t
                         const WriteHooks* hooks, std::string& error) {
     error.clear();
     if (path.empty()) return bad(error, 0, "empty destination path");
-    const std::string expected = kind == Kind::Group ? ".cdgroup" : ".cdproj";
-    if (path.size() < expected.size() || path.compare(path.size() - expected.size(), expected.size(), expected) != 0)
+    if (!extensionKindMatches(path, kind == Kind::Group ? ".cdgroup" : ".cdproj"))
         return bad(error, 0, "wrong extension for kind");
     // The text must already be a valid document of this kind: nothing is created for
     // garbage, and the readback below re-checks the actual bytes.

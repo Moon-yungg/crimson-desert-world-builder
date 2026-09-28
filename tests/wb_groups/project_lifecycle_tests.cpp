@@ -1222,6 +1222,98 @@ static void CaseAutoloadAtomic() {
     Check("autoload-no-owned-temp-left", tmp == INVALID_HANDLE_VALUE, ""); if (tmp != INVALID_HANDLE_VALUE) FindClose(tmp);
 }
 
+// B2 repair regression: the Windows library (ValidFileName via FileNameEqual) and ImportProjectFile (_stricmp)
+// accept .CDPROJ/.CDGROUP case-insensitively, so the codec's Parse/WriteTransactional extension-kind gates must
+// accept the same bytes at the same paths. Real valid bytes, exact on-disk casing identity, no path rewriting.
+static std::string ExactDirEntry(const std::string& dir, const std::string& name) {
+    // Case-sensitive compare against the actual directory entry: proves the on-disk casing.
+    WIN32_FIND_DATAA fd{}; HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    std::string found;
+    if (h != INVALID_HANDLE_VALUE) {
+        do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && name == fd.cFileName) found = fd.cFileName; } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    return found;
+}
+static void CaseMixedCaseExtensions() {
+    BeginCase("mixed-case-extension-lifecycle");
+    const std::string projectBytes = OneEnvelopeDoc({ Row("/object/house.prefab", 3, 0, 3) });
+    const std::string groupBytes = "# cdproj v3 kind=group\n# wb-document " + BoundsTail("0,0,0", "-1,-1,-1", "1,1,1", "measured") +
+                                   "# wb-envelope id=1 " + BoundsTail("0,0,0", "-1,-1,-1", "1,1,1", "measured") +
+                                   "# wb-member record=1 envelope=1\n" + Row("/object/kit.prefab", 0, 0, 0);
+    const std::string source = OutsidePath("House.CDPROJ"), plainSource = OutsidePath("plain.cdproj");
+    Require(WriteTextFile(source, projectBytes) &&
+            WriteTextFile(plainSource, OneEnvelopeDoc({ Row("/object/plain.prefab", 1, 0, 1) })), "mixedcase-sources-written", "");
+
+    // Wrong extensions stay rejected: the gate becomes case-insensitive, never kind-blind.
+    proj_codec::Document wrong; std::string werr;
+    Check("mixedcase-wrong-extension-rejected",
+          !proj_codec::Parse(projectBytes, OutsidePath("House.cdproj.bak"), proj_codec::Kind::Project, wrong, werr) &&
+          werr == "record 0: wrong extension for kind", werr);
+    Check("mixedcase-wrong-kind-extension-rejected",
+          !proj_codec::WriteTransactional(ProjectDir() + "\\wrong-kind.cdproj", proj_codec::Kind::Group, groupBytes, nullptr, werr) &&
+          werr == "record 0: wrong extension for kind" && !FileExists(ProjectDir() + "\\wrong-kind.cdproj"), werr);
+
+    // Import a real House.CDPROJ: traverses Parse at the mixed-case source path and WriteTransactional at the
+    // mixed-case destination inside the projects directory. The call is evaluated before ProjError() so the
+    // observed diagnostic is deterministic (C++ argument evaluation order is otherwise unspecified).
+    const bool importedHouse = core::ImportProjectFile(source);
+    Require(importedHouse, "mixedcase-import-house-cdproj", "error=" + ProjError());
+    const std::string importedPath = ProjectDir() + "\\House.CDPROJ";
+    const std::string houseOnDisk = ExactDirEntry(ProjectDir(), "House.CDPROJ");
+    Check("mixedcase-import-keeps-exact-casing", houseOnDisk == "House.CDPROJ", houseOnDisk);
+    Check("mixedcase-import-bytes-identical", FileText(importedPath) == projectBytes, Sha256File(importedPath));
+    std::vector<core::SavedFile> listed;
+    Require(core::ListSavedFiles(proj_codec::Kind::Project, false, listed).ok(), "mixedcase-list-projects-ok", "");
+    Check("mixedcase-import-listed-exact-identity",
+          std::any_of(listed.begin(), listed.end(), [&](const core::SavedFile& f) { return f.filename == "House.CDPROJ" && f.path == importedPath; }), "");
+
+    // Lower-case behavior is unchanged: same flow, lowercase name, lowercase identity on disk.
+    const bool importedPlain = core::ImportProjectFile(plainSource);
+    Require(importedPlain, "mixedcase-lowercase-import-unchanged", "error=" + ProjError());
+    const std::string plainOnDisk = ExactDirEntry(ProjectDir(), "plain.cdproj");
+    Check("mixedcase-lowercase-keeps-exact-casing", plainOnDisk == "plain.cdproj", plainOnDisk);
+
+    // Direct codec write at a mixed-case destination pins WriteTransactional's own gate independently of import.
+    const std::string directPath = ProjectDir() + "\\Writer.CDPROJ";
+    Check("mixedcase-write-transactional-mixed-case",
+          proj_codec::WriteTransactional(directPath, proj_codec::Kind::Project, projectBytes, nullptr, werr) && FileText(directPath) == projectBytes, werr);
+
+    // The real editor Read consumer on the imported mixed-case project.
+    const editor::ProjectFile imported{ "House", proj_codec::Kind::Project, false, importedPath };
+    const bool readProject = editor::DispatchProjectAction(imported, editor::ProjectAction::Read);
+    Require(readProject, "mixedcase-editor-read-project", editor::g_projectStatus);
+    Check("mixedcase-editor-read-exact",
+          editor::g_projectReadValid && editor::g_projectReadPath == importedPath && editor::g_projectRead.records.size() == 1 &&
+          editor::g_projectRead.records[0].prefab == "/object/house.prefab", editor::g_projectReadPath);
+
+    // A valid Kit.CDGROUP: listed exactly, read by the editor, and placed through the real editor workflow
+    // (DispatchProjectAction Place -> ReadProjectFile -> PlaceGroupCopy -> AdmitGroupFileCopy Parse at the path).
+    const auto kit = Entry(proj_codec::Kind::Group, false, "Kit.CDGROUP");
+    MakeFile(kit, groupBytes);
+    std::vector<core::SavedFile> groups;
+    Require(core::ListSavedFiles(proj_codec::Kind::Group, false, groups).ok(), "mixedcase-list-groups-ok", "");
+    Check("mixedcase-group-listed-exact-identity",
+          std::any_of(groups.begin(), groups.end(), [&](const core::SavedFile& f) { return f.filename == "Kit.CDGROUP" && f.path == kit.path; }), "");
+    const editor::ProjectFile kitFile{ "Kit", proj_codec::Kind::Group, false, kit.path };
+    const bool readGroup = editor::DispatchProjectAction(kitFile, editor::ProjectAction::Read);
+    Require(readGroup, "mixedcase-editor-read-group", editor::g_projectStatus);
+    Check("mixedcase-editor-read-group-exact",
+          editor::g_projectReadValid && editor::g_projectReadPath == kit.path && editor::g_projectRead.kind == proj_codec::Kind::Group, editor::g_projectReadPath);
+    core::PrefabInfo prefab{}; prefab.path = "/object/kit.prefab"; host::SetPrefabIndex({ prefab });
+    const bool placedGroup = editor::DispatchProjectAction(kitFile, editor::ProjectAction::Place);
+    Require(placedGroup, "mixedcase-editor-place-group", editor::g_projectStatus);
+    Check("mixedcase-place-carried", editor::g_place.active && editor::g_place.req != nullptr, editor::g_projectStatus);
+    const auto request = editor::g_place.req;
+    PumpAll();
+    Check("mixedcase-place-attached", core::PlaceRequestState(request).attached == 1, "");
+    editor::CancelProjectPlacement(request);
+    PumpAll();
+    Check("mixedcase-place-settled", core::PlaceRequestState(request).settled, "");
+
+    Require(DeleteFileA(source.c_str()) != 0 && DeleteFileA(plainSource.c_str()) != 0, "mixedcase-sources-cleaned", "");
+}
+
 // Task11 core-only library surface: the same production API later consumed by the full/Dock table.
 // Opaque file bytes deliberately are NOT valid documents; browsing must not parse or rewrite them.
 using LK = core::SavedLibraryKind;
@@ -1465,6 +1557,7 @@ int main(int argc, char** argv) {
         { "group-autoload-prohibited", CaseGroupAutoload },
         { "post-admission-partial", CasePostAdmissionPartial },
         { "autoload-atomic-refusal", CaseAutoloadAtomic },
+        { "mixed-case-extension-lifecycle", CaseMixedCaseExtensions },
         { "file-archive-restore-delete", CaseFileRoundtrip },
         { "file-failure-and-stale-target", CaseFileFailures },
         { "file-project-reference-matrix", CaseFileReferences },
