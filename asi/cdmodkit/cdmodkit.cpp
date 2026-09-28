@@ -27,7 +27,6 @@ thread_local GuardFrame* t_guardTop = nullptr;
 }
 #include "thumbgen.h"
 #include "input.h"
-#include "overlay_discovery.h"
 #include "http_api.h"
 #include "proj_codec.h"
 #include "wb_group_math.h"
@@ -1308,37 +1307,21 @@ static std::vector<int> ParsePattern(const char* s) {
     std::vector<int> out; for (const char* p = s; *p; ) { while (*p == ' ') p++; if (!*p) break; if (*p == '?') { out.push_back(-1); while (*p == '?') p++; } else { out.push_back((int)strtoul(p, (char**)&p, 16)); } }
     return out;
 }
-// The pattern scanners read the main image only through the bounded PE reader extracted into
-// overlay_discovery (the same reader the overlay's discovery uses), but they do NOT inherit that consumer's
-// eligibility: a scan needs a readable image with an executable section, not the binding route's import
-// directory, containing section or fixed section/file alignment (overlay::discovery::ImageCoreBounds vs
-// ImageBounds). Every scan is a bounds-checked, chunked read, so an unmapped or malformed image can never be walked.
-static const overlay::discovery::ImageInfo& ScanImage() {
-    static overlay::discovery::ImageInfo img;   // only a SUCCESSFUL validation is cached; a rejected image is retried
-    if (!img.base && g_base) {
-        overlay::discovery::ImageInfo fresh = {};
-        if (overlay::discovery::ImageCoreBounds(g_base, &fresh)) img = fresh;
+static uintptr_t FindPattern(const char* pat) {
+    auto p = ParsePattern(pat);
+    if (p.empty()) return 0;
+    auto dos = (IMAGE_DOS_HEADER*)g_base; auto nt = (IMAGE_NT_HEADERS64*)(g_base + dos->e_lfanew); auto sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* s = (uint8_t*)(g_base + sec[i].VirtualAddress); size_t n = sec[i].Misc.VirtualSize;
+        for (size_t k = 0; k + p.size() <= n; k++) {
+            if (p[0] >= 0 && s[k] != p[0]) continue;   // a wildcard as the first byte matches anything (as in FindPatternCount)
+            bool ok = true; for (size_t j = 1; j < p.size(); j++) if (p[j] >= 0 && s[k + j] != p[j]) { ok = false; break; }
+            if (ok) return (uintptr_t)(s + k);
+        }
     }
-    return img;
+    return 0;
 }
-static uintptr_t ScanPattern(const std::vector<int>& p, int* count) {
-    if (count) *count = 0;
-    if (p.empty() || p.size() > 64) {                  // the bounded reader takes patterns up to 64 bytes
-        if (p.size() > 64) Log("[scan] pattern_tokens_rejected tokens=%d limit=64: the bounded reader would be overrun, so the pattern is not scanned - raise the reader's limit instead of letting a longer pattern miss silently", (int)p.size());
-        return 0;
-    }
-    unsigned char val[64] = {}, mask[64] = {};
-    for (size_t i = 0; i < p.size(); i++) { val[i] = p[i] < 0 ? 0 : (unsigned char)p[i]; mask[i] = p[i] < 0 ? 0 : 0xFF; }
-    const overlay::discovery::ImageInfo& img = ScanImage();
-    if (!img.base) return 0;
-    int hits = 0; bool complete = false;
-    const uintptr_t rva = overlay::discovery::GameBoundaryScan(img, true, val, mask, (int)p.size(), &hits, &complete);
-    if (!complete) return 0;                           // a partial scan can never prove a match
-    if (count) *count = hits > 64 ? 65 : hits;         // caps the LOGGED count: the pre-extraction scanner kept its raw per-section count,
-                                                       // which could exceed 65 across sections; every uniqueness decision compares against 1
-    return rva ? img.base + rva : 0;
-}
-static uintptr_t FindPattern(const char* pat) { return ScanPattern(ParsePattern(pat), nullptr); }
 using PumpFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 static PumpFn g_origPump = nullptr;
 static std::mutex g_qMutex; static std::deque<std::function<void()>> g_queue;
@@ -6190,11 +6173,18 @@ static DWORD WINAPI InitThread(LPVOID) {
 // ---- runtime signature resolution (survives game updates as long as the prologues stay) ----
 // counts pattern hits in executable sections; returns the first hit
 static uintptr_t FindPatternCount(const char* pat, int* count) {
-    // *count is clamped to 65, and the clamp only bounds the number that gets LOGGED: the pre-extraction scanner
-    // kept counting raw per-section hits (which could exceed 65 across sections), while the uniqueness consumer
-    // compares the count against 1, so its decision is unchanged by the clamp. The 22 call-site literals
-    // (15 direct + 7 ResolveSig) are at most 63 tokens, inside the reader's 64-byte limit.
-    return ScanPattern(ParsePattern(pat), count);
+    auto p = ParsePattern(pat); uintptr_t first = 0; int n = 0;
+    auto dos = (IMAGE_DOS_HEADER*)g_base; auto nt = (IMAGE_NT_HEADERS64*)(g_base + dos->e_lfanew); auto sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* s = (uint8_t*)(g_base + sec[i].VirtualAddress); size_t sz = sec[i].Misc.VirtualSize;
+        for (size_t k = 0; k + p.size() <= sz; k++) {
+            if (p[0] >= 0 && s[k] != p[0]) continue;
+            bool ok = true; for (size_t j = 1; j < p.size(); j++) if (p[j] >= 0 && s[k + j] != p[j]) { ok = false; break; }
+            if (ok) { if (!first) first = (uintptr_t)(s + k); n++; if (n > 64) break; }
+        }
+    }
+    *count = n; return first;
 }
 static bool ResolveSig(const char* name, const char* sig, uintptr_t* outRva, bool mustBeUnique = true) {
     int n = 0; uintptr_t hit = FindPatternCount(sig, &n);
