@@ -198,10 +198,11 @@ namespace editor {
     static bool  g_showSpawnOpts = false, g_showMass = false; static int g_hoverUid = 0, g_hoverNpcUid = 0;
     static bool  g_cardView = false; static float g_cardSize = 96.0f;   // browser: tile view instead of the list (same matches / filters)
     static int   g_browserDragPrefab = -1;   // browser row/card being dragged out into the game view
-    struct BrowserDropJob { int prefab = -1, ticket = 0; DWORD queuedAt = 0; Vec3 center{}; float yaw = 0, scale = 1; };
+    struct BrowserDropJob { int prefab = -1, ticket = 0; DWORD queuedAt = 0; Vec3 center{}; float yaw = 0, scale = 1, probeTop = 0; int retry = 0; };
     static std::vector<BrowserDropJob> g_browserDropJobs;   // ground is probed before spawning, so a new object's own collision cannot be mistaken for the surface
     static int   g_npcDragIndex = -1;        // character row/card being dragged out into the game view
-    struct NpcDropJob { uint32_t key = 0; int ticket = 0; DWORD queuedAt = 0; Vec3 at{}; int count = 1, formation = 1; float spacing = 1.5f, radius = 8.0f, fx = 0, fz = 1; bool ai = true; int behavior = 0; };
+    struct NpcDropJob { uint32_t key = 0; int ticket = 0; DWORD queuedAt = 0; Vec3 at{}; int count = 1, formation = 1; float spacing = 1.5f, radius = 8.0f, fx = 0, fz = 1; bool ai = true; int behavior = 0;
+        float probeTop = 0; int retry = 0; bool centerResolved = false; std::vector<Vec3> positions; std::vector<int> memberTickets; std::vector<uint8_t> memberRetries; };
     static std::vector<NpcDropJob> g_npcDropJobs;
     static std::set<std::string> g_tagFilter;
     static std::vector<int> g_matches; static std::string g_lastKey;
@@ -1269,7 +1270,10 @@ namespace editor {
         const float cy = gh.centerY - gh.radius;
         core::Log("[ground] cast from y %.2f: %s fraction %.4f center %.2f (object %.2f..%.2f)", startY, gh.hit ? "hit" : "no hit", gh.fraction, gh.centerY, bottom, top);
         if (++iter > 40) return -1;
-        if (!gh.hit) return -1;
+        if (!gh.hit) {
+            if (iter == 1) { startY = top + 150.0f; return 0; }
+            return -1;
+        }
         const bool inside = gh.fraction <= 0.0005f;   // the sphere started inside a body (Havok reports a negative fraction)
         if (iter == 1 && inside) { startY = top + 150.0f; return 0; }   // buried: something solid sits above the top, so the surface is found from far above
         if (startY > bottom - 0.1f) {                                    // still beside the object: hits here are the object itself (a 36 m tower needs one jump, not 0.5 m steps)
@@ -1419,6 +1423,13 @@ namespace editor {
         g_managedNpcSel.clear(); g_managedNpcPrimary = g_managedNpcLast = 0;
         g_terrainTileSelected = false;
         g_sceneLastEntity = 0; g_editUid = 0;
+    }
+    static void ClearDeletedSelectionUi(bool deletedObject) {
+        g_propertiesOpen = g_propertiesPopupRequested = false;
+        g_numericSceneUid = g_numericNpcUid = 0; CancelNumericEdit();
+        g_hoverUid = g_hoverNpcUid = g_rightUid = 0;
+        g_sceneLastEntity = g_lastClicked = g_editUid = 0;
+        if (deletedObject) g_selPrefab = -1;
     }
     static size_t SceneSelectionCount() { return g_sel.size() + g_managedNpcSel.size(); }
     static bool SceneHasSelection() { return !g_sel.empty() || !g_managedNpcSel.empty(); }
@@ -1599,6 +1610,7 @@ namespace editor {
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; Act a; a.kind = Act::Delete; a.uid = uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale; a.group = o->group; a.proj = o->proj; a.text0 = o->note; acts.push_back(a); core::HideUid(uid); }
         if (!acts.empty()) { Note(T("deleted %d objects"), (int)acts.size()); Push(acts); }
         g_sel.clear(); g_primary = 0;
+        if (!SceneHasSelection()) ClearDeletedSelectionUi(!acts.empty());
     }
     // objects that sit exactly on an earlier identical one (same prefab, position, rotation and scale), as after a project
     // loaded twice: selects the later copies and returns how many
@@ -2107,13 +2119,12 @@ namespace editor {
     static const char* kNpcCats[] = { "all", "people", "animals and mounts", "monsters", "bosses", "other" };
     static const char* kNpcFormations[] = { "Line", "Matrix", "Circle" };
     static const char* kNpcBehaviors[] = { "Normal autonomous", "Hold position (AI paused)" };
-    static void SpawnNpcFormation(uint32_t key, Vec3 center, int count, int formation, float spacing, float radius, float fx, float fz, bool ai, int behavior) {
-        if (!PrepareHistoryMutation([=]() { SpawnNpcFormation(key, center, count, formation, spacing, radius, fx, fz, ai, behavior); })) return;
+    static std::vector<Vec3> NpcFormationPositions(Vec3 center, int count, int formation, float spacing, float radius, float fx, float fz) {
         count = std::clamp(count, 1, kNpcMaxCount); formation = std::clamp(formation, 0, 2);
         const float fl = sqrtf(fx * fx + fz * fz); if (fl > 1e-4f) { fx /= fl; fz /= fl; } else { fx = 0; fz = 1; }
         const float rx = fz, rz = -fx;
         const int cols = std::max(1, (int)ceilf(sqrtf((float)count))), rows = std::max(1, (count + cols - 1) / cols);
-        std::vector<Act> acts; acts.reserve(count); std::vector<int> spawned; spawned.reserve(count);
+        std::vector<Vec3> positions; positions.reserve(count);
         for (int k = 0; k < count; ++k) {
             float side = 0, depth = 0;
             if (formation == 0) side = (k - (count - 1) * 0.5f) * spacing;
@@ -2124,7 +2135,14 @@ namespace editor {
                 const float a = 6.28318530718f * k / (float)count, r = count > 1 ? radius : 0.0f;
                 side = cosf(a) * r; depth = sinf(a) * r;
             }
-            const Vec3 at{ center.x + rx * side + fx * depth, center.y, center.z + rz * side + fz * depth };
+            positions.push_back({ center.x + rx * side + fx * depth, center.y, center.z + rz * side + fz * depth });
+        }
+        return positions;
+    }
+    static void SpawnNpcPositions(uint32_t key, const std::vector<Vec3>& positions, bool ai, int behavior) {
+        if (!PrepareHistoryMutation([=]() { SpawnNpcPositions(key, positions, ai, behavior); })) return;
+        std::vector<Act> acts; acts.reserve(positions.size()); std::vector<int> spawned; spawned.reserve(positions.size());
+        for (const Vec3& at : positions) {
             const int uid = core::SpawnManagedNpc(key, at, 1, 0, ai, behavior);
             if (uid) { Act a; a.kind = Act::NpcSpawn; a.uid = uid; a.prefab = std::string("NPC ") + std::to_string(key); a.pos1 = at; a.flag1 = ai; a.behavior1 = behavior; acts.push_back(std::move(a)); spawned.push_back(uid); }
         }
@@ -2135,16 +2153,17 @@ namespace editor {
             g_managedNpcPrimary = spawned.front(); g_managedNpcLast = spawned.back(); g_sceneLastEntity = -g_managedNpcPrimary;
         }
     }
+    static void SpawnNpcFormation(uint32_t key, Vec3 center, int count, int formation, float spacing, float radius, float fx, float fz, bool ai, int behavior) {
+        SpawnNpcPositions(key, NpcFormationPositions(center, count, formation, spacing, radius, fx, fz), ai, behavior);
+    }
     static void SpawnNpcFormationGrounded(uint32_t key, Vec3 center, int count, int formation, float spacing, float radius, float fx, float fz, bool ai, int behavior) {
-        if (core::GroundProbeReady()) {
-            const float startY = center.y + 150.0f;
-            const int ticket = core::GroundProbe({ center.x, startY, center.z }, 400.0f);
-            if (ticket) {
-                g_npcDropJobs.push_back({ key, ticket, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
-            } else Note("NPC surface request refused");
-            return;
-        }
-        SpawnNpcFormation(key, center, count, formation, spacing, radius, fx, fz, ai, behavior);
+        if (!core::GroundProbeReady()) { Note(T("snap to ground: no surface found below")); return; }
+        const CamFrame cf = CurrentCam();
+        const float startY = std::max(center.y, cf.ok ? cf.pos.y : center.y) + 150.0f;
+        const int ticket = core::GroundProbe({ center.x, startY, center.z }, 500.0f);
+        if (!ticket) { Note(T("snap to ground: no surface found below")); return; }
+        g_npcDropJobs.push_back({ key, ticket, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
+        g_npcDropJobs.back().probeTop = startY;
     }
     static int NpcCategory(const std::string& n) {   // from the internal name's first token: NHM_ = human male, NGW_ = goblin female, ...
         const std::string t = n.substr(0, n.find('_'));
@@ -2238,12 +2257,16 @@ namespace editor {
     }
     static void DeleteSelectedNpcs() {
         if (!PrepareHistoryMutation([]() { DeleteSelectedNpcs(); })) return;
+        if (g_place.active && std::any_of(g_place.m.begin(), g_place.m.end(), [](const Member& m) { return m.npc && g_managedNpcSel.count(m.uid); })) {
+            DropCarried(); if (g_place.active) return;
+        }
         const auto list = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) if (!n->hidden) {
             Act a; a.kind = Act::NpcDelete; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = n->pos; a.flag0 = n->aiEnabled; a.behavior0 = n->behavior; a.group = n->group; a.text0 = n->label;
             acts.push_back(a); core::HideManagedNpc(uid);
         }
         Push(std::move(acts)); g_managedNpcSel.clear(); g_managedNpcPrimary = 0;
+        if (!SceneHasSelection()) ClearDeletedSelectionUi(false);
     }
     static void GroupSelectedNpcs(bool makeGroup) {
         if (!PrepareHistoryMutation([makeGroup]() { GroupSelectedNpcs(makeGroup); })) return;
@@ -2260,6 +2283,9 @@ namespace editor {
     }
     static void DeleteSceneSelection() {
         if (!PrepareHistoryMutation([]() { DeleteSceneSelection(); })) return;
+        if (g_place.active && std::any_of(g_place.m.begin(), g_place.m.end(), [](const Member& m) { return m.npc ? g_managedNpcSel.count(m.uid) != 0 : g_sel.count(m.uid) != 0; })) {
+            DropCarried(); if (g_place.active) return;
+        }
         auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_sel) if (const auto* o = Find(objects, uid)) if (!o->hidden) {
             Act a; a.kind = Act::Delete; a.uid = uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale; a.group = o->group; a.proj = o->proj; a.text0 = o->note;
@@ -2269,8 +2295,9 @@ namespace editor {
             Act a; a.kind = Act::NpcDelete; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = n->pos; a.flag0 = n->aiEnabled; a.behavior0 = n->behavior; a.group = n->group; a.proj = n->proj; a.text0 = n->label;
             acts.push_back(a); core::HideManagedNpc(uid);
         }
+        const bool deletedObject = std::any_of(acts.begin(), acts.end(), [](const Act& a) { return a.kind == Act::Delete; });
         if (!acts.empty()) Push(std::move(acts));
-        ClearSceneSelection();
+        ClearSceneSelection(); ClearDeletedSelectionUi(deletedObject);
     }
     static void GroupSceneSelection(bool makeGroup) {
         if (!PrepareHistoryMutation([makeGroup]() { GroupSceneSelection(makeGroup); })) return;
@@ -2362,7 +2389,7 @@ namespace editor {
         }
     }
     // tiles like the prefab browser's cards: the appearance preview, the in-game name below, a double-click spawns
-    static void DrawNpcCards(const std::vector<thumbgen::CharInfo>& chars, float listH, float ui, bool canSpawn) {
+    static void DrawNpcCards(const std::vector<thumbgen::CharInfo>& chars, float listH, float ui, bool canSpawn, bool canDrag) {
         const float pad = 4.0f * ui, tile = g_cardSize * ui, textH = ImGui::GetTextLineHeight() * 2 + 3;
         const float cw = tile + 2 * pad, ch = tile + 2 * pad + textH;
         ImGui::BeginChild("npccards", ImVec2(0, listH), ImGuiChildFlags_Borders);
@@ -2383,7 +2410,7 @@ namespace editor {
                 const bool hov = ImGui::IsItemHovered(), sel = g_npcSel == i;
                 if (ImGui::IsItemClicked(0)) g_npcSel = i;
                 if (hov && ImGui::IsMouseDoubleClicked(0) && canSpawn) { g_npcSel = i; SpawnNpcInFront(c); }
-                if (canSpawn && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) g_npcDragIndex = i;
+                if (canDrag && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) g_npcDragIndex = i;
                 dl->AddRectFilled(p0, p1, sel ? ImGui::GetColorU32(ImGuiCol_Header) : hov ? ImGui::GetColorU32(ImGuiCol_FrameBgHovered) : ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
                 if (sel) dl->AddRect(p0, p1, ImGui::GetColorU32(ImGuiCol_HeaderActive), 4.0f, 0, 2.0f);
                 ImTextureID tex = c.app.empty() ? ImTextureID{} : overlay::Thumb(core::ThumbFile(c.app));
@@ -2597,7 +2624,7 @@ namespace editor {
         float listH = ImGui::GetContentRegionAvail().y - detailsH - (detailsH > 0 ? ImGui::GetStyle().ItemSpacing.y : 0.0f); if (listH < 80 * ui) listH = 80 * ui;
         const bool useCards = compact || g_npcCards;
         if (g_npcRows.empty()) ImGui::TextDisabled("%s", T("No characters match the current search and category."));
-        else if (useCards) DrawNpcCards(*chars, listH, ui, havePos && st == 2);
+        else if (useCards) DrawNpcCards(*chars, listH, ui, havePos && st == 2, st == 2);
         else if (ImGui::BeginTable("npcs", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable, ImVec2(0, listH))) {
             ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch, 3);
             ImGui::TableSetupColumn(T("internal name"), ImGuiTableColumnFlags_WidthStretch, 4);
@@ -2611,7 +2638,7 @@ namespace editor {
                     g_npcSel = i;
                     if (ImGui::IsMouseDoubleClicked(0) && havePos && st == 2) SpawnNpcInFront(c);
                 }
-                if (havePos && st == 2 && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) g_npcDragIndex = i;
+                if (st == 2 && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) g_npcDragIndex = i;
                 ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", c.internal.c_str());
                 ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%u", c.key);
                 ImGui::PopID();
@@ -3444,7 +3471,7 @@ namespace editor {
         }
 
         selectedTerrain = std::find_if(terrainTiles.begin(), terrainTiles.end(), [](const SceneTerrainTile& tile) { return TerrainTileSelected(tile); });
-        for(auto it=g_sel.begin();it!=g_sel.end();){if(!Find(objects,*it))it=g_sel.erase(it);else ++it;} for(auto it=g_managedNpcSel.begin();it!=g_managedNpcSel.end();){if(!FindManagedNpc(npcs,*it))it=g_managedNpcSel.erase(it);else ++it;}
+        for(auto it=g_sel.begin();it!=g_sel.end();){const auto* o=Find(objects,*it);if(!o||o->hidden)it=g_sel.erase(it);else ++it;} for(auto it=g_managedNpcSel.begin();it!=g_managedNpcSel.end();){const auto* n=FindManagedNpc(npcs,*it);if(!n||n->hidden)it=g_managedNpcSel.erase(it);else ++it;}
         if (SceneHasSelection()) {
             SameLineForControl("Properties");
             if (ImGui::Button(T("Properties"))) OpenSelectionProperties();
@@ -3461,9 +3488,9 @@ namespace editor {
     static void DrawSelectionPropertiesContent(const PosInfo& p, bool havePos, bool compact) {
         auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); const auto chars = thumbgen::Characters();
         const float ui = ImGui::GetFontSize() / 17.0f;
-        for (auto it = g_sel.begin(); it != g_sel.end();) { if (!Find(objects, *it)) it = g_sel.erase(it); else ++it; }
-        for (auto it = g_managedNpcSel.begin(); it != g_managedNpcSel.end();) { if (!FindManagedNpc(npcs, *it)) it = g_managedNpcSel.erase(it); else ++it; }
-        if (!SceneHasSelection()) { ImGui::TextDisabled("%s", T("Select an object or NPC to edit it.")); return; }
+        for (auto it = g_sel.begin(); it != g_sel.end();) { const auto* o = Find(objects, *it); if (!o || o->hidden) it = g_sel.erase(it); else ++it; }
+        for (auto it = g_managedNpcSel.begin(); it != g_managedNpcSel.end();) { const auto* n = FindManagedNpc(npcs, *it); if (!n || n->hidden) it = g_managedNpcSel.erase(it); else ++it; }
+        if (!SceneHasSelection()) { g_propertiesOpen = false; return; }
         ImGui::Separator();
         const SpawnedObj* objPrim=(g_sel.size()==1&&g_managedNpcSel.empty())?Find(objects,*g_sel.begin()):nullptr;
         const ManagedNpc* npcPrim=(g_managedNpcSel.size()==1&&g_sel.empty())?FindManagedNpc(npcs,*g_managedNpcSel.begin()):nullptr;
@@ -3525,7 +3552,7 @@ namespace editor {
             ImGui::OpenPopup(title);
             g_propertiesPopupRequested = false;
         }
-        if (!g_propertiesOpen) return;
+        if (!g_propertiesOpen && !ImGui::IsPopupOpen(title)) return;
         const float ui = ImGui::GetFontSize() / 17.0f;
         const ImVec2 display = ImGui::GetIO().DisplaySize;
         ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -3533,6 +3560,7 @@ namespace editor {
         ImGui::SetNextWindowSizeConstraints(ImVec2(std::min(300.0f * ui, display.x - 24.0f), std::min(200.0f * ui, display.y - 24.0f)), ImVec2(display.x - 24.0f, display.y - 24.0f));
         if (ImGui::BeginPopupModal(title, &g_propertiesOpen)) {
             DrawSelectionPropertiesContent(p, havePos, false);
+            if (!g_propertiesOpen) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
     }
@@ -4636,13 +4664,25 @@ namespace editor {
         for (size_t i = 0; i < g_browserDropJobs.size(); ) {
             BrowserDropJob& j = g_browserDropJobs[i]; core::GroundHit gh;
             if (g_deferredEditor.action || !ReconcileGroundBatch(false)) return;
+            if (GetTickCount() - j.queuedAt > 30000) {
+                Note(T("snap to ground: no surface found below"));
+                g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
+            }
             const auto status = core::GroundResultState(j.ticket, &gh);
             if (status == core::GroundProbeStatus::Pending) { ++i; continue; }
             if (status == core::GroundProbeStatus::Invalidated || status == core::GroundProbeStatus::Unknown) {
                 g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
             }
+            if (status != core::GroundProbeStatus::Hit || !gh.hit || !std::isfinite(gh.centerY)) {
+                if (j.retry++ == 0) {
+                    j.ticket = core::GroundProbe({ j.center.x, j.probeTop + 300.0f, j.center.z }, 1000.0f);
+                    if (j.ticket) { ++i; continue; }
+                }
+                Note(T("snap to ground: no surface found below"));
+                g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
+            }
             Vec3 center = j.center;
-            if (j.prefab >= 0 && j.prefab < (int)idx.size() && gh.hit) {
+            if (j.prefab >= 0 && j.prefab < (int)idx.size()) {
                 const auto& pi = idx[j.prefab]; const float groundY = gh.centerY - gh.radius;
                 // BrowserDropPoint stores a bbox center when bounds are known.  Put its lowest point exactly on the
                 // physical surface; the prefab pivot is recovered by SpawnBrowserDrop afterwards.
@@ -4659,7 +4699,7 @@ namespace editor {
         ImGuiIO& io = ImGui::GetIO(); const auto& pi = idx[g_browserDragPrefab];
         if (!io.MouseDown[ImGuiMouseButton_Left] && !ImGui::IsMouseReleased(ImGuiMouseButton_Left)) { g_browserDragPrefab = -1; return; }
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemHovered();
-        Vec3 center{}; bool groundPlane = false; const bool projected = BrowserDropPoint(pi, io.MousePos, &center, &groundPlane);
+        Vec3 center{}; const bool projected = BrowserDropPoint(pi, io.MousePos, &center, nullptr);
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         const std::string shown = ShownName(pi);
         dl->AddText({ io.MousePos.x + 16.0f, io.MousePos.y + 14.0f }, IM_COL32(255, 220, 150, 255), shown.c_str());
@@ -4670,17 +4710,13 @@ namespace editor {
         if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left)) return;
         const int prefab = g_browserDragPrefab; g_browserDragPrefab = -1;
         if (overUi || !projected || !core::GameThreadReady() || IsAppearance(pi)) return;
-        if (groundPlane && core::GroundProbeReady()) {
-            const float startY = center.y + 150.0f;
-            const int ticket = core::GroundProbe({ center.x, startY, center.z }, 400.0f);
-            if (ticket) {
-                g_browserDropJobs.push_back({ prefab, ticket, GetTickCount(), center, g_spawnYaw, g_spawnScale });
-            } else Note("Browser surface request refused");
-            return;
-        }
-        // Physics may not be ready immediately after loading.  The fallback still places the measured bbox bottom on
-        // the player-height plane; unlike the old path it does not spawn first and then cast through its own collision.
-        SpawnBrowserDrop(prefab, center, g_spawnYaw, g_spawnScale);
+        if (!core::GroundProbeReady()) { Note(T("snap to ground: no surface found below")); return; }
+        const CamFrame cf = CurrentCam();
+        const float startY = std::max(center.y, cf.ok ? cf.pos.y : center.y) + 150.0f;
+        const int ticket = core::GroundProbe({ center.x, startY, center.z }, 500.0f);
+        if (!ticket) { Note(T("snap to ground: no surface found below")); return; }
+        g_browserDropJobs.push_back({ prefab, ticket, GetTickCount(), center, g_spawnYaw, g_spawnScale });
+        g_browserDropJobs.back().probeTop = startY;
     }
     static bool NpcDropPoint(ImVec2 mouse, Vec3* at, bool* onGroundPlane) {
         CamFrame cf = CurrentCam(); if (!cf.ok) return false;
@@ -4705,14 +4741,63 @@ namespace editor {
         for (size_t i = 0; i < g_npcDropJobs.size();) {
             NpcDropJob& j = g_npcDropJobs[i]; core::GroundHit gh;
             if (g_deferredEditor.action || !ReconcileGroundBatch(false)) return;
-            const auto status = core::GroundResultState(j.ticket, &gh);
-            if (status == core::GroundProbeStatus::Pending) { ++i; continue; }
-            if (status == core::GroundProbeStatus::Invalidated || status == core::GroundProbeStatus::Unknown) {
+            if (GetTickCount() - j.queuedAt > 30000) {
+                Note(T("snap to ground: no surface found below"));
                 g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
             }
-            Vec3 at = j.at;
-            if (gh.hit) at.y = gh.centerY - gh.radius;
-            SpawnNpcFormation(j.key, at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz, j.ai, j.behavior);
+            if (!j.centerResolved) {
+                const auto status = core::GroundResultState(j.ticket, &gh);
+                if (status == core::GroundProbeStatus::Pending) { ++i; continue; }
+                if (status == core::GroundProbeStatus::Invalidated || status == core::GroundProbeStatus::Unknown) {
+                    g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
+                }
+                if (status != core::GroundProbeStatus::Hit || !gh.hit || !std::isfinite(gh.centerY)) {
+                    if (j.retry++ == 0) {
+                        j.ticket = core::GroundProbe({ j.at.x, j.probeTop + 300.0f, j.at.z }, 1000.0f);
+                        if (j.ticket) { ++i; continue; }
+                    }
+                    Note(T("snap to ground: no surface found below"));
+                    g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
+                }
+                j.at.y = gh.centerY - gh.radius;
+                j.positions = NpcFormationPositions(j.at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz);
+                if (j.positions.size() == 1) {
+                    SpawnNpcPositions(j.key, j.positions, j.ai, j.behavior);
+                    g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
+                }
+                j.memberTickets.assign(j.positions.size(), 0);
+                j.memberRetries.assign(j.positions.size(), 0);
+                j.centerResolved = true;
+            }
+            int issued = 0; bool pending = false, invalidated = false;
+            for (size_t k = 0; k < j.positions.size(); ++k) {
+                int& ticket = j.memberTickets[k];
+                if (ticket == 0 && issued < 16) {
+                    ticket = core::GroundProbe({ j.positions[k].x, j.probeTop, j.positions[k].z }, 500.0f);
+                    ++issued;
+                    if (!ticket) { invalidated = true; break; }
+                }
+                if (ticket == 0) { pending = true; continue; }
+                if (ticket < 0) continue;
+                core::GroundHit memberHit;
+                const auto status = core::GroundResultState(ticket, &memberHit);
+                if (status == core::GroundProbeStatus::Pending) { pending = true; continue; }
+                if (status == core::GroundProbeStatus::Invalidated || status == core::GroundProbeStatus::Unknown) { invalidated = true; break; }
+                if (status == core::GroundProbeStatus::Hit && memberHit.hit && std::isfinite(memberHit.centerY)) {
+                    j.positions[k].y = memberHit.centerY - memberHit.radius;
+                    ticket = -1;
+                } else if (j.memberRetries[k]++ == 0) {
+                    ticket = core::GroundProbe({ j.positions[k].x, j.probeTop + 300.0f, j.positions[k].z }, 1000.0f);
+                    if (!ticket) { invalidated = true; break; }
+                    pending = true;
+                } else ticket = -2;
+            }
+            if (invalidated) { g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue; }
+            if (pending) { ++i; continue; }
+            std::vector<Vec3> grounded; grounded.reserve(j.positions.size());
+            for (size_t k = 0; k < j.positions.size(); ++k) if (j.memberTickets[k] == -1) grounded.push_back(j.positions[k]);
+            if (grounded.size() != j.positions.size()) Note(T("snap to ground: no surface found below"));
+            if (!grounded.empty()) SpawnNpcPositions(j.key, grounded, j.ai, j.behavior);
             g_npcDropJobs.erase(g_npcDropJobs.begin() + i);
         }
     }
@@ -4733,7 +4818,10 @@ namespace editor {
         }
         if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left)) return;
         const uint32_t key = c.key; g_npcDragIndex = -1;
-        if (overUi || !projected || core::NpcState() != 2) return;
+        core::Log("[editor/npc-drop] release: key=%u ui=%d projected=%d npcState=%d groundReady=%d at=(%.2f %.2f %.2f)",
+            key, (int)overUi, (int)projected, core::NpcState(), (int)core::GroundProbeReady(), at.x, at.y, at.z);
+        if (overUi || !projected) return;
+        if (core::NpcState() != 2) { Note(T("walk a few steps first: the game's spawn request needs your character's server actor")); return; }
         CamFrame cf = CurrentCam(); float fx = cf.ok ? cf.fwd.x : g_fx, fz = cf.ok ? cf.fwd.z : g_fz;
         const float fl = sqrtf(fx * fx + fz * fz); if (fl > 1e-4f) { fx /= fl; fz /= fl; } else { fx = g_fx; fz = g_fz; }
         SpawnNpcFormationGrounded(key, at, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, fx, fz, g_npcSpawnAi, g_npcSpawnBehavior);
