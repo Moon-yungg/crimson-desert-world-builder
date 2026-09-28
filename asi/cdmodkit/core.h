@@ -574,7 +574,7 @@ namespace core {
     struct GroupExportApproval {
         bool valid = false;                        // prepared from authoritative values and a fresh publication
         std::string name;                          // destination group name (no extension)
-        std::string path;                          // full destination path (<moddir>\Groups\<name>.cdgroup)
+        std::string path;                          // full destination path (<moddir>\groups\<name>.cdgroup)
         bool overwriteApproved = false;            // explicit approval to replace an existing file
         proj_codec::Document document;             // the approved semantic values/envelopes (kind=Group)
         std::vector<int> included;                 // included uids, registry order

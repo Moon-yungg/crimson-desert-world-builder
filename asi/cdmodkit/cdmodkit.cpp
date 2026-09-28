@@ -955,7 +955,7 @@ bool Trace() { return g_trace; }
 // so an object that is updated every frame never comes back. The final drop always re-creates (g_recreateOnMove) for a clean state.
 // 2 = setWorldTransform(0,1): remove + re-insert per update, visible but may flicker; 1 = (0,0) leaves the object invisible until
 // re-inserted; 0 = disable/enable hides it (async re-add). Release/drop always re-creates.
-int g_liveMode = 3; // keep the object enabled while its live transform changes
+int g_liveMode = 2; // restore the pre-regression re-insert path so the object stays visible while dragging
 static void DoLiveMove(uintptr_t obj, Vec3 pos, Rot rot, float scale, DWORD queuedAt) {
 #ifdef WB_UNIFIED_HOST_TEST
     const DWORD wait = GetTickCount() - queuedAt;
@@ -1604,7 +1604,7 @@ struct FileHandle {
 struct FileSelection { SavedFile file; BY_HANDLE_FILE_INFORMATION info{}; std::string bytes; };
 static const char* FileExtension(proj_codec::Kind kind) { return kind == proj_codec::Kind::Project ? ".cdproj" : ".cdgroup"; }
 static std::string FileDirectory(proj_codec::Kind kind, bool archived) {
-    return g_modDir + (kind == proj_codec::Kind::Project ? "\\projects" : "\\Groups") + (archived ? "\\.archive" : "");
+    return g_modDir + (kind == proj_codec::Kind::Project ? "\\projects" : "\\groups") + (archived ? "\\.archive" : "");
 }
 static bool ValidFileName(const std::string& filename, proj_codec::Kind kind) {
     if (kind != proj_codec::Kind::Project && kind != proj_codec::Kind::Group) return false;
@@ -2286,10 +2286,10 @@ ExportContext PublishedExportContext() {
     std::lock_guard<std::mutex> l(g_exportCtxMutex);
     return g_exportContext;
 }
-static std::string GroupDir() { return g_modDir + "\\Groups"; }
+static std::string GroupDir() { return g_modDir + "\\groups"; }
 static std::string GroupPath(const std::string& name) { return GroupDir() + "\\" + name + ".cdgroup"; }
 static bool FileAt(const std::string& path) { return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
-// One path component inside Groups\: no separators, no reserved characters, no extension (the export adds
+// One path component inside groups\: no separators, no reserved characters, no extension (the export adds
 // .cdgroup), never a directory name. An invalid name must never become a path outside the group folder.
 static bool ValidateExportName(const std::string& name, std::string& error) {
     if (name.empty()) { error = "record 0: empty group name"; return false; }
@@ -2447,7 +2447,7 @@ bool WriteGroupExport(const GroupExportApproval& approval, std::string& error) {
     std::string text;
     if (!proj_codec::Serialize(approval.document, text, error)) { Log("export: %s", error.c_str()); return false; }
     if (!CreateDirectoryA(GroupDir().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        error = "record 0: cannot create the Groups directory"; Log("export: %s", error.c_str()); return false;
+        error = "record 0: cannot create the groups directory"; Log("export: %s", error.c_str()); return false;
     }
     // 2. same-directory temporary through the ONE transactional writer; the final replacement revalidates both
     //    authorities and renames while they are held (hooks.replace), so the pre-replace callback runs first and
@@ -2683,7 +2683,7 @@ bool ImportProjectFile(const std::string& path) {
     g_projectError.clear();
     return true;
 }
-// validate-first import: shared .cdgroup bytes enter Groups only after parsing and narrowing succeed.
+// validate-first import: shared .cdgroup bytes enter groups only after parsing and narrowing succeed.
 bool ImportGroupFile(const std::string& path) {
     const std::string base = path.substr(path.find_last_of("\\/") + 1);
     if (base.empty()) { g_projectError = "record 0: empty import file name"; return false; }
@@ -2710,7 +2710,7 @@ bool ImportGroupFile(const std::string& path) {
     }
     if (_stricmp(path.c_str(), destination.c_str()) == 0) { g_projectError.clear(); return true; }
     if (!CreateDirectoryA(GroupDir().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        g_projectError = "record 0: cannot create the Groups directory"; return false;
+        g_projectError = "record 0: cannot create the groups directory"; return false;
     }
     proj_codec::WriteHooks hooks; proj_codec::WriteHooks* writeHooks = nullptr;
 #ifdef WB_UNIFIED_HOST_TEST
@@ -5704,7 +5704,7 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
           if (invalid) { stored->second.status = GroundProbeStatus::Invalidated; continue; }
         }
         float radius; { std::lock_guard<std::mutex> lock(g_tplMutex); radius = g_probeRadius; }
-        const int tx = (int)(rq.start.x * 0.001), tz = (int)(rq.start.z * 0.001);
+        const int tx = (int)(rq.start.x * 0.001f), tz = (int)(rq.start.z * 0.001f);
         t_geoTracing = InterlockedExchange(&g_geoTraceArm, 0) != 0;   // research: log the geometry calls of this one cast
         if (t_geoTracing) Log("[geo] ---- traced cast from (%.2f %.2f %.2f) %.2f m down", rq.start.x, rq.start.y, rq.start.z, rq.len);
         GroundHit h;
