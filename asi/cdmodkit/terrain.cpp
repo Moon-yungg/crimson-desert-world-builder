@@ -75,11 +75,31 @@ static bool TileRange(int tx, int tz, float* range, float* offset) {   // height
     return *range > 0;
 }
 static void TilesOf(const TerrainStroke& s, std::vector<std::pair<int, int>>* out) {
+    if (s.tileScoped) { out->push_back({ s.tileX, s.tileZ }); return; }
     const int tx0 = (int)std::floor((s.x - s.r) / 1024.0f), tx1 = (int)std::floor((s.x + s.r) / 1024.0f);
     const int tz0 = (int)std::floor((s.z - s.r) / 1024.0f), tz1 = (int)std::floor((s.z + s.r) / 1024.0f);
     for (int tx = tx0; tx <= tx1; tx++) for (int tz = tz0; tz <= tz1; tz++) out->push_back({ tx, tz });
 }
+static std::pair<int, int> StrokeOwnerTile(const TerrainStroke& s) {
+    if (s.tileScoped) return { s.tileX, s.tileZ };
+    return { (int)std::floor(s.x / 1024.0f), (int)std::floor(s.z / 1024.0f) };
+}
+static std::vector<TerrainStroke> SplitStroke(const TerrainStroke& stroke) {
+    if (stroke.tileScoped) return { stroke };
+    std::vector<std::pair<int, int>> tiles; TilesOf(stroke, &tiles);
+    std::vector<TerrainStroke> result; result.reserve(tiles.size());
+    for (const auto& tile : tiles) {
+        TerrainStroke part = stroke; part.tileScoped = true; part.tileX = tile.first; part.tileZ = tile.second;
+        result.push_back(part);
+    }
+    return result;
+}
+static std::vector<std::pair<int, int>> UniqueTiles(const std::vector<std::pair<int, int>>& tiles) {
+    std::set<std::pair<int, int>> unique(tiles.begin(), tiles.end());
+    return { unique.begin(), unique.end() };
+}
 static bool StrokeTouchesTile(const TerrainStroke& s, int tx, int tz) {
+    if (s.tileScoped && (s.tileX != tx || s.tileZ != tz)) return false;
     const float x0 = tx * 1024.0f, z0 = tz * 1024.0f;
     return s.x + s.r >= x0 && s.x - s.r < x0 + 1024.0f && s.z + s.r >= z0 && s.z - s.r < z0 + 1024.0f;
 }
@@ -90,8 +110,7 @@ static void ApplyStrokeCpu(std::vector<float>& e, int tx, int tz, const TerrainS
     float target = 0;
     if (s.mode == TerrainFlatten) {
         int ac = (int)std::floor((s.ax - ox) / size), ar = dim - 1 - (int)std::floor((s.az - oz) / size);
-        if (ar < 0 || ac < 0 || ar >= dim || ac >= dim) { ac = (int)std::floor((s.x - ox) / size); ar = dim - 1 - (int)std::floor((s.z - oz) / size); }
-        if (ar < 0 || ac < 0 || ar >= dim || ac >= dim) return;
+        ac = std::clamp(ac, 0, dim - 1); ar = std::clamp(ar, 0, dim - 1);
         target = e[(size_t)ar * dim + ac];
     }
     const int c0 = std::max(0, (int)std::floor((s.x - s.r - ox) / size)), c1 = std::min(dim - 1, (int)std::floor((s.x + s.r - ox) / size));
@@ -165,10 +184,11 @@ static uint32_t ApplyGuarded(uint8_t* buf, uint32_t off, uint32_t len, int tx, i
                 for (int k = 0; k < ns; k++) {
                     const TerrainStroke& s = st[k]; if (s.r <= 0) continue;
                     float target = 0;
-                    if (s.mode == TerrainFlatten) {   // the height at the anchor (else at the stroke centre) in this mip, before this stroke
+                    if (s.mode == TerrainFlatten) {   // nearest sample to the anchor in this tile, before this stroke
                         uint16_t* p = nullptr;
                         int ac = (int)std::floor((s.ax - ox) / size), ar = dim - 1 - (int)std::floor((s.az - oz) / size);
-                        if (!sample(ar, ac, &p)) { ac = (int)std::floor((s.x - ox) / size); ar = dim - 1 - (int)std::floor((s.z - oz) / size); if (!sample(ar, ac, &p)) continue; }
+                        ac = std::clamp(ac, 0, dim - 1); ar = std::clamp(ar, 0, dim - 1);
+                        if (!sample(ar, ac, &p)) continue;
                         target = offset + *p * toM;
                     }
                     const int c0 = std::max(0, (int)std::floor((s.x - s.r - ox) / size)), c1 = std::min(dim - 1, (int)std::floor((s.x + s.r - ox) / size));
@@ -218,8 +238,7 @@ static uint8_t __fastcall HookEvPoll(uintptr_t ev) {
             TileInfo ti; std::vector<TerrainStroke> mineStrokes;
             {
                 std::lock_guard<std::mutex> l(g_mx); g_pending.erase(ev); ti = g_info[{ pr.tx, pr.tz }];
-                const float x0 = pr.tx * 1024.0f, z0 = pr.tz * 1024.0f;
-                for (const auto& s : g_strokes) if (s.x + s.r >= x0 && s.x - s.r < x0 + 1024.0f && s.z + s.r >= z0 && s.z - s.r < z0 + 1024.0f) mineStrokes.push_back(s);
+                for (const auto& s : g_strokes) if (StrokeTouchesTile(s, pr.tx, pr.tz)) mineStrokes.push_back(s);
                 if (st == 0 && pr.off == kHeader && pr.len >= 699050) { auto& tc = g_cpu[{ pr.tx, pr.tz }]; tc.gpuStrokes = mineStrokes; tc.gpuValid = false; }   // a fresh texture
             }
             if (ti.range <= 0 && GameReadAvailable()) {   // not fetched yet: read it now (the game's own loader, outside any of its locks here)
@@ -258,13 +277,25 @@ bool TerrainAvailable() { return g_ok; }
 // Live: tiles whose strokes changed get their texture rewritten (original chain + all strokes, the stream patch's own code)
 static std::mutex g_liveMx; static std::set<std::pair<int, int>> g_liveDirty; static std::atomic<bool> g_liveRunning{ false };
 static std::atomic<int> g_liveDone{ 0 }; static bool g_liveFailed = false;   // guarded by g_liveMx
+static void MarkAppliedAtGeneration(int generation) {
+    std::lock_guard<std::mutex> l(g_mx);
+    if (g_gen == generation) g_needsApply = false;
+}
 static void QueueLive(const std::vector<std::pair<int, int>>& tiles) {
-    if (!TerrainLiveAvailable()) return;
-    { std::lock_guard<std::mutex> l(g_liveMx); for (auto& t : tiles) g_liveDirty.insert(t); }
-    bool expected = false; if (!g_liveRunning.compare_exchange_strong(expected, true)) return;
+    if (!TerrainLiveAvailable() || tiles.empty()) return;
+    {
+        std::lock_guard<std::mutex> l(g_liveMx);
+        for (auto& t : tiles) g_liveDirty.insert(t);
+        if (g_liveRunning) return;
+        g_liveRunning = true;
+    }
     std::thread([]() {
+        bool markApplied = false;
         for (;;) {
-            std::pair<int, int> t; { std::lock_guard<std::mutex> l(g_liveMx); if (g_liveDirty.empty()) break; t = *g_liveDirty.begin(); g_liveDirty.erase(g_liveDirty.begin()); }
+            std::pair<int, int> t;
+            { std::lock_guard<std::mutex> l(g_liveMx);
+              if (g_liveDirty.empty()) { markApplied = !g_liveFailed; g_liveFailed = false; g_liveRunning = false; break; }
+              t = *g_liveDirty.begin(); g_liveDirty.erase(g_liveDirty.begin()); }
             if (!TerrainLiveHasTexture(t.first, t.second)) continue;
             std::vector<uint8_t> chain; std::vector<TerrainStroke> st; TileInfo ti; std::vector<float> prev, next;
             { std::lock_guard<std::mutex> l(g_mx); auto it = g_cpu.find(t); if (it == g_cpu.end() || !it->second.ok || it->second.chain.size() < 699050) continue;
@@ -278,55 +309,124 @@ static void QueueLive(const std::vector<std::pair<int, int>>& tiles) {
             int patches = 0;
             if (ok) { patches = TerrainPhysSync(t.first, t.second, prev.data(), next.data());   // the collision takes the same change
                 std::lock_guard<std::mutex> l(g_mx); auto& tc = g_cpu[t]; tc.gpu.swap(next); tc.gpuValid = true; }
-            g_liveDone++; if (!ok) g_liveFailed = true;
+            g_liveDone++; if (!ok) { std::lock_guard<std::mutex> l(g_liveMx); g_liveFailed = true; }
             Log("[terrain] live: tile %d,%d, %zu strokes, %u samples -> %s, %d collision patches", t.first, t.second, st.size(), n, ok ? "uploaded" : "FAILED", patches);
             Sleep(30);   // coalesce a drag: the next pass takes every stroke painted meanwhile
         }
-        { std::lock_guard<std::mutex> l(g_liveMx); if (g_liveDirty.empty() && !g_liveFailed) TerrainMarkApplied(); g_liveFailed = false; }
-        g_liveRunning = false;
+        if (markApplied) {
+            int generation = 0; { std::lock_guard<std::mutex> l(g_mx); generation = g_gen; }
+            MarkAppliedAtGeneration(generation);
+        }
     }).detach();
 }
 void TerrainAddStroke(const TerrainStroke& s) {
-    { std::lock_guard<std::mutex> l(g_mx); g_strokes.push_back(s); std::vector<std::pair<int, int>> t; TilesOf(s, &t); for (auto& k : t) g_edited.insert(k); g_needsApply = true;
-      for (auto& k : t) { auto it = g_cpu.find(k); if (it != g_cpu.end() && it->second.ok) ApplyStrokeCpu(it->second.edit, k.first, k.second, s); } g_gen++; }
+    const auto parts = SplitStroke(s);
+    std::vector<std::pair<int, int>> t;
+    { std::lock_guard<std::mutex> l(g_mx); for (const auto& part : parts) {
+          g_strokes.push_back(part); TilesOf(part, &t);
+          const auto tile = StrokeOwnerTile(part); g_edited.insert(tile);
+          auto it = g_cpu.find(tile); if (it != g_cpu.end() && it->second.ok) ApplyStrokeCpu(it->second.edit, tile.first, tile.second, part);
+      }
+      g_needsApply = true; g_gen++; }
     if (s.proj) MarkProjectDirty(s.proj);
     FetchTables();
-    std::vector<std::pair<int, int>> t; TilesOf(s, &t); QueueLive(t);
+    QueueLive(UniqueTiles(t));
 }
 bool TerrainUndo() {
-    int proj = 0;
-    { std::lock_guard<std::mutex> l(g_mx); if (g_strokes.empty()) return false; proj = g_strokes.back().proj; g_strokes.pop_back(); RebuildEditedLocked(); RecomputeCpuLocked(); g_needsApply = true; }
+    int proj = 0; std::vector<std::pair<int, int>> touched;
+    { std::lock_guard<std::mutex> l(g_mx); if (g_strokes.empty()) return false; proj = g_strokes.back().proj;
+      TilesOf(g_strokes.back(), &touched); g_strokes.pop_back(); RebuildEditedLocked(); RecomputeCpuLocked(); g_needsApply = true; }
     if (proj) MarkProjectDirty(proj);
-    std::vector<std::pair<int, int>> t; { std::lock_guard<std::mutex> l(g_mx); for (auto& kv : g_cpu) t.push_back(kv.first); } QueueLive(t);
+    QueueLive(UniqueTiles(touched));
     return true;
 }
 void TerrainClear() {
-    std::set<int> dirty;
+    std::set<int> dirty; std::vector<std::pair<int, int>> changedTiles;
     {
         std::lock_guard<std::mutex> l(g_mx);
         if (!g_strokes.empty()) g_needsApply = true;
-        for (const auto& s : g_strokes) if (s.proj) dirty.insert(s.proj);
+        std::vector<std::pair<int, int>> touched;
+        for (const auto& s : g_strokes) { if (s.proj) dirty.insert(s.proj); TilesOf(s, &touched); }
+        changedTiles = UniqueTiles(touched);
         g_strokes.clear(); RebuildEditedLocked(); RecomputeCpuLocked();
     }
     for (int proj : dirty) MarkProjectDirty(proj);
+    QueueLive(changedTiles);
     Log("[terrain] strokes cleared");
 }
 std::vector<TerrainStroke> TerrainStrokes() { std::lock_guard<std::mutex> l(g_mx); return g_strokes; }
-void TerrainSetProject(int from, int to) { std::lock_guard<std::mutex> l(g_mx); for (auto& s : g_strokes) if (s.proj == from) s.proj = to; }
+bool TerrainRemoveTile(int tx, int tz, int project, std::vector<TerrainStroke>& removed, std::vector<size_t>& positions) {
+    removed.clear(); positions.clear();
+    std::set<int> dirty; std::vector<std::pair<int, int>> changedTiles;
+    {
+        std::lock_guard<std::mutex> l(g_mx);
+        std::vector<std::pair<int, int>> touched;
+        for (size_t i = 0; i < g_strokes.size(); ++i) {
+            const auto& s = g_strokes[i]; const auto owner = StrokeOwnerTile(s);
+            if (owner.first != tx || owner.second != tz || (project >= 0 && s.proj != project)) continue;
+            removed.push_back(s); positions.push_back(i);
+            if (s.proj) dirty.insert(s.proj); TilesOf(s, &touched);
+        }
+        if (removed.empty()) return false;
+        g_strokes.erase(std::remove_if(g_strokes.begin(), g_strokes.end(), [=](const TerrainStroke& s) {
+            const auto owner = StrokeOwnerTile(s); return owner.first == tx && owner.second == tz && (project < 0 || s.proj == project);
+        }), g_strokes.end());
+        changedTiles = UniqueTiles(touched);
+        RebuildEditedLocked(); RecomputeCpuLocked(); g_needsApply = true;
+    }
+    for (int proj : dirty) MarkProjectDirty(proj);
+    QueueLive(changedTiles);
+    Log("[terrain] tile %d,%d project %d: removed terrain strokes", tx, tz, project);
+    return true;
+}
+void TerrainRestoreStrokes(const std::vector<TerrainStroke>& strokes, const std::vector<size_t>& positions) {
+    if (strokes.empty()) return;
+    std::set<int> dirty; std::vector<std::pair<int, int>> touched;
+    {
+        std::lock_guard<std::mutex> l(g_mx);
+        for (size_t i = 0; i < strokes.size(); ++i) {
+            const size_t at = i < positions.size() ? std::min(positions[i], g_strokes.size()) : g_strokes.size();
+            g_strokes.insert(g_strokes.begin() + at, strokes[i]);
+            if (strokes[i].proj) dirty.insert(strokes[i].proj); TilesOf(strokes[i], &touched);
+        }
+        RebuildEditedLocked(); RecomputeCpuLocked(); g_needsApply = true;
+    }
+    for (int proj : dirty) MarkProjectDirty(proj);
+    FetchTables(); QueueLive(UniqueTiles(touched));
+}
+void TerrainSetProject(int from, int to) { std::lock_guard<std::mutex> l(g_mx); bool changed = false;
+    for (auto& s : g_strokes) if (s.proj == from && from != to) { s.proj = to; changed = true; }
+    if (changed) g_gen++;
+}
 // A project's strokes as loaded from its file: replaces what that project had. Identical strokes (the startup preload followed
 // by the autoload of the same project) change nothing and need no apply.
 void TerrainReplaceProject(int proj, const std::vector<TerrainStroke>& strokes) {
+    std::vector<TerrainStroke> normalized;
+    for (const auto& stroke : strokes) {
+        auto parts = SplitStroke(stroke);
+        for (auto& part : parts) { part.proj = proj; normalized.push_back(part); }
+    }
+    std::vector<std::pair<int, int>> changedTiles;
     {
         std::lock_guard<std::mutex> l(g_mx);
         std::vector<TerrainStroke> old; for (auto& s : g_strokes) if (s.proj == proj) old.push_back(s);
-        bool same = old.size() == strokes.size();
-        for (size_t i = 0; same && i < old.size(); i++) same = memcmp(&old[i], &strokes[i], sizeof(TerrainStroke)) == 0;
+        bool same = old.size() == normalized.size();
+        for (size_t i = 0; same && i < old.size(); i++) {
+            const auto& x = old[i]; const auto& y = normalized[i];
+            same = x.mode == y.mode && x.x == y.x && x.z == y.z && x.r == y.r && x.amount == y.amount &&
+                x.strength == y.strength && x.ax == y.ax && x.az == y.az && x.y == y.y && x.proj == y.proj &&
+                x.tileScoped == y.tileScoped && x.tileX == y.tileX && x.tileZ == y.tileZ;
+        }
         if (same) return;
+        std::vector<std::pair<int, int>> touched;
+        for (const auto& s : old) TilesOf(s, &touched);
+        for (const auto& s : normalized) TilesOf(s, &touched);
         g_strokes.erase(std::remove_if(g_strokes.begin(), g_strokes.end(), [proj](const TerrainStroke& s) { return s.proj == proj; }), g_strokes.end());
-        for (auto s : strokes) { s.proj = proj; g_strokes.push_back(s); }
+        for (const auto& s : normalized) g_strokes.push_back(s);
+        changedTiles = UniqueTiles(touched);
         RebuildEditedLocked(); RecomputeCpuLocked(); g_needsApply = true;
     }
-    FetchTables();
+    FetchTables(); QueueLive(changedTiles);
 }
 void TerrainMarkApplied() { std::lock_guard<std::mutex> l(g_mx); g_needsApply = false; }
 bool TerrainNeedsApply() { std::lock_guard<std::mutex> l(g_mx); return g_needsApply && g_ok; }
@@ -369,7 +469,26 @@ bool TerrainApply(Vec3 back) {
     return true;
 }
 
-int TerrainPreviewGen() { return g_gen; }
+int TerrainPreviewGen() { std::lock_guard<std::mutex> l(g_mx); return g_gen; }
+bool TerrainTilePreview(int tx, int tz, int project, int dim, std::vector<float>* delta) {
+    if (!delta || dim < 1 || dim > 64) return false;
+    std::lock_guard<std::mutex> l(g_mx);
+    const auto it = g_cpu.find({ tx, tz });
+    if (it == g_cpu.end() || !it->second.ok) return false;
+    const auto& original = it->second.orig;
+    std::vector<float> edited = original;
+    for (const auto& stroke : g_strokes)
+        if (stroke.proj == project && StrokeTouchesTile(stroke, tx, tz)) ApplyStrokeCpu(edited, tx, tz, stroke);
+    delta->assign((size_t)dim * dim, 0.0f);
+    for (int row = 0; row < kTile; ++row) for (int col = 0; col < kTile; ++col) {
+        const size_t sample = (size_t)row * kTile + col;
+        const int x = col * dim / kTile, y = (kTile - 1 - row) * dim / kTile;
+        float& cell = (*delta)[(size_t)y * dim + x];
+        const float change = edited[sample] - original[sample];
+        if (std::fabs(change) > std::fabs(cell)) cell = change;
+    }
+    return true;
+}
 // Heights on the 2 m texel grid for the preview: sample (i, j) is the texel containing (x0 + 2i, z0 + 2j); NaN where the tile's
 // copy is not loaded. x0 / z0 should be even (texel edges) so the samples are the texel centres at x0 + 2i + 1.
 bool TerrainPreviewGrid(float x0, float z0, int nx, int nz, std::vector<float>* orig, std::vector<float>* edit) {

@@ -199,7 +199,7 @@ namespace overlay {
 
     // decode queue: files are decoded on a worker thread; the render thread only picks up finished pixels
     struct Decoded { std::string file; int w = 0, h = 0; unsigned char* px = nullptr; };
-    static std::mutex g_decMutex; static std::deque<std::string> g_decQueue; static std::deque<Decoded> g_decDone; static std::set<std::string> g_decInFlight; static HANDLE g_decThread = nullptr;
+    static std::mutex g_decMutex; static std::deque<std::string> g_decQueue; static std::deque<Decoded> g_decDone; static std::set<std::string> g_decInFlight, g_decInvalidated; static HANDLE g_decThread = nullptr;
     static DWORD WINAPI DecodeThread(LPVOID) {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
@@ -282,6 +282,27 @@ namespace overlay {
         if (t.failed || !t.uploaded) return 0;
         if (w) *w = t.w; if (h) *h = t.h;
         return (ImTextureID)GpuHandle(t.slot).ptr;
+    }
+    void InvalidateThumb(const std::string& file) {
+        auto it = g_texs.find(file);
+        if (it != g_texs.end()) {
+            Tex& t = it->second;
+            if (t.res) g_retire.push_back({ t.res, g_fenceValue + 1 });
+            if (t.upload) g_retire.push_back({ t.upload, g_fenceValue + 1 });
+            if (t.slot) g_freeSlots.push_back(t.slot);
+            g_texs.erase(it);
+        }
+        std::lock_guard<std::mutex> lock(g_decMutex);
+        bool queued = false;
+        for (auto q = g_decQueue.begin(); q != g_decQueue.end();) {
+            if (*q == file) { q = g_decQueue.erase(q); queued = true; } else ++q;
+        }
+        bool completed = false;
+        for (auto d = g_decDone.begin(); d != g_decDone.end();) {
+            if (d->file == file) { if (d->px) stbi_image_free(d->px); d = g_decDone.erase(d); completed = true; } else ++d;
+        }
+        if (queued || completed) g_decInFlight.erase(file);
+        else if (g_decInFlight.count(file)) g_decInvalidated.insert(file); // a worker is reading the old file snapshot
     }
 
     static bool CreateRenderTargets(IDXGISwapChain3* sc) {
@@ -411,7 +432,9 @@ namespace overlay {
     static void DrawFrame(IDXGISwapChain3* sc) {
         g_loadsThisFrame = 0; RetireResources(); EvictIfNeeded();
         for (;;) {   // finished decodes -> GPU textures, a few per frame
-            Decoded d; { std::lock_guard<std::mutex> l(g_decMutex); if (g_decDone.empty() || g_loadsThisFrame >= 4) break; d = g_decDone.front(); g_decDone.pop_front(); g_decInFlight.erase(d.file); }
+            Decoded d; bool stale = false;
+            { std::lock_guard<std::mutex> l(g_decMutex); if (g_decDone.empty() || g_loadsThisFrame >= 4) break; d = g_decDone.front(); g_decDone.pop_front(); g_decInFlight.erase(d.file); stale = g_decInvalidated.erase(d.file) != 0; }
+            if (stale) { if (d.px) stbi_image_free(d.px); QueueDecode(d.file); continue; }
             g_loadsThisFrame++;
             Tex t; t.lastUse = GetTickCount(); t.gen = thumbgen::Generation();
             if (!CreateFromPixels(d.px, d.w, d.h, t)) t.failed = true; else g_pendingUploads.push_back(d.file);

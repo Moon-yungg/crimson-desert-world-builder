@@ -21,7 +21,7 @@
 //   # wb-envelope  id=N anchor=x,y,z min=x,y,z max=x,y,z quality=measured|approx  (sequential, per copy)
 //   # wb-member    record=N envelope=N                                            (one per data record)
 //   prefab|x|y|z|yawDeg|scale|group|pitchDeg|rollDeg
-//   #terrain|mode|x|z|r|amount|strength|ax|az|y   (projects only; main's terrain format)
+//   #terrain|mode|x|z|r|amount|strength|ax|az|y[|tileX|tileZ]   (projects only)
 // Legacy rows stay valid input: four fields (prefab|x|y|z), seven fields
 // (+yaw|scale|group) and the nine-field row; omitted optional fields take their
 // defaults (yaw/pitch/roll=0, scale=1, group=0). Ordinary comments never consume
@@ -52,6 +52,8 @@ struct Record {
 struct TerrainRecord {
     int mode = 0;
     double x = 0, z = 0, r = 0, amount = 0, strength = 0, ax = 0, az = 0, y = 0;
+    bool tileScoped = false;
+    int tileX = 0, tileZ = 0;
 };
 
 struct NpcRecord {

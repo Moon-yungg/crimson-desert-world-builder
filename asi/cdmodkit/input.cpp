@@ -283,6 +283,11 @@ namespace input {
     // While the menu is open the game keeps running and stays controllable: the mouse belongs to the menu only while the
     // cursor is over a World Builder window (core::g_uiWantsMouse), the keyboard only while a text field is active (g_uiWantsKeyboard).
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+        if (msg == WM_LBUTTONDOWN && core::g_menuOpen) {
+            static LONG clickReports = 0;
+            if (InterlockedIncrement(&clickReports) <= 24)
+                core::Log("[input/pick] left down: ui=%d rawButtons=%d freeCam=%d", (int)core::g_uiWantsMouse, (int)g_rawButtons, (int)g_freeCam);
+        }
         if (IsKeyboard(msg)) TrackKey(msg, lParam);
         if (msg == WM_KILLFOCUS || (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE)) { memset(g_scanDown, 0, sizeof g_scanDown); g_rmb = false; }
         // Keep the platform backend's keyboard code page in sync even when the game's WndProc would otherwise consume the change.

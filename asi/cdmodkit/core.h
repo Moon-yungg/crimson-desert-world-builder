@@ -27,7 +27,7 @@ struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float 
                                                        // replaced (restore, re-create) or invalidated (hide/forget) so that engine work queued for an older incarnation can
                                                        // never attach to a newer one; the record keeps its uid, project, group and pose across all of them.
 struct ManagedNpc { int uid = 0; uint32_t key = 0; Vec3 pos{}; int type = 1; uint32_t extra = 0; uintptr_t actor = 0; uint32_t actorId = 0;
-                    uintptr_t transform = 0; DWORD spawnRequestTick = 0; bool editMoving = false; Vec3 liveMoveTarget{}; bool liveMovePending = false;   // runtime-only live binding/edit state; not serialized
+                    uintptr_t transform = 0; DWORD spawnRequestTick = 0; bool bindTimeoutLogged = false; bool editMoving = false; Vec3 liveMoveTarget{}; bool liveMovePending = false;   // runtime-only live binding/edit state; not serialized
                     bool aiEnabled = true; bool aiApplied = true; int behavior = 0; bool hidden = false; bool spawnPending = false; DWORD tick = 0;
                     int group = 0; int proj = 0; std::string label, note; uint64_t gen = 0; };
 
@@ -77,16 +77,21 @@ namespace core {
         float amount, strength, ax, az;
         float y;                     // ground height when painted (display only)
         int proj;                    // project the stroke belongs to (0 = painted since the last save), like SpawnedObj::proj
+        bool tileScoped = false;     // a stroke crossing a tile boundary is stored once for each affected tile
+        int tileX = 0, tileZ = 0;    // only the named tile receives this copy; legacy project rows are expanded on load
     };
     bool TerrainAvailable(); std::string TerrainStatus();
     void TerrainAddStroke(const TerrainStroke& s); bool TerrainUndo(); void TerrainClear();
     std::vector<TerrainStroke> TerrainStrokes();
+    bool TerrainRemoveTile(int tx, int tz, int project, std::vector<TerrainStroke>& removed, std::vector<size_t>& positions);
+    void TerrainRestoreStrokes(const std::vector<TerrainStroke>& strokes, const std::vector<size_t>& positions);
     void TerrainSetProject(int from, int to);                                     // strokes saved into a project become its members
     void TerrainReplaceProject(int proj, const std::vector<TerrainStroke>& strokes); // a project's strokes as loaded from its file
     bool TerrainNeedsApply(); void TerrainMarkApplied();
     bool TerrainApply(Vec3 back);        // fast travel 5 km away and back to 'back': the edited tiles stream again (async)
     std::string TerrainApplyState();     // "" when idle
     int TerrainPreviewGen();             // changes whenever the preview heights change
+    bool TerrainTilePreview(int tx, int tz, int project, int dim, std::vector<float>* delta); // downsampled edited-minus-original heights
     bool TerrainPreviewGrid(float x0, float z0, int nx, int nz, std::vector<float>* orig, std::vector<float>* edit);   // 2 m texel grid, NaN = not loaded
     // Travel (travel.cpp): the game's own fast travel to any position (loading screen; the world streams at the destination).
     bool TravelAvailable(); bool TravelPrepared(); void TravelPrepare(); std::string TravelStatus();
@@ -161,7 +166,7 @@ namespace core {
     void SetManagedNpcNote(int uid, const std::string& note);
     void SetManagedNpcLabel(int uid, const std::string& label);
     int  NpcState();                                  // 0 = not available in this game build, 1 = walk a few steps first (player actor unknown), 2 = ready
-    bool NpcAiControlAvailable();                      // native AI control-ownership request + actor registry resolved
+    bool NpcAiControlAvailable();                      // native NPC AI termination control resolved
 #ifdef WB_UNIFIED_HOST_TEST
     // Native boundaries only; registry, generation, desired AI state, queues and persistence remain production.
     struct ManagedNpcNativeTest {
@@ -357,6 +362,7 @@ namespace core {
     // validate-first copy of a shared .cdproj into bin64\cdmodkit\projects: malformed bytes are refused and
     // nothing appears on disk (the previous file of that name, if any, is untouched)
     bool ImportProjectFile(const std::string& path);
+    bool ImportGroupFile(const std::string& path);
     bool UnloadProject(int id); // false = busy/empty/invalid, no deferred unload; true = logical removal done, native cleanup may remain queued
     bool ReloadProject(const std::string& name); // same synchronous outcome as Load; ONE snapshot validated before any old entities are removed
     bool ProjectMutationPending(int id); // live AUTOSAVE/readiness gate only; false is NOT a success/completion receipt

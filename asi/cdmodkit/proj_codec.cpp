@@ -38,6 +38,11 @@ bool integer(std::string_view s, int& n, bool positive = false) {
     auto r = std::from_chars(s.data(), s.data() + s.size(), n);
     return r.ec == std::errc{} && r.ptr == s.data() + s.size() && (positive ? n > 0 : n >= 0);
 }
+bool signedInteger(std::string_view s, int& n) {
+    if (s.empty()) return false;
+    auto r = std::from_chars(s.data(), s.data() + s.size(), n);
+    return r.ec == std::errc{} && r.ptr == s.data() + s.size();
+}
 
 bool unsignedValue(std::string_view s, uint32_t& value) {
     if (s.empty()) return false;
@@ -93,9 +98,14 @@ bool terrainValid(const TerrainRecord& t) {
 }
 bool terrainRow(std::string_view s, TerrainRecord& t) {
     const auto v = split(s, '|');
-    if (v.size() < 7 || v.size() > 10 || !integer(v[1], t.mode)) return false;
+    if ((v.size() < 7 || v.size() > 10) && v.size() != 12) return false;
+    if (!integer(v[1], t.mode)) return false;
     double* values[] = { &t.x, &t.z, &t.r, &t.amount, &t.strength, &t.ax, &t.az, &t.y };
-    for (size_t i = 2; i < v.size(); ++i) if (!num(v[i], *values[i - 2])) return false;
+    for (size_t i = 2; i < std::min(v.size(), size_t(10)); ++i) if (!num(v[i], *values[i - 2])) return false;
+    if (v.size() == 12) {
+        if (!signedInteger(v[10], t.tileX) || !signedInteger(v[11], t.tileZ)) return false;
+        t.tileScoped = true;
+    }
     return terrainValid(t);
 }
 bool terrainDocumentValid(const Document& d, std::string& error) {
@@ -344,7 +354,8 @@ bool SameValues(const Document& a, const Document& b) {
     for (size_t i = 0; i < a.terrain.size(); ++i) {
         const auto& x = a.terrain[i]; const auto& y = b.terrain[i];
         if (x.mode != y.mode || x.x != y.x || x.z != y.z || x.r != y.r || x.amount != y.amount || x.strength != y.strength ||
-            x.ax != y.ax || x.az != y.az || x.y != y.y) return false;
+            x.ax != y.ax || x.az != y.az || x.y != y.y || x.tileScoped != y.tileScoped ||
+            x.tileX != y.tileX || x.tileZ != y.tileZ) return false;
     }
     return true;
 }
@@ -399,7 +410,8 @@ bool Serialize(const Document& d, std::string& text, std::string& error) {
             std::to_string(n.behavior) + "|" + std::to_string(n.group) + "|" + hex(n.label) + "|" + hex(n.note) + "\n";
     for (const auto& t : d.terrain)
         s += "#terrain|" + std::to_string(t.mode) + "|" + dec(t.x) + "|" + dec(t.z) + "|" + dec(t.r) + "|" +
-            dec(t.amount) + "|" + dec(t.strength) + "|" + dec(t.ax) + "|" + dec(t.az) + "|" + dec(t.y) + "\n";
+            dec(t.amount) + "|" + dec(t.strength) + "|" + dec(t.ax) + "|" + dec(t.az) + "|" + dec(t.y) +
+            (t.tileScoped ? "|" + std::to_string(t.tileX) + "|" + std::to_string(t.tileZ) : std::string()) + "\n";
     Document check;
     if (!Parse(s, d.kind == Kind::Group ? "out.cdgroup" : "out.cdproj", d.kind, check, error)) return false;
     if (!SameValues(expected, check)) return bad(error, 0, "serialization changed semantic values");
