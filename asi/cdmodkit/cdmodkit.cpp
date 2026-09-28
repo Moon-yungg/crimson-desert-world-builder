@@ -5358,7 +5358,7 @@ bool BeginManagedNpcMove(int uid) {
         if (psec[0] || psec[1] || fabsf(parent[0]) > 0.001f || fabsf(parent[1]) > 0.001f || fabsf(parent[2]) > 0.001f) { Log("[npc] managed #%d live move refused: actor is parented/attached", uid); return false; }
         // An NPC whose runtime AI is already off needs no native control request just to move. If AI is still active,
         // however, the edit transaction must be able to take control before queued transform writes begin.
-        queuePause = true;
+        queuePause = n.aiApplied;
         if (queuePause) {
             if (!NpcAiControlAvailable()) { Log("[npc] managed #%d live move: AI control is not available to pause the actor", uid); return false; }
         }

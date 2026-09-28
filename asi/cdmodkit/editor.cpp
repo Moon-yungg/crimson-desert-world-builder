@@ -857,6 +857,21 @@ namespace editor {
     static void CommitPlaceHistory(Place& P);
     static bool ApplyCarriedPose(const Place& candidate, bool send);
     static bool g_placeHudDrawn = false;
+    static void DrawPlacementSnapControls() {
+        ImGui::Checkbox(T("snap"), &g_snap);
+        SameLineOrWrap(true, ImGui::CalcTextSize(T("position")).x);
+        ImGui::TextUnformatted(T("position"));
+        SameLineOrWrap(true, 85.0f);
+        ImGui::SetNextItemWidth(std::min(80.0f, ImGui::GetContentRegionAvail().x));
+        ComboT("##snappos", &g_snapPosIdx, kSnapPosNames, 5);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("grid and angle steps for the placement mode"));
+        SameLineOrWrap(true, ImGui::CalcTextSize(T("Rotate")).x);
+        ImGui::TextUnformatted(T("Rotate"));
+        SameLineOrWrap(true, 85.0f);
+        ImGui::SetNextItemWidth(std::min(80.0f, ImGui::GetContentRegionAvail().x));
+        ComboT("##snapyaw", &g_snapYawIdx, kSnapYawNames, 5);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("grid and angle steps for the placement mode"));
+    }
     static void DrawPlaceHud(bool embedded = false, float top = -1.0f) {
         g_placeHudDrawn = true; Place P = g_place; ImGuiIO& io = ImGui::GetIO();
         const auto& style = ImGui::GetStyle();
@@ -874,7 +889,7 @@ namespace editor {
             SameLineForControl("Cancel"); if (ImGui::Button(T("Cancel"))) CancelCarried();
             SameLineForControl("To ground"); if (ImGui::Button(T("To ground"))) StartGroundSnap(P);
             if (!P.hasNpc) { SameLineForControl("level"); if (ImGui::Button(T("level"))) { if (P.m.size() == 1) { P.pitch = -P.m[0].rot0.pitch; P.roll = -P.m[0].rot0.roll; } else { P.pitch = P.roll = 0; } P.dirty = P.touched = true; CommitPlaceHistory(P); } }
-            SameLineForControl("snap", true); ImGui::Checkbox(T("snap"), &g_snap);
+            DrawPlacementSnapControls();
             // Explicit translation controls are useful when a world-space gizmo handle is hard to hit (especially for NPCs).
             // They operate on the same placement transaction, so one click is one undoable move and NPC AI stays paused until Drop.
             const float moveStep = g_snap ? kSnapPos[g_snapPosIdx] : 0.25f;
@@ -3038,13 +3053,14 @@ namespace editor {
         dl->AddRectFilled(min, max, IM_COL32(27, 36, 43, 255), 4.0f);
         dl->PushClipRect(min, max, true);
         constexpr int dim = 32;
-        struct Preview { int generation = -1; bool ready = false; std::vector<float> delta; float peak = 0; };
+        struct Preview { int generation = -1; DWORD attempted = 0; bool ready = false; std::vector<float> delta; float peak = 0; };
         static std::map<std::tuple<int, int, int>, Preview> previews;
         if (previews.size() > 256) previews.clear();
         Preview& preview = previews[{ tile.tx, tile.tz, tile.project }];
         const int generation = core::TerrainPreviewGen();
-        if (preview.generation != generation) {
+        if (preview.generation != generation || (!preview.ready && GetTickCount() - preview.attempted >= 1000)) {
             preview.generation = generation;
+            preview.attempted = GetTickCount();
             preview.ready = core::TerrainTilePreview(tile.tx, tile.tz, tile.project, dim, &preview.delta);
             preview.peak = 0;
             if (preview.ready) for (float value : preview.delta) preview.peak = std::max(preview.peak, std::fabs(value));
@@ -3060,11 +3076,18 @@ namespace editor {
                 const ImVec2 b(min.x + size.x * (x + 1) / dim, min.y + size.y * (y + 1) / dim);
                 dl->AddRectFilled(a, b, color);
             }
-        } else if (size.x >= 80.0f) {
-            const char* label = T("no preview");
-            const ImVec2 textSize = ImGui::CalcTextSize(label);
-            dl->AddText(ImVec2(min.x + (size.x - textSize.x) * 0.5f, min.y + (size.y - textSize.y) * 0.5f),
-                IM_COL32(170, 183, 194, 255), label);
+        } else {
+            // Unloaded tiles have no sampled heights yet. Show the saved stroke footprint until the tile streams in.
+            const size_t begin = tile.strokes.size() > 256 ? tile.strokes.size() - 256 : 0;
+            for (size_t i = begin; i < tile.strokes.size(); ++i) {
+                const auto& stroke = tile.strokes[i];
+                const float u = std::clamp((stroke.x - tile.tx * 1024.0f) / 1024.0f, 0.0f, 1.0f);
+                const float v = std::clamp((stroke.z - tile.tz * 1024.0f) / 1024.0f, 0.0f, 1.0f);
+                const float radius = std::max(2.5f, stroke.r * size.x / 1024.0f);
+                const ImU32 color = stroke.mode == core::TerrainFlatten ? IM_COL32(115, 210, 145, 175) :
+                    stroke.amount >= 0 ? IM_COL32(255, 177, 91, 175) : IM_COL32(91, 175, 255, 175);
+                dl->AddCircleFilled(ImVec2(min.x + u * size.x, max.y - v * size.y), radius, color, 12);
+            }
         }
         dl->AddRect(min, max, IM_COL32(105, 127, 143, 255), 4.0f, 0, 1.0f);
         dl->PopClipRect();
@@ -3424,6 +3447,11 @@ namespace editor {
             SameLineForControl("click selects group", true);
         }
         ImGui::Checkbox(T("click selects group"),&g_selectGroups); SameLineForControl("show deleted", true); ImGui::Checkbox(T("show deleted"),&g_showDeleted);
+        DrawPlacementSnapControls();
+        SameLineOrWrap(compact, 75.0f);
+        ImGui::SetNextItemWidth(std::min(70.0f, ImGui::GetContentRegionAvail().x));
+        DragFloatEdit("##rotstep", &g_rotationStep, 1.0f, 1.0f, 90.0f, "%.0f deg");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("rotation step for Rotate - / Rotate +"));
         SameLineForControl("Clear selection"); ImGui::BeginDisabled(!SceneHasSelection() && !g_terrainTileSelected); if(ImGui::Button(T("Clear selection")))ClearSceneSelection(); ImGui::EndDisabled();
         SameLineForControl("Undo"); ImGui::BeginDisabled(g_undo.empty()); if(ImGui::Button(T("Undo")))Undo(); ImGui::EndDisabled();
         SameLineForControl("Redo"); ImGui::BeginDisabled(g_redo.empty()); if(ImGui::Button(T("Redo")))Redo(); ImGui::EndDisabled();
