@@ -3327,6 +3327,9 @@ namespace editor {
         }
         g_sceneLastEntity = 0; g_editUid = 0;
     }
+    static int CardGridColumns(float availableWidth, float cardWidth, float spacing) {
+        return std::max(1, (int)((availableWidth + spacing) / (cardWidth + spacing)));
+    }
     // scene as tiles: loose objects first, then every group as a framed block with its own header (click = select all, arrow = collapse)
     // Unified Scene cards: prefab objects and managed NPCs are peers in the same ordered/grouped collection.
     static void DrawSceneCards(const std::vector<SpawnedObj>& objects, const std::vector<ManagedNpc>& npcs,
@@ -3339,7 +3342,7 @@ namespace editor {
         const float pad = 4.0f * ui, tile = g_cardSize * ui, textH = ImGui::GetTextLineHeight() * 2 + 3;
         const float cw = tile + 2 * pad, ch = tile + 2 * pad + textH;
         ImGui::BeginChild("scenecards", ImVec2(0, listH), ImGuiChildFlags_Borders);
-        const float sp = ImGui::GetStyle().ItemSpacing.x; const int cols = std::max(1, (int)((ImGui::GetContentRegionAvail().x + sp) / (cw + sp)));
+        const float sp = ImGui::GetStyle().ItemSpacing.x; const int cols = CardGridColumns(ImGui::GetContentRegionAvail().x, cw, sp);
         ImDrawList* dl = ImGui::GetWindowDrawList();
         auto card = [&](int ei) {
             const SceneEntityRef& e = entities[ei]; const std::string name = SceneEntityName(e, objects, npcs, chars); const Vec3 pos = SceneEntityPos(e, objects, npcs);
@@ -3611,9 +3614,9 @@ namespace editor {
     static core::SavedLibrarySnapshot g_projectLibrary;
     static core::SavedFile g_librarySelected;
     static std::vector<size_t> g_libraryRows;
-    static std::map<std::string, ULONGLONG> g_badBlueprintThumbnailStamps;
-    static std::map<std::string, DWORD> g_pendingBlueprintThumbnailTicks;
-    static std::set<std::string> g_currentBlueprintThumbnails;
+    static std::map<std::string, ULONGLONG> g_badSavedThumbnailStamps;
+    static std::map<std::string, DWORD> g_pendingSavedThumbnailTicks;
+    static std::set<std::string> g_currentSavedThumbnails;
     static char g_librarySearch[256] = {};
     static int g_libraryLocation = 0;
     static bool g_libraryShowingBlueprints = false;
@@ -3720,7 +3723,7 @@ namespace editor {
     }
     static void RefreshProjectLibrary() {
         if (!g_projectRefresh) return;
-        g_projectRefresh = false; g_badBlueprintThumbnailStamps.clear(); g_libraryResult = core::RefreshSavedLibrary(g_projectLibrary);
+        g_projectRefresh = false; g_badSavedThumbnailStamps.clear(); g_libraryResult = core::RefreshSavedLibrary(g_projectLibrary);
         if (!g_libraryResult.ok()) return;
         g_projectAutoload = core::Autoload(); g_libraryFilterDirty = true;
         if (std::none_of(g_projectLibrary.entries.begin(), g_projectLibrary.entries.end(), [](const auto& row) { return SameSavedFile(row.file, g_librarySelected); })) g_librarySelected = {};
@@ -3741,40 +3744,41 @@ namespace editor {
         if (!valid && reportError) g_projectStatus = error;
         return valid;
     }
-    static std::string BlueprintThumbnailPath(const ProjectFile& file) {
+    static std::string SavedThumbnailPath(const ProjectFile& file) {
         std::string path = ProjectFilePath(file);
         if (path.size() >= 8 && _stricmp(path.c_str() + path.size() - 8, ".cdgroup") == 0) path.resize(path.size() - 8);
+        else if (path.size() >= 7 && _stricmp(path.c_str() + path.size() - 7, ".cdproj") == 0) path.resize(path.size() - 7);
         return path + ".png";
     }
-    static bool GenerateBlueprintThumbnail(const ProjectFile& file, const proj_codec::Document& doc) {
-        if (doc.records.empty()) return false;
-        const std::string png = BlueprintThumbnailPath(file);
-        thumbgen::RequestBlueprint(doc, png);
-        g_pendingBlueprintThumbnailTicks[png] = GetTickCount();
+    static bool GenerateSavedThumbnail(const ProjectFile& file, const proj_codec::Document& doc) {
+        if (doc.records.empty() && doc.npcs.empty() && doc.terrain.empty()) return false;
+        const std::string png = SavedThumbnailPath(file);
+        thumbgen::RequestDocumentThumbnail(doc, png);
+        g_pendingSavedThumbnailTicks[png] = GetTickCount();
         return true;
     }
-    static void EnsureBlueprintThumbnail(const ProjectFile& file) {
-        const std::string path = BlueprintThumbnailPath(file), source = ProjectFilePath(file);
+    static void EnsureSavedThumbnail(const ProjectFile& file) {
+        const std::string path = SavedThumbnailPath(file), source = ProjectFilePath(file);
         WIN32_FILE_ATTRIBUTE_DATA thumbInfo{}, sourceInfo{};
         if (!GetFileAttributesExA(source.c_str(), GetFileExInfoStandard, &sourceInfo) ||
             (sourceInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return;
         const bool haveThumb = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &thumbInfo) &&
             !(thumbInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
-        if (thumbgen::BlueprintPending(path)) return;
-        if (haveThumb && !g_currentBlueprintThumbnails.count(path)) {
+        if (thumbgen::DocumentThumbnailPending(path)) return;
+        if (haveThumb && !g_currentSavedThumbnails.count(path)) {
             int w = 0, h = 0, comp = 0; unsigned char* old = stbi_load(path.c_str(), &w, &h, &comp, 4);
-            if (old && w == 320 && h == 240 && old[3] == 0) g_currentBlueprintThumbnails.insert(path);
+            if (old && w == 320 && h == 240 && old[3] == 0) g_currentSavedThumbnails.insert(path);
             if (old) stbi_image_free(old);
         }
-        const auto pending = g_pendingBlueprintThumbnailTicks.find(path);
-        if (pending != g_pendingBlueprintThumbnailTicks.end() && GetTickCount() - pending->second < 2000) return;
-        if (haveThumb && g_currentBlueprintThumbnails.count(path) &&
+        const auto pending = g_pendingSavedThumbnailTicks.find(path);
+        if (pending != g_pendingSavedThumbnailTicks.end() && GetTickCount() - pending->second < 2000) return;
+        if (haveThumb && g_currentSavedThumbnails.count(path) &&
             CompareFileTime(&thumbInfo.ftLastWriteTime, &sourceInfo.ftLastWriteTime) >= 0) return;
         const ULONGLONG stamp = ((ULONGLONG)sourceInfo.ftLastWriteTime.dwHighDateTime << 32) | sourceInfo.ftLastWriteTime.dwLowDateTime;
-        if (const auto it = g_badBlueprintThumbnailStamps.find(source); it != g_badBlueprintThumbnailStamps.end() && it->second == stamp) return;
+        if (const auto it = g_badSavedThumbnailStamps.find(source); it != g_badSavedThumbnailStamps.end() && it->second == stamp) return;
         proj_codec::Document doc;
-        if (!ReadProjectFile(file, doc, false) || !GenerateBlueprintThumbnail(file, doc)) g_badBlueprintThumbnailStamps[source] = stamp;
-        else g_badBlueprintThumbnailStamps.erase(source);
+        if (!ReadProjectFile(file, doc, false) || !GenerateSavedThumbnail(file, doc)) g_badSavedThumbnailStamps[source] = stamp;
+        else g_badSavedThumbnailStamps.erase(source);
     }
     static bool SaveProjectAction(const std::string& rawName, int scope, bool approved) {
         const bool inPlace = scope == core::SaveProjectOnly || scope == core::SaveProjectAndNew;
@@ -3788,7 +3792,13 @@ namespace editor {
         if (g_projectCommandPending || g_place.active || g_numericSceneUid || g_numericNpcUid) { g_projectStatus = "finish-edit-before-save"; return false; }
         if (!PrepareHistoryMutation([name, scope, approved]() { SaveProjectAction(name, scope, approved); })) return false;
         const bool ok = core::SaveProject(name, scope); g_projectStatus = ok ? "saved" : core::ProjectError();
-        if (ok) { g_projectRefresh = true; if (!inPlace) strncpy_s(g_projName, name.c_str(), _TRUNCATE); }
+        if (ok) {
+            g_projectRefresh = true;
+            if (!inPlace) strncpy_s(g_projName, name.c_str(), _TRUNCATE);
+            const ProjectFile file{ name, proj_codec::Kind::Project };
+            proj_codec::Document doc;
+            if (ReadProjectFile(file, doc, false)) GenerateSavedThumbnail(file, doc);
+        }
         return ok;
     }
     static void PublishProjectContext() {
@@ -3826,7 +3836,7 @@ namespace editor {
         PublishProjectContext(); RefreshExportApproval(); bool ok = false;
         if (!g_exportApproval.valid) g_exportStatus = "preflight-changed";
         else ok = core::WriteGroupExport(g_exportApproval, g_exportStatus);
-        if (ok) { g_exportStatus = "written"; GenerateBlueprintThumbnail({ g_blueprintName, proj_codec::Kind::Group, false, g_exportApproval.path }, g_exportApproval.document); g_projectRefresh = true; g_exportOpen = false; }
+        if (ok) { g_exportStatus = "written"; GenerateSavedThumbnail({ g_blueprintName, proj_codec::Kind::Group, false, g_exportApproval.path }, g_exportApproval.document); g_projectRefresh = true; g_exportOpen = false; }
         if (g_exportAttempt) g_exportAttempts[g_exportAttempt - 1].result = g_exportStatus;
         g_exportApproval.valid = false; g_exportObjects.clear(); g_exportAttempt = 0; return ok;
     }
@@ -3848,7 +3858,7 @@ namespace editor {
         proj_codec::Document doc; if (action == ProjectAction::Read) g_projectReadValid = false;
         if (!ReadProjectFile(file, doc)) { g_projectFileFailures.push_back({ action == ProjectAction::Read ? "Read" : "Place", ProjectFilePath(file), g_projectStatus }); return false; }
         if (action == ProjectAction::Read) { g_projectRead = std::move(doc); g_projectReadPath = ProjectFilePath(file); g_projectReadValid = true; g_projectDetails.erase("read-preview"); return true; }
-        if (action == ProjectAction::Overwrite) { strncpy_s(g_blueprintName, file.name.c_str(), _TRUNCATE); g_exportOpen = true; g_exportOverwrite = false; ResetExportApproval(); PublishProjectContext(); return true; }
+        if (action == ProjectAction::Overwrite) { strncpy_s(g_blueprintName, file.name.c_str(), _TRUNCATE); g_exportOpen = true; g_exportOverwrite = false; g_projectDetails.insert("create-blueprint"); ResetExportApproval(); PublishProjectContext(); return true; }
         if (g_place.active) {
             DropCarried();
             if (g_place.active) {
@@ -3935,15 +3945,16 @@ namespace editor {
         const core::SavedFile file = core::SelectedFile(g_libraryAction.selection);
         g_libraryAction.result = core::ExecuteFileAction(g_libraryAction.selection, g_libraryAction.action, file.filename, GuardLibraryFile);
         if (!g_libraryAction.result.ok()) return false;
-        if (file.kind == proj_codec::Kind::Group) {
-            const ProjectFile blueprint{ file.filename.substr(0, file.filename.size() - 8), file.kind, file.archived, file.path };
-            const std::string thumbnail = BlueprintThumbnailPath(blueprint);
+        {
+            const size_t extension = file.kind == proj_codec::Kind::Group ? 8 : 7;
+            const ProjectFile saved{ file.filename.substr(0, file.filename.size() - extension), file.kind, file.archived, file.path };
+            const std::string thumbnail = SavedThumbnailPath(saved);
             if (!DeleteFileA(thumbnail.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND)
-                core::Log("[blueprint] could not remove obsolete thumbnail %s (error %lu)", thumbnail.c_str(), GetLastError());
+                core::Log("[library] could not remove obsolete thumbnail %s (error %lu)", thumbnail.c_str(), GetLastError());
             overlay::InvalidateThumb(thumbnail);
-            g_badBlueprintThumbnailStamps.erase(file.path);
-            g_pendingBlueprintThumbnailTicks.erase(thumbnail);
-            g_currentBlueprintThumbnails.erase(thumbnail);
+            g_badSavedThumbnailStamps.erase(file.path);
+            g_pendingSavedThumbnailTicks.erase(thumbnail);
+            g_currentSavedThumbnails.erase(thumbnail);
             if (g_projectReadPath == file.path) g_projectReadValid = false;
         }
         g_projectRefresh = true; g_projectStatus.clear(); return true;
@@ -3979,33 +3990,34 @@ namespace editor {
         const size_t archiveCount = groupKind ? g_projectLibrary.archived.groups : g_projectLibrary.archived.projects;
         ImGui::TextDisabled(T("%zu active / %zu archived / %zu shown"), activeCount, archiveCount, g_libraryRows.size());
         if (!g_libraryResult.ok()) ImGui::TextWrapped("%s: %s (%lu)", T("Library refresh failed"), ProjectUiStatus(core::FileReasonCode(g_libraryResult.reason)), g_libraryResult.systemError);
-        const float stride = ImGui::GetFrameHeightWithSpacing();
-        const int visibleRows = std::min(7, (int)g_libraryRows.size());
-        if (visibleRows == 0) ImGui::TextDisabled("%s", T("No matching saved files"));
-        else if (groupKind) {
-            const float width = ImGui::GetContentRegionAvail().x;
+        if (g_libraryRows.empty()) ImGui::TextDisabled("%s", T("No matching saved files"));
+        else {
+            const float ui = ImGui::GetFontSize() / 17.0f;
             const float spacing = ImGui::GetStyle().ItemSpacing.x;
-            const int columns = width >= 190.0f ? 2 : 1;
-            const float cardWidth = std::max(80.0f, (width - 16.0f - spacing * (columns - 1)) / columns);
-            const float imageHeight = cardWidth * 0.75f;
+            const float cardWidth = g_cardSize * ui + 8.0f * ui;
+            const float imageHeight = g_cardSize * ui * 0.75f;
             const float cardHeight = imageHeight + ImGui::GetTextLineHeightWithSpacing() + 10.0f;
-            const int rows = ((int)g_libraryRows.size() + columns - 1) / columns;
-            if (ImGui::BeginChild("blueprint-gallery", ImVec2(0, std::min(350.0f, rows * (cardHeight + spacing) + 12.0f)), ImGuiChildFlags_Borders)) {
+            const float available = std::max(1.0f, ImGui::GetContentRegionAvail().x - 2.0f * ImGui::GetStyle().WindowPadding.x);
+            const int estimatedColumns = CardGridColumns(available, cardWidth, spacing);
+            const int rows = ((int)g_libraryRows.size() + estimatedColumns - 1) / estimatedColumns;
+            if (ImGui::BeginChild("saved-gallery", ImVec2(0, std::min(350.0f, rows * (cardHeight + spacing) + 12.0f)), ImGuiChildFlags_Borders)) {
+                const int columns = CardGridColumns(ImGui::GetContentRegionAvail().x, cardWidth, spacing);
                 for (size_t n = 0; n < g_libraryRows.size(); ++n) {
-                    const auto& saved = g_projectLibrary.entries[g_libraryRows[n]].file;
-                    const ProjectFile file{ saved.filename.substr(0, saved.filename.size() - 8), saved.kind, saved.archived, saved.path };
-                    EnsureBlueprintThumbnail(file);
+                    const auto& row = g_projectLibrary.entries[g_libraryRows[n]];
+                    const auto& saved = row.file;
+                    const ProjectFile file{ saved.filename.substr(0, saved.filename.size() - (groupKind ? 8 : 7)), saved.kind, saved.archived, saved.path };
+                    EnsureSavedThumbnail(file);
                     ImGui::PushID(saved.path.c_str());
                     const ImVec2 start = ImGui::GetCursorScreenPos();
                     const bool selected = SameSavedFile(saved, g_librarySelected);
-                    if (ImGui::InvisibleButton("##blueprint-card", ImVec2(cardWidth, cardHeight))) g_librarySelected = saved;
+                    if (ImGui::InvisibleButton("##saved-card", ImVec2(cardWidth, cardHeight))) g_librarySelected = saved;
                     const bool hovered = ImGui::IsItemHovered();
-                    if (!saved.archived && hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    if (groupKind && !saved.archived && hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                         DispatchProjectAction(file, ProjectAction::Place);
-                    if (!saved.archived && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) {
+                    if (groupKind && !saved.archived && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) {
                         g_blueprintDragFile = file; g_blueprintDragging = true;
                     }
-                    if (ImGui::BeginPopupContextItem("##blueprint-actions")) {
+                    if (groupKind && ImGui::BeginPopupContextItem("##blueprint-actions")) {
                         g_librarySelected = saved;
                         if (!saved.archived) {
                             if (ImGui::MenuItem(T("Place"))) DispatchProjectAction(file, ProjectAction::Place);
@@ -4021,10 +4033,20 @@ namespace editor {
                     ImDrawList* dl = ImGui::GetWindowDrawList();
                     const ImVec2 end{ start.x + cardWidth, start.y + cardHeight };
                     dl->AddRectFilled(start, end, ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
-                    if (ImTextureID image = overlay::Thumb(BlueprintThumbnailPath(file)))
-                        dl->AddImage(image, ImVec2(start.x + 3, start.y + 3), ImVec2(start.x + cardWidth - 3, start.y + imageHeight + 3));
+                    const ImVec2 imageMin{ start.x + 4.0f, start.y + 4.0f };
+                    const ImVec2 imageMax{ end.x - 4.0f, start.y + imageHeight + 4.0f };
+                    if (ImTextureID image = overlay::Thumb(SavedThumbnailPath(file)))
+                        dl->AddImage(image, imageMin, imageMax);
+                    else {
+                        dl->AddRectFilled(imageMin, imageMax, ImGui::GetColorU32(ImGuiCol_FrameBgHovered), 3.0f);
+                        const char* icon = groupKind ? ICON_CUBE : ICON_FLOPPY_DISK;
+                        const ImVec2 size = ImGui::CalcTextSize(icon);
+                        dl->AddText(ImVec2((imageMin.x + imageMax.x - size.x) * 0.5f, (imageMin.y + imageMax.y - size.y) * 0.5f),
+                            ImGui::GetColorU32(ImGuiCol_TextDisabled), icon);
+                    }
                     dl->PushClipRect(ImVec2(start.x + 4, start.y + imageHeight + 4), ImVec2(end.x - 4, end.y - 2), true);
-                    dl->AddText(ImVec2(start.x + 5, start.y + imageHeight + 6), ImGui::GetColorU32(ImGuiCol_Text), file.name.c_str());
+                    const std::string label = file.name + (row.ownership.dirty ? " *" : "") + (saved.archived ? " [A]" : "");
+                    dl->AddText(ImVec2(start.x + 5, start.y + imageHeight + 6), ImGui::GetColorU32(ImGuiCol_Text), label.c_str());
                     dl->PopClipRect();
                     dl->AddRect(start, end, ImGui::GetColorU32(selected ? ImGuiCol_HeaderActive : ImGuiCol_Border), 4.0f, 0, selected ? 2.0f : 1.0f);
                     if (hovered) ImGui::SetTooltip("%s", saved.path.c_str());
@@ -4034,19 +4056,6 @@ namespace editor {
             }
             ImGui::EndChild();
         }
-        else if (ImGui::BeginChild("saved-library", ImVec2(0, stride * visibleRows + ImGui::GetStyle().WindowPadding.y), ImGuiChildFlags_Borders)) {
-            ImGuiListClipper clipper; clipper.Begin((int)g_libraryRows.size(), stride);
-            while (clipper.Step()) for (int n = clipper.DisplayStart; n < clipper.DisplayEnd; ++n) {
-                const auto& row = g_projectLibrary.entries[g_libraryRows[n]]; const auto& file = row.file;
-                ImGui::PushID(file.path.c_str());
-                const bool selected = SameSavedFile(file, g_librarySelected);
-                const std::string label = file.filename + (row.ownership.dirty ? " *" : "") + (file.archived ? " [A]" : "");
-                if (ImGui::Selectable((label + "###saved-file").c_str(), selected, 0, ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight()))) g_librarySelected = file;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", file.path.c_str());
-                ImGui::PopID();
-            }
-        }
-        if (visibleRows > 0 && !groupKind) ImGui::EndChild();
         if (!groupKind) for (size_t index : g_libraryRows) {
             const auto row = g_projectLibrary.entries[index]; const auto& saved = row.file;
             if (!SameSavedFile(saved, g_librarySelected)) continue;
@@ -4173,18 +4182,19 @@ namespace editor {
         ImGui::PushStyleColor(ImGuiCol_Text, autosave ? ImVec4(0.45f, 0.9f, 0.55f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::Text("%s: %s", T("Auto-save"), T(autosave ? "ON" : "OFF")); ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("New objects, NPCs and terrain are saved to their editing project."));
-        ImGui::SeparatorText(T("Create project"));
-        SetLabeledItemWidth("project name", 260); InputTextI18n(TStable("project name"), "", name, sizeof name);
-        ImGui::BeginDisabled(!name[0]);
-        if (ImGui::Button(T("Create project"))) {
-            const std::string project = name;
-            const std::string path = core::ModDir() + "\\projects\\" + project + ".cdproj";
-            if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) g_projectStatus = "Collision";
-            else if (core::SaveProject(project, core::SaveProjectOnly) && core::SetEditingProject(project)) {
-                name[0] = 0; g_projectRefresh = true; ClearSceneSelection(); g_projectStatus = "saved";
-            } else g_projectStatus = core::ProjectError();
+        if (ProjectDisclosure(T("Create project"), "create-project")) {
+            SetLabeledItemWidth("project name", 260); InputTextI18n(TStable("project name"), "", name, sizeof name);
+            ImGui::BeginDisabled(!name[0]);
+            if (ImGui::Button(T("Create project"))) {
+                const std::string project = name;
+                const std::string path = core::ModDir() + "\\projects\\" + project + ".cdproj";
+                if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) g_projectStatus = "Collision";
+                else if (core::SaveProject(project, core::SaveProjectOnly) && core::SetEditingProject(project)) {
+                    name[0] = 0; g_projectRefresh = true; ClearSceneSelection(); g_projectStatus = "saved";
+                } else g_projectStatus = core::ProjectError();
+            }
+            ImGui::EndDisabled();
         }
-        ImGui::EndDisabled();
         ProjectButtonWrap("Import project file");
         if (ImGui::Button(T("Import project file"))) {
             char file[MAX_PATH] = { 0 }; OPENFILENAMEA ofn = {}; ofn.lStructSize = sizeof ofn; ofn.lpstrFilter = "World Builder project (*.cdproj)\0*.cdproj\0All files\0*.*\0"; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
@@ -4196,18 +4206,18 @@ namespace editor {
         DrawProjectReports();
     }
     static void DrawBlueprintsPage() {
+        if (ProjectDisclosure(T("Create blueprint"), "create-blueprint")) {
+            SetLabeledItemWidth("Blueprint name", 300);
+            if (InputTextI18n(T("Blueprint name"), "", g_blueprintName, sizeof g_blueprintName)) ResetExportApproval();
+            if (FittedCheckbox(T("Approve existing-file overwrite"), &g_exportOverwrite)) ResetExportApproval();
+            ImGui::BeginDisabled(!g_blueprintName[0]);
+            if (FittedButton(T("Write blueprint"))) { g_exportOpen = true; if (ProjectExportPreflight()) ProjectExportWrite(); }
+            ImGui::EndDisabled();
+            if (g_exportOpen) { ProjectButtonWrap("Cancel export"); if (ImGui::Button(T("Cancel export"))) { g_exportOpen = false; ResetExportApproval(); g_exportOverwrite = false; } }
+        }
         ImGui::TextDisabled("%s", T("Blueprints are reusable object groups. They are stored separately from projects and do not load into the scene until placed."));
         ImGui::TextWrapped("%s", T("Double-click or drag a blueprint into the world to place it in the editing project."));
         DrawSavedLibrary(true);
-        ImGui::SeparatorText(T("Create blueprint"));
-        if (ImGui::Button(T("Export selection as blueprint"))) { g_exportOpen = true; g_exportOverwrite = false; ResetExportApproval(); }
-        if (g_exportOpen) {
-            SetLabeledItemWidth("Blueprint name", 300); InputTextI18n(T("Blueprint name"), "", g_blueprintName, sizeof g_blueprintName);
-            if (FittedCheckbox(T("Approve existing-file overwrite"), &g_exportOverwrite)) ResetExportApproval();
-            ProjectButtonWrap("Write blueprint");
-            if (FittedButton(T("Write blueprint")) && ProjectExportPreflight()) ProjectExportWrite();
-            ProjectButtonWrap("Cancel export"); if (ImGui::Button(T("Cancel export"))) { g_exportOpen = false; ResetExportApproval(); g_exportOverwrite = false; }
-        }
         if (!g_exportStatus.empty()) ImGui::TextWrapped("%s: %s", T("Export status"), ProjectUiStatus(g_exportStatus.c_str()));
         ImGui::SeparatorText(T("Blueprint file"));
         if (ImGui::Button(T("Import blueprint"))) {
@@ -4219,7 +4229,7 @@ namespace editor {
                 if (core::ImportGroupFile(path)) {
                     const std::string importPath(path), base = importPath.substr(importPath.find_last_of("\\/") + 1);
                     const ProjectFile file{ base.substr(0, base.size() - 8), proj_codec::Kind::Group, false, core::ModDir() + "\\groups\\" + base };
-                    proj_codec::Document doc; if (ReadProjectFile(file, doc, false)) GenerateBlueprintThumbnail(file, doc);
+                    proj_codec::Document doc; if (ReadProjectFile(file, doc, false)) GenerateSavedThumbnail(file, doc);
                     Note(T("imported %s"), importPath.c_str()); g_projectRefresh = true;
                 } else { g_projectStatus = core::ProjectError(); Note(T("blueprint import failed")); }
             }

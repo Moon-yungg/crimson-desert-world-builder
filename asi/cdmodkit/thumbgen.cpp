@@ -1263,9 +1263,9 @@ static bool LoadCharacters(const std::string& lang) {
 // ---------------------------------------------------------------- worker
 static std::mutex g_mu;
 static std::deque<std::string> g_requests;
-struct BlueprintJob { proj_codec::Document document; std::string png; int attempts = 0; };
-static std::deque<BlueprintJob> g_blueprintJobs;
-static std::unordered_set<std::string> g_blueprintPending;
+struct DocumentThumbnailJob { proj_codec::Document document; std::string png; int attempts = 0; };
+static std::deque<DocumentThumbnailJob> g_documentThumbnailJobs;
+static std::unordered_set<std::string> g_documentThumbnailPending;
 // browser requests: last time the tile asked (every frame while visible); 0 = sticky (Refresh). The worker takes the newest
 // and drops the ones not asked for in 1.5 s, so after scrolling through hundreds of tiles the ones on screen come first.
 static std::unordered_map<std::string, DWORD> g_reqSeen;
@@ -1370,18 +1370,29 @@ static bool GenerateGuarded(const std::string& logical, float dims[6], std::stri
     return false;
 }
 
-// Render a saved group from its actual prefab meshes. The record transform is applied after
+// Render a saved document from its actual prefab meshes. The record transform is applied after
 // each prefab's own node transform, exactly as the game places that prefab in the world.
-static bool RenderBlueprintDocument(const proj_codec::Document& doc, const std::string& png, std::string& why) {
+static bool RenderDocumentThumbnail(const proj_codec::Document& doc, const std::string& png, std::string& why) {
     g_readError = false;
     Mesh all; std::vector<uint16_t> faces; std::vector<Surface> surfaces;
+    std::vector<proj_codec::Record> records = doc.records;
+    if (doc.kind == proj_codec::Kind::Project && !doc.npcs.empty()) {
+        const auto characters = thumbgen::Characters();
+        if (!characters) { why = "read error"; return false; }
+        for (const auto& npc : doc.npcs) {
+            const auto found = std::find_if(characters->begin(), characters->end(), [&](const auto& c) { return c.key == npc.key; });
+            if (found == characters->end() || found->app.empty()) continue;
+            proj_codec::Record appearance; appearance.prefab = found->app; appearance.pos = npc.pos;
+            records.push_back(std::move(appearance));
+        }
+    }
     const proj_codec::Point origin = doc.hasBounds ? doc.bounds.anchor :
-        doc.records.empty() ? proj_codec::Point{} : doc.records.front().pos;
+        !records.empty() ? records.front().pos : !doc.terrain.empty() ? proj_codec::Point{ doc.terrain.front().x, doc.terrain.front().y, doc.terrain.front().z } : proj_codec::Point{};
     size_t rendered = 0;
-    for (const auto& record : doc.records) {
+    for (const auto& record : records) {
         if (record.state != proj_codec::Record::State::Placeable) continue;
         std::vector<Node> roots;
-        if (!LoadPrefabRoots(record.prefab, roots, nullptr)) continue;
+        if (!(EndsWith(record.prefab, ".app_xml") ? LoadAppearanceRoots(record.prefab, roots, nullptr) : LoadPrefabRoots(record.prefab, roots, nullptr))) continue;
         std::vector<Inst> instances;
         const float identity[9] = { 1,0,0, 0,1,0, 0,0,1 }, zero[3] = {};
         CollectCtx context; context.chain.push_back(record.prefab);
@@ -1439,18 +1450,48 @@ static bool RenderBlueprintDocument(const proj_codec::Document& doc, const std::
             ++rendered;
         }
     }
+    uint16_t terrainMaterials[3] = { 0xFFFF, 0xFFFF, 0xFFFF };
+    if (doc.kind == proj_codec::Kind::Project) for (const auto& terrain : doc.terrain) {
+        const float radius = (float)std::max(0.5, terrain.r);
+        const float x = (float)(terrain.x - origin.x), y = (float)(terrain.y - origin.y), z = (float)(terrain.z - origin.z);
+        const uint32_t base = (uint32_t)(all.v.size() / 3);
+        const int style = terrain.mode == 2 ? 2 : terrain.amount >= 0 ? 0 : 1;
+        if (terrainMaterials[style] == 0xFFFF) {
+            if (surfaces.size() >= 0xFFFE) { why = "too many materials"; return false; }
+            Surface surface; surface.col[0] = style == 2 ? 0.48f : style == 0 ? 0.60f : 0.42f;
+            surface.col[1] = style == 2 ? 0.60f : style == 0 ? 0.53f : 0.38f;
+            surface.col[2] = style == 2 ? 0.42f : 0.35f; surface.uvScale = 1.0f;
+            terrainMaterials[style] = (uint16_t)surfaces.size(); surfaces.push_back(std::move(surface));
+        }
+        const uint16_t material = terrainMaterials[style];
+        all.v.insert(all.v.end(), { x, y + (float)std::clamp(terrain.amount, -1.0, 1.0), z }); all.uv.insert(all.uv.end(), { 0.5f, 0.5f });
+        for (int k = 0; k < 16; ++k) {
+            const float angle = 6.28318530718f * k / 16.0f;
+            all.v.insert(all.v.end(), { x + radius * cosf(angle), y, z + radius * sinf(angle) });
+            all.uv.insert(all.uv.end(), { 0.5f + 0.5f * cosf(angle), 0.5f + 0.5f * sinf(angle) });
+        }
+        for (int k = 0; k < 16; ++k) {
+            all.f.insert(all.f.end(), { base, base + 1 + (uint32_t)k, base + 1 + (uint32_t)((k + 1) % 16) });
+            faces.push_back(material);
+        }
+    }
     if (g_readError) { why = "read error"; return false; }
     if (all.f.empty()) { why = "no geometry"; return false; }
     const std::string temp = png + ".tmp-" + std::to_string(GetCurrentProcessId()) + ".png";
+    const std::string source = png.substr(0, png.size() - 4) + (doc.kind == proj_codec::Kind::Group ? ".cdgroup" : ".cdproj");
+    if (GetFileAttributesA(source.c_str()) == INVALID_FILE_ATTRIBUTES) { why = "source removed"; return false; }
     if (!RenderPng(all, faces, surfaces, temp, 35.0f, 30.0f, 320, 240) ||
+        GetFileAttributesA(source.c_str()) == INVALID_FILE_ATTRIBUTES ||
         !MoveFileExA(temp.c_str(), png.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DeleteFileA(temp.c_str()); why = "render"; return false;
     }
-    Log("[blueprint] rendered %zu prefab mesh instance%s from %zu records: %s", rendered, rendered == 1 ? "" : "s", doc.records.size(), png.c_str());
+    Log("[%s] rendered %zu prefab mesh instance%s from %zu objects, %zu NPCs and %zu terrain strokes: %s",
+        doc.kind == proj_codec::Kind::Group ? "blueprint" : "project", rendered, rendered == 1 ? "" : "s",
+        doc.records.size(), doc.npcs.size(), doc.terrain.size(), png.c_str());
     return true;
 }
-static bool RenderBlueprintGuarded(const proj_codec::Document& doc, const std::string& png, std::string& why) {
-    CDK_GUARD_BEGIN return RenderBlueprintDocument(doc, png, why);
+static bool RenderDocumentThumbnailGuarded(const proj_codec::Document& doc, const std::string& png, std::string& why) {
+    CDK_GUARD_BEGIN return RenderDocumentThumbnail(doc, png, why);
     CDK_GUARD_FAIL why = "crash"; return false;
     CDK_GUARD_END
     return false;
@@ -1565,24 +1606,34 @@ static DWORD WINAPI Worker(LPVOID) {
           if (!s_keys && GetTickCount() - s_keysTry > 5000) { s_keysTry = GetTickCount(); const bool e = g_readError; s_keys = LoadGimmickKeys(); g_readError = e; } }
         {   // in-game names for the browser: (re)loaded when the UI language differs from the loaded one
             std::string want; { std::lock_guard<std::mutex> l(g_mu); want = g_namesWanted; }
-            if (!want.empty() && want != g_namesLoaded) { g_namesLoaded = want; const bool e = g_readError; LoadGameNames(want); LoadCharacters(want); g_readError = e; }
+            static std::string lastAttempt;
+            static DWORD lastAttemptTick = 0;
+            const DWORD now = GetTickCount();
+            if (!want.empty() && want != g_namesLoaded &&
+                (want != lastAttempt || now - lastAttemptTick >= 5000)) {
+                lastAttempt = want; lastAttemptTick = now;
+                const bool earlierReadError = g_readError;
+                LoadGameNames(want);
+                if (LoadCharacters(want)) g_namesLoaded = want;
+                g_readError = earlierReadError;
+            }
         }
-        BlueprintJob blueprint;
+        DocumentThumbnailJob documentJob;
         { std::lock_guard<std::mutex> lock(g_mu);
-          if (!g_blueprintJobs.empty()) { blueprint = std::move(g_blueprintJobs.front()); g_blueprintJobs.pop_front(); } }
-        if (!blueprint.png.empty()) {
+          if (!g_documentThumbnailJobs.empty()) { documentJob = std::move(g_documentThumbnailJobs.front()); g_documentThumbnailJobs.pop_front(); } }
+        if (!documentJob.png.empty()) {
             std::string reason;
-            const bool ok = RenderBlueprintGuarded(blueprint.document, blueprint.png, reason);
-            if (!ok && reason == "read error" && blueprint.attempts < 3) {
-                ++blueprint.attempts;
-                { std::lock_guard<std::mutex> lock(g_mu); g_blueprintJobs.push_back(std::move(blueprint)); }
+            const bool ok = RenderDocumentThumbnailGuarded(documentJob.document, documentJob.png, reason);
+            if (!ok && reason == "read error" && documentJob.attempts < 3) {
+                ++documentJob.attempts;
+                { std::lock_guard<std::mutex> lock(g_mu); g_documentThumbnailJobs.push_back(std::move(documentJob)); }
                 Sleep(500); continue;
             }
             { std::lock_guard<std::mutex> lock(g_mu);
-              g_blueprintPending.erase(blueprint.png);
-              if (ok) g_refreshed.push_back(blueprint.png); }
+              g_documentThumbnailPending.erase(documentJob.png);
+              if (ok) g_refreshed.push_back(documentJob.png); }
             if (ok) g_gen++;
-            else Log("[blueprint] render failed for %s: %s", blueprint.png.c_str(), reason.c_str());
+            else Log("[thumbnail] render failed for %s: %s", documentJob.png.c_str(), reason.c_str());
             continue;
         }
         std::string path; bool prio = false; bool measure = false, check = false;
@@ -1680,13 +1731,13 @@ void Request(const std::string& p) {
     if (g_processed.count(p) && !(g_passActive && !g_passDone.count(p))) return;   // during a re-render pass a processed prefab may still be queued once
     g_pending.insert(p); g_requests.push_back(p); g_reqSeen[p] = GetTickCount();
 }
-void RequestBlueprint(const proj_codec::Document& document, const std::string& pngPath) {
+void RequestDocumentThumbnail(const proj_codec::Document& document, const std::string& pngPath) {
     std::lock_guard<std::mutex> lock(g_mu);
-    if (g_blueprintPending.insert(pngPath).second) g_blueprintJobs.push_back({ document, pngPath, 0 });
+    if (g_documentThumbnailPending.insert(pngPath).second) g_documentThumbnailJobs.push_back({ document, pngPath, 0 });
 }
-bool BlueprintPending(const std::string& pngPath) {
+bool DocumentThumbnailPending(const std::string& pngPath) {
     std::lock_guard<std::mutex> lock(g_mu);
-    return g_blueprintPending.count(pngPath) != 0;
+    return g_documentThumbnailPending.count(pngPath) != 0;
 }
 static void RequestSticky(const std::string& p) {   // one-shot callers (Refresh): never expires
     std::lock_guard<std::mutex> l(g_mu);
