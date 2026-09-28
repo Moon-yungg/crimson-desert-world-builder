@@ -7,6 +7,7 @@
 #include "guard.h"
 #include "core.h"
 #include "thumbgen.h"
+#include "proj_codec.h"
 #include "i18n.h"
 #include <cstdio>
 #include <cstring>
@@ -919,8 +920,9 @@ static void FillTri(uint8_t* buf, int W, const float* x, const float* y, uint8_t
         for (int px = px0; px <= px1; px++, row += 4) { row[0] = r; row[1] = g; row[2] = b; row[3] = 255; }
     }
 }
-static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const std::vector<Surface>& surf, const std::string& file, float azDeg = 35.0f, float elDeg = 25.0f) {
-    const int S = 256, SS = 2, W = S * SS;
+static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const std::vector<Surface>& surf, const std::string& file,
+                      float azDeg = 35.0f, float elDeg = 25.0f, int outputWidth = 256, int outputHeight = 256) {
+    const int SS = 2, W = outputWidth * SS, H = outputHeight * SS;
     const size_t nv = mesh.v.size() / 3; if (!nv || mesh.f.size() < 3) return false;
     const bool haveUv = mesh.uv.size() == nv * 2;
     // camera: azimuth 35 deg around Y, then elevation 25 deg around X (matches scripts/render_thumbs.py)
@@ -935,8 +937,8 @@ static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const s
         p[i * 3] = x2; p[i * 3 + 1] = y2; p[i * 3 + 2] = z2;
         for (int k = 0; k < 3; k++) { mn[k] = std::min(mn[k], p[i * 3 + k]); mx[k] = std::max(mx[k], p[i * 3 + k]); }
     }
-    float ext = std::max(mx[0] - mn[0], mx[1] - mn[1]); if (!(ext > 0)) ext = 1.0f;
-    const float scale = (W * 0.86f) / ext, cx = (mn[0] + mx[0]) * 0.5f, cy = (mn[1] + mx[1]) * 0.5f;
+    const float extX = std::max(0.001f, mx[0] - mn[0]), extY = std::max(0.001f, mx[1] - mn[1]);
+    const float scale = 0.86f * std::min(W / extX, H / extY), cx = (mn[0] + mx[0]) * 0.5f, cy = (mn[1] + mx[1]) * 0.5f;
     const size_t nf = mesh.f.size() / 3; size_t stepF = nf > 600000 ? nf / 600000 + 1 : 1;   // z-buffer cost is per pixel, so big meshes are drawn completely (the old painter cap of 40k left holes)
     struct Tri { float depth; uint32_t i; float shade; };
     std::vector<Tri> tris; tris.reserve(std::min<size_t>(nf, 600000));
@@ -952,7 +954,7 @@ static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const s
         tris.push_back({ (A[2] + B[2] + C[2]) / 3.0f, (uint32_t)t, shade });
     }
     if (tris.empty()) return false;
-    std::vector<uint8_t> buf((size_t)W * W * 4, 0); std::vector<float> zbuf((size_t)W * W, -1e30f);
+    std::vector<uint8_t> buf((size_t)W * H * 4, 0); std::vector<float> zbuf((size_t)W * H, -1e30f);
     auto texel = [](const TexImg* t, float u, float v) -> const uint8_t* {   // nearest sample, wrapping
         u -= floorf(u); v -= floorf(v);
         const int tx = std::min(t->w - 1, (int)(u * t->w)), ty = std::min(t->h - 1, (int)(v * t->h));
@@ -967,11 +969,11 @@ static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const s
         const TexImg* mask = sf && sf->hasZones ? ok(sf->mask) : nullptr; const TexImg* ovl = mask ? ok(sf->overlay) : nullptr;
         const TexImg* nrm = sf && haveUv ? ok(sf->norm) : nullptr; const TexImg* spc = sf ? ok(sf->spec) : nullptr; const TexImg* emi = sf ? ok(sf->emi) : nullptr;
         const bool anyTex = tex || mask || nrm || spc || emi;
-        for (int k = 0; k < 3; k++) { const uint32_t vi = mesh.f[tr.i * 3 + k]; const float* P = &p[vi * 3]; xs[k] = (P[0] - cx) * scale + W / 2.0f; ys[k] = W / 2.0f - (P[1] - cy) * scale; zs[k] = P[2];
+        for (int k = 0; k < 3; k++) { const uint32_t vi = mesh.f[tr.i * 3 + k]; const float* P = &p[vi * 3]; xs[k] = (P[0] - cx) * scale + W / 2.0f; ys[k] = H / 2.0f - (P[1] - cy) * scale; zs[k] = P[2];
             if (anyTex && haveUv) { us[k] = mesh.uv[vi * 2] * sf->uvScale; vs[k] = mesh.uv[vi * 2 + 1] * sf->uvScale; } }
         const float det = (xs[1] - xs[0]) * (ys[2] - ys[0]) - (xs[2] - xs[0]) * (ys[1] - ys[0]); if (fabsf(det) < 1e-6f) continue;
         const int x0 = std::max(0, (int)floorf(std::min({ xs[0], xs[1], xs[2] }))), x1 = std::min(W - 1, (int)ceilf(std::max({ xs[0], xs[1], xs[2] })));
-        const int y0 = std::max(0, (int)floorf(std::min({ ys[0], ys[1], ys[2] }))), y1 = std::min(W - 1, (int)ceilf(std::max({ ys[0], ys[1], ys[2] })));
+        const int y0 = std::max(0, (int)floorf(std::min({ ys[0], ys[1], ys[2] }))), y1 = std::min(H - 1, (int)ceilf(std::max({ ys[0], ys[1], ys[2] })));
         float base[3] = { 214, 196, 168 }; if (sf) { base[0] = sf->col[0] * 255; base[1] = sf->col[1] * 255; base[2] = sf->col[2] * 255; }
         // tangent frame in view space for the normal map: N faces the camera, T/B follow the uv directions of this triangle
         float N[3] = { 0, 0, 1 }, T[3] = { 1, 0, 0 }, Bt[3] = { 0, 1, 0 }; bool frame = false;
@@ -1039,14 +1041,14 @@ static bool RenderPng(const Mesh& mesh, const std::vector<uint16_t>& fs, const s
         }
     }
     // 2x2 box filter, alpha weighted
-    std::vector<uint8_t> out((size_t)S * S * 4, 0);
-    for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
+    std::vector<uint8_t> out((size_t)outputWidth * outputHeight * 4, 0);
+    for (int y = 0; y < outputHeight; y++) for (int x = 0; x < outputWidth; x++) {
         unsigned r = 0, g = 0, b = 0, a = 0;
         for (int dy = 0; dy < SS; dy++) for (int dx = 0; dx < SS; dx++) { const uint8_t* q = &buf[(((size_t)y * SS + dy) * W + (size_t)x * SS + dx) * 4]; r += q[0] * q[3]; g += q[1] * q[3]; b += q[2] * q[3]; a += q[3]; }
-        uint8_t* o = &out[((size_t)y * S + x) * 4];
+        uint8_t* o = &out[((size_t)y * outputWidth + x) * 4];
         if (a) { o[0] = (uint8_t)(r / a); o[1] = (uint8_t)(g / a); o[2] = (uint8_t)(b / a); o[3] = (uint8_t)(a / (SS * SS)); }
     }
-    return stbi_write_png(file.c_str(), S, S, 4, out.data(), S * 4) != 0;
+    return stbi_write_png(file.c_str(), outputWidth, outputHeight, 4, out.data(), outputWidth * 4) != 0;
 }
 
 // ---------------------------------------------------------------- in-game names (browser)
@@ -1261,6 +1263,9 @@ static bool LoadCharacters(const std::string& lang) {
 // ---------------------------------------------------------------- worker
 static std::mutex g_mu;
 static std::deque<std::string> g_requests;
+struct BlueprintJob { proj_codec::Document document; std::string png; int attempts = 0; };
+static std::deque<BlueprintJob> g_blueprintJobs;
+static std::unordered_set<std::string> g_blueprintPending;
 // browser requests: last time the tile asked (every frame while visible); 0 = sticky (Refresh). The worker takes the newest
 // and drops the ones not asked for in 1.5 s, so after scrolling through hundreds of tiles the ones on screen come first.
 static std::unordered_map<std::string, DWORD> g_reqSeen;
@@ -1360,6 +1365,92 @@ static bool Generate(const std::string& logical, float dims[6], std::string& why
 }
 static bool GenerateGuarded(const std::string& logical, float dims[6], std::string& why) {
     CDK_GUARD_BEGIN return Generate(logical, dims, why);
+    CDK_GUARD_FAIL why = "crash"; return false;
+    CDK_GUARD_END
+    return false;
+}
+
+// Render a saved group from its actual prefab meshes. The record transform is applied after
+// each prefab's own node transform, exactly as the game places that prefab in the world.
+static bool RenderBlueprintDocument(const proj_codec::Document& doc, const std::string& png, std::string& why) {
+    g_readError = false;
+    Mesh all; std::vector<uint16_t> faces; std::vector<Surface> surfaces;
+    const proj_codec::Point origin = doc.hasBounds ? doc.bounds.anchor :
+        doc.records.empty() ? proj_codec::Point{} : doc.records.front().pos;
+    size_t rendered = 0;
+    for (const auto& record : doc.records) {
+        if (record.state != proj_codec::Record::State::Placeable) continue;
+        std::vector<Node> roots;
+        if (!LoadPrefabRoots(record.prefab, roots, nullptr)) continue;
+        std::vector<Inst> instances;
+        const float identity[9] = { 1,0,0, 0,1,0, 0,0,1 }, zero[3] = {};
+        CollectCtx context; context.chain.push_back(record.prefab);
+        for (const auto& root : roots) Collect(root, identity, zero, instances, context);
+        const float radians = 3.14159265f / 180.0f;
+        const float cy = cosf((float)record.yaw * radians), sy = sinf((float)record.yaw * radians);
+        const float cp = cosf((float)record.pitch * radians), sp = sinf((float)record.pitch * radians);
+        const float cr = cosf((float)record.roll * radians), sr = sinf((float)record.roll * radians);
+        for (const Inst& in : instances) {
+            const auto mesh = LoadMesh(in.path); if (!mesh) continue;
+            const uint32_t base = (uint32_t)(all.v.size() / 3);
+            const bool haveUv = mesh->uv.size() == (mesh->v.size() / 3) * 2;
+            for (size_t i = 0; i + 2 < mesh->v.size(); i += 3) {
+                const float x = mesh->v[i], y = mesh->v[i + 1], z = mesh->v[i + 2];
+                float px = (in.m[0] * x + in.m[1] * y + in.m[2] * z + in.t[0]) * (float)record.scale;
+                float py = (in.m[3] * x + in.m[4] * y + in.m[5] * z + in.t[1]) * (float)record.scale;
+                float pz = (in.m[6] * x + in.m[7] * y + in.m[8] * z + in.t[2]) * (float)record.scale;
+                const float rx = cr * px - sr * py, ry = sr * px + cr * py;
+                const float ry2 = cp * ry - sp * pz, rz = sp * ry + cp * pz;
+                px = cy * rx + sy * rz; py = ry2; pz = -sy * rx + cy * rz;
+                all.v.push_back(px + (float)(record.pos.x - origin.x));
+                all.v.push_back(py + (float)(record.pos.y - origin.y));
+                all.v.push_back(pz + (float)(record.pos.z - origin.z));
+                if (haveUv) { all.uv.push_back(mesh->uv[(i / 3) * 2]); all.uv.push_back(mesh->uv[(i / 3) * 2 + 1]); }
+                else { all.uv.push_back(0); all.uv.push_back(0); }
+            }
+            const auto* materials = LoadMaterials(in.path);
+            std::vector<uint16_t> subSurface(mesh->mats.size() + 1, 0xFFFF);
+            auto surfaceFor = [&](uint8_t sub) -> uint16_t {
+                const size_t slot = std::min<size_t>(sub, mesh->mats.size());
+                if (subSurface[slot] != 0xFFFF) return subSurface[slot];
+                if (surfaces.size() >= 0xFFFE) return 0;
+                Surface surface; surface.col[0] = 0.72f; surface.col[1] = 0.66f; surface.col[2] = 0.56f; surface.uvScale = 1.0f;
+                if (materials && slot < mesh->mats.size()) {
+                    auto mat = materials->find(mesh->mats[slot]);
+                    if (mat == materials->end()) { std::string lower = mesh->mats[slot]; for (char& c : lower) c = (char)tolower((unsigned char)c); mat = materials->find(lower); }
+                    if (mat == materials->end() && materials->size() == 1) mat = materials->begin();
+                    if (mat != materials->end()) {
+                        const MatInfo& info = mat->second; memcpy(surface.col, info.rc, sizeof surface.col);
+                        surface.uvScale = info.uvScale; surface.skip = info.decal;
+                        if (!info.tex.empty()) surface.tex = LoadTexture(info.tex);
+                        if (g_quality >= 1) { surface.hasTint = info.hasTint; memcpy(surface.tint, info.tint, sizeof surface.tint); }
+                    }
+                }
+                surfaces.push_back(std::move(surface));
+                return subSurface[slot] = (uint16_t)(surfaces.size() - 1);
+            };
+            const bool haveFaceMaterials = mesh->fm.size() == mesh->f.size() / 3;
+            for (size_t tri = 0; tri < mesh->f.size() / 3; ++tri) {
+                const uint16_t surface = surfaceFor(haveFaceMaterials ? mesh->fm[tri] : 0);
+                if (surface < surfaces.size() && surfaces[surface].skip) continue;
+                for (int k = 0; k < 3; ++k) all.f.push_back(mesh->f[tri * 3 + k] + base);
+                faces.push_back(surface);
+            }
+            ++rendered;
+        }
+    }
+    if (g_readError) { why = "read error"; return false; }
+    if (all.f.empty()) { why = "no geometry"; return false; }
+    const std::string temp = png + ".tmp-" + std::to_string(GetCurrentProcessId()) + ".png";
+    if (!RenderPng(all, faces, surfaces, temp, 35.0f, 30.0f, 320, 240) ||
+        !MoveFileExA(temp.c_str(), png.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(temp.c_str()); why = "render"; return false;
+    }
+    Log("[blueprint] rendered %zu prefab mesh instance%s from %zu records: %s", rendered, rendered == 1 ? "" : "s", doc.records.size(), png.c_str());
+    return true;
+}
+static bool RenderBlueprintGuarded(const proj_codec::Document& doc, const std::string& png, std::string& why) {
+    CDK_GUARD_BEGIN return RenderBlueprintDocument(doc, png, why);
     CDK_GUARD_FAIL why = "crash"; return false;
     CDK_GUARD_END
     return false;
@@ -1476,6 +1567,24 @@ static DWORD WINAPI Worker(LPVOID) {
             std::string want; { std::lock_guard<std::mutex> l(g_mu); want = g_namesWanted; }
             if (!want.empty() && want != g_namesLoaded) { g_namesLoaded = want; const bool e = g_readError; LoadGameNames(want); LoadCharacters(want); g_readError = e; }
         }
+        BlueprintJob blueprint;
+        { std::lock_guard<std::mutex> lock(g_mu);
+          if (!g_blueprintJobs.empty()) { blueprint = std::move(g_blueprintJobs.front()); g_blueprintJobs.pop_front(); } }
+        if (!blueprint.png.empty()) {
+            std::string reason;
+            const bool ok = RenderBlueprintGuarded(blueprint.document, blueprint.png, reason);
+            if (!ok && reason == "read error" && blueprint.attempts < 3) {
+                ++blueprint.attempts;
+                { std::lock_guard<std::mutex> lock(g_mu); g_blueprintJobs.push_back(std::move(blueprint)); }
+                Sleep(500); continue;
+            }
+            { std::lock_guard<std::mutex> lock(g_mu);
+              g_blueprintPending.erase(blueprint.png);
+              if (ok) g_refreshed.push_back(blueprint.png); }
+            if (ok) g_gen++;
+            else Log("[blueprint] render failed for %s: %s", blueprint.png.c_str(), reason.c_str());
+            continue;
+        }
         std::string path; bool prio = false; bool measure = false, check = false;
         {
             std::lock_guard<std::mutex> l(g_mu);
@@ -1570,6 +1679,14 @@ void Request(const std::string& p) {
     if (g_pending.count(p)) { auto it = g_reqSeen.find(p); if (it != g_reqSeen.end() && it->second) it->second = GetTickCount(); return; }   // still visible: keep it fresh
     if (g_processed.count(p) && !(g_passActive && !g_passDone.count(p))) return;   // during a re-render pass a processed prefab may still be queued once
     g_pending.insert(p); g_requests.push_back(p); g_reqSeen[p] = GetTickCount();
+}
+void RequestBlueprint(const proj_codec::Document& document, const std::string& pngPath) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_blueprintPending.insert(pngPath).second) g_blueprintJobs.push_back({ document, pngPath, 0 });
+}
+bool BlueprintPending(const std::string& pngPath) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    return g_blueprintPending.count(pngPath) != 0;
 }
 static void RequestSticky(const std::string& p) {   // one-shot callers (Refresh): never expires
     std::lock_guard<std::mutex> l(g_mu);

@@ -24,7 +24,6 @@
 #include "input.h"
 #include "http_api.h"
 #include "i18n.h"
-#include "stb_image_write.h"
 #include "stb_image.h"
 
 namespace editor {
@@ -3614,7 +3613,6 @@ namespace editor {
     static std::vector<size_t> g_libraryRows;
     static std::map<std::string, ULONGLONG> g_badBlueprintThumbnailStamps;
     static std::map<std::string, DWORD> g_pendingBlueprintThumbnailTicks;
-    static std::map<std::string, DWORD> g_blueprintThumbAuditTicks;
     static std::set<std::string> g_currentBlueprintThumbnails;
     static char g_librarySearch[256] = {};
     static int g_libraryLocation = 0;
@@ -3748,126 +3746,11 @@ namespace editor {
         if (path.size() >= 8 && _stricmp(path.c_str() + path.size() - 8, ".cdgroup") == 0) path.resize(path.size() - 8);
         return path + ".png";
     }
-    static void ThumbnailBlend(std::vector<unsigned char>& pixels, int x, int y, const unsigned char* rgba) {
-        if (x < 0 || x >= 256 || y < 0 || y >= 192 || !rgba[3]) return;
-        unsigned char* d = pixels.data() + ((size_t)y * 256 + x) * 4;
-        const unsigned sa = rgba[3], da = d[3], outA = sa + (da * (255 - sa) + 127) / 255;
-        if (!outA) return;
-        for (int k = 0; k < 3; ++k) d[k] = (unsigned char)((rgba[k] * sa + (d[k] * da * (255 - sa) + 127) / 255 + outA / 2) / outA);
-        d[3] = (unsigned char)outA;
-    }
-    static void ThumbnailTriangle(std::vector<unsigned char>& pixels, ImVec2 a, ImVec2 b, ImVec2 c, const unsigned char* color) {
-        const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-        if (fabsf(area) < 0.01f) return;
-        const int x0 = std::max(0, (int)floorf(std::min({ a.x, b.x, c.x }))), x1 = std::min(255, (int)ceilf(std::max({ a.x, b.x, c.x })));
-        const int y0 = std::max(0, (int)floorf(std::min({ a.y, b.y, c.y }))), y1 = std::min(191, (int)ceilf(std::max({ a.y, b.y, c.y })));
-        for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) {
-            const float px = x + 0.5f, py = y + 0.5f;
-            const float u = ((b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x)) / area;
-            const float v = ((c.x - b.x) * (py - b.y) - (c.y - b.y) * (px - b.x)) / area;
-            const float w = ((a.x - c.x) * (py - c.y) - (a.y - c.y) * (px - c.x)) / area;
-            if (u >= 0 && v >= 0 && w >= 0) ThumbnailBlend(pixels, x, y, color);
-        }
-    }
     static bool GenerateBlueprintThumbnail(const ProjectFile& file, const proj_codec::Document& doc) {
+        if (doc.records.empty()) return false;
         const std::string png = BlueprintThumbnailPath(file);
-        struct Element { double x, y, z, u, v, size; std::string preview, prefab; int kind = 0, mode = 0; double amount = 0; };
-        std::vector<Element> elements; elements.reserve(doc.records.size() + doc.npcs.size() + doc.terrain.size());
-        const double baseX = !doc.records.empty() ? doc.records.front().pos.x : !doc.npcs.empty() ? doc.npcs.front().pos.x : !doc.terrain.empty() ? doc.terrain.front().x : 0;
-        const double baseZ = !doc.records.empty() ? doc.records.front().pos.z : !doc.npcs.empty() ? doc.npcs.front().pos.z : !doc.terrain.empty() ? doc.terrain.front().z : 0;
-        const double baseY = !doc.records.empty() ? doc.records.front().pos.y : !doc.npcs.empty() ? doc.npcs.front().pos.y : 0;
-        auto iso = [&](double x, double y, double z) {
-            const double dx = x - baseX, dz = z - baseZ;
-            return std::pair<double, double>{ (dx - dz) * 0.70710678118, (dx + dz) * 0.35355339059 - std::clamp(y - baseY, -50.0, 50.0) * 0.28 };
-        };
-        static std::unordered_map<std::string, const core::PrefabInfo*> prefabInfo;
-        if (prefabInfo.empty()) for (const auto& p : core::PrefabIndex()) prefabInfo.emplace(p.path, &p);
-        for (const auto& r : doc.records) {
-            if (r.state != proj_codec::Record::State::Placeable) continue;
-            double size = 2.0;
-            if (auto it = prefabInfo.find(r.prefab); it != prefabInfo.end()) size = std::max({ 0.5, (double)it->second->sx, (double)it->second->sy, (double)it->second->sz }) * std::max(0.1, r.scale);
-            const auto [u, v] = iso(r.pos.x, r.pos.y, r.pos.z);
-            elements.push_back({ r.pos.x, r.pos.y, r.pos.z, u, v, size, core::ThumbFile(r.prefab), r.prefab, 0 });
-        }
-        const auto chars = thumbgen::Characters();
-        bool pending = !doc.npcs.empty() && !chars;
-        for (const auto& n : doc.npcs) {
-            std::string app;
-            if (chars) for (const auto& c : *chars) if (c.key == n.key) { app = c.app; break; }
-            const auto [u, v] = iso(n.pos.x, n.pos.y, n.pos.z);
-            elements.push_back({ n.pos.x, n.pos.y, n.pos.z, u, v, 2.0, app.empty() ? std::string() : core::ThumbFile(app), app, 1 });
-        }
-        for (const auto& t : doc.terrain) {
-            const auto [u, v] = iso(t.x, baseY, t.z);
-            elements.push_back({ t.x, baseY, t.z, u, v, std::max(0.5, t.r), {}, {}, 2, t.mode, t.amount });
-        }
-        double minU = 0, maxU = 0, minV = 0, maxV = 0; bool first = true;
-        auto include = [&](double u, double v) {
-            if (first) { minU = maxU = u; minV = maxV = v; first = false; }
-            else { minU = std::min(minU, u); maxU = std::max(maxU, u); minV = std::min(minV, v); maxV = std::max(maxV, v); }
-        };
-        for (const auto& e : elements) {
-            include(e.u, e.v);
-            if (e.kind == 2) for (int k = 0; k < 8; ++k) {
-                const double a = k * 0.78539816339;
-                const auto [u, v] = iso(e.x + cos(a) * e.size, baseY, e.z + sin(a) * e.size); include(u, v);
-            }
-        }
-        const double fit = std::min(208.0 / std::max(1.0, maxU - minU), 126.0 / std::max(1.0, maxV - minV));
-        const double imageCenterY = elements.size() == 1 && elements.front().kind != 2 ? 166.0 : 108.0;
-        auto screen = [&](double u, double v) { return ImVec2((float)(128.0 + (u - (minU + maxU) * 0.5) * fit), (float)(imageCenterY + (v - (minV + maxV) * 0.5) * fit)); };
-        std::vector<unsigned char> pixels(256 * 192 * 4, 0); // transparent outside the actual blueprint
-        std::stable_sort(elements.begin(), elements.end(), [](const Element& a, const Element& b) { return a.kind == 2 && b.kind != 2 ? true : a.kind != 2 && b.kind == 2 ? false : a.v < b.v; });
-        struct Sprite { std::vector<unsigned char> rgba; int w = 0, h = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0; };
-        std::unordered_map<std::string, Sprite> sprites;
-        for (const auto& e : elements) {
-            if (e.kind == 2) {
-                const ImVec2 center = screen(e.u, e.v);
-                const float lift = (float)std::clamp(e.amount * fit * 0.16, -8.0, 8.0);
-                const unsigned char edge[4] = { 75, 67, 48, 120 };
-                const unsigned char raised[4] = { 153, 135, 87, 215 }, lowered[4] = { 112, 93, 69, 215 }, flat[4] = { 128, 151, 104, 215 };
-                const unsigned char* topColor = e.mode == core::TerrainFlatten ? flat : e.amount >= 0 ? raised : lowered;
-                ImVec2 ring[16]; for (int k = 0; k < 16; ++k) {
-                    const double a = k * 6.28318530718 / 16.0;
-                    const auto [u, v] = iso(e.x + cos(a) * e.size, baseY, e.z + sin(a) * e.size);
-                    ring[k] = screen(u, v); ring[k].y -= lift;
-                }
-                const ImVec2 top(center.x, center.y - lift);
-                for (int k = 0; k < 16; ++k) {
-                    ImVec2 a = ring[k], b = ring[(k + 1) % 16];
-                    ThumbnailTriangle(pixels, { center.x, center.y + 3 }, { a.x, a.y + 3 }, { b.x, b.y + 3 }, edge);
-                    ThumbnailTriangle(pixels, top, a, b, topColor);
-                }
-                continue;
-            }
-            if (e.preview.empty()) continue;
-            auto it = sprites.find(e.preview);
-            if (it == sprites.end()) {
-                Sprite s; int comp = 0; unsigned char* raw = stbi_load(e.preview.c_str(), &s.w, &s.h, &comp, 4);
-                if (!raw) { if (!e.prefab.empty()) thumbgen::Request(e.prefab); pending = true; sprites.emplace(e.preview, Sprite{}); continue; }
-                s.rgba.assign(raw, raw + (size_t)s.w * s.h * 4); stbi_image_free(raw);
-                s.x0 = s.w; s.y0 = s.h;
-                for (int y = 0; y < s.h; ++y) for (int x = 0; x < s.w; ++x) if (s.rgba[((size_t)y * s.w + x) * 4 + 3] > 8) {
-                    s.x0 = std::min(s.x0, x); s.y0 = std::min(s.y0, y); s.x1 = std::max(s.x1, x + 1); s.y1 = std::max(s.y1, y + 1);
-                }
-                it = sprites.emplace(e.preview, std::move(s)).first;
-            }
-            const Sprite& s = it->second; if (s.x1 <= s.x0 || s.y1 <= s.y0) continue;
-            const float natural = (float)std::clamp(e.size * fit * 0.9, elements.size() == 1 ? 88.0 : 16.0, elements.size() == 1 ? 132.0 : 92.0);
-            const float aspect = (float)(s.x1 - s.x0) / std::max(1, s.y1 - s.y0);
-            const int h = std::max(8, (int)lroundf(natural)), w = std::max(8, (int)lroundf(natural * aspect));
-            const ImVec2 anchor = screen(e.u, e.v); const int left = (int)lroundf(anchor.x - w * 0.5f), top = (int)lroundf(anchor.y - h + 6.0f);
-            for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
-                const int sx = s.x0 + (int)((int64_t)x * (s.x1 - s.x0) / w), sy = s.y0 + (int)((int64_t)y * (s.y1 - s.y0) / h);
-                ThumbnailBlend(pixels, left + x, top + y, s.rgba.data() + ((size_t)sy * s.w + sx) * 4);
-            }
-        }
-        if (pending) g_pendingBlueprintThumbnailTicks[png] = GetTickCount(); else g_pendingBlueprintThumbnailTicks.erase(png);
-        const std::string temp = png + ".tmp-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount()) + ".png";
-        if (!stbi_write_png(temp.c_str(), 256, 192, 4, pixels.data(), 256 * 4)) { DeleteFileA(temp.c_str()); return false; }
-        if (!MoveFileExA(temp.c_str(), png.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { DeleteFileA(temp.c_str()); return false; }
-        overlay::InvalidateThumb(png);
-        g_currentBlueprintThumbnails.insert(png);
+        thumbgen::RequestBlueprint(doc, png);
+        g_pendingBlueprintThumbnailTicks[png] = GetTickCount();
         return true;
     }
     static void EnsureBlueprintThumbnail(const ProjectFile& file) {
@@ -3877,34 +3760,16 @@ namespace editor {
             (sourceInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return;
         const bool haveThumb = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &thumbInfo) &&
             !(thumbInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+        if (thumbgen::BlueprintPending(path)) return;
         if (haveThumb && !g_currentBlueprintThumbnails.count(path)) {
             int w = 0, h = 0, comp = 0; unsigned char* old = stbi_load(path.c_str(), &w, &h, &comp, 4);
-            if (old && w == 256 && h == 192 && old[3] == 0) g_currentBlueprintThumbnails.insert(path);
+            if (old && w == 320 && h == 240 && old[3] == 0) g_currentBlueprintThumbnails.insert(path);
             if (old) stbi_image_free(old);
         }
         const auto pending = g_pendingBlueprintThumbnailTicks.find(path);
         if (pending != g_pendingBlueprintThumbnailTicks.end() && GetTickCount() - pending->second < 2000) return;
-        if (haveThumb && g_currentBlueprintThumbnails.count(path) && pending == g_pendingBlueprintThumbnailTicks.end() &&
-            CompareFileTime(&thumbInfo.ftLastWriteTime, &sourceInfo.ftLastWriteTime) >= 0) {
-            const DWORD now = GetTickCount();
-            const auto audited = g_blueprintThumbAuditTicks.find(path);
-            if (audited != g_blueprintThumbAuditTicks.end() && now - audited->second < 10000) return;
-            g_blueprintThumbAuditTicks[path] = now;
-            proj_codec::Document current;
-            if (!ReadProjectFile(file, current, false)) return;
-            std::set<std::string> previews;
-            for (const auto& r : current.records) if (r.state == proj_codec::Record::State::Placeable) previews.insert(core::ThumbFile(r.prefab));
-            if (const auto chars = thumbgen::Characters()) for (const auto& n : current.npcs)
-                for (const auto& c : *chars) if (c.key == n.key && !c.app.empty()) { previews.insert(core::ThumbFile(c.app)); break; }
-            bool stale = false;
-            for (const auto& preview : previews) {
-                WIN32_FILE_ATTRIBUTE_DATA info{};
-                if (GetFileAttributesExA(preview.c_str(), GetFileExInfoStandard, &info) &&
-                    CompareFileTime(&info.ftLastWriteTime, &thumbInfo.ftLastWriteTime) > 0) { stale = true; break; }
-            }
-            if (!stale) return;
-            if (GenerateBlueprintThumbnail(file, current)) return;
-        }
+        if (haveThumb && g_currentBlueprintThumbnails.count(path) &&
+            CompareFileTime(&thumbInfo.ftLastWriteTime, &sourceInfo.ftLastWriteTime) >= 0) return;
         const ULONGLONG stamp = ((ULONGLONG)sourceInfo.ftLastWriteTime.dwHighDateTime << 32) | sourceInfo.ftLastWriteTime.dwLowDateTime;
         if (const auto it = g_badBlueprintThumbnailStamps.find(source); it != g_badBlueprintThumbnailStamps.end() && it->second == stamp) return;
         proj_codec::Document doc;
@@ -4120,8 +3985,8 @@ namespace editor {
         else if (groupKind) {
             const float width = ImGui::GetContentRegionAvail().x;
             const float spacing = ImGui::GetStyle().ItemSpacing.x;
-            const int columns = std::max(1, std::min(4, (int)((width + spacing) / (145.0f + spacing))));
-            const float cardWidth = std::max(85.0f, (width - 16.0f - spacing * (columns - 1)) / columns);
+            const int columns = width >= 190.0f ? 2 : 1;
+            const float cardWidth = std::max(80.0f, (width - 16.0f - spacing * (columns - 1)) / columns);
             const float imageHeight = cardWidth * 0.75f;
             const float cardHeight = imageHeight + ImGui::GetTextLineHeightWithSpacing() + 10.0f;
             const int rows = ((int)g_libraryRows.size() + columns - 1) / columns;

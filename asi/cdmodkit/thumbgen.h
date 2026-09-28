@@ -6,10 +6,13 @@
 #include <memory>
 #include <unordered_map>
 #include <cstdint>
+namespace proj_codec { struct Document; }
 namespace thumbgen {
     struct CharInfo { uint32_t key = 0; std::string internal, name, app; };   // characterinfo row: spawn key, internal name, in-game name, .app_xml of its look (either may be empty)
     void Start();                                   // called once after the prefab index is loaded
     void Request(const std::string& prefabPath);    // render this prefab next (no-op when done or already queued)
+    void RequestBlueprint(const proj_codec::Document& document, const std::string& pngPath);
+    bool BlueprintPending(const std::string& pngPath);
     void Refresh(const std::string& prefabPath);    // render again even if it was done before
     bool Pending(const std::string& prefabPath);    // queued or currently rendering
     bool Processed(const std::string& prefabPath);  // rendered before (success or failure)
