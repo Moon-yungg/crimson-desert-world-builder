@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <tuple>
 #include <cmath>
 #include <commdlg.h>
@@ -24,6 +25,7 @@
 #include "http_api.h"
 #include "i18n.h"
 #include "stb_image_write.h"
+#include "stb_image.h"
 
 namespace editor {
     // UI text goes through T("english") (translated, English fallback) - labels of tabs, popups and headers through
@@ -965,7 +967,7 @@ namespace editor {
         if (fabsf(g_fx) >= fabsf(g_fz)) { P.snapAx = g_fx > 0 ? 1.0f : -1.0f; P.snapAz = 0; } else { P.snapAx = 0; P.snapAz = g_fz > 0 ? 1.0f : -1.0f; }
         if (keepCamera) { P.reopen = false; }                             // camera mode stays live while the gizmo is shown
         else if (g_compact && g_open) { P.reopen = false; }               // the dock stays where it is
-        else { P.reopen = g_open; g_open = false; }
+        else { P.reopen = false; }   // keep the browser and NPC library available while another object is carried
         if (!keepCamera) StopCameraMode();
         g_playMode = false; core::g_placing = true; input::ClearKeys();
         core::PublishGroundPlacement(GroundPlacementOf(P));
@@ -1059,6 +1061,10 @@ namespace editor {
         }
         g_projectStatus = report.valid ? "placement-admitted" : report.error;
         if (!report.valid) { Note("%s", report.error.c_str()); return false; }
+        if (!uids.empty()) {
+            const auto placed = core::Spawned();
+            if (const auto* first = Find(placed, uids.front())) if (first->group > 0) core::SetGroupName(first->group, name);
+        }
         StartGrab(uids, true, name, &pivot, report.request);
         return g_place.active && g_place.req == report.request;
     }
@@ -3566,11 +3572,17 @@ namespace editor {
     }
 
     struct ProjectFile { std::string name; proj_codec::Kind kind = proj_codec::Kind::Project; bool archived = false; std::string path; };
+    static ProjectFile g_blueprintDragFile;
+    static bool g_blueprintDragging = false;
+    struct PendingBlueprintPlace { bool active = false; ProjectFile file; Vec3 target{}; DWORD queuedAt = 0; };
+    static PendingBlueprintPlace g_pendingBlueprintPlace;
     enum class ProjectAction { Read, Load, Replace, SaveBack, Autoload, Place, Overwrite, Reload, Save, Unload, AddUnassigned };
     static core::SavedLibrarySnapshot g_projectLibrary;
     static core::SavedFile g_librarySelected;
     static std::vector<size_t> g_libraryRows;
     static std::map<std::string, ULONGLONG> g_badBlueprintThumbnailStamps;
+    static std::map<std::string, DWORD> g_pendingBlueprintThumbnailTicks;
+    static std::set<std::string> g_currentBlueprintThumbnails;
     static char g_librarySearch[256] = {};
     static int g_libraryLocation = 0;
     static bool g_libraryShowingBlueprints = false;
@@ -3701,53 +3713,126 @@ namespace editor {
         if (path.size() >= 8 && _stricmp(path.c_str() + path.size() - 8, ".cdgroup") == 0) path.resize(path.size() - 8);
         return path + ".png";
     }
-    static void ThumbnailPixel(std::vector<unsigned char>& pixels, int x, int y, ImU32 color) {
-        if (x < 0 || x >= 256 || y < 0 || y >= 192) return;
-        const size_t at = ((size_t)y * 256 + x) * 4;
-        pixels[at + 0] = (unsigned char)(color & 255); pixels[at + 1] = (unsigned char)((color >> 8) & 255);
-        pixels[at + 2] = (unsigned char)((color >> 16) & 255); pixels[at + 3] = (unsigned char)((color >> 24) & 255);
+    static void ThumbnailBlend(std::vector<unsigned char>& pixels, int x, int y, const unsigned char* rgba) {
+        if (x < 0 || x >= 256 || y < 0 || y >= 192 || !rgba[3]) return;
+        unsigned char* d = pixels.data() + ((size_t)y * 256 + x) * 4;
+        const unsigned sa = rgba[3], da = d[3], outA = sa + (da * (255 - sa) + 127) / 255;
+        if (!outA) return;
+        for (int k = 0; k < 3; ++k) d[k] = (unsigned char)((rgba[k] * sa + (d[k] * da * (255 - sa) + 127) / 255 + outA / 2) / outA);
+        d[3] = (unsigned char)outA;
     }
-    static void ThumbnailLine(std::vector<unsigned char>& pixels, int x0, int y0, int x1, int y1, ImU32 color) {
-        const int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-        int error = dx + dy;
-        for (;;) { ThumbnailPixel(pixels, x0, y0, color); if (x0 == x1 && y0 == y1) break;
-            const int twice = 2 * error; if (twice >= dy) { error += dy; x0 += sx; } if (twice <= dx) { error += dx; y0 += sy; } }
+    static void ThumbnailTriangle(std::vector<unsigned char>& pixels, ImVec2 a, ImVec2 b, ImVec2 c, const unsigned char* color) {
+        const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        if (fabsf(area) < 0.01f) return;
+        const int x0 = std::max(0, (int)floorf(std::min({ a.x, b.x, c.x }))), x1 = std::min(255, (int)ceilf(std::max({ a.x, b.x, c.x })));
+        const int y0 = std::max(0, (int)floorf(std::min({ a.y, b.y, c.y }))), y1 = std::min(191, (int)ceilf(std::max({ a.y, b.y, c.y })));
+        for (int y = y0; y <= y1; ++y) for (int x = x0; x <= x1; ++x) {
+            const float px = x + 0.5f, py = y + 0.5f;
+            const float u = ((b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x)) / area;
+            const float v = ((c.x - b.x) * (py - b.y) - (c.y - b.y) * (px - b.x)) / area;
+            const float w = ((a.x - c.x) * (py - c.y) - (a.y - c.y) * (px - c.x)) / area;
+            if (u >= 0 && v >= 0 && w >= 0) ThumbnailBlend(pixels, x, y, color);
+        }
     }
     static bool GenerateBlueprintThumbnail(const ProjectFile& file, const proj_codec::Document& doc) {
-        struct Point { double x, z; int group; bool npc, terrain; };
-        std::vector<Point> points; points.reserve(doc.records.size() + doc.npcs.size() + doc.terrain.size());
-        double minX = 0, maxX = 0, minZ = 0, maxZ = 0; bool first = true;
-        auto add = [&](double x, double z, int group, bool npc, bool terrain = false) {
-            points.push_back({ x, z, group, npc, terrain });
-            if (first) { minX = maxX = x; minZ = maxZ = z; first = false; }
-            else { minX = std::min(minX, x); maxX = std::max(maxX, x); minZ = std::min(minZ, z); maxZ = std::max(maxZ, z); }
+        const std::string png = BlueprintThumbnailPath(file);
+        struct Element { double x, y, z, u, v, size; std::string preview, prefab; int kind = 0, mode = 0; double amount = 0; };
+        std::vector<Element> elements; elements.reserve(doc.records.size() + doc.npcs.size() + doc.terrain.size());
+        const double baseX = !doc.records.empty() ? doc.records.front().pos.x : !doc.npcs.empty() ? doc.npcs.front().pos.x : !doc.terrain.empty() ? doc.terrain.front().x : 0;
+        const double baseZ = !doc.records.empty() ? doc.records.front().pos.z : !doc.npcs.empty() ? doc.npcs.front().pos.z : !doc.terrain.empty() ? doc.terrain.front().z : 0;
+        const double baseY = !doc.records.empty() ? doc.records.front().pos.y : !doc.npcs.empty() ? doc.npcs.front().pos.y : 0;
+        auto iso = [&](double x, double y, double z) {
+            const double dx = x - baseX, dz = z - baseZ;
+            return std::pair<double, double>{ (dx - dz) * 0.70710678118, (dx + dz) * 0.35355339059 - std::clamp(y - baseY, -50.0, 50.0) * 0.28 };
         };
-        for (const auto& r : doc.records) add(r.pos.x, r.pos.z, r.group, false);
-        for (const auto& n : doc.npcs) add(n.pos.x, n.pos.z, n.group, true);
-        for (const auto& t : doc.terrain) add(t.x, t.z, 0, false, true);
-        const double spanX = std::max(1.0, maxX - minX), spanZ = std::max(1.0, maxZ - minZ);
-        std::vector<unsigned char> pixels(256 * 192 * 4);
-        for (int y = 0; y < 192; ++y) for (int x = 0; x < 256; ++x) ThumbnailPixel(pixels, x, y, IM_COL32(22, 29, 38, 255));
-        for (int x = 16; x < 256; x += 24) ThumbnailLine(pixels, x, 14, x, 178, IM_COL32(42, 53, 66, 255));
-        for (int y = 14; y < 192; y += 24) ThumbnailLine(pixels, 16, y, 240, y, IM_COL32(42, 53, 66, 255));
-        const double fit = std::min(214.0 / spanX, 154.0 / spanZ);
-        const double usedX = spanX * fit, usedZ = spanZ * fit;
-        const double left = 128.0 - usedX * 0.5, top = 96.0 - usedZ * 0.5;
-        const ImU32 palette[] = { IM_COL32(97, 190, 246, 255), IM_COL32(250, 179, 82, 255), IM_COL32(149, 222, 161, 255), IM_COL32(202, 151, 240, 255), IM_COL32(244, 124, 133, 255) };
-        for (const auto& point : points) {
-            const int x = (int)std::lround(left + (point.x - minX) * fit), y = (int)std::lround(top + (point.z - minZ) * fit);
-            const unsigned paletteIndex = point.group > 0 ? (unsigned)point.group % 5 : 0;
-            const ImU32 color = point.terrain ? IM_COL32(115, 211, 158, 255) : point.npc ? IM_COL32(255, 230, 145, 255) : palette[paletteIndex];
-            for (int py = -3; py <= 3; ++py) for (int px = -3; px <= 3; ++px) {
-                if (point.terrain ? (px * px + py * py <= 9) : point.npc ? (abs(px) + abs(py) <= 4) : (abs(px) <= 2 || abs(py) <= 2)) ThumbnailPixel(pixels, x + px, y + py, color);
+        static std::unordered_map<std::string, const core::PrefabInfo*> prefabInfo;
+        if (prefabInfo.empty()) for (const auto& p : core::PrefabIndex()) prefabInfo.emplace(p.path, &p);
+        for (const auto& r : doc.records) {
+            if (r.state != proj_codec::Record::State::Placeable) continue;
+            double size = 2.0;
+            if (auto it = prefabInfo.find(r.prefab); it != prefabInfo.end()) size = std::max({ 0.5, (double)it->second->sx, (double)it->second->sy, (double)it->second->sz }) * std::max(0.1, r.scale);
+            const auto [u, v] = iso(r.pos.x, r.pos.y, r.pos.z);
+            elements.push_back({ r.pos.x, r.pos.y, r.pos.z, u, v, size, core::ThumbFile(r.prefab), r.prefab, 0 });
+        }
+        const auto chars = thumbgen::Characters();
+        for (const auto& n : doc.npcs) {
+            std::string app;
+            if (chars) for (const auto& c : *chars) if (c.key == n.key) { app = c.app; break; }
+            const auto [u, v] = iso(n.pos.x, n.pos.y, n.pos.z);
+            elements.push_back({ n.pos.x, n.pos.y, n.pos.z, u, v, 2.0, app.empty() ? std::string() : core::ThumbFile(app), app, 1 });
+        }
+        for (const auto& t : doc.terrain) {
+            const auto [u, v] = iso(t.x, baseY, t.z);
+            elements.push_back({ t.x, baseY, t.z, u, v, std::max(0.5, t.r), {}, {}, 2, t.mode, t.amount });
+        }
+        double minU = 0, maxU = 0, minV = 0, maxV = 0; bool first = true;
+        auto include = [&](double u, double v) {
+            if (first) { minU = maxU = u; minV = maxV = v; first = false; }
+            else { minU = std::min(minU, u); maxU = std::max(maxU, u); minV = std::min(minV, v); maxV = std::max(maxV, v); }
+        };
+        for (const auto& e : elements) {
+            include(e.u, e.v);
+            if (e.kind == 2) for (int k = 0; k < 8; ++k) {
+                const double a = k * 0.78539816339;
+                const auto [u, v] = iso(e.x + cos(a) * e.size, baseY, e.z + sin(a) * e.size); include(u, v);
             }
         }
-        ThumbnailLine(pixels, 0, 0, 255, 0, IM_COL32(92, 112, 135, 255)); ThumbnailLine(pixels, 0, 191, 255, 191, IM_COL32(92, 112, 135, 255));
-        ThumbnailLine(pixels, 0, 0, 0, 191, IM_COL32(92, 112, 135, 255)); ThumbnailLine(pixels, 255, 0, 255, 191, IM_COL32(92, 112, 135, 255));
-        const std::string png = BlueprintThumbnailPath(file), temp = png + ".tmp-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount()) + ".png";
+        const double fit = std::min(208.0 / std::max(1.0, maxU - minU), 126.0 / std::max(1.0, maxV - minV));
+        const double imageCenterY = elements.size() == 1 && elements.front().kind != 2 ? 166.0 : 108.0;
+        auto screen = [&](double u, double v) { return ImVec2((float)(128.0 + (u - (minU + maxU) * 0.5) * fit), (float)(imageCenterY + (v - (minV + maxV) * 0.5) * fit)); };
+        std::vector<unsigned char> pixels(256 * 192 * 4, 0); // transparent outside the actual blueprint
+        std::stable_sort(elements.begin(), elements.end(), [](const Element& a, const Element& b) { return a.kind == 2 && b.kind != 2 ? true : a.kind != 2 && b.kind == 2 ? false : a.v < b.v; });
+        struct Sprite { std::vector<unsigned char> rgba; int w = 0, h = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0; };
+        std::unordered_map<std::string, Sprite> sprites;
+        bool pending = false;
+        for (const auto& e : elements) {
+            if (e.kind == 2) {
+                const ImVec2 center = screen(e.u, e.v);
+                const float lift = (float)std::clamp(e.amount * fit * 0.16, -8.0, 8.0);
+                const unsigned char edge[4] = { 75, 67, 48, 120 };
+                const unsigned char raised[4] = { 153, 135, 87, 215 }, lowered[4] = { 112, 93, 69, 215 }, flat[4] = { 128, 151, 104, 215 };
+                const unsigned char* topColor = e.mode == core::TerrainFlatten ? flat : e.amount >= 0 ? raised : lowered;
+                ImVec2 ring[16]; for (int k = 0; k < 16; ++k) {
+                    const double a = k * 6.28318530718 / 16.0;
+                    const auto [u, v] = iso(e.x + cos(a) * e.size, baseY, e.z + sin(a) * e.size);
+                    ring[k] = screen(u, v); ring[k].y -= lift;
+                }
+                const ImVec2 top(center.x, center.y - lift);
+                for (int k = 0; k < 16; ++k) {
+                    ImVec2 a = ring[k], b = ring[(k + 1) % 16];
+                    ThumbnailTriangle(pixels, { center.x, center.y + 3 }, { a.x, a.y + 3 }, { b.x, b.y + 3 }, edge);
+                    ThumbnailTriangle(pixels, top, a, b, topColor);
+                }
+                continue;
+            }
+            if (e.preview.empty()) continue;
+            auto it = sprites.find(e.preview);
+            if (it == sprites.end()) {
+                Sprite s; int comp = 0; unsigned char* raw = stbi_load(e.preview.c_str(), &s.w, &s.h, &comp, 4);
+                if (!raw) { if (!e.prefab.empty()) thumbgen::Request(e.prefab); pending = true; sprites.emplace(e.preview, Sprite{}); continue; }
+                s.rgba.assign(raw, raw + (size_t)s.w * s.h * 4); stbi_image_free(raw);
+                s.x0 = s.w; s.y0 = s.h;
+                for (int y = 0; y < s.h; ++y) for (int x = 0; x < s.w; ++x) if (s.rgba[((size_t)y * s.w + x) * 4 + 3] > 8) {
+                    s.x0 = std::min(s.x0, x); s.y0 = std::min(s.y0, y); s.x1 = std::max(s.x1, x + 1); s.y1 = std::max(s.y1, y + 1);
+                }
+                it = sprites.emplace(e.preview, std::move(s)).first;
+            }
+            const Sprite& s = it->second; if (s.x1 <= s.x0 || s.y1 <= s.y0) continue;
+            const float natural = (float)std::clamp(e.size * fit * 0.9, elements.size() == 1 ? 88.0 : 16.0, elements.size() == 1 ? 132.0 : 92.0);
+            const float aspect = (float)(s.x1 - s.x0) / std::max(1, s.y1 - s.y0);
+            const int h = std::max(8, (int)lroundf(natural)), w = std::max(8, (int)lroundf(natural * aspect));
+            const ImVec2 anchor = screen(e.u, e.v); const int left = (int)lroundf(anchor.x - w * 0.5f), top = (int)lroundf(anchor.y - h + 6.0f);
+            for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+                const int sx = s.x0 + (int)((int64_t)x * (s.x1 - s.x0) / w), sy = s.y0 + (int)((int64_t)y * (s.y1 - s.y0) / h);
+                ThumbnailBlend(pixels, left + x, top + y, s.rgba.data() + ((size_t)sy * s.w + sx) * 4);
+            }
+        }
+        if (pending) g_pendingBlueprintThumbnailTicks[png] = GetTickCount(); else g_pendingBlueprintThumbnailTicks.erase(png);
+        const std::string temp = png + ".tmp-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount()) + ".png";
         if (!stbi_write_png(temp.c_str(), 256, 192, 4, pixels.data(), 256 * 4)) { DeleteFileA(temp.c_str()); return false; }
         if (!MoveFileExA(temp.c_str(), png.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { DeleteFileA(temp.c_str()); return false; }
         overlay::InvalidateThumb(png);
+        g_currentBlueprintThumbnails.insert(png);
         return true;
     }
     static void EnsureBlueprintThumbnail(const ProjectFile& file) {
@@ -3755,8 +3840,16 @@ namespace editor {
         WIN32_FILE_ATTRIBUTE_DATA thumbInfo{}, sourceInfo{};
         if (!GetFileAttributesExA(source.c_str(), GetFileExInfoStandard, &sourceInfo) ||
             (sourceInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return;
-        if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &thumbInfo) &&
-            !(thumbInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+        const bool haveThumb = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &thumbInfo) &&
+            !(thumbInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+        if (haveThumb && !g_currentBlueprintThumbnails.count(path)) {
+            int w = 0, h = 0, comp = 0; unsigned char* old = stbi_load(path.c_str(), &w, &h, &comp, 4);
+            if (old && w == 256 && h == 192 && old[3] == 0) g_currentBlueprintThumbnails.insert(path);
+            if (old) stbi_image_free(old);
+        }
+        const auto pending = g_pendingBlueprintThumbnailTicks.find(path);
+        if (pending != g_pendingBlueprintThumbnailTicks.end() && GetTickCount() - pending->second < 2000) return;
+        if (haveThumb && g_currentBlueprintThumbnails.count(path) && pending == g_pendingBlueprintThumbnailTicks.end() &&
             CompareFileTime(&thumbInfo.ftLastWriteTime, &sourceInfo.ftLastWriteTime) >= 0) return;
         const ULONGLONG stamp = ((ULONGLONG)sourceInfo.ftLastWriteTime.dwHighDateTime << 32) | sourceInfo.ftLastWriteTime.dwLowDateTime;
         if (const auto it = g_badBlueprintThumbnailStamps.find(source); it != g_badBlueprintThumbnailStamps.end() && it->second == stamp) return;
@@ -3818,7 +3911,7 @@ namespace editor {
         if (g_exportAttempt) g_exportAttempts[g_exportAttempt - 1].result = g_exportStatus;
         g_exportApproval.valid = false; g_exportObjects.clear(); g_exportAttempt = 0; return ok;
     }
-    static bool DispatchProjectAction(const ProjectFile& file, ProjectAction action, bool on = false) {
+    static bool DispatchProjectAction(const ProjectFile& file, ProjectAction action, bool on = false, const Vec3* dropTarget = nullptr) {
         const bool group = file.kind == proj_codec::Kind::Group;
         if (file.archived && action != ProjectAction::Read) { g_projectStatus = "invalid-action"; return false; }
         const bool groupAction = action == ProjectAction::Place || action == ProjectAction::Overwrite;
@@ -3837,11 +3930,25 @@ namespace editor {
         if (!ReadProjectFile(file, doc)) { g_projectFileFailures.push_back({ action == ProjectAction::Read ? "Read" : "Place", ProjectFilePath(file), g_projectStatus }); return false; }
         if (action == ProjectAction::Read) { g_projectRead = std::move(doc); g_projectReadPath = ProjectFilePath(file); g_projectReadValid = true; g_projectDetails.erase("read-preview"); return true; }
         if (action == ProjectAction::Overwrite) { strncpy_s(g_blueprintName, file.name.c_str(), _TRUNCATE); g_exportOpen = true; g_exportOverwrite = false; ResetExportApproval(); PublishProjectContext(); return true; }
-        if (g_place.active) { g_projectStatus = "placement-pending"; return false; }
+        if (g_place.active) {
+            DropCarried();
+            if (g_place.active) {
+                g_pendingBlueprintPlace = { true, file, dropTarget ? *dropTarget : InFront(1, 0), GetTickCount() };
+                g_projectStatus = "placement-pending";
+                return true;
+            }
+        }
         const auto path = ProjectFilePath(file); core::SavedFile saved{ file.kind, false, path.substr(path.find_last_of("\\/") + 1), path };
         core::FileSelectionHandle selected; const auto result = core::SelectSavedFile(saved, selected);
         if (!result.ok()) { g_projectStatus = core::FileReasonCode(result.reason); return false; }
-        return PlaceGroupCopy(doc, InFront(1, 0), 0, 1, file.name, selected);
+        return PlaceGroupCopy(doc, dropTarget ? *dropTarget : InFront(1, 0), 0, 1, file.name, selected);
+    }
+    static void PumpPendingBlueprintPlace() {
+        if (!g_pendingBlueprintPlace.active || g_place.active) return;
+        auto pending = g_pendingBlueprintPlace;
+        g_pendingBlueprintPlace = {};
+        if (GetTickCount() - pending.queuedAt < 30000)
+            DispatchProjectAction(pending.file, ProjectAction::Place, false, &pending.target);
     }
     static void ProjectButtonWrap(const char* label) { SameLineOrWrap(true, ImGui::CalcTextSize(T(label)).x + ImGui::GetStyle().FramePadding.x * 2); }
     static bool ProjectDisclosure(const std::string& caption, const std::string& key) {
@@ -3925,6 +4032,8 @@ namespace editor {
                 core::Log("[blueprint] could not remove obsolete thumbnail %s (error %lu)", thumbnail.c_str(), GetLastError());
             overlay::InvalidateThumb(thumbnail);
             g_badBlueprintThumbnailStamps.erase(file.path);
+            g_pendingBlueprintThumbnailTicks.erase(thumbnail);
+            g_currentBlueprintThumbnails.erase(thumbnail);
             if (g_projectReadPath == file.path) g_projectReadValid = false;
         }
         g_projectRefresh = true; g_projectStatus = T("File action completed. Scene objects and History were not changed."); return true;
@@ -3984,9 +4093,48 @@ namespace editor {
         const size_t archiveCount = groupKind ? g_projectLibrary.archived.groups : g_projectLibrary.archived.projects;
         ImGui::TextDisabled(T("%zu active / %zu archived / %zu shown"), activeCount, archiveCount, g_libraryRows.size());
         if (!g_libraryResult.ok()) ImGui::TextWrapped("%s: %s (%lu)", T("Library refresh failed"), ProjectUiStatus(core::FileReasonCode(g_libraryResult.reason)), g_libraryResult.systemError);
-        const float stride = groupKind ? 56.0f : ImGui::GetFrameHeightWithSpacing();
+        const float stride = ImGui::GetFrameHeightWithSpacing();
         const int visibleRows = std::min(7, (int)g_libraryRows.size());
         if (visibleRows == 0) ImGui::TextDisabled("%s", T("No matching saved files"));
+        else if (groupKind) {
+            const float width = ImGui::GetContentRegionAvail().x;
+            const float spacing = ImGui::GetStyle().ItemSpacing.x;
+            const int columns = std::max(1, std::min(4, (int)((width + spacing) / (145.0f + spacing))));
+            const float cardWidth = std::max(85.0f, (width - 16.0f - spacing * (columns - 1)) / columns);
+            const float imageHeight = cardWidth * 0.75f;
+            const float cardHeight = imageHeight + ImGui::GetTextLineHeightWithSpacing() + 10.0f;
+            const int rows = ((int)g_libraryRows.size() + columns - 1) / columns;
+            if (ImGui::BeginChild("blueprint-gallery", ImVec2(0, std::min(350.0f, rows * (cardHeight + spacing) + 12.0f)), ImGuiChildFlags_Borders)) {
+                for (size_t n = 0; n < g_libraryRows.size(); ++n) {
+                    const auto& saved = g_projectLibrary.entries[g_libraryRows[n]].file;
+                    const ProjectFile file{ saved.filename.substr(0, saved.filename.size() - 8), saved.kind, saved.archived, saved.path };
+                    EnsureBlueprintThumbnail(file);
+                    ImGui::PushID(saved.path.c_str());
+                    const ImVec2 start = ImGui::GetCursorScreenPos();
+                    const bool selected = SameSavedFile(saved, g_librarySelected);
+                    if (ImGui::InvisibleButton("##blueprint-card", ImVec2(cardWidth, cardHeight))) g_librarySelected = saved;
+                    const bool hovered = ImGui::IsItemHovered();
+                    if (!saved.archived && hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                        DispatchProjectAction(file, ProjectAction::Place);
+                    if (!saved.archived && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f)) {
+                        g_blueprintDragFile = file; g_blueprintDragging = true;
+                    }
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    const ImVec2 end{ start.x + cardWidth, start.y + cardHeight };
+                    dl->AddRectFilled(start, end, ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
+                    if (ImTextureID image = overlay::Thumb(BlueprintThumbnailPath(file)))
+                        dl->AddImage(image, ImVec2(start.x + 3, start.y + 3), ImVec2(start.x + cardWidth - 3, start.y + imageHeight + 3));
+                    dl->PushClipRect(ImVec2(start.x + 4, start.y + imageHeight + 4), ImVec2(end.x - 4, end.y - 2), true);
+                    dl->AddText(ImVec2(start.x + 5, start.y + imageHeight + 6), ImGui::GetColorU32(ImGuiCol_Text), file.name.c_str());
+                    dl->PopClipRect();
+                    dl->AddRect(start, end, ImGui::GetColorU32(selected ? ImGuiCol_HeaderActive : ImGuiCol_Border), 4.0f, 0, selected ? 2.0f : 1.0f);
+                    if (hovered) ImGui::SetTooltip("%s", saved.path.c_str());
+                    ImGui::PopID();
+                    if ((int)(n % columns) != columns - 1 && n + 1 < g_libraryRows.size()) ImGui::SameLine();
+                }
+            }
+            ImGui::EndChild();
+        }
         else if (ImGui::BeginChild("saved-library", ImVec2(0, stride * visibleRows + ImGui::GetStyle().WindowPadding.y), ImGuiChildFlags_Borders)) {
             ImGuiListClipper clipper; clipper.Begin((int)g_libraryRows.size(), stride);
             while (clipper.Step()) for (int n = clipper.DisplayStart; n < clipper.DisplayEnd; ++n) {
@@ -3994,25 +4142,12 @@ namespace editor {
                 ImGui::PushID(file.path.c_str());
                 const bool selected = SameSavedFile(file, g_librarySelected);
                 const std::string label = file.filename + (row.ownership.dirty ? " *" : "") + (file.archived ? " [A]" : "");
-                const float rowHeight = groupKind ? 52.0f : ImGui::GetFrameHeight();
-                if (groupKind) {
-                    const ProjectFile blueprint{ file.filename.substr(0, file.filename.size() - 8), file.kind, file.archived, file.path };
-                    EnsureBlueprintThumbnail(blueprint);
-                    const ImVec2 rowStart = ImGui::GetCursorScreenPos();
-                    if (ImGui::Selectable("##saved-file", selected, 0, ImVec2(ImGui::GetContentRegionAvail().x, rowHeight))) g_librarySelected = file;
-                    const ImVec2 rowEnd = ImGui::GetItemRectMax();
-                    if (ImTextureID image = overlay::Thumb(BlueprintThumbnailPath(blueprint))) ImGui::GetWindowDrawList()->AddImage(image, ImVec2(rowStart.x + 4, rowStart.y + 3), ImVec2(rowStart.x + 64, rowStart.y + rowHeight - 3));
-                    const ImU32 textColor = ImGui::GetColorU32(ImGuiCol_Text);
-                    ImGui::GetWindowDrawList()->AddText(ImVec2(rowStart.x + 72, rowStart.y + (rowHeight - ImGui::GetTextLineHeight()) * 0.5f), textColor, label.c_str());
-                    if (ImGui::IsMouseHoveringRect(rowStart, rowEnd) && ImGui::IsWindowHovered()) ImGui::SetTooltip("%s", file.path.c_str());
-                } else {
-                    if (ImGui::Selectable((label + "###saved-file").c_str(), selected, 0, ImVec2(ImGui::GetContentRegionAvail().x, rowHeight))) g_librarySelected = file;
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", file.path.c_str());
-                }
+                if (ImGui::Selectable((label + "###saved-file").c_str(), selected, 0, ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight()))) g_librarySelected = file;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", file.path.c_str());
                 ImGui::PopID();
             }
         }
-        if (visibleRows > 0) ImGui::EndChild();
+        if (visibleRows > 0 && !groupKind) ImGui::EndChild();
         for (size_t index : g_libraryRows) {
             const auto row = g_projectLibrary.entries[index]; const auto& saved = row.file;
             if (!SameSavedFile(saved, g_librarySelected)) continue;
@@ -4020,15 +4155,13 @@ namespace editor {
             ImGui::TextWrapped("%s / %s", T(saved.archived ? "Archived" : "Active"), saved.filename.c_str());
             const auto& o = row.ownership;
             if (groupKind) {
-                EnsureBlueprintThumbnail(file);
-                if (ImTextureID image = overlay::Thumb(BlueprintThumbnailPath(file))) ImGui::Image(image, ImVec2(168.0f, 126.0f));
-                ImGui::SameLine(); ImGui::BeginGroup(); ImGui::TextDisabled("%s", T("Blueprint file")); ImGui::TextDisabled(".cdgroup"); ImGui::EndGroup();
+                ImGui::TextDisabled(".cdgroup");
             } else {
                 ImGui::TextDisabled("%s: %zu / %s: %zu / %s: %zu", T("Object"), o.visible, T("NPC"), o.visibleNpcs, T("Terrain"), o.terrain);
                 ImGui::TextDisabled(T("Hidden objects: %zu / hidden NPCs: %zu / pending: %zu"), o.hidden, o.hiddenNpcs, o.pendingObjects + o.pendingNpcs);
             }
             ImGui::PushID(groupKind ? "blueprint" : "project"); ImGui::PushID(file.name.c_str());
-            if (ImGui::Button(T("Read"))) DispatchProjectAction(file, ProjectAction::Read);
+            if (!groupKind && ImGui::Button(T("Read"))) DispatchProjectAction(file, ProjectAction::Read);
             if (!saved.archived) {
                 if (groupKind) {
                     ProjectButtonWrap("Place"); if (ImGui::Button(T("Place"))) DispatchProjectAction(file, ProjectAction::Place);
@@ -4227,8 +4360,6 @@ namespace editor {
         if (!g_projectStatus.empty()) ImGui::TextWrapped("%s", ProjectUiStatus(g_projectStatus.c_str()));
         DrawExportAttempts();
         DrawSavedLibrary(true);
-        if (g_projectReadValid && g_projectReadPath.size() >= 8 && _stricmp(g_projectReadPath.c_str() + g_projectReadPath.size() - 8, ".cdgroup") == 0)
-            ImGui::TextDisabled(T("Read preview: %zu objects, %zu NPCs, %zu terrain strokes"), g_projectRead.records.size(), g_projectRead.npcs.size(), g_projectRead.terrain.size());
     }
     static void DrawProject() {
         ImGui::PushOverrideID(ImHashStr("project-page"));
@@ -4583,7 +4714,7 @@ namespace editor {
         if(ImGui::IsMouseReleased(ImGuiMouseButton_Left)){if(!g_boxMoved&&!g_boxAdd)ClearSceneSelection();g_boxSelecting=g_boxMoved=g_boxAdd=false;g_boxBase.clear();g_boxNpcBase.clear();}
     }
     static void ClickSelect(const PosInfo& p, bool havePos) {
-        (void)p;(void)havePos;g_hoverUid=g_hoverNpcUid=0;ImGuiIO&io=ImGui::GetIO();if(g_browserDragPrefab>=0||g_npcDragIndex>=0)return;if(BrushActive())return;
+        (void)p;(void)havePos;g_hoverUid=g_hoverNpcUid=0;ImGuiIO&io=ImGui::GetIO();if(g_browserDragPrefab>=0||g_npcDragIndex>=0||g_blueprintDragging)return;if(BrushActive())return;
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemHovered();
         const bool addSelect=CtrlHeld(io),addBox=CtrlHeld(io)||ShiftHeld(io),placing=g_place.active;if(g_playMode)return;
         if (io.MouseClicked[ImGuiMouseButton_Left]) {
@@ -4668,6 +4799,7 @@ namespace editor {
                 Note(T("snap to ground: no surface found below"));
                 g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
             }
+            if (g_place.active) { DropCarried(); if (g_place.active) { ++i; continue; } }
             const auto status = core::GroundResultState(j.ticket, &gh);
             if (status == core::GroundProbeStatus::Pending) { ++i; continue; }
             if (status == core::GroundProbeStatus::Invalidated || status == core::GroundProbeStatus::Unknown) {
@@ -4737,6 +4869,27 @@ namespace editor {
         }
         *at = hit; if (onGroundPlane) *onGroundPlane = plane; return true;
     }
+    static void ProcessBlueprintDrag() {
+        if (!g_blueprintDragging) return;
+        ImGuiIO& io = ImGui::GetIO();
+        if (!io.MouseDown[ImGuiMouseButton_Left] && !ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            g_blueprintDragging = false; return;
+        }
+        const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) || ImGui::IsAnyItemHovered();
+        Vec3 at{}; const bool projected = NpcDropPoint(io.MousePos, &at, nullptr);
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        dl->AddText(ImVec2(io.MousePos.x + 16.0f, io.MousePos.y + 14.0f), IM_COL32(255, 220, 150, 255), g_blueprintDragFile.name.c_str());
+        if (!overUi && projected) {
+            ImVec2 screen{};
+            if (WorldToScreen(CurrentCam(), at, &screen)) {
+                dl->AddCircle(screen, 11.0f, IM_COL32(255, 190, 90, 255), 24, 2.0f);
+                dl->AddCircleFilled(screen, 3.0f, IM_COL32(255, 230, 180, 255));
+            }
+        }
+        if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left)) return;
+        g_blueprintDragging = false;
+        if (!overUi && projected) DispatchProjectAction(g_blueprintDragFile, ProjectAction::Place, false, &at);
+    }
     static void PumpNpcDropJobs() {
         for (size_t i = 0; i < g_npcDropJobs.size();) {
             NpcDropJob& j = g_npcDropJobs[i]; core::GroundHit gh;
@@ -4745,6 +4898,7 @@ namespace editor {
                 Note(T("snap to ground: no surface found below"));
                 g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
             }
+            if (g_place.active) { DropCarried(); if (g_place.active) { ++i; continue; } }
             if (!j.centerResolved) {
                 const auto status = core::GroundResultState(j.ticket, &gh);
                 if (status == core::GroundProbeStatus::Pending) { ++i; continue; }
@@ -4933,6 +5087,7 @@ namespace editor {
         if (g_compactPage == TabBlueprint) {
             if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
             DrawBlueprint();
+            ProcessBlueprintDrag();
             ImGui::End();
             if (playAlpha) ImGui::PopStyleVar();
             return;
@@ -5069,6 +5224,7 @@ namespace editor {
         SampleCamera();
         PumpSnapJobs();
         PlaceTick();                           // runs with the menu closed as well
+        PumpPendingBlueprintPlace();
         PumpBrowserDropJobs();                 // a drop whose ground probe returns after the window was hidden still spawns
         PumpNpcDropJobs();
         if (g_place.active && (g_place.hasNpc || g_gizmo || MouseMode())) { const bool one = g_place.m.size() == 1; const CamFrame cf = CurrentCam();
@@ -5343,6 +5499,7 @@ namespace editor {
         }
         ProcessBrowserDrag();
         ProcessNpcDrag();
+        ProcessBlueprintDrag();
         DrawMetadataPopups();
         ImGui::End();
         DrawPropertiesWindow(p, havePos);

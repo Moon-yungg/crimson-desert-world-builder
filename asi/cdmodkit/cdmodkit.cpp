@@ -1027,7 +1027,9 @@ static std::function<void()> AdmitMoveLocked(size_t i, Vec3 pos, Rot rot, float 
     const uint64_t pose = e.poseGen;
     return [uid, gen, pose, final, recreate, done, target]() {
         { REG_LOCK; const int ix = IndexOfUidLocked(uid);
-          if (ix < 0 || g_reg[(size_t)ix].poseGen != pose || !GenCurrentLocked(uid, gen)) return; }
+          // Live jobs read the newest admitted pose in ApplyMove. Rejecting every older queued
+          // sample can starve visible motion while the UI keeps admitting a new pose each frame.
+          if (ix < 0 || (final && g_reg[(size_t)ix].poseGen != pose) || !GenCurrentLocked(uid, gen)) return; }
         if (recreate) DoReplace(uid, gen, done, done ? &target : nullptr); else ApplyMove(uid, gen, final, done, done ? &target : nullptr);
     };
 }
@@ -2067,7 +2069,7 @@ GroupAdmissionReport AdmitGroupCopy(const proj_codec::Document& doc, Vec3 target
     for (const auto& record : placed.records) prefabs.push_back(record.prefab);
     rep.request = BeginPlaceRequest(prefabs);
     rep.requested = (int)placed.records.size();
-    std::map<int, int> groups;   // source partition -> fresh independent session id (zero stays zero)
+    const int group = NewGroupId(); // every placed blueprint copy is one selectable group
     std::vector<int> admitted(placed.records.size(), 0);
     for (size_t i = 0; i < placed.records.size(); ++i) {
         const std::string& prefab = placed.records[i].prefab;
@@ -2076,15 +2078,7 @@ GroupAdmissionReport AdmitGroupCopy(const proj_codec::Document& doc, Vec3 target
             rep.excludedPrefabs.push_back(prefab);
             continue;
         }
-        // C4-PARTITION-BEGIN
-        int group = 0;
-        if (placed.records[i].group) {
-            auto it = groups.find(placed.records[i].group);
-            if (it == groups.end()) it = groups.emplace(placed.records[i].group, NewGroupId()).first;
-            group = it->second;
-        }
         placed.records[i].group = group;
-        // C4-PARTITION-END
         const proj_codec::EngineRow& row = narrowed[i];
         const int uid = SubmitPlaceRow(rep.request, (int)i, { row.x, row.y, row.z }, Rot{ row.yaw, row.pitch, row.roll }, row.scale, group);
         admitted[i] = uid;
@@ -2092,10 +2086,7 @@ GroupAdmissionReport AdmitGroupCopy(const proj_codec::Document& doc, Vec3 target
         else rep.excludedPrefabs.push_back(prefab);   // the admission itself refused: a named exclusion, not a success
     }
     placed.groupNames.clear();
-    for (const auto& name : doc.groupNames) {
-        const auto mapped = groups.find(name.first);
-        if (mapped != groups.end()) { placed.groupNames.emplace(mapped->second, name.second); SetGroupName(mapped->second, name.second); }
-    }
+    if (doc.groupNames.size() == 1) { placed.groupNames.emplace(group, doc.groupNames.begin()->second); SetGroupName(group, doc.groupNames.begin()->second); }
     rep.admitted = (int)uids.size();
     rep.excluded = (int)rep.excludedPrefabs.size();
     if (uids.empty()) return fail("record 0: no placeable members");
