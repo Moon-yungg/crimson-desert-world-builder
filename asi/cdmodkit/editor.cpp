@@ -2373,35 +2373,42 @@ namespace editor {
         Push({ a });
     }
     static void DrawMetadataPopups() {
-        g_metadataEditing = g_metadataPopupRequest || ImGui::IsPopupOpen("Edit NPC note") || ImGui::IsPopupOpen("Rename NPC") ||
-            ImGui::IsPopupOpen("Rename group") || ImGui::IsPopupOpen("Edit object note");
+        const auto title = [](int kind) -> const char* {
+            switch (kind) {
+            case 1: return TStable("Edit NPC note");
+            case 2: return TStable("Rename NPC");
+            case 3: return TStable("Rename group");
+            default: return TStable("Edit object note");
+            }
+        };
+        g_metadataEditing = g_metadataPopupRequest || ImGui::IsPopupOpen(title(1)) || ImGui::IsPopupOpen(title(2)) ||
+            ImGui::IsPopupOpen(title(3)) || ImGui::IsPopupOpen(title(4));
         if (g_metadataPopupRequest) {
-            const char* id = g_metadataPopupRequest == 1 ? "Edit NPC note" : g_metadataPopupRequest == 2 ? "Rename NPC" : g_metadataPopupRequest == 3 ? "Rename group" : "Edit object note";
-            ImGui::OpenPopup(id); g_metadataPopupRequest = 0;
+            ImGui::OpenPopup(title(g_metadataPopupRequest)); g_metadataPopupRequest = 0;
         }
-        if (ImGui::BeginPopupModal("Edit NPC note", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::SetNextItemWidth(460); ImGui::InputTextMultiline("##npcnote", g_npcNoteEdit, sizeof g_npcNoteEdit, ImVec2(460, 110));
+        if (ImGui::BeginPopupModal(title(1), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::SetNextItemWidth(460); if (ImGui::InputTextMultiline("##npcnote", g_npcNoteEdit, sizeof g_npcNoteEdit, ImVec2(460, 110))) i18n::AddGlyphText(g_npcNoteEdit);
             if (ImGui::Button(T("Save"))) {
                 SaveMetadata(Act::NpcNote, g_npcNoteEditUid, g_npcNoteEdit); ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
-        if (ImGui::BeginPopupModal("Rename NPC", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::SetNextItemWidth(360); ImGui::InputText("##npclabel", g_npcLabelEdit, sizeof g_npcLabelEdit);
+        if (ImGui::BeginPopupModal(title(2), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::SetNextItemWidth(360); InputTextI18n("##npclabel", "", g_npcLabelEdit, sizeof g_npcLabelEdit);
             if (ImGui::Button(T("Save"))) {
                 SaveMetadata(Act::NpcLabel, g_npcLabelEditUid, g_npcLabelEdit); ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
-        if (ImGui::BeginPopupModal("Rename group", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::SetNextItemWidth(360); ImGui::InputText("##groupname", g_groupNameEdit, sizeof g_groupNameEdit);
+        if (ImGui::BeginPopupModal(title(3), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::SetNextItemWidth(360); InputTextI18n("##groupname", "", g_groupNameEdit, sizeof g_groupNameEdit);
             if (ImGui::Button(T("Save"))) {
                 SaveMetadata(Act::GroupName, g_groupNameEditId, g_groupNameEdit); ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
-        if (ImGui::BeginPopupModal("Edit object note", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::SetNextItemWidth(460); ImGui::InputTextMultiline("##objectnote", g_objectNoteEdit, sizeof g_objectNoteEdit, ImVec2(460, 110));
+        if (ImGui::BeginPopupModal(title(4), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::SetNextItemWidth(460); if (ImGui::InputTextMultiline("##objectnote", g_objectNoteEdit, sizeof g_objectNoteEdit, ImVec2(460, 110))) i18n::AddGlyphText(g_objectNoteEdit);
             if (ImGui::Button(T("Save"))) {
                 SaveMetadata(Act::ObjectNote, g_objectNoteEditUid, g_objectNoteEdit); ImGui::CloseCurrentPopup();
             }
@@ -3214,8 +3221,11 @@ namespace editor {
         return out;
     }
     static std::string SceneEntityName(const SceneEntityRef& e, const std::vector<SpawnedObj>& objects, const std::vector<ManagedNpc>& npcs, const std::vector<thumbgen::CharInfo>* chars) {
-        if (e.npc) return ManagedNpcName(npcs[e.index], chars);
-        return ShortName(objects[e.index].prefab);
+        const std::string name = e.npc ? ManagedNpcName(npcs[e.index], chars) : ShortName(objects[e.index].prefab);
+        std::string note = e.npc ? npcs[e.index].note : objects[e.index].note;
+        if (note.empty()) return name;
+        for (char& c : note) if (c == '\r' || c == '\n') c = ' ';
+        return note + " · " + name;
     }
     static Vec3 SceneEntityPos(const SceneEntityRef& e, const std::vector<SpawnedObj>& objects, const std::vector<ManagedNpc>& npcs) {
         return e.npc ? ManagedNpcDisplayPos(npcs[e.index]) : objects[e.index].pos;
@@ -3993,18 +4003,9 @@ namespace editor {
     }
     struct LibraryFileAction {
         core::FileSelectionHandle selection; core::FileAction action = core::FileAction::Archive;
-        core::FileResult result; bool openConfirmation = false; char typed[1024] = {};
+        core::FileResult result;
     };
     static LibraryFileAction g_libraryAction;
-    static const char* LibraryActionName(core::FileAction action) {
-        switch (action) {
-        case core::FileAction::Archive: return "Archive";
-        case core::FileAction::Restore: return "Restore";
-        case core::FileAction::Purge: return "Purge";
-        case core::FileAction::Delete: return "Permanent delete";
-        }
-        return "File action";
-    }
     static core::FileReason GuardLibraryFile(const core::SavedFile& file) {
         using R = core::FileReason;
         if (!SameSavedFile(file, g_librarySelected)) return R::SelectionChanged;
@@ -4015,7 +4016,7 @@ namespace editor {
         const bool group = file.kind == proj_codec::Kind::Group;
         const std::string stem = file.filename.substr(0, file.filename.size() - (group ? 8 : 7));
         if (group) {
-            const std::string name = g_projName; const auto first = name.find_first_not_of(" \t"), last = name.find_last_not_of(" \t");
+            const std::string name = g_blueprintName; const auto first = name.find_first_not_of(" \t"), last = name.find_last_not_of(" \t");
             if (g_exportOpen && first != std::string::npos && core::FileNameEqual(name.substr(first, last - first + 1), stem)) return R::InFlightExport;
             for (const auto& report : g_projectPlacements) {
                 const auto source = core::SelectedFile(report.source);
@@ -4050,7 +4051,7 @@ namespace editor {
     }
     static bool ExecuteLibraryAction() {
         const core::SavedFile file = core::SelectedFile(g_libraryAction.selection);
-        g_libraryAction.result = core::ExecuteFileAction(g_libraryAction.selection, g_libraryAction.action, g_libraryAction.typed, GuardLibraryFile);
+        g_libraryAction.result = core::ExecuteFileAction(g_libraryAction.selection, g_libraryAction.action, file.filename, GuardLibraryFile);
         if (!g_libraryAction.result.ok()) return false;
         if (file.kind == proj_codec::Kind::Group) {
             const ProjectFile blueprint{ file.filename.substr(0, file.filename.size() - 8), file.kind, file.archived, file.path };
@@ -4063,43 +4064,19 @@ namespace editor {
             g_currentBlueprintThumbnails.erase(thumbnail);
             if (g_projectReadPath == file.path) g_projectReadValid = false;
         }
-        g_projectRefresh = true; g_projectStatus = T("File action completed. Scene objects and History were not changed."); return true;
+        g_projectRefresh = true; g_projectStatus.clear(); return true;
     }
     static void BeginLibraryAction(const core::SavedFile& file, core::FileAction action) {
         g_libraryAction = {}; g_libraryAction.action = action; g_projectStatus.clear();
         g_libraryAction.result = core::SelectSavedFile(file, g_libraryAction.selection);
         if (!g_libraryAction.result.ok()) return;
-        if ((action == core::FileAction::Delete || action == core::FileAction::Purge) && file.kind == proj_codec::Kind::Group) {
-            strncpy_s(g_libraryAction.typed, file.filename.c_str(), _TRUNCATE);
-            ExecuteLibraryAction();
-        }
-        else if (action == core::FileAction::Delete || action == core::FileAction::Purge) g_libraryAction.openConfirmation = true;
-        else ExecuteLibraryAction();
+        ExecuteLibraryAction();
     }
     static void DrawLibraryFailure() {
         const auto& r = g_libraryAction.result; if (r.ok()) return;
         ImGui::TextWrapped("%s: %s (%lu)", T("File action failed"), ProjectUiStatus(core::FileReasonCode(r.reason)), r.systemError);
         if (r.reason == core::FileReason::AutoloadEnabled) ImGui::TextWrapped("%s", T("Turn autoload OFF explicitly before changing this file."));
-        else if (r.reason == core::FileReason::ConfirmationMismatch) ImGui::TextWrapped("%s", T("Type the exact full filename, including its extension and letter case."));
         else ImGui::TextWrapped("%s", T("The file action failed. Check file access, then refresh and try again."));
-    }
-    static void DrawLibraryConfirmation() {
-        if (g_libraryAction.openConfirmation) { ImGui::OpenPopup("###file-confirm"); g_libraryAction.openConfirmation = false; }
-        const auto& style = ImGui::GetStyle(); const auto display = ImGui::GetIO().DisplaySize;
-        const float width = std::min(ImGui::GetFontSize() * 36, display.x - style.WindowPadding.x * 2);
-        ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0), ImVec2(width, display.y - style.WindowPadding.y * 2));
-        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-        if (!ImGui::BeginPopupModal(TStable("Confirm permanent file deletion###file-confirm"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
-        const auto file = core::SelectedFile(g_libraryAction.selection);
-        ImGui::TextWrapped("%s / %s / %s", T(LibraryActionName(g_libraryAction.action)), T(file.kind == proj_codec::Kind::Group ? "group" : "project"), T(file.archived ? "Archived" : "Active"));
-        ImGui::TextWrapped("%s", file.filename.c_str()); ImGui::TextWrapped("%s", file.path.c_str());
-        ImGui::TextWrapped("%s", T("Permanent file deletion cannot be recovered with Scene Undo. Scene objects and placed group copies will not be deleted."));
-        ImGui::TextWrapped("%s", T("Type the exact full filename, including its extension and letter case."));
-        ImGui::SetNextItemWidth(-1); InputTextI18n("##file-confirm-name", "", g_libraryAction.typed, sizeof g_libraryAction.typed); DrawLibraryFailure();
-        if (ImGui::Button(T("Cancel file action"))) { g_libraryAction.selection.reset(); ImGui::CloseCurrentPopup(); }
-        ImGui::SetItemDefaultFocus(); ProjectButtonWrap("Confirm permanent delete");
-        if (ImGui::Button(T("Confirm permanent delete")) && ExecuteLibraryAction()) ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
     }
     static void DrawSavedLibrary(bool blueprints) {
         if (g_libraryShowingBlueprints != blueprints) {
@@ -4189,49 +4166,34 @@ namespace editor {
             }
         }
         if (visibleRows > 0 && !groupKind) ImGui::EndChild();
-        for (size_t index : g_libraryRows) {
+        if (!groupKind) for (size_t index : g_libraryRows) {
             const auto row = g_projectLibrary.entries[index]; const auto& saved = row.file;
             if (!SameSavedFile(saved, g_librarySelected)) continue;
-            const ProjectFile file{ saved.filename.substr(0, saved.filename.size() - (groupKind ? 8 : 7)), saved.kind, saved.archived, saved.path };
-            ImGui::TextWrapped("%s / %s", T(saved.archived ? "Archived" : "Active"), saved.filename.c_str());
+            const ProjectFile file{ saved.filename.substr(0, saved.filename.size() - 7), saved.kind, saved.archived, saved.path };
             const auto& o = row.ownership;
-            if (groupKind) {
-                ImGui::TextDisabled(".cdgroup");
-            } else {
-                ImGui::TextDisabled("%s: %zu / %s: %zu / %s: %zu", T("Object"), o.visible, T("NPC"), o.visibleNpcs, T("Terrain"), o.terrain);
-                ImGui::TextDisabled(T("Hidden objects: %zu / hidden NPCs: %zu / pending: %zu"), o.hidden, o.hiddenNpcs, o.pendingObjects + o.pendingNpcs);
-            }
-            ImGui::PushID(groupKind ? "blueprint" : "project"); ImGui::PushID(file.name.c_str());
-            if (!groupKind && ImGui::Button(T("Read"))) DispatchProjectAction(file, ProjectAction::Read);
+            ImGui::TextDisabled("%s: %zu / %s: %zu / %s: %zu", T("Object"), o.visible, T("NPC"), o.visibleNpcs, T("Terrain"), o.terrain);
+            ImGui::TextDisabled(T("Hidden objects: %zu / hidden NPCs: %zu / pending: %zu"), o.hidden, o.hiddenNpcs, o.pendingObjects + o.pendingNpcs);
+            ImGui::PushID("project"); ImGui::PushID(file.name.c_str());
+            if (ImGui::Button(T("Read"))) DispatchProjectAction(file, ProjectAction::Read);
             if (!saved.archived) {
-                if (groupKind) {
-                    ProjectButtonWrap("Place"); if (ImGui::Button(T("Place"))) DispatchProjectAction(file, ProjectAction::Place);
-                    ProjectButtonWrap("Overwrite"); if (ImGui::Button(T("Overwrite"))) DispatchProjectAction(file, ProjectAction::Overwrite);
-                } else {
-                    const bool loaded = o.visible || o.hidden || o.visibleNpcs || o.hiddenNpcs || o.terrain;
-                    ProjectButtonWrap("Load"); ImGui::BeginDisabled(loaded || g_projectCommandPending); if (ImGui::Button(T("Load"))) DispatchProjectAction(file, ProjectAction::Load); ImGui::EndDisabled();
-                    ProjectButtonWrap("Reload"); ImGui::BeginDisabled(!loaded || g_projectCommandPending); if (ImGui::Button(T("Reload"))) DispatchProjectAction(file, ProjectAction::Reload); ImGui::EndDisabled();
-                    ProjectButtonWrap("Save"); ImGui::BeginDisabled(!loaded || !o.dirty); if (ImGui::Button(T("Save"))) DispatchProjectAction(file, ProjectAction::Save); ImGui::EndDisabled();
-                    ProjectButtonWrap("Unload"); ImGui::BeginDisabled(!loaded || g_projectCommandPending); if (ImGui::Button(T("Unload"))) DispatchProjectAction(file, ProjectAction::Unload); ImGui::EndDisabled();
-                    const auto& unassigned = g_projectLibrary.unassigned;
-                    ProjectButtonWrap("Add unassigned"); ImGui::BeginDisabled(!loaded || !(unassigned.visible || unassigned.visibleNpcs || unassigned.terrain)); if (ImGui::Button(T("Add unassigned"))) DispatchProjectAction(file, ProjectAction::AddUnassigned); ImGui::EndDisabled();
-                    ProjectButtonWrap("autoload"); bool on = std::any_of(g_projectAutoload.begin(), g_projectAutoload.end(), [&](const auto& name) { return core::FileNameEqual(name, file.name); });
-                    if (ImGui::Checkbox(T("autoload"), &on)) DispatchProjectAction(file, ProjectAction::Autoload, on);
-                }
+                const bool loaded = o.visible || o.hidden || o.visibleNpcs || o.hiddenNpcs || o.terrain;
+                ProjectButtonWrap("Load"); ImGui::BeginDisabled(loaded || g_projectCommandPending); if (ImGui::Button(T("Load"))) DispatchProjectAction(file, ProjectAction::Load); ImGui::EndDisabled();
+                ProjectButtonWrap("Reload"); ImGui::BeginDisabled(!loaded || g_projectCommandPending); if (ImGui::Button(T("Reload"))) DispatchProjectAction(file, ProjectAction::Reload); ImGui::EndDisabled();
+                ProjectButtonWrap("Save"); ImGui::BeginDisabled(!loaded || !o.dirty); if (ImGui::Button(T("Save"))) DispatchProjectAction(file, ProjectAction::Save); ImGui::EndDisabled();
+                ProjectButtonWrap("Unload"); ImGui::BeginDisabled(!loaded || g_projectCommandPending); if (ImGui::Button(T("Unload"))) DispatchProjectAction(file, ProjectAction::Unload); ImGui::EndDisabled();
+                const auto& unassigned = g_projectLibrary.unassigned;
+                ProjectButtonWrap("Add unassigned"); ImGui::BeginDisabled(!loaded || !(unassigned.visible || unassigned.visibleNpcs || unassigned.terrain)); if (ImGui::Button(T("Add unassigned"))) DispatchProjectAction(file, ProjectAction::AddUnassigned); ImGui::EndDisabled();
+                ProjectButtonWrap("autoload"); bool on = std::any_of(g_projectAutoload.begin(), g_projectAutoload.end(), [&](const auto& name) { return core::FileNameEqual(name, file.name); });
+                if (ImGui::Checkbox(T("autoload"), &on)) DispatchProjectAction(file, ProjectAction::Autoload, on);
                 ProjectButtonWrap("Archive"); if (ImGui::Button(T("Archive"))) BeginLibraryAction(saved, core::FileAction::Archive);
-                if (groupKind) {
-                    ProjectButtonWrap("Delete"); if (ImGui::Button(T("Delete"))) BeginLibraryAction(saved, core::FileAction::Delete);
-                } else {
-                    ProjectButtonWrap("More file actions"); if (ImGui::Button(T("More file actions"))) ImGui::OpenPopup("file-actions");
-                    if (ImGui::BeginPopup("file-actions")) { if (ImGui::MenuItem(T("Permanent delete"))) BeginLibraryAction(saved, core::FileAction::Delete); ImGui::EndPopup(); }
-                }
+                ProjectButtonWrap("Delete"); if (ImGui::Button(T("Delete"))) BeginLibraryAction(saved, core::FileAction::Delete);
             } else {
                 ProjectButtonWrap("Restore"); if (ImGui::Button(T("Restore"))) BeginLibraryAction(saved, core::FileAction::Restore);
-                ProjectButtonWrap(groupKind ? "Delete" : "Purge"); if (ImGui::Button(T(groupKind ? "Delete" : "Purge"))) BeginLibraryAction(saved, core::FileAction::Purge);
+                ProjectButtonWrap("Delete"); if (ImGui::Button(T("Delete"))) BeginLibraryAction(saved, core::FileAction::Purge);
             }
             ImGui::PopID(); ImGui::PopID(); break;
         }
-        DrawLibraryFailure(); DrawLibraryConfirmation();
+        DrawLibraryFailure();
     }
     static void DrawPlacementReport(const report_projection::Placement& report) {
         const auto& v = report.receipt; const std::string key = "placement-" + std::to_string(report.id); char summary[256];
@@ -4337,7 +4299,7 @@ namespace editor {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Objects: %d | NPCs: %d | terrain strokes: %d | pending spawns: %d"), objectCount, npcCount, terrainCount, pending);
 
         ImGui::SeparatorText(T("Create or update a project"));
-        SetLabeledItemWidth("project name", 260); InputTextI18n(T("project name"), "", name, sizeof name);
+        SetLabeledItemWidth("project name", 260); InputTextI18n(TStable("project name"), "", name, sizeof name);
         ProjectButtonWrap(ICON_FLOPPY_DISK " Save whole scene as project");
         ImGui::BeginDisabled(!name[0] || totalCount == 0);
         if (FittedButton(T(ICON_FLOPPY_DISK " Save whole scene as project"))) SaveProjectAction(name, core::SaveWholeScene);

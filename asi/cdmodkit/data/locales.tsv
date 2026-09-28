@@ -571,6 +571,8 @@ Clear selection	Clear selection	清除选择	清除選取	Auswahl aufheben	Effac
 Delete selected	Delete selected	删除所选	刪除所選	Auswahl löschen	Supprimer la sélection	선택 항목 삭제	選択を削除	Eliminar seleccionados	Excluir selecionados	Удалить выбранное	Seçileni sil
 Disable AI	Disable AI	禁用 AI	停用 AI	KI deaktivieren	Désactiver l’IA	AI 비활성화	AIを無効化	Desactivar IA	Desativar IA	Отключить ИИ	AI'ı devre dışı bırak
 Edit note	Edit note	编辑备注	編輯備註	Notiz bearbeiten	Modifier la note	메모 편집	メモを編集	Editar nota	Editar nota	Изменить заметку	Notu düzenle
+Edit NPC note	Edit NPC note	编辑 NPC 备注	編輯 NPC 備註	NPC-Notiz bearbeiten	Modifier la note du PNJ	NPC 메모 편집	NPCのメモを編集	Editar nota del PNJ	Editar nota do NPC	Изменить заметку NPC	NPC notunu düzenle
+Edit object note	Edit object note	编辑物品备注	編輯物品備註	Objektnotiz bearbeiten	Modifier la note de l’objet	물품 메모 편집	オブジェクトのメモを編集	Editar nota del objeto	Editar nota do objeto	Изменить заметку объекта	Nesne notunu düzenle
 Enable AI	Enable AI	启用 AI	啟用 AI	KI aktivieren	Activer l’IA	AI 활성화	AIを有効化	Activar IA	Ativar IA	Включить ИИ	AI'ı etkinleştir
 Group %d	Group %d	组 %d	群組 %d	Gruppe %d	Groupe %d	그룹 %d	グループ %d	Grupo %d	Grupo %d	Группа %d	Grup %d
 Hold	Hold	驻留	駐留	Halten	Maintien	고정	待機	Mantener	Manter	Удержание	Beklet
