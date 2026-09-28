@@ -4081,62 +4081,18 @@ namespace editor {
         const size_t archiveCount = groupKind ? g_projectLibrary.archived.groups : g_projectLibrary.archived.projects;
         ImGui::TextDisabled(T("%zu active / %zu archived / %zu shown"), activeCount, archiveCount, g_libraryRows.size());
         if (!g_libraryResult.ok()) ImGui::TextWrapped("%s: %s (%lu)", T("Library refresh failed"), ProjectUiStatus(core::FileReasonCode(g_libraryResult.reason)), g_libraryResult.systemError);
-        if (!groupKind) for (size_t index : g_libraryRows) {
-            const auto row = g_projectLibrary.entries[index]; const auto& saved = row.file;
-            if (!SameSavedFile(saved, g_librarySelected)) continue;
-            const ProjectFile file{ saved.filename.substr(0, saved.filename.size() - 7), saved.kind, saved.archived, saved.path };
-            const auto& o = row.ownership;
-            ImGui::TextDisabled("%s: %zu / %s: %zu / %s: %zu", T("Object"), o.visible, T("NPC"), o.visibleNpcs, T("Terrain"), o.terrain);
-            ImGui::TextDisabled(T("Hidden objects: %zu / hidden NPCs: %zu / pending: %zu"), o.hidden, o.hiddenNpcs, o.pendingObjects + o.pendingNpcs);
-            ImGui::PushID("project"); ImGui::PushID(file.name.c_str());
-            if (ImGui::Button(T("Read"))) DispatchProjectAction(file, ProjectAction::Read);
-            if (!saved.archived) {
-                const bool editing = core::FileNameEqual(core::EditingProject(), file.name);
-                ProjectButtonWrap("Edit project");
-                if (ImGui::RadioButton(T("Edit project"), editing)) {
-                    if (g_numericSceneUid || g_numericNpcUid) g_projectStatus = "finish-edit-before-save";
-                    else if (g_place.active) DropCarried();
-                    if (g_numericSceneUid || g_numericNpcUid || g_place.active) g_projectStatus = "finish-edit-before-save";
-                    else if (core::SetEditingProject(file.name)) { ClearSceneSelection(); g_projectRefresh = true; }
-                    else g_projectStatus = core::ProjectError();
-                }
-                ProjectButtonWrap("Load project"); bool loaded = core::IsProjectLoaded(file.name);
-                ImGui::BeginDisabled(g_projectCommandPending || (editing && loaded));
-                if (ImGui::Checkbox(T("Load project"), &loaded))
-                    DispatchProjectAction(file, loaded ? ProjectAction::Load : ProjectAction::Unload);
-                ImGui::EndDisabled();
-                ProjectButtonWrap("Reload"); ImGui::BeginDisabled(!loaded || g_projectCommandPending); if (ImGui::Button(T("Reload"))) DispatchProjectAction(file, ProjectAction::Reload); ImGui::EndDisabled();
-                ProjectButtonWrap("Save"); ImGui::BeginDisabled(!loaded || !o.dirty); if (ImGui::Button(T("Save"))) DispatchProjectAction(file, ProjectAction::Save); ImGui::EndDisabled();
-                const auto& unassigned = g_projectLibrary.unassigned;
-                ProjectButtonWrap("Add unassigned"); ImGui::BeginDisabled(!loaded || !(unassigned.visible || unassigned.visibleNpcs || unassigned.terrain)); if (ImGui::Button(T("Add unassigned"))) DispatchProjectAction(file, ProjectAction::AddUnassigned); ImGui::EndDisabled();
-                ProjectButtonWrap("autoload"); bool on = std::any_of(g_projectAutoload.begin(), g_projectAutoload.end(), [&](const auto& name) { return core::FileNameEqual(name, file.name); });
-                if (ImGui::Checkbox(T("autoload"), &on)) DispatchProjectAction(file, ProjectAction::Autoload, on);
-                ProjectButtonWrap("Archive"); if (ImGui::Button(T("Archive"))) BeginLibraryAction(saved, core::FileAction::Archive);
-                ProjectButtonWrap("Delete"); if (ImGui::Button(T("Delete"))) BeginLibraryAction(saved, core::FileAction::Delete);
-            } else {
-                ProjectButtonWrap("Restore"); if (ImGui::Button(T("Restore"))) BeginLibraryAction(saved, core::FileAction::Restore);
-                ProjectButtonWrap("Delete"); if (ImGui::Button(T("Delete"))) BeginLibraryAction(saved, core::FileAction::Purge);
-            }
-            ImGui::PopID(); ImGui::PopID(); break;
-        }
-        if (!groupKind) {
-            bool autosave = core::g_projectAutoSave;
-            ProjectButtonWrap("Auto-save");
-            if (ImGui::Checkbox("##project-autosave", &autosave)) { core::g_projectAutoSave = autosave; core::SaveSettings(); }
-            SameLineForControl("Auto-save");
-            ImGui::PushStyleColor(ImGuiCol_Text, autosave ? ImVec4(0.45f, 0.9f, 0.55f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-            ImGui::Text("%s: %s", T("Auto-save"), T(autosave ? "ON" : "OFF")); ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("New objects, NPCs and terrain are saved to their editing project."));
-        }
         DrawLibraryDeleteConfirmation();
         DrawLibraryFailure();
         static float blueprintFooterHeight = 0.0f;
+        static float projectFooterHeight = 0.0f;
         const bool blueprintSelected = groupKind && std::any_of(g_libraryRows.begin(), g_libraryRows.end(), [&](size_t index) {
             return SameSavedFile(g_projectLibrary.entries[index].file, g_librarySelected);
         });
         if (!blueprintSelected) blueprintFooterHeight = 0.0f;
-        const float galleryHeight = blueprintSelected
-            ? std::max(1.0f, ImGui::GetContentRegionAvail().y - blueprintFooterHeight - ImGui::GetStyle().ItemSpacing.y)
+        if (!groupKind && projectFooterHeight <= 0.0f) projectFooterHeight = ImGui::GetFrameHeightWithSpacing();
+        const float footerHeight = groupKind ? (blueprintSelected ? blueprintFooterHeight : 0.0f) : projectFooterHeight;
+        const float galleryHeight = footerHeight > 0.0f
+            ? std::max(1.0f, ImGui::GetContentRegionAvail().y - footerHeight - ImGui::GetStyle().ItemSpacing.y)
             : 0.0f;
         if (ImGui::BeginChild("saved-gallery", ImVec2(0, galleryHeight), ImGuiChildFlags_Borders)) {
         if (g_libraryRows.empty()) ImGui::TextDisabled("%s", T("No matching saved files"));
@@ -4200,6 +4156,55 @@ namespace editor {
             }
         }
         ImGui::EndChild();
+        const float projectFooterStart = ImGui::GetCursorPosY();
+        if (!groupKind) for (size_t index : g_libraryRows) {
+            const auto row = g_projectLibrary.entries[index]; const auto& saved = row.file;
+            if (!SameSavedFile(saved, g_librarySelected)) continue;
+            const ProjectFile file{ saved.filename.substr(0, saved.filename.size() - 7), saved.kind, saved.archived, saved.path };
+            const auto& o = row.ownership;
+            ImGui::TextDisabled("%s: %zu / %s: %zu / %s: %zu", T("Object"), o.visible, T("NPC"), o.visibleNpcs, T("Terrain"), o.terrain);
+            ImGui::TextDisabled(T("Hidden objects: %zu / hidden NPCs: %zu / pending: %zu"), o.hidden, o.hiddenNpcs, o.pendingObjects + o.pendingNpcs);
+            ImGui::PushID("project"); ImGui::PushID(file.name.c_str());
+            if (ImGui::Button(T("Read"))) DispatchProjectAction(file, ProjectAction::Read);
+            if (!saved.archived) {
+                const bool editing = core::FileNameEqual(core::EditingProject(), file.name);
+                ProjectButtonWrap("Edit project");
+                if (ImGui::RadioButton(T("Edit project"), editing)) {
+                    if (g_numericSceneUid || g_numericNpcUid) g_projectStatus = "finish-edit-before-save";
+                    else if (g_place.active) DropCarried();
+                    if (g_numericSceneUid || g_numericNpcUid || g_place.active) g_projectStatus = "finish-edit-before-save";
+                    else if (core::SetEditingProject(file.name)) { ClearSceneSelection(); g_projectRefresh = true; }
+                    else g_projectStatus = core::ProjectError();
+                }
+                ProjectButtonWrap("Load project"); bool loaded = core::IsProjectLoaded(file.name);
+                ImGui::BeginDisabled(g_projectCommandPending || (editing && loaded));
+                if (ImGui::Checkbox(T("Load project"), &loaded))
+                    DispatchProjectAction(file, loaded ? ProjectAction::Load : ProjectAction::Unload);
+                ImGui::EndDisabled();
+                ProjectButtonWrap("Reload"); ImGui::BeginDisabled(!loaded || g_projectCommandPending); if (ImGui::Button(T("Reload"))) DispatchProjectAction(file, ProjectAction::Reload); ImGui::EndDisabled();
+                ProjectButtonWrap("Save"); ImGui::BeginDisabled(!loaded || !o.dirty); if (ImGui::Button(T("Save"))) DispatchProjectAction(file, ProjectAction::Save); ImGui::EndDisabled();
+                const auto& unassigned = g_projectLibrary.unassigned;
+                ProjectButtonWrap("Add unassigned"); ImGui::BeginDisabled(!loaded || !(unassigned.visible || unassigned.visibleNpcs || unassigned.terrain)); if (ImGui::Button(T("Add unassigned"))) DispatchProjectAction(file, ProjectAction::AddUnassigned); ImGui::EndDisabled();
+                ProjectButtonWrap("autoload"); bool on = std::any_of(g_projectAutoload.begin(), g_projectAutoload.end(), [&](const auto& name) { return core::FileNameEqual(name, file.name); });
+                if (ImGui::Checkbox(T("autoload"), &on)) DispatchProjectAction(file, ProjectAction::Autoload, on);
+                ProjectButtonWrap("Archive"); if (ImGui::Button(T("Archive"))) BeginLibraryAction(saved, core::FileAction::Archive);
+                ProjectButtonWrap("Delete"); if (ImGui::Button(T("Delete"))) BeginLibraryAction(saved, core::FileAction::Delete);
+            } else {
+                ProjectButtonWrap("Restore"); if (ImGui::Button(T("Restore"))) BeginLibraryAction(saved, core::FileAction::Restore);
+                ProjectButtonWrap("Delete"); if (ImGui::Button(T("Delete"))) BeginLibraryAction(saved, core::FileAction::Purge);
+            }
+            ImGui::PopID(); ImGui::PopID(); break;
+        }
+        if (!groupKind) {
+            bool autosave = core::g_projectAutoSave;
+            ProjectButtonWrap("Auto-save");
+            if (ImGui::Checkbox("##project-autosave", &autosave)) { core::g_projectAutoSave = autosave; core::SaveSettings(); }
+            SameLineForControl("Auto-save");
+            ImGui::PushStyleColor(ImGuiCol_Text, autosave ? ImVec4(0.45f, 0.9f, 0.55f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::Text("%s: %s", T("Auto-save"), T(autosave ? "ON" : "OFF")); ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("New objects, NPCs and terrain are saved to their editing project."));
+        }
+        if (!groupKind) projectFooterHeight = ImGui::GetCursorPosY() - projectFooterStart;
         if (groupKind) for (size_t index : g_libraryRows) {
             const core::SavedFile saved = g_projectLibrary.entries[index].file;
             if (!SameSavedFile(saved, g_librarySelected)) continue;
