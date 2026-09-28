@@ -25,4 +25,7 @@ namespace i18n {
     void RebuildGlyphRanges();
     void MergeSystemFonts(ImFontAtlas* atlas, float size);
     void ReleaseMergedFontData(ImFontAtlas* atlas);   // after the atlas was built; it must not be built again
+#ifdef WB_I18N_HOST_TEST
+    void TestReset();   // host suite only: drops the loaded pack so the next Initialize() reloads embedded + personal file
+#endif
 }

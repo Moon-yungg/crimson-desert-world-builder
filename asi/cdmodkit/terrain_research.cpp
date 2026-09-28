@@ -147,8 +147,8 @@ static uintptr_t __fastcall HookTileTask(uintptr_t a, uintptr_t b, uintptr_t c, 
     const bool log = InterlockedIncrement(&g_tileTaskLines) <= 30;
     if (log) { uint64_t cq[6] = {}; ReadBytes(c, cq, sizeof cq);
         Log("[terrain] tile task a=%llx c=%s", (unsigned long long)a, DescribePtr(c).c_str());
-        for (int k : { 2, 4 }) if (cq[k]) { uint64_t e[4] = {}; ReadBytes(cq[k], e, sizeof e);
-            Log("[terrain]   c[%d] -> %s", k, DescribePtr(cq[k]).c_str()); for (int m = 0; m < 4; m++) if (e[m] > 0x10000000000ull && e[m] < 0x7ff000000000ull) Log("[terrain]     [%d] -> %s", m, DescribePtr(e[m]).c_str()); } }
+        for (int k : { 2, 4 }) if (cq[k]) { uint64_t eq[4] = {}; ReadBytes(cq[k], eq, sizeof eq);
+            Log("[terrain]   c[%d] -> %s", k, DescribePtr(cq[k]).c_str()); for (int m = 0; m < 4; m++) if (eq[m] > 0x10000000000ull && eq[m] < 0x7ff000000000ull) Log("[terrain]     [%d] -> %s", m, DescribePtr(eq[m]).c_str()); } }
     const uintptr_t r = g_origTileTask(a, b, c, d, e, f, g, h, i, j);
     if (log) { uint8_t st = 0; ReadBytes(d, &st, 1); Log("[terrain] tile task done, status %u", st); }
     return r;

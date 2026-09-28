@@ -2,7 +2,12 @@
 // placement mode (single objects and groups, snapping), copy/paste, line/circle tools, projects.
 #define NOMINMAX
 #include "core.h"
+#include "report_projection.h"
 #include <imgui.h>
+#include <imgui_internal.h>
+#include <functional>
+#include <fstream>
+#include <iterator>
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -80,7 +85,7 @@ namespace editor {
     static bool NumericEditFoldout(const char* label, float* value, float min, float max, const char* format, bool vec3) {
         const ImGuiID id = ImGui::GetID(label);
         const float gap = ImGui::GetStyle().ItemSpacing.x, buttonW = ImGui::GetFrameHeight();
-        const float right = ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
+        const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
         if (ImGui::GetItemRectMax().x + gap + buttonW <= right) ImGui::SameLine();
         ImGui::PushID(label);
         const bool clicked = ImGui::SmallButton(g_numericEditId == id ? "v##number" : ">##number");
@@ -119,8 +124,56 @@ namespace editor {
     static void SameLineOrWrap(bool compact, float nextWidth = 80.0f, float spacing = -1.0f) {
         (void)compact;   // kept in the signature because the same page functions are shared by the full editor and dock
         const float gap = spacing >= 0 ? spacing : ImGui::GetStyle().ItemSpacing.x;
-        const float right = ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
+        const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
         if (ImGui::GetItemRectMax().x + gap + nextWidth <= right) ImGui::SameLine(0, spacing);
+    }
+    static void SameLineForControl(const char* label, bool checkbox = false) {
+        const auto& s = ImGui::GetStyle();
+        SameLineOrWrap(true, ImGui::CalcTextSize(T(label), nullptr, true).x + (checkbox ? ImGui::GetFrameHeight() + s.ItemInnerSpacing.x : s.FramePadding.x * 2));
+    }
+    static void SetLabeledItemWidth(const char* label, float preferred) {
+        ImGui::SetNextItemWidth(std::max(ImGui::GetFrameHeight(), std::min(preferred, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(T(label), nullptr, true).x - ImGui::GetStyle().ItemInnerSpacing.x)));
+    }
+    // Long translated action labels wrap inside their real hit rectangle; the original label/ID
+    // and native button behavior remain unchanged. Ordinary-width controls use ImGui directly.
+    static bool FittedButton(const char* label, bool fill = false) {
+        const auto& style = ImGui::GetStyle(); const float width = ImGui::GetContentRegionAvail().x;
+        const char* end = ImGui::FindRenderedTextEnd(label);
+        if (ImGui::CalcTextSize(label, end).x + style.FramePadding.x * 2 <= width)
+            return ImGui::Button(label, fill ? ImVec2(-1, 0) : ImVec2(0, 0));
+        const float wrap = std::max(1.0f, width - style.FramePadding.x * 2);
+        const ImVec2 text = ImGui::CalcTextSize(label, end, false, wrap);
+        const ImU32 color = ImGui::GetColorU32(ImGuiCol_Text);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0, 0, 0, 0));
+        const bool pressed = ImGui::Button(label, ImVec2(width, text.y + style.FramePadding.y * 2));
+        ImGui::PopStyleColor();
+        const ImVec2 at(ImGui::GetItemRectMin().x + style.FramePadding.x + (wrap - text.x) * style.ButtonTextAlign.x,
+                        ImGui::GetItemRectMin().y + style.FramePadding.y);
+        ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), ImGui::GetFontSize(), at, color, label, end, wrap);
+        return pressed;
+    }
+    static bool FittedCheckbox(const char* label, bool* value) {
+        const auto& style = ImGui::GetStyle(); const float width = ImGui::GetContentRegionAvail().x, side = ImGui::GetFrameHeight();
+        const char* end = ImGui::FindRenderedTextEnd(label);
+        if (side + style.ItemInnerSpacing.x + ImGui::CalcTextSize(label, end).x <= width) return ImGui::Checkbox(label, value);
+        ImGuiWindow* window = ImGui::GetCurrentWindow(); if (window->SkipItems) return false;
+        ImGuiContext& g = *ImGui::GetCurrentContext(); const ImGuiID id = window->GetID(label);
+        const float wrap = std::max(1.0f, width - side - style.ItemInnerSpacing.x);
+        const ImVec2 text = ImGui::CalcTextSize(label, end, false, wrap), pos = window->DC.CursorPos;
+        const ImRect bounds(pos, ImVec2(pos.x + width, pos.y + std::max(side, text.y + style.FramePadding.y * 2)));
+        ImGui::ItemSize(bounds, style.FramePadding.y);
+        if (!ImGui::ItemAdd(bounds, id)) {
+            IMGUI_TEST_ENGINE_ITEM_INFO(id, label, g.LastItemData.StatusFlags | ImGuiItemStatusFlags_Checkable | (*value ? ImGuiItemStatusFlags_Checked : 0));
+            return false;
+        }
+        bool hovered, held; const bool pressed = ImGui::ButtonBehavior(bounds, id, &hovered, &held);
+        if (pressed) { *value = !*value; ImGui::MarkItemEdited(id); }
+        ImGui::RenderNavCursor(bounds, id);
+        ImGui::RenderFrame(pos, ImVec2(pos.x + side, pos.y + side), ImGui::GetColorU32(held && hovered ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), true, style.FrameRounding);
+        if (*value) { const float pad = std::max(1.0f, floorf(side / 6)); ImGui::RenderCheckMark(window->DrawList, ImVec2(pos.x + pad, pos.y + pad), ImGui::GetColorU32(ImGuiCol_CheckMark), side - pad * 2); }
+        window->DrawList->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(pos.x + side + style.ItemInnerSpacing.x, pos.y + style.FramePadding.y), ImGui::GetColorU32(ImGuiCol_Text), label, end, wrap);
+        IMGUI_TEST_ENGINE_ITEM_INFO(id, label, g.LastItemData.StatusFlags | ImGuiItemStatusFlags_Checkable | (*value ? ImGuiItemStatusFlags_Checked : 0));
+        return pressed;
     }
     static constexpr const char* kEditorVersion = "0.97";
 
@@ -136,6 +189,10 @@ namespace editor {
     };
     static bool  g_compact = false; static int g_dockCols = 2;   // narrow dock window; supported pages reuse the full editor functions
     static int g_mainTab = TabBrowser, g_compactPage = TabBrowser; static bool g_selectMainTab = false;
+    static bool SharedPage(int page) {
+        return page == TabBrowser || page == TabScene || page == TabNpcs || page == TabProject ||
+               page == TabEnvironment || (page == TabTerrain && core::TerrainAvailable());
+    }
     static bool  g_showSpawnOpts = false, g_showMass = false; static int g_hoverUid = 0, g_hoverNpcUid = 0;
     static bool  g_cardView = false; static float g_cardSize = 96.0f;   // browser: tile view instead of the list (same matches / filters)
     static int   g_browserDragPrefab = -1;   // browser row/card being dragged out into the game view
@@ -155,6 +212,10 @@ namespace editor {
     // collections: named prefab lists kept in bin64\cdmodkit\collections.txt (name, then paths, tab separated)
     struct Collection { std::string name; std::vector<std::string> paths; };
     static std::vector<Collection> g_colls; static int g_selColl = -1; static bool g_collsLoaded = false; static char g_newColl[48] = "";
+    static char g_projName[64] = "mybuild";
+    static std::string g_projectStatus;
+    static bool g_projectRefresh = true, g_projectCommandPending = false;
+    static bool SceneProjectMutation(const std::string& name, int mode);
     // scene state: object and managed-NPC selections share one Scene workflow.
     // g_rightUid and g_sceneLastEntity use positive object UIDs and negative NPC UIDs.
     static std::set<int> g_sel; static int g_primary = 0; static int g_lastClicked = 0;
@@ -200,11 +261,59 @@ namespace editor {
         int uid = 0; std::string prefab; Vec3 pos0{}, pos1{}; Rot rot0, rot1; float sc0 = 1, sc1 = 1;
         int group = 0, group1 = 0; int proj = 0; bool flag0 = false, flag1 = false; int behavior0 = 0, behavior1 = 0; std::string text0, text1;
         std::vector<core::TerrainStroke> terrain;
+        std::set<int> projects; // captured provenance survives forgetting records and empty named groups
     };   // object and managed-NPC committed edits share one chronological undo/redo stack
-    struct HistoryEntry { unsigned long long serial = 0; std::vector<Act> acts; };
+    struct HistoryEntry { unsigned long long serial = 0; std::vector<Act> acts; uint64_t branch = 0, placement = 0; core::PlaceRequestHandle spawnRequest; };
     static constexpr size_t kHistoryLimit = 1000;
     static unsigned long long g_historySerial = 0;
+    static uint64_t g_historyBranch = 1, g_clipRevision = 0;
     static std::vector<HistoryEntry> g_undo, g_redo;
+    static std::vector<core::GroundHandle> g_pendingGround;
+    static std::vector<core::GroundView> g_groundLastResults;
+    static report_projection::GroundArchive g_groundReports;
+    static int g_numericSceneUid = 0, g_numericNpcUid = 0;
+    static Vec3 g_numericNpcBase{};
+    static bool NpcAct(Act::Kind kind) {
+        return kind == Act::NpcSpawn || kind == Act::NpcMove || kind == Act::NpcDelete || kind == Act::NpcControl ||
+            kind == Act::NpcGroup || kind == Act::NpcNote || kind == Act::NpcLabel;
+    }
+    static void CaptureProvenance(Act& a) {
+        if (a.kind == Act::TerrainBatch || a.kind == Act::TerrainClear) {
+            for (const auto& t : a.terrain) if (t.proj) a.projects.insert(t.proj);
+        } else if (a.kind == Act::GroupName) {
+            for (const auto& o : core::Spawned()) if (o.group == a.group && o.proj) a.projects.insert(o.proj);
+            for (const auto& n : core::ManagedNpcs()) if (n.group == a.group && n.proj) a.projects.insert(n.proj);
+        } else if (NpcAct(a.kind)) {
+            for (const auto& n : core::ManagedNpcs()) if (n.uid == a.uid) { a.proj = n.proj; break; }
+        } else {
+            for (const auto& o : core::Spawned()) if (o.uid == a.uid) { a.proj = o.proj; break; }
+        }
+        if (a.proj) a.projects.insert(a.proj);
+    }
+    struct DeferredEditorIntent {
+        std::function<void()> action;
+        std::set<int> selection, npcSelection;
+        int primary = 0, npcPrimary = 0, project = -1;
+        uint64_t placement = 0, clipboard = 0;
+        int prefab = -1;
+        float spawnYaw = 0, spawnScale = 1;
+        Vec3 offsets{};
+        std::vector<SpawnedObj> targets;
+        std::vector<ManagedNpc> npcTargets;
+    };
+    static DeferredEditorIntent g_deferredEditor;
+    static bool g_resumingMutation = false;
+    static uint64_t g_seenGroundNotice = 0;
+    static bool ReconcileGroundBatch(bool cancelUnapplied);
+    static void PumpGroundHistory();
+    static bool PrepareHistoryMutation(std::function<void()> intent, const std::vector<int>& targets = {});
+    static void CommitBrushHistory();
+    static bool BrushMutationPending();
+    static bool EditorMutationPending();
+    static void PublishProjectContext();
+    static void FinalizeNumericEdits();
+    static const char* ProjectInPlaceSaveError(const std::string& name);
+    static bool SaveProjectAction(const std::string& rawName, int scope, bool approved = false);
     static bool VecChanged(Vec3 a, Vec3 b) { return a.x != b.x || a.y != b.y || a.z != b.z; }
     static bool RotChanged(Rot a, Rot b) { return a.yaw != b.yaw || a.pitch != b.pitch || a.roll != b.roll; }
     static bool ActChanged(const Act& a) {
@@ -217,10 +326,28 @@ namespace editor {
         // History is intentionally exact: even a sub-millimetre move or a tiny typed rotation/scale change counts.
         return VecChanged(a.pos0, a.pos1) || RotChanged(a.rot0, a.rot1) || a.sc0 != a.sc1;
     }
-    static void Push(std::vector<Act> acts) {
+    static void ReconcileSpawnHistory() {
+        // Admission reserves the upstream Spawn step immediately. A terminal native failure
+        // retracts only that row's speculative act, even if Drop or Undo preceded settlement.
+        for (auto* stack : { &g_undo, &g_redo }) for (auto it = stack->begin(); it != stack->end();) {
+            if (!it->spawnRequest) { ++it; continue; }
+            const auto result = core::PlaceRequestState(it->spawnRequest);
+            std::set<int> failed;
+            for (const auto& row : result.rows) if (row.state == core::PlaceFailed) failed.insert(row.uid);
+            auto& acts = it->acts;
+            if (!failed.empty()) acts.erase(std::remove_if(acts.begin(), acts.end(), [&](const Act& a) {
+                return a.kind == Act::Spawn && failed.count(a.uid);
+            }), acts.end());
+            if (!result.pending) it->spawnRequest.reset();
+            if (acts.empty()) it = stack->erase(it); else ++it;
+        }
+    }
+    static void Push(std::vector<Act> acts, uint64_t placement = 0, const core::PlaceRequestHandle& spawnRequest = {}) {
         acts.erase(std::remove_if(acts.begin(), acts.end(), [](const Act& a) { return !ActChanged(a); }), acts.end());
         if (acts.empty()) return;
-        g_undo.push_back({ ++g_historySerial, std::move(acts) });
+        for (auto& a : acts) CaptureProvenance(a);
+        g_undo.push_back({ ++g_historySerial, std::move(acts), g_historyBranch, placement, spawnRequest });
+        g_projectRefresh = true;
         if (g_undo.size() > kHistoryLimit) g_undo.erase(g_undo.begin());
         g_redo.clear();
     }
@@ -237,14 +364,29 @@ namespace editor {
         bool haveCenter = false; int prefabIdx = -1;   // single object: bbox center known (rotation about it) or still being measured
         float snapAx = 0, snapAz = 1;                  // fixed world-axis frame for optional keyboard placement
         bool mouse = false;                            // optional keyboard placement: mouse to gizmo while menu is closed
-        bool keyTransformHeld = false;
+        bool keyTransformHeld = false, commitRequested = false;
         int hover = 0, drag = 0;   // gizmo: 1 X, 2 Y, 3 Z, 4 yaw ring, 5 center dot, 6 scale cube, 7 pitch ring, 8 roll ring
         float drag0 = 0; Vec3 dragCenter0{}; float dragYaw0 = 0, dragScale0 = 1, dragPitch0 = 0, dragRoll0 = 0;
         std::vector<core::MoveReq> historyBase;
-        size_t historyMark = 0;
-        int groundTicket = 0, groundIter = 0; float groundBottom = 0, groundTop = 0, groundStartY = 0;   // snap to ground in flight (see GroundStep)
+        uint64_t generation = 0, transform = 0;
+        core::PlaceRequestHandle req;
     };
     static Place g_place;
+    struct ProjectPlacementReport { std::string name; core::PlaceRequestHandle request; bool approximate = false; core::FileSelectionHandle source; };
+    static std::vector<ProjectPlacementReport> g_projectPlacements;
+    static report_projection::PlacementArchive g_placementReports;
+    static uint64_t g_nextPlacement = 0;
+    static DWORD g_tickOverride = 0;
+    static DWORD TickNow() { return g_tickOverride ? g_tickOverride : GetTickCount(); }
+    static core::GroundPlacement GroundPlacementOf(const Place& p) {
+        core::GroundPlacement c;
+        if (p.active && !p.hasNpc) {
+            c.generation = p.generation; c.transform = p.transform;
+            for (const auto& m : p.m) c.members.push_back(m.uid);
+        }
+        return c;
+    }
+    static std::vector<core::GroundHandle> BeginGrounding(const std::vector<int>& uids, bool rigid, const core::GroundPlacement& carried = {});
     static void StopCameraMode(bool forceFreeCamOff = false) {
         if (!g_cameraMode && !(forceFreeCamOff && core::FreeCamActive())) return;
         g_cameraMode = false; g_cameraViewMode = 0; g_cameraStartAt = 0; g_cameraEverActive = false; memset(g_cameraShortcutDown, 0, sizeof g_cameraShortcutDown);
@@ -252,6 +394,7 @@ namespace editor {
         core::SetFreeCam(false); core::g_fcHoldMove = false; input::ClearKeys(); ImGui::GetIO().ClearInputKeys();
     }
     static void FinishCloseEditor() {
+        CommitBrushHistory();
         StopCameraMode(true);
         g_playMode = false;
         g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear(); g_boxNpcBase.clear();
@@ -344,17 +487,17 @@ namespace editor {
     }
     static void AutoSaveTick() {
         static ULONGLONG retryAt = 0;
-        if (!core::g_projectAutoSave || GetTickCount64() < retryAt) return;
+        if (!core::g_projectAutoSave || GetTickCount64() < retryAt || EditorMutationPending()) return;
         bool failed = false;
         std::set<int> ids;
         for (const auto& o : core::Spawned()) if (o.proj > 0) ids.insert(o.proj);
         for (const auto& n : core::ManagedNpcs()) if (n.proj > 0) ids.insert(n.proj);
         for (const auto& t : core::TerrainStrokes()) if (t.proj > 0) ids.insert(t.proj);
         for (int id : ids) {
-            if (!core::ProjectDirty(id)) continue;
+            if (!core::ProjectDirty(id) || core::ProjectMutationPending(id)) continue;
             const std::string name = core::ProjectNameOf(id);
             if (!name.empty()) {
-                if (core::SaveProject(name, core::SaveProjectOnly)) core::Log("[editor] autosave: %s", name.c_str());
+                if (!ProjectInPlaceSaveError(name) && SaveProjectAction(name, core::SaveProjectOnly, true)) core::Log("[editor] autosave: %s", name.c_str());
                 else { core::Log("[editor] autosave failed: %s", name.c_str()); failed = true; }
             }
         }
@@ -519,6 +662,7 @@ namespace editor {
     static float ObjectRadius(const SpawnedObj& o) { int pi = IndexOfPrefab(o.prefab); if (pi < 0) return 1.0f; const auto& info = core::PrefabIndex()[pi]; return std::max(info.sx, std::max(info.sy, info.sz)) * 0.5f * o.scale; }
 
     static void RecordSpawn(std::vector<Act>& acts, int uid, const std::string& prefab, Vec3 pos, Rot rot, float sc, int group) {
+        if (!uid) return;
         Act a; a.kind = Act::Spawn; a.uid = uid; a.prefab = prefab; a.pos1 = pos; a.rot1 = rot; a.sc1 = sc; a.group = group; acts.push_back(a);
     }
     // spawn spot for a prefab: in front of the character, footprint away, bounding box center on that spot; offsets are forward / up / sideways
@@ -531,6 +675,7 @@ namespace editor {
     }
     static bool IsAppearance(const core::PrefabInfo& pi) { return pi.tags.rfind("Appearance", 0) == 0; }   // .app_xml rows: preview only
     static void SpawnSelected(const PosInfo& p) {
+        if (!PrepareHistoryMutation([p]() { SpawnSelected(p); })) return;
         if (g_selPrefab < 0) return;
         const auto& pi = core::PrefabIndex()[g_selPrefab];
         if (IsAppearance(pi)) { Note(T("these appearances can only be previewed; living characters are spawned from the NPCs tab")); return; }
@@ -681,19 +826,28 @@ namespace editor {
     static void CancelCarried(bool notify = true);
     static void StartGroundSnap(Place& P);
     static void CommitPlaceHistory(Place& P);
-    static void DrawPlaceHud() {
-        Place& P = g_place; ImGuiIO& io = ImGui::GetIO();
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 28.0f), ImGuiCond_Always, ImVec2(0.5f, 0));
-        ImGui::SetNextWindowBgAlpha(0.75f);
-        if (ImGui::Begin("##placehud", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
-            ImGui::Text(ICON_CUBE "  %s  %s%s", T(P.isNew ? "Place" : "Grab"), P.name.c_str(), P.m.size() > 1 ? T("  (group)") : "");
-            ImGui::TextDisabled(T("center %.1f  %.1f  %.1f    rotation %+.0f    tilt %+.0f, %+.0f    scale x%.2f    snap %s"), P.center.x, P.center.y, P.center.z, P.yaw, P.pitch, P.roll, P.scale,
+    static bool ApplyCarriedPose(const Place& candidate, bool send);
+    static bool g_placeHudDrawn = false, g_focusHudDrawn = false;
+    static float g_focusHudHeight = 0;
+    static void DrawFocusHud(bool embedded = false, float top = 8.0f);
+    static void DrawPlaceHud(bool embedded = false, float top = -1.0f) {
+        g_placeHudDrawn = true; Place P = g_place; ImGuiIO& io = ImGui::GetIO();
+        const auto& style = ImGui::GetStyle();
+        if (!embedded) {
+            ImGui::SetNextWindowPos(ImVec2(style.WindowPadding.x, top >= 0 ? top : g_focusHudHeight + style.ItemSpacing.y), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(std::min(io.DisplaySize.x - style.WindowPadding.x * 2, ImGui::GetFontSize() * 42), 0), ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.75f);
+        }
+        if (embedded || ImGui::Begin("##placehud", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
+            ImGui::PushID("placement-bar");
+            ImGui::TextWrapped(ICON_CUBE "  %s  %s%s", T(P.isNew ? "Place" : "Grab"), P.name.c_str(), P.m.size() > 1 ? T("  (group)") : "");
+            ImGui::TextWrapped(T("center %.1f  %.1f  %.1f    rotation %+.0f    tilt %+.0f, %+.0f    scale x%.2f    snap %s"), P.center.x, P.center.y, P.center.z, P.yaw, P.pitch, P.roll, P.scale,
                 g_snap ? (std::string(T(kSnapPosNames[g_snapPosIdx])) + ", " + T(kSnapYawNames[g_snapYawIdx])).c_str() : T("off"));
             if (ImGui::Button(T("drop"))) DropCarried();
-            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) CancelCarried();
-            ImGui::SameLine(); if (ImGui::Button(T("To ground"))) StartGroundSnap(P);
-            if (!P.hasNpc) { ImGui::SameLine(); if (ImGui::Button(T("level"))) { if (P.m.size() == 1) { P.pitch = -P.m[0].rot0.pitch; P.roll = -P.m[0].rot0.roll; } else { P.pitch = P.roll = 0; } P.dirty = P.touched = true; CommitPlaceHistory(P); } }
-            ImGui::SameLine(); ImGui::Checkbox(T("snap"), &g_snap);
+            SameLineForControl("Cancel"); if (ImGui::Button(T("Cancel"))) CancelCarried();
+            SameLineForControl("To ground"); if (ImGui::Button(T("To ground"))) StartGroundSnap(P);
+            if (!P.hasNpc) { SameLineForControl("level"); if (ImGui::Button(T("level"))) { if (P.m.size() == 1) { P.pitch = -P.m[0].rot0.pitch; P.roll = -P.m[0].rot0.roll; } else { P.pitch = P.roll = 0; } P.dirty = P.touched = true; CommitPlaceHistory(P); } }
+            SameLineForControl("snap", true); ImGui::Checkbox(T("snap"), &g_snap);
             // Explicit translation controls are useful when a world-space gizmo handle is hard to hit (especially for NPCs).
             // They operate on the same placement transaction, so one click is one undoable move and NPC AI stays paused until Drop.
             const float moveStep = g_snap ? kSnapPos[g_snapPosIdx] : 0.25f;
@@ -702,32 +856,36 @@ namespace editor {
                 P.dirty = P.touched = true; CommitPlaceHistory(P);
             };
             ImGui::TextDisabled("%s  %.2f m", T("Move"), moveStep);
-            ImGui::SameLine(); if (ImGui::SmallButton("X-")) nudge(-moveStep, 0, 0);
-            ImGui::SameLine(); if (ImGui::SmallButton("X+")) nudge( moveStep, 0, 0);
-            ImGui::SameLine(); if (ImGui::SmallButton("Y-")) nudge(0, -moveStep, 0);
-            ImGui::SameLine(); if (ImGui::SmallButton("Y+")) nudge(0,  moveStep, 0);
-            ImGui::SameLine(); if (ImGui::SmallButton("Z-")) nudge(0, 0, -moveStep);
-            ImGui::SameLine(); if (ImGui::SmallButton("Z+")) nudge(0, 0,  moveStep);
+            SameLineForControl("X-"); if (ImGui::SmallButton("X-")) nudge(-moveStep, 0, 0);
+            SameLineForControl("X+"); if (ImGui::SmallButton("X+")) nudge( moveStep, 0, 0);
+            SameLineForControl("Y-"); if (ImGui::SmallButton("Y-")) nudge(0, -moveStep, 0);
+            SameLineForControl("Y+"); if (ImGui::SmallButton("Y+")) nudge(0,  moveStep, 0);
+            SameLineForControl("Z-"); if (ImGui::SmallButton("Z-")) nudge(0, 0, -moveStep);
+            SameLineForControl("Z+"); if (ImGui::SmallButton("Z+")) nudge(0, 0,  moveStep);
             if (core::g_keyboardPlacement && !g_compact) {
                 auto kn = [](int pk) { return core::KeyName(core::g_placeKeys[pk]); };
-                ImGui::TextDisabled(T("Move: %s %s %s %s%s     Rotate: %s %s     Height: %s %s     Size: %s %s"), kn(core::PK_FWD), kn(core::PK_BACK), kn(core::PK_LEFT), kn(core::PK_RIGHT),
+                ImGui::TextWrapped(T("Move: %s %s %s %s%s     Rotate: %s %s     Height: %s %s     Size: %s %s"), kn(core::PK_FWD), kn(core::PK_BACK), kn(core::PK_LEFT), kn(core::PK_RIGHT),
                     g_snap ? T(" (one grid step per press)") : (std::string(" (") + kn(core::PK_FAST) + " = " + T("fast") + ")").c_str(), kn(core::PK_ROT_L), kn(core::PK_ROT_R), kn(core::PK_UP), kn(core::PK_DOWN), kn(core::PK_SCALE_UP), kn(core::PK_SCALE_DOWN));
-                ImGui::TextDisabled(T("%s = bring in front     %s = snap     %s = mouse gizmo and game     %s = level     %s = ground     %s = drop     %s = %s"),
+                ImGui::TextWrapped(T("%s = bring in front     %s = snap     %s = mouse gizmo and game     %s = level     %s = ground     %s = drop     %s = %s"),
                     kn(core::PK_FETCH), kn(core::PK_SNAP), kn(core::PK_MOUSE), kn(core::PK_LEVEL), kn(core::PK_GROUND), kn(core::PK_DROP), kn(core::PK_CANCEL), T(P.isNew ? "cancel" : "put back"));
-            } else if (!g_compact && !g_cameraMode) ImGui::TextDisabled(T("To look around: %s opens the editor, %s there switches to the free camera"), core::KeyName(core::g_keyToggle), core::KeyName(core::g_keyMode));
+            } else if (!g_compact && !g_cameraMode) ImGui::TextWrapped(T("To look around: %s opens the editor, %s there switches to the free camera"), core::KeyName(core::g_keyToggle), core::KeyName(core::g_keyMode));
+            ImGui::PopID();
         }
-        ImGui::End();
+        if (!embedded) ImGui::End();
+        if (ApplyCarriedPose(P, true) && P.commitRequested) CommitPlaceHistory(g_place);
     }
 
     // ---- placement ----
     static bool IsCarried(int uid);
-    static void StartGrab(const std::vector<int>& uids, bool isNew, const std::string& name) {
+    static void StartGrab(const std::vector<int>& uids, bool isNew, const std::string& name, const Vec3* savedPivot = nullptr, const core::PlaceRequestHandle& request = {}) {
+        const bool hasPivot = savedPivot != nullptr; const Vec3 pivot = savedPivot ? *savedPivot : Vec3{};
+        if (!PrepareHistoryMutation([uids, isNew, name, hasPivot, pivot, request]() { StartGrab(uids, isNew, name, hasPivot ? &pivot : nullptr, request); }, uids)) return;
         if (uids.empty()) return;
         if (g_place.active) DropCarried();   // whatever is in the hands is left where it is (undo step included)
         const bool keepCamera = g_cameraMode;
         auto list = core::Spawned();
         auto npcs = core::ManagedNpcs();
-        Place P; P.active = true; P.isNew = isNew; P.name = name;
+        Place P; P.active = true; P.isNew = isNew; P.name = name; P.req = request; P.generation = ++g_nextPlacement;
         Vec3 c{ 0, 0, 0 };
         bool needsGameThread = false, failedNpc = false;
         for (int key : uids) {
@@ -753,9 +911,12 @@ namespace editor {
         else { for (auto& m : P.m) { c.x += m.origPos.x; c.y += m.origPos.y; c.z += m.origPos.z; } const float inv = 1.0f / (float)P.m.size(); c.x *= inv; c.y *= inv; c.z *= inv;
                if (P.hasNpc) c.y += 0.9f;
                for (auto& m : P.m) { float dx = m.origPos.x - c.x, dz = m.origPos.z - c.z; P.radius = std::max(P.radius, sqrtf(dx * dx + dz * dz) + 1.0f); } }
+        if (savedPivot) {
+            c = *savedPivot; P.haveCenter = false; P.prefabIdx = -1;
+            for (const auto& m : P.m) { const float dx = m.origPos.x - c.x, dz = m.origPos.z - c.z; P.radius = std::max(P.radius, sqrtf(dx * dx + dz * dz) + 1.0f); }
+        }
         for (auto& m : P.m) m.rel = { m.origPos.x - c.x, m.origPos.y - c.y, m.origPos.z - c.z };
-        P.center = c; P.lastCenter = c; P.lastYaw = 0; P.lastScale = 1; P.dirty = isNew;
-        P.historyMark = g_undo.size();
+        P.center = c; P.lastCenter = c; P.lastYaw = P.lastPitch = P.lastRoll = 0; P.lastScale = 1; P.dirty = isNew;
         for (const auto& m : P.m) P.historyBase.push_back({ m.uid, m.origPos, m.origRot, m.origScale });
         if (isNew) {
             std::vector<Act> spawned; spawned.reserve(P.m.size());
@@ -765,7 +926,7 @@ namespace editor {
                 const SpawnedObj* o = Find(list, m.uid); if (o) { a.group = o->group; a.proj = o->proj; }
                 spawned.push_back(std::move(a));
             }
-            Push(std::move(spawned));
+            Push(std::move(spawned), P.generation, request);
         }
         if (fabsf(g_fx) >= fabsf(g_fz)) { P.snapAx = g_fx > 0 ? 1.0f : -1.0f; P.snapAz = 0; } else { P.snapAx = 0; P.snapAz = g_fz > 0 ? 1.0f : -1.0f; }
         if (keepCamera) { P.reopen = false; }                             // camera mode stays live while the gizmo is shown
@@ -773,11 +934,13 @@ namespace editor {
         else { P.reopen = g_open; g_open = false; }
         if (!keepCamera) StopCameraMode();
         g_playMode = false; core::g_placing = true; input::ClearKeys();
+        core::PublishGroundPlacement(GroundPlacementOf(P));
         g_place = P;
         if (core::g_keyboardPlacement) Note(T("%s: %s | %d objects | %s = done, %s %s"), T(isNew ? "placing" : "grabbed"), name.c_str(), (int)P.m.size(), core::KeyName(core::g_placeKeys[core::PK_DROP]), core::KeyName(core::g_placeKeys[core::PK_CANCEL]), T(isNew ? "cancels" : "puts back"));
         else Note("%s: %s", T(isNew ? "placing" : "grabbed"), name.c_str());
     }
     static void StartPlaceNew(const PosInfo& p, bool havePos) {
+        if (!PrepareHistoryMutation([p, havePos]() { StartPlaceNew(p, havePos); })) return;
         CamFrame cf = CurrentCam();
         if (g_selPrefab < 0 || (!havePos && !cf.ok) || !core::GameThreadReady()) return;
         const auto& pi = core::PrefabIndex()[g_selPrefab];
@@ -803,27 +966,63 @@ namespace editor {
         if (uid) StartGrab({ uid }, true, ShownName(pi));
     }
     static void FinishPlace() {
+        core::PublishGroundPlacement({});
         g_place.active = false; core::g_placing = false; input::ClearKeys();
         if (g_place.reopen) { g_open = true; g_playMode = true; }   // visible again, but the game keeps the input (Home to edit)
     }
     static void CancelCarried(bool notify) {
+        if (!PrepareHistoryMutation([notify]() { CancelCarried(notify); })) return;
         Place& P = g_place; if (!P.active) return;
+        if (P.req) core::PlaceRequestCancel(P.req);
         if (P.isNew) {
-            for (auto& m : P.m) if (!m.npc) { core::HideUid(m.uid); core::ForgetUid(m.uid); }
-            if (g_undo.size() > P.historyMark) g_undo.resize(P.historyMark);
-            g_redo.clear();
-        }
-        else {
-            std::vector<core::MoveReq> r;
-            for (auto& m : P.m) {
-                if (m.npc) core::EndManagedNpcMove(m.uid, m.origPos);
-                else r.push_back({ m.uid, m.origPos, m.origRot, m.origScale });
+            for (const auto& m : P.m) if (!m.npc) { core::HideUid(m.uid); core::ForgetUid(m.uid); }
+            for (auto* stack : { &g_undo, &g_redo }) stack->erase(std::remove_if(stack->begin(), stack->end(),
+                [&](const HistoryEntry& e) { return e.placement == P.generation; }), stack->end());
+        } else {
+            // Gestures and accepted ground receipts are committed history, not a speculative suffix.
+            // Put-back is an exact compensating move; unrelated entries and reserved serials survive.
+            std::vector<Act> acts; std::vector<core::MoveReq> r;
+            const auto objects = core::Spawned(); const auto npcs = core::ManagedNpcs();
+            for (const auto& m : P.m) {
+                Act a; a.kind = m.npc ? Act::NpcMove : Act::Move; a.uid = m.uid; a.prefab = m.prefab;
+                if (m.npc) { const auto* n = FindManagedNpc(npcs, m.uid); if (!n) continue; a.pos0 = n->pos;
+                    if (!core::EndManagedNpcMove(m.uid, m.origPos)) continue; }
+                else { const auto* o = Find(objects, m.uid); if (!o) continue; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale;
+                    r.push_back({ m.uid, m.origPos, m.origRot, m.origScale }); }
+                a.pos1 = m.origPos; a.rot1 = m.origRot; a.sc1 = m.origScale; acts.push_back(a);
             }
-            if (!r.empty()) core::MoveMany(r, true);
-            if (g_undo.size() > P.historyMark) g_undo.resize(P.historyMark);
-            g_redo.clear();
+            if (!r.empty() && !core::MoveMany(r, true)) { Note("placement: put-back refused"); return; }
+            Push(std::move(acts));
         }
         if (notify) Note(T("placement cancelled")); FinishPlace();
+    }
+    static bool PlaceGroupCopy(const proj_codec::Document& doc, Vec3 target, float yawDelta, float scale, const std::string& name,
+                               const core::FileSelectionHandle& source = {}) {
+        std::vector<proj_codec::EngineRow> checked;
+        if (doc.kind != proj_codec::Kind::Group) { g_projectStatus = "wrong-kind"; return false; }
+        if (!proj_codec::NarrowForEngine(doc, checked, g_projectStatus)) return false;
+        if (!PrepareHistoryMutation([doc, target, yawDelta, scale, name, source]() { PlaceGroupCopy(doc, target, yawDelta, scale, name, source); })) return false;
+        std::vector<int> uids; Vec3 pivot{};
+        const auto report = source ? core::AdmitGroupFileCopy(source, target, yawDelta, scale, uids, pivot)
+                                   : core::AdmitGroupCopy(doc, target, yawDelta, scale, uids, pivot);
+        if (report.request) {
+            g_projectPlacements.push_back({ name, report.request, doc.bounds.approximate, source });
+            g_placementReports.Admit(report.request, name, doc.bounds.approximate);
+        }
+        g_projectStatus = report.valid ? "placement-admitted" : report.error;
+        if (!report.valid) { Note("%s", report.error.c_str()); return false; }
+        StartGrab(uids, true, name, &pivot, report.request);
+        return g_place.active && g_place.req == report.request;
+    }
+    static void CancelProjectPlacement(const core::PlaceRequestHandle& request) {
+        if (!PrepareHistoryMutation([request]() { CancelProjectPlacement(request); })) return;
+        if (g_place.active && g_place.req == request) { CancelCarried(); return; }
+        core::PlaceRequestCancel(request);
+        for (const auto& row : core::PlaceRequestState(request).rows) if (row.uid) {
+            core::ForgetUid(row.uid); g_sel.erase(row.uid);
+            if (g_primary == row.uid) g_primary = 0;
+            if (g_lastClicked == row.uid) g_lastClicked = 0;
+        }
     }
     // pivot of a member relative to the placement center for the given deltas. A single object with a measured box turns about
     // that box center for yaw, pitch and roll alike (the gizmo sits in the middle); sets keep their layout and turn about the +y axis.
@@ -843,8 +1042,136 @@ namespace editor {
             out.push_back({ m.uid, { center.x + rel.x, center.y + rel.y, center.z + rel.z }, fr, P.hasNpc ? m.scale0 : m.scale0 * scaleMul });
         }
     }
+    static bool PrepareHistoryMutation(std::function<void()> intent, const std::vector<int>& targets) {
+        ReconcileSpawnHistory();
+        if (g_resumingMutation) return true;
+        if (g_deferredEditor.action) { Note("grounding: mutation pending"); return false; }
+        CommitBrushHistory();
+        if (!ReconcileGroundBatch(true)) {
+            auto& d = g_deferredEditor; d.action = std::move(intent); d.selection = g_sel; d.npcSelection = g_managedNpcSel;
+            d.primary = g_primary; d.npcPrimary = g_managedNpcPrimary; d.project = g_projTab;
+            d.placement = g_place.active ? g_place.generation : 0; d.clipboard = g_clipRevision; d.prefab = g_selPrefab;
+            d.spawnYaw = g_spawnYaw; d.spawnScale = g_spawnScale; d.offsets = { g_off[0], g_off[1], g_off[2] };
+            for (const auto& o : core::Spawned()) if (g_sel.count(o.uid) || std::find(targets.begin(), targets.end(), o.uid) != targets.end() ||
+                (g_place.active && std::any_of(g_place.m.begin(), g_place.m.end(), [&](const Member& m) { return !m.npc && m.uid == o.uid; }))) d.targets.push_back(o);
+            for (const auto& n : core::ManagedNpcs()) if (g_managedNpcSel.count(n.uid) || std::find(targets.begin(), targets.end(), -n.uid) != targets.end() ||
+                (g_place.active && std::any_of(g_place.m.begin(), g_place.m.end(), [&](const Member& m) { return m.npc && m.uid == n.uid; }))) d.npcTargets.push_back(n);
+            Note("grounding: waiting for actual movement completion"); return false;
+        }
+        ++g_historyBranch; return true;
+    }
+    static bool ReconcileGroundBatch(bool cancelUnapplied) {
+        if (g_pendingGround.empty()) return true;
+        auto views = core::GroundBarrier(g_pendingGround, cancelUnapplied);
+        for (const auto& v : views) g_groundReports.Observe(v);
+        for (const auto& v : views) if (!v.terminal()) return false;
+        std::sort(views.begin(), views.end(), [](const auto& a, const auto& b) { return a.serial < b.serial; });
+        bool any = false;
+        for (const auto& v : views) {
+            std::vector<Act> acts;
+            for (const auto& m : v.members) if (m.accepted) {
+                Act a; a.kind = Act::Move; a.uid = m.before.uid; a.prefab = m.before.prefab; a.proj = m.after.proj;
+                if (m.before.proj) a.projects.insert(m.before.proj); if (m.after.proj) a.projects.insert(m.after.proj);
+                a.pos0 = m.before.pos; a.rot0 = m.before.rot; a.sc0 = m.before.scale;
+                a.pos1 = m.after.pos; a.rot1 = m.after.rot; a.sc1 = m.after.scale;
+                if (ActChanged(a)) acts.push_back(a);
+            }
+            if (!acts.empty()) {
+                const auto at = std::lower_bound(g_undo.begin(), g_undo.end(), v.serial, [](const HistoryEntry& e, uint64_t s) { return e.serial < s; });
+                g_undo.insert(at, HistoryEntry{ v.serial, std::move(acts), v.branch, 0 }); any = true;
+            }
+            const auto carried = GroundPlacementOf(g_place);
+            if (v.carried.generation && carried.generation == v.carried.generation && carried.transform == v.carried.transform && carried.members == v.carried.members) {
+                bool moved = false; float dy = 0;
+                for (const auto& m : v.members) if (m.accepted) { dy = m.after.pos.y - m.before.pos.y; moved = true; break; }
+                if (moved) {
+                    Place next = g_place; next.center.y += dy;
+                    if (next.drag >= 1 && next.drag <= 3) next.dragCenter0.y += dy;
+                    for (size_t i = 0; i < next.m.size(); ++i) {
+                        auto& m = next.m[i]; const auto& r = v.members[i];
+                        m.rel = { r.after.pos.x - next.center.x, r.after.pos.y - next.center.y, r.after.pos.z - next.center.z };
+                        m.rot0 = r.after.rot; m.scale0 = r.after.scale;
+                        next.historyBase[i] = { m.uid, r.after.pos, r.after.rot, r.after.scale };
+                    }
+                    next.yaw = next.pitch = next.roll = 0; next.scale = 1;
+                    next.lastCenter = next.center; next.lastYaw = next.lastPitch = next.lastRoll = 0; next.lastScale = 1;
+                    next.dirty = false; ++next.transform;
+                    const auto h = *std::find_if(g_pendingGround.begin(), g_pendingGround.end(), [&](const auto& op) { return core::GroundStateOf(op).id == v.id; });
+                    if (!core::GroundUpdateCarried(h, GroundPlacementOf(next), [next]() { g_place = next; })) {
+                        Note("grounding: carried target changed after application"); FinishPlace();
+                    }
+                }
+            }
+        }
+        if (any) { g_redo.clear(); g_editUid = 0; g_projectRefresh = true; }
+        if (g_undo.size() > kHistoryLimit) g_undo.erase(g_undo.begin(), g_undo.end() - kHistoryLimit);
+        core::GroundReconcile(g_pendingGround);
+        g_groundLastResults = std::move(views); g_pendingGround.clear(); ++g_historyBranch;
+        return true;
+    }
+    static void PumpGroundHistory() {
+        g_seenGroundNotice = core::GroundNotice();
+        if (!ReconcileGroundBatch(false) || !g_deferredEditor.action) return;
+        DeferredEditorIntent d = std::move(g_deferredEditor); g_deferredEditor = {};
+        bool valid = d.selection == g_sel && d.npcSelection == g_managedNpcSel && d.primary == g_primary && d.npcPrimary == g_managedNpcPrimary &&
+            d.project == g_projTab && d.placement == (g_place.active ? g_place.generation : 0) && d.clipboard == g_clipRevision && d.prefab == g_selPrefab &&
+            d.spawnYaw == g_spawnYaw && d.spawnScale == g_spawnScale && d.offsets.x == g_off[0] && d.offsets.y == g_off[1] && d.offsets.z == g_off[2];
+        const auto all = core::Spawned(); const auto npcs = core::ManagedNpcs();
+        for (auto expected : d.targets) {
+            for (const auto& v : g_groundLastResults) for (const auto& m : v.members) if (m.before.uid == expected.uid) expected = m.after;
+            const auto* n = Find(all, expected.uid);
+            valid &= n && n->gen == expected.gen && n->poseGen == expected.poseGen && n->hidden == expected.hidden && n->proj == expected.proj && n->group == expected.group && n->note == expected.note;
+        }
+        for (const auto& e : d.npcTargets) {
+            const auto* n = FindManagedNpc(npcs, e.uid);
+            valid &= n && n->gen == e.gen && n->hidden == e.hidden && !VecChanged(n->pos, e.pos) && n->proj == e.proj && n->group == e.group &&
+                n->aiEnabled == e.aiEnabled && n->behavior == e.behavior && n->label == e.label && n->note == e.note;
+        }
+        if (!valid) { Note("grounding: deferred mutation canceled (stale selection or target)"); return; }
+        ++g_historyBranch;
+        struct ResumeScope { ResumeScope() { g_resumingMutation = true; } ~ResumeScope() { g_resumingMutation = false; } } scope;
+        d.action();
+    }
+    static bool ApplyCarriedPose(const Place& candidate, bool send) {
+        if (!g_place.active || candidate.generation != g_place.generation || candidate.transform != g_place.transform) return false;
+        const bool changed = VecChanged(candidate.center, g_place.center) || candidate.yaw != g_place.yaw || candidate.pitch != g_place.pitch ||
+            candidate.roll != g_place.roll || candidate.scale != g_place.scale || candidate.haveCenter != g_place.haveCenter;
+        if (changed) {
+            // Exact UI motion accumulates against the last successful native send, not the previous frame.
+            const bool significant = fabsf(candidate.center.x - g_place.lastCenter.x) > 0.005f ||
+                fabsf(candidate.center.y - g_place.lastCenter.y) > 0.005f || fabsf(candidate.center.z - g_place.lastCenter.z) > 0.005f ||
+                fabsf(candidate.yaw - g_place.lastYaw) > 0.01f || fabsf(candidate.pitch - g_place.lastPitch) > 0.01f ||
+                fabsf(candidate.roll - g_place.lastRoll) > 0.01f || fabsf(candidate.scale - g_place.lastScale) > 0.001f;
+            // A clean micro-sample during Applying is reconstructed by the held gesture next frame;
+            // it must not consume the single deferred command slot or publish a stale carried identity.
+            if (!g_place.dirty && !significant && !ReconcileGroundBatch(true)) return false;
+            if (!PrepareHistoryMutation([candidate, send]() { if (ApplyCarriedPose(candidate, send) && candidate.commitRequested) CommitPlaceHistory(g_place); })) return false;
+            if (!g_place.active || candidate.generation != g_place.generation || candidate.transform != g_place.transform) return false;
+            Place next = candidate; next.commitRequested = false; next.touched = true; next.dirty = g_place.dirty || significant; ++next.transform;
+            if (!core::PublishGroundPlacement(GroundPlacementOf(next))) return false;
+            g_place = std::move(next);
+        } else {
+            g_place.hover = candidate.hover; g_place.drag = candidate.drag; g_place.drag0 = candidate.drag0;
+            g_place.dragCenter0 = candidate.dragCenter0; g_place.dragYaw0 = candidate.dragYaw0; g_place.dragPitch0 = candidate.dragPitch0;
+            g_place.dragRoll0 = candidate.dragRoll0; g_place.dragScale0 = candidate.dragScale0;
+            g_place.keyTransformHeld = candidate.keyTransformHeld; g_place.mouse = candidate.mouse;
+        }
+        if (send && g_place.dirty && g_pendingGround.empty()) {
+            std::vector<core::MoveReq> moves, objects; MembersTo(moves, g_place, g_place.center, g_place.yaw, g_place.scale); bool sent = true;
+            for (size_t i = 0; i < moves.size(); ++i) {
+                if (g_place.m[i].npc) sent = core::MoveManagedNpcLive(moves[i].uid, moves[i].pos) && sent; else objects.push_back(moves[i]);
+            }
+            if (!objects.empty()) sent = core::MoveMany(objects, false) && sent;
+            if (sent) { g_place.dirty = false; g_place.lastSend = TickNow(); g_place.lastCenter = g_place.center;
+                g_place.lastYaw = g_place.yaw; g_place.lastScale = g_place.scale; g_place.lastPitch = g_place.pitch; g_place.lastRoll = g_place.roll; }
+        }
+        return true;
+    }
+    static bool PlaceCommitLive(const Place& candidate, bool send) { return ApplyCarriedPose(candidate, send); }
     static void CommitPlaceHistory(Place& P) {
-        if (P.historyBase.size() != P.m.size()) return;
+        if (&P != &g_place) { P.commitRequested = true; return; }
+        if (!PrepareHistoryMutation([]() { CommitPlaceHistory(g_place); })) return;
+        if (!P.active || P.historyBase.size() != P.m.size()) return;
         std::vector<core::MoveReq> now; MembersTo(now, P, P.center, P.yaw, P.scale);
         std::vector<Act> acts; acts.reserve(now.size());
         std::vector<core::MoveReq> objects;
@@ -853,12 +1180,15 @@ namespace editor {
             Act a; a.kind = P.m[i].npc ? Act::NpcMove : Act::Move; a.uid = P.m[i].uid; a.prefab = P.m[i].prefab;
             a.pos0 = before.pos; a.rot0 = before.rot; a.sc0 = before.scale;
             a.pos1 = after.pos; a.rot1 = after.rot; a.sc1 = after.scale;
+            if (!ActChanged(a)) continue;
+            if (!P.m[i].npc) objects.push_back(after);
             acts.push_back(std::move(a));
-            if (P.m[i].npc) core::CommitManagedNpcMove(P.m[i].uid, after.pos);
-            else objects.push_back(after);
         }
-        if (!objects.empty()) core::MoveMany(objects, true);
-        Push(std::move(acts));
+        if (!objects.empty() && !core::MoveMany(objects, true)) { Note("placement: move refused"); return; }
+        acts.erase(std::remove_if(acts.begin(), acts.end(), [](const Act& a) {
+            return a.kind == Act::NpcMove && !core::CommitManagedNpcMove(a.uid, a.pos1);
+        }), acts.end());
+        Push(std::move(acts), P.generation);
         P.historyBase = std::move(now);
         P.lastCenter = P.center; P.lastYaw = P.yaw; P.lastScale = P.scale; P.lastPitch = P.pitch; P.lastRoll = P.roll; P.dirty = false;
     }
@@ -889,29 +1219,30 @@ namespace editor {
     // -1 = give up. The object's own collision is in the way: hits inside its vertical range are stepped through (a cast that
     // starts inside a body reports fraction 0, so the start is lowered in 0.5 m steps until it leaves the body).
     static int GroundStep(const core::GroundHit& gh, float x, float z, float bottom, float top, float& startY, int& iter, float* groundY) {
-        const float cy = gh.centerY - core::g_probeRadius;
+        const float cy = gh.centerY - gh.radius;
         core::Log("[ground] cast from y %.2f: %s fraction %.4f center %.2f (object %.2f..%.2f)", startY, gh.hit ? "hit" : "no hit", gh.fraction, gh.centerY, bottom, top);
         if (++iter > 40) return -1;
         if (!gh.hit) return -1;
         const bool inside = gh.fraction <= 0.0005f;   // the sphere started inside a body (Havok reports a negative fraction)
         if (iter == 1 && inside) { startY = top + 150.0f; return 0; }   // buried: something solid sits above the top, so the surface is found from far above
         if (startY > bottom - 0.1f) {                                    // still beside the object: hits here are the object itself (a 36 m tower needs one jump, not 0.5 m steps)
-            if (inside || (cy > bottom - 0.03f && cy < top + 0.03f)) { startY = bottom - 0.1f; return 0; }
+            if (inside || (cy > bottom + 0.03f && cy < top + 0.03f)) { startY = bottom - 0.1f; return 0; }
             *groundY = cy; return 1;                                     // a surface above the object (far-above cast) or already below its bottom
         }
         if (inside) { startY -= 0.5f; return 0; }                        // collision reaches below the bounding box: step out of it
         *groundY = cy; return 1;
     }
     static void StartGroundSnap(Place& P) {
-        if (!core::GroundProbeReady()) { Note(T("snap to ground: not ready yet (walk a step first)")); return; }
-        P.groundBottom = P.center.y + SetBottomOffset(P); P.groundTop = P.center.y + SetTopOffset(P);
-        P.groundStartY = P.groundTop + 0.5f; P.groundIter = 0;
-        P.groundTicket = core::GroundProbe({ P.center.x, P.groundStartY, P.center.z }, 400.0f);
+        if (P.hasNpc) { g_projectStatus = "Grounding supports objects only; NPC and mixed selections were not changed."; Note("%s", T(g_projectStatus.c_str())); return; }
+        std::vector<int> uids; for (const auto& m : P.m) uids.push_back(m.uid);
+        BeginGrounding(uids, true, GroundPlacementOf(P));
     }
     // drops the carried set at its current transform: fresh objects (collision + render state match the final transform), one undo step
     static void DropCarried() {
+        if (!PrepareHistoryMutation([]() { DropCarried(); })) return;
         Place& P = g_place; if (!P.active) return;
         CommitPlaceHistory(P);
+        if (P.dirty) return;
         if (P.hasNpc && P.historyBase.size() == P.m.size()) {
             for (size_t i = 0; i < P.m.size(); ++i) if (P.m[i].npc)
                 core::EndManagedNpcMove(P.m[i].uid, P.historyBase[i].pos);
@@ -979,7 +1310,7 @@ namespace editor {
     }
     static void PlaceTick() {
         if (!g_place.active) return;
-        Place& P = g_place;
+        Place P = g_place;
         if (P.hasNpc) { P.yaw = P.pitch = P.roll = 0.0f; P.scale = 1.0f; }   // NPC/mixed grabs are translation-only
         if (P.m.size() == 1 && !P.haveCenter && P.prefabIdx >= 0 && core::PrefabIndex()[P.prefabIdx].hasCenter) {   // center measured meanwhile: keep the pivot, move the rotation center
             const auto& info = core::PrefabIndex()[P.prefabIdx]; Member& m = P.m[0];
@@ -1024,30 +1355,7 @@ namespace editor {
                 }
             }
         } else { if (P.drag) CommitPlaceHistory(P); P.hover = 0; P.drag = 0; }
-        if (P.groundTicket) {
-            core::GroundHit gh;
-            if (core::GroundResult(P.groundTicket, &gh)) {
-                P.groundTicket = 0; float groundY = 0;
-                const int r = GroundStep(gh, P.center.x, P.center.z, P.groundBottom, P.groundTop, P.groundStartY, P.groundIter, &groundY);
-                if (r == 1) { P.center.y += groundY - P.groundBottom; Note(T("snapped to the ground (%+.2f m)"), groundY - P.groundBottom); CommitPlaceHistory(P); }
-                else if (r == 0) P.groundTicket = core::GroundProbe({ P.center.x, P.groundStartY, P.center.z }, 400.0f);
-                else Note(T("snap to ground: no surface found below"));
-            }
-        }
-        Vec3 c = P.center; float yaw = P.yaw, sc = P.scale;
-        const DWORD now = GetTickCount();
-        const bool changed = fabsf(c.x - P.lastCenter.x) > 0.005f || fabsf(c.y - P.lastCenter.y) > 0.005f || fabsf(c.z - P.lastCenter.z) > 0.005f
-            || fabsf(yaw - P.lastYaw) > 0.01f || fabsf(sc - P.lastScale) > 0.001f || fabsf(P.pitch - P.lastPitch) > 0.01f || fabsf(P.roll - P.lastRoll) > 0.01f;
-        if (changed) { P.dirty = true; P.touched = true; }
-        if (!P.dirty || now - P.lastSend < 60) return;
-        std::vector<core::MoveReq> r; MembersTo(r, P, c, yaw, sc);
-        std::vector<core::MoveReq> objects; bool sent = true;
-        for (size_t i = 0; i < r.size(); ++i) {
-            if (P.m[i].npc) sent = core::MoveManagedNpcLive(P.m[i].uid, r[i].pos) && sent;
-            else objects.push_back(r[i]);
-        }
-        if (!objects.empty()) sent = core::MoveMany(objects, false) && sent;
-        if (sent) { P.dirty = false; P.lastSend = now; P.lastCenter = c; P.lastYaw = yaw; P.lastScale = sc; P.lastPitch = P.pitch; P.lastRoll = P.roll; }   // dropped: try again next frame
+        if (PlaceCommitLive(P, TickNow() - P.lastSend >= 60) && P.commitRequested) CommitPlaceHistory(g_place);
     }
     // ---- selection helpers, undo, copy/paste ----
     static std::vector<int> SelUids() { return std::vector<int>(g_sel.begin(), g_sel.end()); }
@@ -1067,6 +1375,7 @@ namespace editor {
     static size_t SceneSelectionCount() { return g_sel.size() + g_managedNpcSel.size(); }
     static bool SceneHasSelection() { return !g_sel.empty() || !g_managedNpcSel.empty(); }
     static void SelectSingleUid(int uid) {
+        if (!PrepareHistoryMutation([uid]() { SelectSingleUid(uid); }, { uid })) return;
         if (g_place.active) DropCarried();
         ClearSceneSelection(); g_sel.insert(uid); g_primary = g_lastClicked = uid; g_sceneLastEntity = uid; g_editUid = 0;
     }
@@ -1111,6 +1420,7 @@ namespace editor {
         return units;
     }
     static void SelectUid(int uid, bool add, const std::vector<SpawnedObj>& list) {
+        if (!PrepareHistoryMutation([uid, add]() { SelectUid(uid, add, core::Spawned()); }, { uid })) return;
         if (g_place.active) DropCarried();   // selecting something else ends the placement
         if (!add) ClearSceneSelection();
         auto addOne = [&](int u) { if (g_sel.count(u)) { if (add) g_sel.erase(u); } else g_sel.insert(u); };
@@ -1123,40 +1433,121 @@ namespace editor {
         g_primary = uid; g_lastClicked = uid; g_sceneLastEntity = uid;
     }
     // snap to ground for placed objects: one probe per object, results applied as they arrive (undoable move)
-    struct SnapJob { int uid, ticket, iter; float bottom, top, startY; };
+    struct SnapJob { core::GroundHandle op; int ticket = 0, iter = 0; float bottom = 0, top = 0, startY = 0, x = 0, z = 0; };
     static std::vector<SnapJob> g_snapJobs;
-    static void SnapSelToGround() {
-        if (!core::GroundProbeReady()) { Note(T("snap to ground: not ready yet (walk a step first)")); return; }
-        auto list = core::Spawned(); int n = 0;
-        for (int uid : g_sel) {
-            const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue;
-            float bottom = o->pos.y, top = o->pos.y + 2.0f; int pi = IndexOfPrefab(o->prefab);
-            if (pi >= 0) { const auto& info = core::PrefabIndex()[pi]; if (info.hasCenter) { bottom = o->pos.y + (info.cy - info.sy * 0.5f) * o->scale; top = o->pos.y + (info.cy + info.sy * 0.5f) * o->scale; } }
-            const float startY = top + 0.5f;
-            int t = core::GroundProbe({ o->pos.x, startY, o->pos.z }, 400.0f); if (t) { g_snapJobs.push_back({ uid, t, 0, bottom, top, startY }); n++; }
+    static void SceneNumericApply(int uid, Vec3 pos, Rot rot, float scale, bool final);
+    static std::vector<core::GroundHandle> BeginGrounding(const std::vector<int>& uids, bool rigid, const core::GroundPlacement& carried) {
+        if (!g_managedNpcSel.empty() || (g_place.active && g_place.hasNpc)) {
+            g_projectStatus = "Grounding supports objects only; NPC and mixed selections were not changed.";
+            Note("%s", T(g_projectStatus.c_str())); return {};
         }
-        if (n) Note(T("snapping %d objects to the ground"), n);
-    }
-    static void PumpSnapJobs() {
-        if (g_snapJobs.empty()) return;
-        auto list = core::Spawned(); std::vector<Act> acts; std::vector<core::MoveReq> moves;
-        for (size_t i = 0; i < g_snapJobs.size(); ) {
-            SnapJob& j = g_snapJobs[i]; core::GroundHit gh;
-            if (!core::GroundResult(j.ticket, &gh)) { i++; continue; }
-            const SpawnedObj* o = Find(list, j.uid);
-            if (!o) { g_snapJobs.erase(g_snapJobs.begin() + i); continue; }
-            float groundY = 0; const int r = GroundStep(gh, o->pos.x, o->pos.z, j.bottom, j.top, j.startY, j.iter, &groundY);
-            if (r == 0) { j.ticket = core::GroundProbe({ o->pos.x, j.startY, o->pos.z }, 400.0f); if (j.ticket) { i++; continue; } }
-            if (r == 1) {
-                Act a; a.kind = Act::Move; a.uid = o->uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale;
-                a.pos1 = { o->pos.x, o->pos.y + (groundY - j.bottom), o->pos.z }; a.rot1 = o->rot; a.sc1 = o->scale; acts.push_back(a);
-                moves.push_back({ o->uid, a.pos1, o->rot, o->scale });
+        if (g_deferredEditor.action) { Note("grounding: mutation pending"); return {}; }
+        CommitBrushHistory();
+        for (const auto& op : g_pendingGround) {
+            const auto v = core::GroundStateOf(op);
+            const bool overlap = std::any_of(v.members.begin(), v.members.end(), [&](const auto& m) { return std::find(uids.begin(), uids.end(), m.before.uid) != uids.end(); });
+            if (overlap && (v.state == core::GroundApplying || v.terminal())) {
+                if (!PrepareHistoryMutation([uids, rigid, carried]() { BeginGrounding(uids, rigid, carried.generation ? GroundPlacementOf(g_place) : core::GroundPlacement{}); }, uids)) return {};
+                break;
             }
+        }
+        ReconcileGroundBatch(false);
+        if (g_numericSceneUid && std::find(uids.begin(), uids.end(), g_numericSceneUid) != uids.end()) {
+            SceneNumericApply(g_numericSceneUid, { g_edit[0], g_edit[1], g_edit[2] }, g_editRot, g_editScale, true);
+            if (g_deferredEditor.action) return {};
+        }
+        if (carried.generation) {
+            if (g_place.generation != carried.generation || !g_place.active) return {};
+            // Close the upstream gesture checkpoint before reserving a later grounding serial.
+            CommitPlaceHistory(g_place);
+            if (g_deferredEditor.action) return {};
+        }
+        const auto context = carried.generation ? GroundPlacementOf(g_place) : carried;
+        std::vector<core::GroundHandle> added;
+        const size_t count = rigid ? (uids.empty() ? 0 : 1) : uids.size();
+        for (size_t i = 0; i < count; ++i) {
+            const auto targets = rigid ? uids : std::vector<int>{ uids[i] };
+            auto op = core::BeginGround(targets, ++g_historySerial, g_historyBranch, context);
+            g_pendingGround.push_back(op); added.push_back(op);
+            proj_codec::Bounds bounds;
+            if (!core::GroundBounds(op, bounds)) { core::GroundCancel(op, "refused"); continue; }
+            SnapJob j; j.op = op; j.bottom = (float)bounds.min.y; j.top = (float)bounds.max.y; j.startY = j.top + 0.5f;
+            const auto view = core::GroundStateOf(op);
+            j.x = context.generation ? g_place.center.x : rigid ? (float)bounds.anchor.x : view.members[0].before.pos.x;
+            j.z = context.generation ? g_place.center.z : rigid ? (float)bounds.anchor.z : view.members[0].before.pos.z;
+            j.ticket = core::GroundTicket(op, { j.x, j.startY, j.z }, 400.0f); g_snapJobs.push_back(j);
+        }
+        for (const auto& op : g_pendingGround) g_groundReports.Observe(core::GroundStateOf(op));
+        return added;
+    }
+    static void SnapSelToGround() { BeginGrounding(SelUids(), false); }
+    static void PumpSnapJobs() {
+        core::GroundFrame(); PumpGroundHistory();
+        for (size_t i = 0; i < g_snapJobs.size();) {
+            auto& j = g_snapJobs[i];
+            if (!core::GroundValidate(j.op)) { g_snapJobs.erase(g_snapJobs.begin() + i); continue; }
+            if (!j.ticket) { j.ticket = core::GroundTicket(j.op, { j.x, j.startY, j.z }, 400.0f); ++i; continue; }
+            core::GroundHit hit; if (!core::GroundPoll(j.op, &hit)) { ++i; continue; }
+            j.ticket = 0; float groundY = 0;
+            const int step = std::isfinite(hit.centerY) && std::isfinite(hit.fraction) ? GroundStep(hit, j.x, j.z, j.bottom, j.top, j.startY, j.iter, &groundY) : -1;
+            if (!step && j.iter < 40) { j.ticket = core::GroundTicket(j.op, { j.x, j.startY, j.z }, 400.0f); ++i; continue; }
+            if (step == 1) {
+                std::vector<core::MoveReq> moves; const auto v = core::GroundStateOf(j.op);
+                for (const auto& m : v.members) { Vec3 pos = m.before.pos; pos.y += groundY - j.bottom; moves.push_back({ m.before.uid, pos, m.before.rot, m.before.scale }); }
+                core::GroundApply(j.op, moves);
+            } else core::GroundCancel(j.op, "no-surface");
             g_snapJobs.erase(g_snapJobs.begin() + i);
         }
-        if (!moves.empty()) { core::MoveMany(moves, true); Push(acts); Note(T("%d objects snapped to the ground"), (int)moves.size()); }
+        for (const auto& op : g_pendingGround) g_groundReports.Observe(core::GroundStateOf(op));
+    }
+    static void ApplyNumeric(int uid, Vec3 pos, Rot rot, float scale, bool final) {
+        if (!PrepareHistoryMutation([uid, pos, rot, scale, final]() { ApplyNumeric(uid, pos, rot, scale, final); }, { uid })) return;
+        const auto list = core::Spawned(); const auto* o = Find(list, uid); if (!o || o->hidden) return;
+        if (g_numericSceneUid != uid) { g_numericSceneUid = uid; g_editPos0 = o->pos; g_editRot0 = o->rot; g_editScale0 = o->scale; }
+        if (!core::MoveMany({ { uid, pos, rot, scale } }, final)) return;
+        if (final) {
+            Act a; a.kind = Act::Move; a.uid = uid; a.prefab = o->prefab;
+            a.pos0 = g_editPos0; a.rot0 = g_editRot0; a.sc0 = g_editScale0; a.pos1 = pos; a.rot1 = rot; a.sc1 = scale; Push({ a });
+            g_editPos0 = pos; g_editRot0 = rot; g_editScale0 = scale; g_numericSceneUid = 0;
+        }
+    }
+    static void SceneNumericApply(int uid, Vec3 pos, Rot rot, float scale, bool final) { ApplyNumeric(uid, pos, rot, scale, final); }
+    static void NpcNumericApply(int uid, Vec3 pos, bool final) {
+        if (!PrepareHistoryMutation([uid, pos, final]() { NpcNumericApply(uid, pos, final); }, { -uid })) return;
+        const auto list = core::ManagedNpcs(); const auto* n = FindManagedNpc(list, uid); if (!n || n->hidden) return;
+        if (g_numericNpcUid != uid) {
+            if (!core::BeginManagedNpcMove(uid)) { Note("NPC live move is not ready"); return; }
+            g_numericNpcUid = uid; g_numericNpcBase = ManagedNpcDisplayPos(*n);
+        }
+        if (final) {
+            if (!core::EndManagedNpcMove(uid, pos)) return;
+            Act a; a.kind = Act::NpcMove; a.uid = uid; a.pos0 = g_numericNpcBase; a.pos1 = pos; a.prefab = n->label; Push({ a }); g_numericNpcUid = 0;
+        } else core::MoveManagedNpcLive(uid, pos);
+    }
+    static void FinalizeNumericEdits() {
+        if (g_deferredEditor.action || !g_pendingGround.empty() || (g_open && (ImGui::IsAnyItemActive() || g_numericEditId))) return;
+        if (g_numericSceneUid) {
+            const auto all = core::Spawned(); const auto* o = Find(all, g_numericSceneUid);
+            if (o && !o->hidden) SceneNumericApply(o->uid, o->pos, o->rot, o->scale, true);
+            else g_numericSceneUid = 0;
+        }
+        if (g_numericNpcUid) {
+            const auto all = core::ManagedNpcs(); const auto* n = FindManagedNpc(all, g_numericNpcUid);
+            if (n && !n->hidden) NpcNumericApply(n->uid, n->liveMovePending ? n->liveMoveTarget : ManagedNpcDisplayPos(*n), true);
+            else g_numericNpcUid = 0;
+        }
+    }
+    static void ForgetSelection() {
+        if (!PrepareHistoryMutation([]() { ForgetSelection(); })) return;
+        for (int uid : g_sel) core::ForgetUid(uid);
+        for (int uid : g_managedNpcSel) core::ForgetManagedNpc(uid);
+        ClearSceneSelection();
+    }
+    static void ClearSceneAction(bool newProject) {
+        if (SceneProjectMutation({}, 3) && newProject) g_projName[0] = 0;
     }
     static void DeleteSel() {
+        if (!PrepareHistoryMutation([]() { DeleteSel(); })) return;
         auto list = core::Spawned(); std::vector<Act> acts;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; Act a; a.kind = Act::Delete; a.uid = uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale; a.group = o->group; a.proj = o->proj; a.text0 = o->note; acts.push_back(a); core::HideUid(uid); }
         if (!acts.empty()) { Note(T("deleted %d objects"), (int)acts.size()); Push(acts); }
@@ -1179,6 +1570,11 @@ namespace editor {
         }
         return (int)g_sel.size();
     }
+    static void RemoveDuplicates() {
+        if (!PrepareHistoryMutation([]() { RemoveDuplicates(); })) return;
+        ClearSceneSelection();
+        if (SelectDuplicates()) DeleteSel();
+    }
     static void RemapUid(int from, int to) {
         if (!from || !to || from == to) return;
         for (auto* stack : { &g_undo, &g_redo }) for (auto& entry : *stack) for (auto& a : entry.acts) if (a.uid == from) a.uid = to;
@@ -1192,13 +1588,15 @@ namespace editor {
         if (g_lastClicked == uid) g_lastClicked = 0;
     }
     static void Undo() {
+        if (!PrepareHistoryMutation([]() { Undo(); })) return;
+        if (g_place.active) { DropCarried(); if (g_place.active) return; }
         if (g_undo.empty()) return;
         HistoryEntry entry = std::move(g_undo.back()); g_undo.pop_back();
         std::vector<Act>& acts = entry.acts;
         std::vector<core::MoveReq> moves;
         for (auto& a : acts) {
             if (a.kind == Act::Spawn) { core::HideUid(a.uid); RemoveSelectionUid(a.uid); }
-            else if (a.kind == Act::Delete) { const int oldUid = a.uid, nu = core::SpawnAt(a.prefab, a.pos0, a.rot0, a.sc0, a.group, a.proj); if (nu) { a.uid = nu; RemapUid(oldUid, nu); if (!a.text0.empty()) core::SetObjectNote(nu, a.text0); g_sel.insert(nu); g_primary = nu; } }
+            else if (a.kind == Act::Delete) { if (core::RestoreUid(a.uid)) { g_sel.insert(a.uid); g_primary = a.uid; } else RemoveSelectionUid(a.uid); }
             else if (a.kind == Act::SetGroup) core::SetGroup(a.uid, a.group);
             else if (a.kind == Act::Move) moves.push_back({ a.uid, a.pos0, a.rot0, a.sc0 });
             else if (a.kind == Act::NpcSpawn) {
@@ -1215,19 +1613,26 @@ namespace editor {
             else if (a.kind == Act::NpcNote) core::SetManagedNpcNote(a.uid, a.text0);
             else if (a.kind == Act::NpcLabel) core::SetManagedNpcLabel(a.uid, a.text0);
             else if (a.kind == Act::GroupName) core::SetGroupName(a.group, a.text0);
-            else if (a.kind == Act::TerrainBatch) { for (size_t i = 0; i < a.terrain.size(); ++i) core::TerrainUndo(); }
+            else if (a.kind == Act::TerrainBatch) {
+                const auto live = core::TerrainStrokes();
+                if (live.size() >= a.terrain.size()) a.terrain.assign(live.end() - a.terrain.size(), live.end());
+                CaptureProvenance(a); // retain adoption before removing the last live reference
+                for (size_t i = 0; i < a.terrain.size(); ++i) core::TerrainUndo();
+            }
             else if (a.kind == Act::TerrainClear) { for (const auto& t : a.terrain) core::TerrainAddStroke(t); }
         }
         if (!moves.empty()) core::MoveMany(moves, true);
-        g_redo.push_back(std::move(entry)); Note(T("undo"));
+        g_redo.push_back(std::move(entry)); g_projectRefresh = true; Note(T("undo"));
     }
     static void Redo() {
+        if (!PrepareHistoryMutation([]() { Redo(); })) return;
+        if (g_place.active) { DropCarried(); if (g_place.active) return; }
         if (g_redo.empty()) return;
         HistoryEntry entry = std::move(g_redo.back()); g_redo.pop_back();
         std::vector<Act>& acts = entry.acts;
         std::vector<core::MoveReq> moves;
         for (auto& a : acts) {
-            if (a.kind == Act::Spawn) { const int oldUid = a.uid, nu = core::SpawnAt(a.prefab, a.pos1, a.rot1, a.sc1, a.group, a.proj); if (nu) { a.uid = nu; RemapUid(oldUid, nu); g_sel.insert(nu); g_primary = nu; } }
+            if (a.kind == Act::Spawn) { if (core::RestoreUid(a.uid)) { g_sel.insert(a.uid); g_primary = a.uid; } else RemoveSelectionUid(a.uid); }
             else if (a.kind == Act::Delete) { core::HideUid(a.uid); RemoveSelectionUid(a.uid); }
             else if (a.kind == Act::SetGroup) core::SetGroup(a.uid, a.group1);
             else if (a.kind == Act::Move) moves.push_back({ a.uid, a.pos1, a.rot1, a.sc1 });
@@ -1246,10 +1651,10 @@ namespace editor {
             else if (a.kind == Act::NpcLabel) core::SetManagedNpcLabel(a.uid, a.text1);
             else if (a.kind == Act::GroupName) core::SetGroupName(a.group, a.text1);
             else if (a.kind == Act::TerrainBatch) { for (const auto& t : a.terrain) core::TerrainAddStroke(t); }
-            else if (a.kind == Act::TerrainClear) core::TerrainClear();
+            else if (a.kind == Act::TerrainClear) { a.terrain = core::TerrainStrokes(); CaptureProvenance(a); core::TerrainClear(); }
         }
         if (!moves.empty()) core::MoveMany(moves, true);
-        g_undo.push_back(std::move(entry)); Note(T("redo"));
+        g_undo.push_back(std::move(entry)); g_projectRefresh = true; Note(T("redo"));
     }
     static const char* HistoryActionName(const HistoryEntry& entry) {
         if (entry.acts.empty()) return "";
@@ -1359,6 +1764,8 @@ namespace editor {
     struct ClipItem { std::string prefab; Vec3 rel; Rot rot; float scale; };
     static std::vector<ClipItem> g_clip; static float g_clipRadius = 1; static Vec3 g_clipCenter{};
     static void CopySel() {
+        if (!PrepareHistoryMutation([]() { CopySel(); })) return;
+        ++g_clipRevision;
         auto list = core::Spawned(); g_clip.clear(); Vec3 c{ 0, 0, 0 }; int n = 0;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; c.x += o->pos.x; c.y += o->pos.y; c.z += o->pos.z; n++; }
         if (!n) return; c.x /= n; c.y /= n; c.z /= n; g_clipCenter = c; g_clipRadius = 1;
@@ -1368,6 +1775,8 @@ namespace editor {
     }
     // spawns a set of objects around a center, groups them (when more than one) and hands them to the placement mode
     static void SpawnSet(const std::vector<ClipItem>& items, Vec3 center, float radius, const char* what) {
+        const std::string label = what;
+        if (!PrepareHistoryMutation([items, center, radius, label]() { SpawnSet(items, center, radius, label.c_str()); })) return;
         if (items.empty() || !core::GameThreadReady()) return;
         int group = items.size() > 1 ? core::NewGroupId() : 0; std::vector<int> uids;
         for (auto& it : items) { int uid = core::SpawnAt(it.prefab, { center.x + it.rel.x, center.y + it.rel.y, center.z + it.rel.z }, it.rot, it.scale, group); if (uid) uids.push_back(uid); }
@@ -1377,6 +1786,7 @@ namespace editor {
         g_place.radius = std::max(g_place.radius, radius);
     }
     static void Paste(bool havePos) {
+        if (!PrepareHistoryMutation([havePos]() { Paste(havePos); })) return;
         (void)havePos; if (g_clip.empty()) return;
         // Prefer a copy next to its source. If that whole copied set would be outside the current camera, bring the copy into view
         // instead so duplicating a distant/off-screen object never creates another object the user cannot find.
@@ -1398,6 +1808,7 @@ namespace editor {
         SpawnSet(g_clip, at, g_clipRadius, "pasted");
     }
     static void GroupSel(bool group) {
+        if (!PrepareHistoryMutation([group]() { GroupSel(group); })) return;
         if (g_sel.empty()) return;
         auto list = core::Spawned(); int gid = group ? core::NewGroupId() : 0; int n = 0; std::vector<Act> acts;
         for (int uid : g_sel) {
@@ -1409,6 +1820,7 @@ namespace editor {
         Note(T("%s %d objects"), T(group ? "grouped" : "ungrouped"), n);
     }
     static void RotateSel(float degrees) {
+        if (!PrepareHistoryMutation([degrees]() { RotateSel(degrees); })) return;
         if (g_sel.empty() || !std::isfinite(degrees)) return;
         auto list = core::Spawned(); Vec3 c{}; int n = 0;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; c.x += o->pos.x; c.y += o->pos.y; c.z += o->pos.z; ++n; }
@@ -1426,6 +1838,7 @@ namespace editor {
         if (!moves.empty()) { if (!core::MoveMany(moves, true)) { Note(T("rotation could not be queued; game thread is not ready")); return; } Push(std::move(acts)); g_editUid = 0; }
     }
     static void MoveSel(Vec3 delta) {
+        if (!PrepareHistoryMutation([delta]() { MoveSel(delta); })) return;
         if (g_sel.empty()) return;
         auto list = core::Spawned(); std::vector<Act> acts; std::vector<core::MoveReq> moves;
         for (int uid : g_sel) {
@@ -1437,6 +1850,7 @@ namespace editor {
         if (!moves.empty() && core::MoveMany(moves, true)) { Push(std::move(acts)); g_editUid = 0; }
     }
     static void ScaleSel(float factor) {
+        if (!PrepareHistoryMutation([factor]() { ScaleSel(factor); })) return;
         if (g_sel.empty() || !std::isfinite(factor) || factor <= 0) return;
         auto list = core::Spawned(); Vec3 c{}; int n = 0;
         for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; c.x += o->pos.x; c.y += o->pos.y; c.z += o->pos.z; ++n; }
@@ -1457,6 +1871,7 @@ namespace editor {
         else { g_mainTab = TabScene; g_selectMainTab = true; }
     }
     static void AlignSel(int axis) {
+        if (!PrepareHistoryMutation([axis]() { AlignSel(axis); })) return;
         if (g_sel.size() < 2 || axis < 0 || axis > 2) return;
         auto list = core::Spawned(); const auto units = SelectionUnits(g_sel, list);
         if (units.size() < 2) return;
@@ -1511,7 +1926,7 @@ namespace editor {
             if (io.WantTextInput || g_playMode) return;
             if (ctrl && pZ) Undo();
             if (ctrl && pY) Redo();
-            if (sceneContext && ctrl && pC && !g_sel.empty()) CopySel();
+            if (sceneContext && ctrl && pC && (!g_sel.empty() || g_managedNpcSel.empty())) CopySel();
             if (sceneContext && ctrl && pV) Paste(havePos);
             if (sceneContext && ctrl && pD && !g_sel.empty()) { CopySel(); Paste(havePos); }
             if (ctrl && pG) groupForContext();
@@ -1522,7 +1937,8 @@ namespace editor {
         if (io.WantTextInput || g_playMode) return;
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) Undo();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) Redo();
-        if (sceneContext && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false) && !g_sel.empty()) CopySel();
+        // Empty Scene copy clears the old object payload; NPC-only copy remains unchanged.
+        if (sceneContext && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false) && (!g_sel.empty() || g_managedNpcSel.empty())) CopySel();
         if (sceneContext && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false)) Paste(havePos);
         if (sceneContext && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false) && !g_sel.empty()) { CopySel(); Paste(havePos); }
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false)) groupForContext();
@@ -1631,6 +2047,7 @@ namespace editor {
     static int g_npcFormation = 0; static float g_npcSpacing = 1.5f, g_npcRadius = 8.0f;
     static bool g_npcSpawnAi = true; static int g_npcSpawnBehavior = 0;
     static int g_npcNoteEditUid = 0, g_npcLabelEditUid = 0, g_groupNameEditId = 0, g_objectNoteEditUid = 0;
+    static bool g_metadataEditing = false;
     static int g_metadataPopupRequest = 0;   // opened from the root ID scope so row/context-menu IDs do not trap the modal
     static char g_npcNoteEdit[512] = "", g_npcLabelEdit[160] = "", g_groupNameEdit[160] = "", g_objectNoteEdit[512] = "";
     // NPCs only live where the world is streamed in around the character, and every one is a full server actor: a few hundred
@@ -1641,6 +2058,7 @@ namespace editor {
     static const char* kNpcFormations[] = { "Line", "Matrix", "Circle" };
     static const char* kNpcBehaviors[] = { "Normal autonomous", "Hold position (AI paused)" };
     static void SpawnNpcFormation(uint32_t key, Vec3 center, int count, int formation, float spacing, float radius, float fx, float fz, bool ai, int behavior) {
+        if (!PrepareHistoryMutation([=]() { SpawnNpcFormation(key, center, count, formation, spacing, radius, fx, fz, ai, behavior); })) return;
         count = std::clamp(count, 1, kNpcMaxCount); formation = std::clamp(formation, 0, 2);
         const float fl = sqrtf(fx * fx + fz * fz); if (fl > 1e-4f) { fx /= fl; fz /= fl; } else { fx = 0; fz = 1; }
         const float rx = fz, rz = -fx;
@@ -1673,8 +2091,8 @@ namespace editor {
             const int ticket = core::GroundProbe({ center.x, startY, center.z }, 400.0f);
             if (ticket) {
                 g_npcDropJobs.push_back({ key, ticket, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
-                return;
-            }
+            } else Note("NPC surface request refused");
+            return;
         }
         SpawnNpcFormation(key, center, count, formation, spacing, radius, fx, fz, ai, behavior);
     }
@@ -1723,6 +2141,7 @@ namespace editor {
     }
     static std::string ManagedNpcHistoryName(const ManagedNpc& n) { return n.label.empty() ? std::string("NPC ") + std::to_string(n.key) : n.label; }
     static void SelectManagedNpc(int uid, bool add) {
+        if (!PrepareHistoryMutation([uid, add]() { SelectManagedNpc(uid, add); }, { -uid })) return;
         if (g_place.active) DropCarried();
         const auto list = core::ManagedNpcs(); const ManagedNpc* n = FindManagedNpc(list, uid);
         if (!add) ClearSceneSelection();
@@ -1739,6 +2158,7 @@ namespace editor {
         g_managedNpcPrimary = g_managedNpcSel.empty() ? 0 : *g_managedNpcSel.begin();
     }
     static void SetSelectedNpcAi(bool enabled) {
+        if (!PrepareHistoryMutation([enabled]() { SetSelectedNpcAi(enabled); })) return;
         const auto list = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
             const int afterBehavior = enabled && n->behavior == 1 ? 0 : n->behavior;
@@ -1748,6 +2168,7 @@ namespace editor {
         Push(std::move(acts));
     }
     static void SetSelectedNpcBehavior(int behavior) {
+        if (!PrepareHistoryMutation([behavior]() { SetSelectedNpcBehavior(behavior); })) return;
         behavior = behavior == 1 ? 1 : 0; const bool enabled = behavior == 0;
         const auto list = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
@@ -1757,6 +2178,7 @@ namespace editor {
         Push(std::move(acts));
     }
     static void MoveSelectedNpcs(Vec3 delta) {
+        if (!PrepareHistoryMutation([delta]() { MoveSelectedNpcs(delta); })) return;
         const auto list = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
             const Vec3 before = ManagedNpcDisplayPos(*n);
@@ -1766,6 +2188,7 @@ namespace editor {
         Push(std::move(acts));
     }
     static void DeleteSelectedNpcs() {
+        if (!PrepareHistoryMutation([]() { DeleteSelectedNpcs(); })) return;
         const auto list = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) if (!n->hidden) {
             Act a; a.kind = Act::NpcDelete; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = n->pos; a.flag0 = n->aiEnabled; a.behavior0 = n->behavior; a.group = n->group; a.text0 = n->label;
@@ -1774,6 +2197,7 @@ namespace editor {
         Push(std::move(acts)); g_managedNpcSel.clear(); g_managedNpcPrimary = 0;
     }
     static void GroupSelectedNpcs(bool makeGroup) {
+        if (!PrepareHistoryMutation([makeGroup]() { GroupSelectedNpcs(makeGroup); })) return;
         if (g_managedNpcSel.empty()) return; const int gid = makeGroup ? core::NewGroupId() : 0; const auto list = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) { Act a; a.kind = Act::NpcGroup; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.group = n->group; a.group1 = gid; acts.push_back(a); core::SetManagedNpcGroup(uid, gid); }
         Push(std::move(acts));
@@ -1786,6 +2210,7 @@ namespace editor {
         else if (!g_managedNpcSel.empty()) { g_managedNpcPrimary = *g_managedNpcSel.begin(); g_sceneLastEntity = -g_managedNpcPrimary; }
     }
     static void DeleteSceneSelection() {
+        if (!PrepareHistoryMutation([]() { DeleteSceneSelection(); })) return;
         auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_sel) if (const auto* o = Find(objects, uid)) if (!o->hidden) {
             Act a; a.kind = Act::Delete; a.uid = uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale; a.group = o->group; a.proj = o->proj; a.text0 = o->note;
@@ -1799,6 +2224,7 @@ namespace editor {
         ClearSceneSelection();
     }
     static void GroupSceneSelection(bool makeGroup) {
+        if (!PrepareHistoryMutation([makeGroup]() { GroupSceneSelection(makeGroup); })) return;
         if (!SceneHasSelection()) return;
         const int gid = makeGroup ? core::NewGroupId() : 0; auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_sel) if (const auto* o = Find(objects, uid)) if (!o->hidden && o->group != gid) {
@@ -1810,6 +2236,7 @@ namespace editor {
         Push(std::move(acts));
     }
     static void MoveSceneSelection(Vec3 delta) {
+        if (!PrepareHistoryMutation([delta]() { MoveSceneSelection(delta); })) return;
         if (!SceneHasSelection()) return;
         auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); std::vector<Act> acts; std::vector<core::MoveReq> moves;
         for (int uid : g_sel) if (const auto* o = Find(objects, uid)) if (!o->hidden) {
@@ -1830,7 +2257,28 @@ namespace editor {
     static void OpenNpcLabelEdit(const ManagedNpc& n) { g_npcLabelEditUid = n.uid; strncpy_s(g_npcLabelEdit, n.label.c_str(), _TRUNCATE); g_metadataPopupRequest = 2; }
     static void OpenGroupNameEdit(int gid) { g_groupNameEditId = gid; const std::string name = core::GroupName(gid); strncpy_s(g_groupNameEdit, name.c_str(), _TRUNCATE); g_metadataPopupRequest = 3; }
     static void OpenObjectNoteEdit(const SpawnedObj& o) { g_objectNoteEditUid = o.uid; strncpy_s(g_objectNoteEdit, o.note.c_str(), _TRUNCATE); g_metadataPopupRequest = 4; }
+    static void SaveMetadata(Act::Kind kind, int id, const std::string& text) {
+        std::vector<int> targets;
+        if (kind == Act::GroupName) {
+            for (const auto& o : core::Spawned()) if (o.group == id) targets.push_back(o.uid);
+            for (const auto& n : core::ManagedNpcs()) if (n.group == id) targets.push_back(-n.uid);
+        } else targets.push_back(NpcAct(kind) ? -id : id);
+        if (!PrepareHistoryMutation([kind, id, text]() { SaveMetadata(kind, id, text); }, targets)) return;
+        Act a; a.kind = kind; a.uid = kind == Act::GroupName ? 0 : id; a.text1 = text;
+        if (kind == Act::GroupName) { a.group = id; a.text0 = core::GroupName(id); CaptureProvenance(a); core::SetGroupName(id, text); }
+        else if (kind == Act::ObjectNote) {
+            const auto all = core::Spawned(); const auto* o = Find(all, id); if (!o) return;
+            a.text0 = o->note; a.proj = o->proj; core::SetObjectNote(id, text);
+        } else {
+            const auto all = core::ManagedNpcs(); const auto* n = FindManagedNpc(all, id); if (!n) return;
+            a.proj = n->proj; a.text0 = kind == Act::NpcNote ? n->note : n->label;
+            if (kind == Act::NpcNote) core::SetManagedNpcNote(id, text); else core::SetManagedNpcLabel(id, text);
+        }
+        Push({ a });
+    }
     static void DrawMetadataPopups() {
+        g_metadataEditing = g_metadataPopupRequest || ImGui::IsPopupOpen("Edit NPC note") || ImGui::IsPopupOpen("Rename NPC") ||
+            ImGui::IsPopupOpen("Rename group") || ImGui::IsPopupOpen("Edit object note");
         if (g_metadataPopupRequest) {
             const char* id = g_metadataPopupRequest == 1 ? "Edit NPC note" : g_metadataPopupRequest == 2 ? "Rename NPC" : g_metadataPopupRequest == 3 ? "Rename group" : "Edit object note";
             ImGui::OpenPopup(id); g_metadataPopupRequest = 0;
@@ -1838,34 +2286,28 @@ namespace editor {
         if (ImGui::BeginPopupModal("Edit NPC note", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::SetNextItemWidth(460); ImGui::InputTextMultiline("##npcnote", g_npcNoteEdit, sizeof g_npcNoteEdit, ImVec2(460, 110));
             if (ImGui::Button(T("Save"))) {
-                const auto list = core::ManagedNpcs(); if (const auto* n = FindManagedNpc(list, g_npcNoteEditUid)) {
-                    Act a; a.kind = Act::NpcNote; a.uid = n->uid; a.text0 = n->note; a.text1 = g_npcNoteEdit; core::SetManagedNpcNote(a.uid, a.text1); Push({ a });
-                } ImGui::CloseCurrentPopup();
+                SaveMetadata(Act::NpcNote, g_npcNoteEditUid, g_npcNoteEdit); ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
         if (ImGui::BeginPopupModal("Rename NPC", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::SetNextItemWidth(360); ImGui::InputText("##npclabel", g_npcLabelEdit, sizeof g_npcLabelEdit);
             if (ImGui::Button(T("Save"))) {
-                const auto list = core::ManagedNpcs(); if (const auto* n = FindManagedNpc(list, g_npcLabelEditUid)) {
-                    Act a; a.kind = Act::NpcLabel; a.uid = n->uid; a.text0 = n->label; a.text1 = g_npcLabelEdit; core::SetManagedNpcLabel(a.uid, a.text1); Push({ a });
-                } ImGui::CloseCurrentPopup();
+                SaveMetadata(Act::NpcLabel, g_npcLabelEditUid, g_npcLabelEdit); ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
         if (ImGui::BeginPopupModal("Rename group", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::SetNextItemWidth(360); ImGui::InputText("##groupname", g_groupNameEdit, sizeof g_groupNameEdit);
             if (ImGui::Button(T("Save"))) {
-                Act a; a.kind = Act::GroupName; a.group = g_groupNameEditId; a.text0 = core::GroupName(a.group); a.text1 = g_groupNameEdit; core::SetGroupName(a.group, a.text1); Push({ a }); ImGui::CloseCurrentPopup();
+                SaveMetadata(Act::GroupName, g_groupNameEditId, g_groupNameEdit); ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
         if (ImGui::BeginPopupModal("Edit object note", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::SetNextItemWidth(460); ImGui::InputTextMultiline("##objectnote", g_objectNoteEdit, sizeof g_objectNoteEdit, ImVec2(460, 110));
             if (ImGui::Button(T("Save"))) {
-                const auto list = core::Spawned(); if (const auto* o = Find(list, g_objectNoteEditUid)) {
-                    Act a; a.kind = Act::ObjectNote; a.uid = o->uid; a.text0 = o->note; a.text1 = g_objectNoteEdit; core::SetObjectNote(a.uid, a.text1); Push({ a });
-                } ImGui::CloseCurrentPopup();
+                SaveMetadata(Act::ObjectNote, g_objectNoteEditUid, g_objectNoteEdit); ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
@@ -2044,15 +2486,13 @@ namespace editor {
                 ImGui::SetNextItemWidth(compact ? -1.0f : 330 * ui);
                 const bool changed = ImGui::DragFloat3(T("position##managednpc"), ep, 0.05f, -100000.0f, 100000.0f, "%.3f");
                 if (changed && g_managedNpcSel.size() == 1) {
-                    if (!liveMove) liveMove = core::BeginManagedNpcMove(n->uid);
-                    const DWORD now = GetTickCount();
-                    if (liveMove && now - liveAt >= 45) { core::MoveManagedNpcLive(n->uid, { ep[0], ep[1], ep[2] }); liveAt = now; }
+                    const DWORD now = TickNow();
+                    if (now - liveAt >= 45) { NpcNumericApply(n->uid, { ep[0], ep[1], ep[2] }, false); liveMove = g_numericNpcUid == n->uid; liveAt = now; }
                 }
                 if (ImGui::IsItemDeactivatedAfterEdit()) {
                     const Vec3 finalPos{ ep[0], ep[1], ep[2] };
-                    if (liveMove) {
-                        core::EndManagedNpcMove(n->uid, finalPos);
-                        Act a; a.kind = Act::NpcMove; a.uid = n->uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = base; a.pos1 = finalPos; Push({ a });
+                    if (liveMove || g_managedNpcSel.size() == 1) {
+                        NpcNumericApply(n->uid, finalPos, true);
                     } else {
                         const Vec3 delta{ finalPos.x - base.x, finalPos.y - base.y, finalPos.z - base.z }; MoveSelectedNpcs(delta);
                     }
@@ -2068,8 +2508,10 @@ namespace editor {
         const auto chars = thumbgen::Characters();
         const float ui = ImGui::GetFontSize() / 17.0f;
         const int st = core::NpcState();
+        ImGui::PushTextWrapPos();
         if (st == 0) { ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), T("NPC spawning is not available in this game build (see the log).")); }
         else if (st == 1) { ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), T("walk a few steps first: the game's spawn request needs your character's server actor")); }
+        ImGui::PopTextWrapPos();
         if (!chars) { ImGui::TextDisabled(T("reading the character list from the game files...")); return; }
         if (!compact) {   // view switch: list or tiles (tile size shared with the browser)
             const ImVec4 on = ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive), off = ImGui::GetStyleColorVec4(ImGuiCol_Button);
@@ -2100,7 +2542,7 @@ namespace editor {
         }
         ImGui::TextDisabled(T("%d characters"), (int)g_npcRows.size());
         SameLineOrWrap(compact, ImGui::CalcTextSize(T("double-click = one NPC; SPAWN or drag = current count and formation")).x);
-        ImGui::TextDisabled("%s", T("double-click = one NPC; SPAWN or drag = current count and formation"));
+        ImGui::PushTextWrapPos(); ImGui::TextDisabled("%s", T("double-click = one NPC; SPAWN or drag = current count and formation")); ImGui::PopTextWrapPos();
         const float detailsH = (compact ? 265.0f : 205.0f) * ui;
         float listH = ImGui::GetContentRegionAvail().y - detailsH - ImGui::GetStyle().ItemSpacing.y; if (listH < 80 * ui) listH = 80 * ui;
         const bool useCards = compact || g_npcCards;
@@ -2138,12 +2580,13 @@ namespace editor {
                     ImGui::TextDisabled(T(!thumbgen::Ready() ? "no preview" : thumbgen::Pending(c.app) ? "rendering..." : thumbgen::Processed(c.app) ? "no preview" : "queued"));
                     ImGui::EndChild();
                 }
-                ImGui::SameLine();
+                SameLineOrWrap(compact, 175 * ui + ImGui::CalcTextSize(T("distance")).x + ImGui::GetStyle().ItemInnerSpacing.x);
             }
             ImGui::BeginGroup();
-            ImGui::Text("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str()); ImGui::SameLine(); ImGui::TextDisabled("  %s   ID %u", c.internal.c_str(), c.key);
-            ImGui::SetNextItemWidth(compact ? 120 * ui : 150 * ui); ImGui::DragFloat(T("distance"), &g_npcDist, 1.0f, 1.0f, kNpcMaxDist, "%.0f m"); g_npcDist = std::clamp(g_npcDist, 1.0f, kNpcMaxDist); SameLineOrWrap(compact, 90 * ui);
-            ImGui::SetNextItemWidth(110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, kNpcMaxCount);
+            ImGui::TextWrapped("%s", c.name.empty() ? c.internal.c_str() : c.name.c_str());
+            ImGui::PushTextWrapPos(); ImGui::TextDisabled("%s   ID %u", c.internal.c_str(), c.key); ImGui::PopTextWrapPos();
+            SetLabeledItemWidth("distance", compact ? 120 * ui : 150 * ui); ImGui::DragFloat(T("distance"), &g_npcDist, 1.0f, 1.0f, kNpcMaxDist, "%.0f m"); g_npcDist = std::clamp(g_npcDist, 1.0f, kNpcMaxDist); SameLineOrWrap(compact, 110 * ui + ImGui::CalcTextSize(T("count")).x + ImGui::GetStyle().ItemInnerSpacing.x);
+            SetLabeledItemWidth("count", 110 * ui); ImGui::InputInt(T("count"), &g_npcCount); g_npcCount = std::clamp(g_npcCount, 1, kNpcMaxCount);
             SameLineOrWrap(compact, 250 * ui);
             ImGui::TextDisabled("%s", T("presets")); ImGui::SameLine(0, 3);
             static const int countPresets[] = { 1, 5, 10, 25, 50, 100, 250, 500 };
@@ -2155,7 +2598,7 @@ namespace editor {
             SameLineOrWrap(compact, 130 * ui);
             ImGui::TextDisabled("%s", T("formation")); SameLineOrWrap(compact, 120 * ui); ImGui::SetNextItemWidth(120 * ui); ComboT("##npcformation", &g_npcFormation, kNpcFormations, 3);
             SameLineOrWrap(compact, 130 * ui);
-            ImGui::SetNextItemWidth(120 * ui);
+            SetLabeledItemWidth(g_npcFormation == 2 ? "radius" : "spacing", 120 * ui);
             if (g_npcFormation == 2) {
                 ImGui::DragFloat(T("radius"), &g_npcRadius, 0.25f, 0.5f, kNpcMaxExtent, "%.1f m");
                 g_npcRadius = std::clamp(g_npcRadius, 0.5f, kNpcMaxExtent);
@@ -2172,11 +2615,11 @@ namespace editor {
             } else {
                 ImGui::TextDisabled(T("diameter: %.1f m"), g_npcRadius * 2.0f);
             }
-            SameLineOrWrap(compact, 160 * ui);
+            SameLineForControl("AI enabled on spawn", true);
             ImGui::BeginDisabled(!core::NpcAiControlAvailable());
             bool spawnAi = g_npcSpawnAi;
-            if (ImGui::Checkbox(T("AI enabled on spawn"), &spawnAi)) { g_npcSpawnAi = spawnAi; g_npcSpawnBehavior = spawnAi ? 0 : 1; }
-            SameLineOrWrap(compact, compact ? 170 * ui : 210 * ui); ImGui::SetNextItemWidth(compact ? 170 * ui : 210 * ui);
+            if (FittedCheckbox(T("AI enabled on spawn"), &spawnAi)) { g_npcSpawnAi = spawnAi; g_npcSpawnBehavior = spawnAi ? 0 : 1; }
+            SameLineOrWrap(compact, compact ? 170 * ui : 210 * ui); ImGui::SetNextItemWidth(std::min(compact ? 170 * ui : 210 * ui, ImGui::GetContentRegionAvail().x));
             int behavior = g_npcSpawnBehavior;
             if (ComboT("##npcspawnbehavior", &behavior, kNpcBehaviors, 2)) { g_npcSpawnBehavior = behavior; g_npcSpawnAi = behavior == 0; }
             ImGui::EndDisabled();
@@ -2188,7 +2631,7 @@ namespace editor {
             ImGui::BeginDisabled(!havePos || st != 2);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
             char spawnLabel[96]; snprintf(spawnLabel, sizeof spawnLabel, "%s  x%d", T(ICON_LOCATION_CROSSHAIRS "   SPAWN   "), g_npcCount);
-            if (ImGui::Button(spawnLabel, ImVec2(175 * ui, 0))) {
+            if (FittedButton(spawnLabel)) {
                 const Vec3 center{ g_lastPlayer.x + g_fx * g_npcDist, g_lastPlayer.y, g_lastPlayer.z + g_fz * g_npcDist };
                 SpawnNpcFormationGrounded(c.key, center, g_npcCount, g_npcFormation, g_npcSpacing, g_npcRadius, g_fx, g_fz, g_npcSpawnAi, g_npcSpawnBehavior);
                 Note(T("spawn %s"), c.name.empty() ? c.internal.c_str() : c.name.c_str());
@@ -2204,6 +2647,7 @@ namespace editor {
     static void DrawEnvironment(bool compact = false) {
         const float ui = ImGui::GetFontSize() / 17.0f;
         ImGui::SeparatorText(T("Time"));
+        ImGui::PushTextWrapPos();
         if (!core::TimeControlAvailable()) {
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), T("Time controls are not available in this game build (see the log)."));
         } else {
@@ -2216,25 +2660,26 @@ namespace editor {
             }
 
             float target = core::TimeTargetHour();
-            ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui);
+            SetLabeledItemWidth("time of day", compact ? ImGui::GetContentRegionAvail().x : 420.0f * ui);
             if (SliderFloatEdit(T("time of day"), &target, 0.0f, 23.9833f, "%.2f h"))
                 core::SetTimeHour(target);
 
             if (ImGui::SmallButton(T("Dawn 06:00"))) core::SetTimeHour(6.0f);
-            ImGui::SameLine();
+            SameLineForControl("Noon 12:00");
             if (ImGui::SmallButton(T("Noon 12:00"))) core::SetTimeHour(12.0f);
-            if (!compact) ImGui::SameLine();
+            SameLineForControl("Sunset 18:00");
             if (ImGui::SmallButton(T("Sunset 18:00"))) core::SetTimeHour(18.0f);
-            ImGui::SameLine();
+            SameLineForControl("Midnight 00:00");
             if (ImGui::SmallButton(T("Midnight 00:00"))) core::SetTimeHour(0.0f);
 
             bool frozen = core::TimeFrozen();
-            if (ImGui::Checkbox(T("freeze time (lighting only)"), &frozen)) core::SetTimeFrozen(frozen);
+            if (FittedCheckbox(T("freeze time (lighting only)"), &frozen)) core::SetTimeFrozen(frozen);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Stops the visual day and night lighting progression. Gameplay, NPCs, physics and combat keep running."));
-            SameLineOrWrap(compact, 105.0f * ui);
+            SameLineForControl("use native time");
             if (ImGui::SmallButton(T("use native time"))) core::ResetTimeControl();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Restore the game's normal visual time progression."));
         }
+        ImGui::PopTextWrapPos();
 
         ImGui::Spacing();
         ImGui::SeparatorText(T("Weather"));
@@ -2262,20 +2707,20 @@ namespace editor {
         ImGui::BeginDisabled(!rainAvail);
         if (ImGui::Checkbox(T("override rain"), &rainOn)) core::SetWeatherRainOverride(rainOn, rain);
         unavailableTip(rainAvail);
-        if (rainOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("rain intensity"), &rain, 0.0f, 1.0f, "%.2f")) core::SetWeatherRainOverride(true, rain); }
+        if (rainOn) { SetLabeledItemWidth("rain intensity", compact ? ImGui::GetContentRegionAvail().x : 420.0f * ui); if (SliderFloatEdit(T("rain intensity"), &rain, 0.0f, 1.0f, "%.2f")) core::SetWeatherRainOverride(true, rain); }
         ImGui::EndDisabled();
         const bool snowEffects = core::WeatherSnowEffectsAvailable();
         ImGui::BeginDisabled(!snowEffects);
         if (ImGui::Checkbox(T("override snow"), &snowOn)) core::SetWeatherSnowOverride(snowOn, snow);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !snowEffects)
             ImGui::SetTooltip("%s", T("Snow particle control is not available in this game build."));
-        if (snowOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("snow intensity"), &snow, 0.0f, 1.0f, "%.2f")) core::SetWeatherSnowOverride(true, snow); }
+        if (snowOn) { SetLabeledItemWidth("snow intensity", compact ? ImGui::GetContentRegionAvail().x : 420.0f * ui); if (SliderFloatEdit(T("snow intensity"), &snow, 0.0f, 1.0f, "%.2f")) core::SetWeatherSnowOverride(true, snow); }
         ImGui::EndDisabled();
         const bool cloudAvail = core::WeatherCloudAvailable();
         ImGui::BeginDisabled(!cloudAvail);
         if (ImGui::Checkbox(T("override clouds"), &cloudOn)) core::SetWeatherCloudOverride(cloudOn, cloud);
         unavailableTip(cloudAvail);
-        if (cloudOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("cloud amount"), &cloud, 0.0f, 3.0f, "%.2f")) core::SetWeatherCloudOverride(true, cloud); }
+        if (cloudOn) { SetLabeledItemWidth("cloud amount", compact ? ImGui::GetContentRegionAvail().x : 420.0f * ui); if (SliderFloatEdit(T("cloud amount"), &cloud, 0.0f, 3.0f, "%.2f")) core::SetWeatherCloudOverride(true, cloud); }
         ImGui::EndDisabled();
         ImGui::EndDisabled();
 
@@ -2283,13 +2728,13 @@ namespace editor {
         ImGui::BeginDisabled(!windAvail);
         if (ImGui::Checkbox(T("override wind"), &windOn)) core::SetWeatherWindOverride(windOn, wind);
         unavailableTip(windAvail);
-        if (windOn) { ImGui::SetNextItemWidth(compact ? -1.0f : 420.0f * ui); if (SliderFloatEdit(T("wind multiplier"), &wind, 0.0f, 3.0f, "x%.2f")) core::SetWeatherWindOverride(true, wind); }
+        if (windOn) { SetLabeledItemWidth("wind multiplier", compact ? ImGui::GetContentRegionAvail().x : 420.0f * ui); if (SliderFloatEdit(T("wind multiplier"), &wind, 0.0f, 3.0f, "x%.2f")) core::SetWeatherWindOverride(true, wind); }
         ImGui::EndDisabled();
 
         if (ImGui::Button(T("use native weather"))) core::ResetWeatherControl();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Disable every World Builder weather override and return control to the game."));
-        if (!compact) ImGui::SameLine();
-        ImGui::TextDisabled(T("Weather values are applied to the game's composed environment each update."));
+        SameLineOrWrap(compact, ImGui::CalcTextSize(T("Weather values are applied to the game's composed environment each update.")).x);
+        ImGui::PushTextWrapPos(); ImGui::TextDisabled(T("Weather values are applied to the game's composed environment each update.")); ImGui::PopTextWrapPos();
     }
 
     static void DrawBrowser(const PosInfo& p, bool havePos) {
@@ -2541,6 +2986,7 @@ namespace editor {
             if (ImGui::MenuItem(T("Z"))) AlignSel(2);
             ImGui::EndMenu();
         }
+        if (ImGui::MenuItem(T("Forget"))) ForgetSelection();
         if (ImGui::MenuItem(T("Delete"))) DeleteSceneSelection();
         ImGui::EndPopup();
     }
@@ -2612,6 +3058,7 @@ namespace editor {
         if (ImGui::MenuItem(T(n.group > 0 ? "Ungroup" : "Group selection"))) GroupSceneSelection(n.group == 0);
         if (n.group > 0 && ImGui::MenuItem(T("Rename group"))) OpenGroupNameEdit(n.group);
         ImGui::Separator();
+        if (ImGui::MenuItem(T("Forget"))) ForgetSelection();
         if (ImGui::MenuItem(T("Delete"))) DeleteSceneSelection();
         ImGui::EndPopup();
     }
@@ -2731,12 +3178,12 @@ namespace editor {
             const bool dirty = core::ProjectDirty(g_projTab);
             if (dirty) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.33f, 0.12f, 1));
             if (ImGui::SmallButton(T(dirty ? ICON_FLOPPY_DISK " Save the changes" : ICON_FLOPPY_DISK " Overwrite this project"))) {
-                if (core::SaveProject(name, core::SaveProjectOnly)) Note(T("overwrote %s (%d entities)"), name.c_str(), n);
+                if (SaveProjectAction(name, core::SaveProjectOnly, true)) Note(T("overwrote %s (%d entities)"), name.c_str(), n);
                 else Note(T("save failed"));
             }
             if (dirty) ImGui::PopStyleColor();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("writes exactly the %d entities shown here back to %s.cdproj.\nEntities of other projects and new entities are not touched."), n, name.c_str());
-            SameLineOrWrap(compact, 110);
+            SameLineForControl("Select all of them");
             if (ImGui::SmallButton(T("Select all of them"))) {
                 SelectAllSceneEntities(all, npcs, g_projTab);
             }
@@ -2753,15 +3200,16 @@ namespace editor {
         if (!compact) {
             const ImVec4 on=ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive),off=ImGui::GetStyleColorVec4(ImGuiCol_Button);
             ImGui::PushStyleColor(ImGuiCol_Button,g_sceneCards?off:on); if(ImGui::Button(T(ICON_LIST " list")))g_sceneCards=false; ImGui::PopStyleColor();
-            ImGui::SameLine(0,2); ImGui::PushStyleColor(ImGuiCol_Button,g_sceneCards?on:off); if(ImGui::Button(T(ICON_COPY " cards")))g_sceneCards=true; ImGui::PopStyleColor();
-            if(g_sceneCards){ImGui::SameLine();ImGui::SetNextItemWidth(95*ui);SliderFloatEdit("##scardsize",&g_cardSize,64,200,"%.0f px");}
-            ImGui::SameLine();
+            SameLineForControl(ICON_COPY " cards"); ImGui::PushStyleColor(ImGuiCol_Button,g_sceneCards?on:off); if(ImGui::Button(T(ICON_COPY " cards")))g_sceneCards=true; ImGui::PopStyleColor();
+            if(g_sceneCards){SameLineOrWrap(compact,95*ui+ImGui::GetFrameHeightWithSpacing());ImGui::SetNextItemWidth(std::min(95*ui,ImGui::GetContentRegionAvail().x));SliderFloatEdit("##scardsize",&g_cardSize,64,200,"%.0f px");}
+            SameLineForControl("click selects group", true);
         }
-        ImGui::Checkbox(T("click selects group"),&g_selectGroups); ImGui::SameLine(); ImGui::Checkbox(T("show deleted"),&g_showDeleted); ImGui::SameLine();
-        ImGui::BeginDisabled(!SceneHasSelection()); if(ImGui::SmallButton(T("Clear selection")))ClearSceneSelection(); ImGui::EndDisabled();
-        ImGui::SameLine(); ImGui::BeginDisabled(g_undo.empty()); if(ImGui::SmallButton(T("Undo")))Undo(); ImGui::EndDisabled();
-        ImGui::SameLine(); ImGui::BeginDisabled(g_redo.empty()); if(ImGui::SmallButton(T("Redo")))Redo(); ImGui::EndDisabled();
-        ImGui::SameLine(); ImGui::TextDisabled(T("%d entities, %d selected"),(int)entities.size(),(int)SceneSelectionCount());
+        ImGui::Checkbox(T("click selects group"),&g_selectGroups); SameLineForControl("show deleted", true); ImGui::Checkbox(T("show deleted"),&g_showDeleted);
+        SameLineForControl("Clear selection"); ImGui::BeginDisabled(!SceneHasSelection()); if(ImGui::SmallButton(T("Clear selection")))ClearSceneSelection(); ImGui::EndDisabled();
+        SameLineForControl("Undo"); ImGui::BeginDisabled(g_undo.empty()); if(ImGui::SmallButton(T("Undo")))Undo(); ImGui::EndDisabled();
+        SameLineForControl("Redo"); ImGui::BeginDisabled(g_redo.empty()); if(ImGui::SmallButton(T("Redo")))Redo(); ImGui::EndDisabled();
+        SameLineForControl("Remove duplicates"); if(FittedButton(T("Remove duplicates")))RemoveDuplicates();
+        ImGui::TextWrapped(T("%d entities, %d selected"),(int)entities.size(),(int)SceneSelectionCount());
 
         const float availY=ImGui::GetContentRegionAvail().y; const bool anySel=SceneHasSelection(); const float footer=(compact?(anySel?210.0f:48.0f):190.0f)*ui;
         const float listH=compact?std::max(180.0f*ui,std::max(availY*0.48f,availY-footer)):std::max(120.0f,availY-footer);
@@ -2785,54 +3233,480 @@ namespace editor {
         }
 
         for(auto it=g_sel.begin();it!=g_sel.end();){if(!Find(objects,*it))it=g_sel.erase(it);else ++it;} for(auto it=g_managedNpcSel.begin();it!=g_managedNpcSel.end();){if(!FindManagedNpc(npcs,*it))it=g_managedNpcSel.erase(it);else ++it;}
-        if(!SceneHasSelection()){ImGui::TextDisabled(T("Select an object or NPC to edit it. Ctrl-click adds, Shift-click selects a range."));return;}
+        if(!SceneHasSelection()){ImGui::TextWrapped("%s",T("Select an object or NPC to edit it. Ctrl-click adds, Shift-click selects a range."));return;}
         ImGui::Separator();
         const SpawnedObj* objPrim=(g_sel.size()==1&&g_managedNpcSel.empty())?Find(objects,*g_sel.begin()):nullptr;
         const ManagedNpc* npcPrim=(g_managedNpcSel.size()==1&&g_sel.empty())?FindManagedNpc(npcs,*g_managedNpcSel.begin()):nullptr;
         if(objPrim){
             const auto&o=*objPrim;if(g_editUid!=o.uid){g_edit[0]=o.pos.x;g_edit[1]=o.pos.y;g_edit[2]=o.pos.z;g_editRot=o.rot;g_editScale=o.scale;g_editPos0=o.pos;g_editRot0=o.rot;g_editScale0=o.scale;g_editUid=o.uid;}
-            ImGui::TextDisabled("%s",o.prefab.c_str());bool changed=false;ImGui::SetNextItemWidth(300*ui);changed|=DragFloat3Edit(T("position"),g_edit,0.05f,-100000,100000,"%.3f");bool rel1=ImGui::IsItemDeactivatedAfterEdit()||NumericEditEnded(T("position"));ImGui::SameLine();ImGui::SetNextItemWidth(140*ui);changed|=SliderFloatEdit(T("yaw##e"),&g_editRot.yaw,-180,180,"%.1f");bool rel2=ImGui::IsItemDeactivatedAfterEdit()||NumericEditEnded(T("yaw##e"));ImGui::SameLine();ImGui::SetNextItemWidth(120*ui);changed|=SliderFloatEdit(T("scale##e"),&g_editScale,0.05f,20,"%.3f");bool rel3=ImGui::IsItemDeactivatedAfterEdit()||NumericEditEnded(T("scale##e"));
-            const DWORD now=GetTickCount();static DWORD liveAt=0;if(changed&&g_live&&now-liveAt>50){core::MoveMany({{o.uid,{g_edit[0],g_edit[1],g_edit[2]},g_editRot,g_editScale}},false);liveAt=now;}
-            if(rel1||rel2||rel3){Vec3 p1{g_edit[0],g_edit[1],g_edit[2]};if(p1.x!=g_editPos0.x||p1.y!=g_editPos0.y||p1.z!=g_editPos0.z||g_editRot.yaw!=g_editRot0.yaw||g_editRot.pitch!=g_editRot0.pitch||g_editRot.roll!=g_editRot0.roll||g_editScale!=g_editScale0){core::MoveMany({{o.uid,p1,g_editRot,g_editScale}},true);Act a;a.kind=Act::Move;a.uid=o.uid;a.prefab=o.prefab;a.pos0=g_editPos0;a.rot0=g_editRot0;a.sc0=g_editScale0;a.pos1=p1;a.rot1=g_editRot;a.sc1=g_editScale;Push({a});g_editPos0=p1;g_editRot0=g_editRot;g_editScale0=g_editScale;}}
+            ImGui::TextWrapped("%s",o.prefab.c_str());bool changed=false;
+            SetLabeledItemWidth("position",300*ui);changed|=DragFloat3Edit(T("position"),g_edit,0.05f,-100000,100000,"%.3f");
+            bool rel1=ImGui::IsItemDeactivatedAfterEdit()||NumericEditEnded(T("position"));
+            SameLineOrWrap(compact,140*ui+ImGui::CalcTextSize(T("yaw##e"),nullptr,true).x+ImGui::GetFrameHeightWithSpacing());
+            SetLabeledItemWidth("yaw##e",140*ui);changed|=SliderFloatEdit(T("yaw##e"),&g_editRot.yaw,-180,180,"%.1f");
+            bool rel2=ImGui::IsItemDeactivatedAfterEdit()||NumericEditEnded(T("yaw##e"));
+            SameLineOrWrap(compact,120*ui+ImGui::CalcTextSize(T("scale##e"),nullptr,true).x+ImGui::GetFrameHeightWithSpacing());
+            SetLabeledItemWidth("scale##e",120*ui);changed|=SliderFloatEdit(T("scale##e"),&g_editScale,0.05f,20,"%.3f");
+            bool rel3=ImGui::IsItemDeactivatedAfterEdit()||NumericEditEnded(T("scale##e"));
+            const DWORD now=TickNow();static DWORD liveAt=0;
+            if(changed&&g_live&&now-liveAt>50){SceneNumericApply(o.uid,{g_edit[0],g_edit[1],g_edit[2]},g_editRot,g_editScale,false);liveAt=now;}
+            if(rel1||rel2||rel3) SceneNumericApply(o.uid,{g_edit[0],g_edit[1],g_edit[2]},g_editRot,g_editScale,true);
         } else if(npcPrim){
             const auto&n=*npcPrim;const Vec3 livePos=ManagedNpcDisplayPos(n);
             static int posUid=0;static float ep[3]={};static Vec3 base{};static bool liveMove=false;static DWORD liveAt=0;
             if(posUid!=n.uid||(!ImGui::IsAnyItemActive()&&!liveMove&&(ep[0]!=livePos.x||ep[1]!=livePos.y||ep[2]!=livePos.z))){
                 posUid=n.uid;ep[0]=base.x=livePos.x;ep[1]=base.y=livePos.y;ep[2]=base.z=livePos.z;liveMove=false;
             }
-            ImGui::TextDisabled(T("NPC properties"));ImGui::SameLine();ImGui::Text("%s",ManagedNpcName(n,chars?chars.get():nullptr).c_str());
-            ImGui::SetNextItemWidth(330*ui);
+            ImGui::TextWrapped("%s: %s",T("NPC properties"),ManagedNpcName(n,chars?chars.get():nullptr).c_str());
+            SetLabeledItemWidth("position##scene_npc",330*ui);
             const bool npcPosChanged=ImGui::DragFloat3(T("position##scene_npc"),ep,0.05f,-100000,100000,"%.3f");
             if(npcPosChanged){
-                if(!liveMove)liveMove=core::BeginManagedNpcMove(n.uid);
-                const DWORD now=GetTickCount();
-                if(liveMove&&now-liveAt>=45){core::MoveManagedNpcLive(n.uid,{ep[0],ep[1],ep[2]});liveAt=now;}
+                const DWORD now=TickNow();
+                if(now-liveAt>=45){NpcNumericApply(n.uid,{ep[0],ep[1],ep[2]},false);liveMove=g_numericNpcUid==n.uid;liveAt=now;}
             }
             if(ImGui::IsItemDeactivatedAfterEdit()){
                 const Vec3 finalPos{ep[0],ep[1],ep[2]};
-                if(liveMove){
-                    core::EndManagedNpcMove(n.uid,finalPos);
-                    Act a;a.kind=Act::NpcMove;a.uid=n.uid;a.prefab=ManagedNpcHistoryName(n);a.pos0=base;a.pos1=finalPos;Push({a});
-                }else{
-                    Vec3 d{finalPos.x-base.x,finalPos.y-base.y,finalPos.z-base.z};MoveSelectedNpcs(d);
-                }
+                NpcNumericApply(n.uid,finalPos,true);
                 base=finalPos;liveMove=false;
             }
-            ImGui::SameLine();bool ai=n.aiEnabled;ImGui::BeginDisabled(!core::NpcAiControlAvailable());if(ImGui::Checkbox(T("AI enabled"),&ai))SetSelectedNpcAi(ai);ImGui::SameLine();int behavior=n.behavior;ImGui::SetNextItemWidth(180*ui);if(ComboT("##npc_behavior_scene",&behavior,kNpcBehaviors,2))SetSelectedNpcBehavior(behavior);ImGui::EndDisabled();ImGui::SameLine();if(ImGui::SmallButton(T("Rename")))OpenNpcLabelEdit(n);ImGui::SameLine();if(ImGui::SmallButton(T("Edit note")))OpenNpcNoteEdit(n);
-        } else ImGui::TextDisabled(T("Mixed selection: %d objects and %d NPCs"),(int)g_sel.size(),(int)g_managedNpcSel.size());
+            SameLineForControl("AI enabled",true);bool ai=n.aiEnabled;ImGui::BeginDisabled(!core::NpcAiControlAvailable());if(ImGui::Checkbox(T("AI enabled"),&ai))SetSelectedNpcAi(ai);
+            SameLineOrWrap(compact,180*ui);int behavior=n.behavior;ImGui::SetNextItemWidth(std::min(180*ui,ImGui::GetContentRegionAvail().x));if(ComboT("##npc_behavior_scene",&behavior,kNpcBehaviors,2))SetSelectedNpcBehavior(behavior);ImGui::EndDisabled();
+            SameLineForControl("Rename");if(ImGui::SmallButton(T("Rename")))OpenNpcLabelEdit(n);SameLineForControl("Edit note");if(ImGui::SmallButton(T("Edit note")))OpenNpcNoteEdit(n);
+        } else ImGui::TextWrapped(T("Mixed selection: %d objects and %d NPCs"),(int)g_sel.size(),(int)g_managedNpcSel.size());
 
-        ImGui::BeginDisabled(!core::FreeCamAvailable());if(ImGui::Button(T("Focus")))FocusSelection();ImGui::EndDisabled();ImGui::SameLine();
-        if(ImGui::Button(T(ICON_HAND " Grab"))){std::string grabName=g_sel.size()==1&&g_managedNpcSel.empty()&&objPrim?ShortName(objPrim->prefab):g_managedNpcSel.size()==1&&g_sel.empty()&&npcPrim?ManagedNpcHistoryName(*npcPrim):"selection";StartGrab(SceneGrabIds(),false,grabName);}ImGui::SameLine();ImGui::BeginDisabled(!g_managedNpcSel.empty());if(ImGui::Button(T("To ground")))SnapSelToGround();ImGui::SameLine();if(ImGui::Button(T(ICON_COPY " Duplicate"))){CopySel();Paste(havePos);}ImGui::EndDisabled();ImGui::SameLine();
-        if(ImGui::Button(T("Group")))GroupSceneSelection(true);ImGui::SameLine();if(ImGui::Button(T("Ungroup")))GroupSceneSelection(false);
-        if(!g_managedNpcSel.empty()){ImGui::SameLine();ImGui::BeginDisabled(!core::NpcAiControlAvailable());if(ImGui::Button(T("AI on")))SetSelectedNpcAi(true);ImGui::SameLine();if(ImGui::Button(T("AI off")))SetSelectedNpcAi(false);ImGui::SameLine();int b=-1;bool first=true,mixed=false;for(int uid:g_managedNpcSel)if(const auto*n=FindManagedNpc(npcs,uid)){if(first){b=n->behavior;first=false;}else if(b!=n->behavior)mixed=true;}ImGui::SetNextItemWidth(180*ui);const char* preview=mixed?T("Mixed"):b==1?T("Hold"):T("Normal");if(ImGui::BeginCombo("##batch_behavior",preview)){if(ImGui::Selectable(T("Normal autonomous"),b==0&&!mixed))SetSelectedNpcBehavior(0);if(ImGui::Selectable(T("Hold position (AI paused)"),b==1&&!mixed))SetSelectedNpcBehavior(1);ImGui::EndCombo();}ImGui::EndDisabled();}
-        ImGui::SameLine();ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.55f,0.15f,0.12f,1));if(ImGui::Button(T(ICON_TRASH " Delete")))DeleteSceneSelection();ImGui::PopStyleColor();
-        if(!compact){ImGui::Separator();ImGui::TextDisabled(T("Ctrl+Z and Ctrl+Y undo and redo   Ctrl+G group   Ctrl+A select all   Delete removes selection   Ctrl-click and Shift-click multi-select"));}
+        ImGui::BeginDisabled(!core::FreeCamAvailable());if(ImGui::Button(T("Focus")))FocusSelection();ImGui::EndDisabled();
+        SameLineForControl(ICON_HAND " Grab");if(ImGui::Button(T(ICON_HAND " Grab"))){std::string grabName=g_sel.size()==1&&g_managedNpcSel.empty()&&objPrim?ShortName(objPrim->prefab):g_managedNpcSel.size()==1&&g_sel.empty()&&npcPrim?ManagedNpcHistoryName(*npcPrim):"selection";StartGrab(SceneGrabIds(),false,grabName);}
+        SameLineForControl("To ground");ImGui::BeginDisabled(!g_managedNpcSel.empty());if(ImGui::Button(T("To ground")))SnapSelToGround();
+        SameLineForControl(ICON_COPY " Duplicate");if(ImGui::Button(T(ICON_COPY " Duplicate"))){CopySel();Paste(havePos);}ImGui::EndDisabled();
+        SameLineForControl("Group");if(ImGui::Button(T("Group")))GroupSceneSelection(true);SameLineForControl("Ungroup");if(ImGui::Button(T("Ungroup")))GroupSceneSelection(false);
+        if(!g_managedNpcSel.empty()){
+            SameLineForControl("AI on");ImGui::BeginDisabled(!core::NpcAiControlAvailable());if(ImGui::Button(T("AI on")))SetSelectedNpcAi(true);
+            SameLineForControl("AI off");if(ImGui::Button(T("AI off")))SetSelectedNpcAi(false);
+            SameLineOrWrap(compact,180*ui);int b=-1;bool first=true,mixed=false;for(int uid:g_managedNpcSel)if(const auto*n=FindManagedNpc(npcs,uid)){if(first){b=n->behavior;first=false;}else if(b!=n->behavior)mixed=true;}
+            ImGui::SetNextItemWidth(std::min(180*ui,ImGui::GetContentRegionAvail().x));const char* preview=mixed?T("Mixed"):b==1?T("Hold"):T("Normal");if(ImGui::BeginCombo("##batch_behavior",preview)){if(ImGui::Selectable(T("Normal autonomous"),b==0&&!mixed))SetSelectedNpcBehavior(0);if(ImGui::Selectable(T("Hold position (AI paused)"),b==1&&!mixed))SetSelectedNpcBehavior(1);ImGui::EndCombo();}ImGui::EndDisabled();
+        }
+        SameLineForControl("Forget");if(FittedButton(T("Forget")))ForgetSelection();
+        SameLineForControl(ICON_TRASH " Delete");ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.55f,0.15f,0.12f,1));if(ImGui::Button(T(ICON_TRASH " Delete")))DeleteSceneSelection();ImGui::PopStyleColor();
+        if(!compact){ImGui::Separator();ImGui::TextWrapped("%s",T("Ctrl+Z and Ctrl+Y undo and redo   Ctrl+G group   Ctrl+A select all   Delete removes selection   Ctrl-click and Shift-click multi-select"));}
     }
 
+    struct ProjectFile { std::string name; proj_codec::Kind kind = proj_codec::Kind::Project; bool archived = false; std::string path; };
+    enum class ProjectAction { Read, Load, Replace, SaveBack, Autoload, Place, Overwrite, Reload, Save, Unload, AddUnassigned };
+    static core::SavedLibrarySnapshot g_projectLibrary;
+    static core::SavedFile g_librarySelected;
+    static std::vector<size_t> g_libraryRows;
+    static char g_librarySearch[256] = {};
+    static int g_libraryKind = 0, g_libraryLocation = 0;
+    static bool g_libraryFilterDirty = true;
+    static core::FileResult g_libraryResult;
+    static std::vector<std::string> g_projectAutoload;
+    static bool g_exportOpen = false, g_exportOverwrite = false;
+    static core::GroupExportApproval g_exportApproval;
+    static std::vector<SpawnedObj> g_exportObjects;
+    static std::string g_exportStatus, g_projectOverwriteName;
+    static int g_projectOverwriteScope = core::SaveWholeScene, g_groundMode = 0;
+    struct ExportAttempt { core::GroupExportApproval approval; std::string result, name; };
+    static std::vector<ExportAttempt> g_exportAttempts;
+    static size_t g_exportAttempt = 0;
+    struct FileFailure { std::string action, path, reason; };
+    static std::vector<FileFailure> g_projectFileFailures;
+    static std::set<std::string> g_projectDetails;
+    static proj_codec::Document g_projectRead;
+    static std::string g_projectReadPath;
+    static bool g_projectReadValid = false;
+    static void FinishProjectSceneMutation();
+    static bool SceneProjectMutation(const std::string& name, int mode) {
+        // Core owns validation and busy admission atomically. Do not run the editor mutation barrier
+        // first: it can commit a brush, reconcile History or defer an intent even when this call fails.
+        const bool ok = mode == 0 ? core::LoadProject(name, false) :
+                        mode == 1 ? core::ReloadProject(name) :
+                        mode == 2 ? core::LoadProject(name, true) :
+                        mode == 3 ? core::ClearScene() : core::UnloadProject(core::ProjectId(name));
+        if (!ok) { g_projectStatus = core::ProjectError(); Note("%s", g_projectStatus.c_str()); return false; }
+        FinishProjectSceneMutation();
+        g_projectStatus = mode < 3 ? "load-admitted" : mode == 3 ? "scene cleared" : "unloaded";
+        Note("%s: %s", T(g_projectStatus.c_str()), name.c_str());
+        if (mode < 3) {
+            // Admission is not native attachment; report the actual object/NPC queue components.
+            const auto report = core::ProjectLoadReportFor(name);
+            Note("%s: objects %d requested / %d queued / %d excluded; NPCs %d requested / %d queued / %d excluded; terrain %d",
+                name.c_str(), report.requested, report.queued, report.excluded,
+                report.requestedNpcs, report.queuedNpcs, report.excludedNpcs, report.terrainStrokes);
+        }
+        return true;
+    }
+    static bool LoadProjectAction(const std::string& name, bool clearFirst) { return SceneProjectMutation(name, clearFirst ? 2 : 0); }
+    static const char* ProjectInPlaceSaveError(const std::string& name) {
+        if (name.find_first_not_of(" \t") == 0 && name.find_last_not_of(" \t") == name.size() - 1) return nullptr;
+        return T("Save refused: this filename has surrounding spaces or tabs. Use Project Save with an unpadded name and approve any overwrite.");
+    }
+    static bool SameSavedFile(const core::SavedFile& a, const core::SavedFile& b) {
+        return a.kind == b.kind && a.archived == b.archived && a.filename == b.filename && a.path == b.path;
+    }
+    static void RefreshProjectLibrary() {
+        if (!g_projectRefresh) return;
+        g_projectRefresh = false; g_libraryResult = core::RefreshSavedLibrary(g_projectLibrary);
+        if (!g_libraryResult.ok()) return;
+        g_projectAutoload = core::Autoload(); g_libraryFilterDirty = true;
+        if (std::none_of(g_projectLibrary.entries.begin(), g_projectLibrary.entries.end(), [](const auto& row) { return SameSavedFile(row.file, g_librarySelected); })) g_librarySelected = {};
+    }
+    static std::string ProjectFilePath(const ProjectFile& file) {
+        if (!file.path.empty()) return file.path;
+        const bool group = file.kind == proj_codec::Kind::Group;
+        return core::ModDir() + (group ? "\\Groups\\" : "\\projects\\") + (file.archived ? ".archive\\" : "") + file.name + (group ? ".cdgroup" : ".cdproj");
+    }
+    static bool ReadProjectFile(const ProjectFile& file, proj_codec::Document& doc) {
+        const std::string path = ProjectFilePath(file); std::ifstream in(path, std::ios::binary);
+        if (!in) { g_projectStatus = "cannot-read"; return false; }
+        const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (in.bad()) { g_projectStatus = "cannot-read"; return false; }
+        std::vector<proj_codec::EngineRow> rows;
+        return proj_codec::Parse(bytes, path, file.kind, doc, g_projectStatus) && proj_codec::NarrowForEngine(doc, rows, g_projectStatus);
+    }
+    static bool SaveProjectAction(const std::string& rawName, int scope, bool approved) {
+        const bool inPlace = scope == core::SaveProjectOnly || scope == core::SaveProjectAndNew;
+        if (inPlace) if (const char* error = ProjectInPlaceSaveError(rawName)) { g_projectStatus = error; return false; }
+        const size_t first = rawName.find_first_not_of(" \t"), last = rawName.find_last_not_of(" \t");
+        if (first == std::string::npos) { g_projectStatus = "invalid-name"; return false; }
+        const std::string name = rawName.substr(first, last - first + 1);
+        if (!approved && GetFileAttributesA(ProjectFilePath({ name }).c_str()) != INVALID_FILE_ATTRIBUTES) {
+            g_projectOverwriteName = name; g_projectOverwriteScope = scope; g_projectStatus = "overwrite-approval-required"; return false;
+        }
+        if (g_projectCommandPending || g_place.active || g_numericSceneUid || g_numericNpcUid) { g_projectStatus = "finish-edit-before-save"; return false; }
+        if (!PrepareHistoryMutation([name, scope, approved]() { SaveProjectAction(name, scope, approved); })) return false;
+        const bool ok = core::SaveProject(name, scope); g_projectStatus = ok ? "saved" : core::ProjectError();
+        if (ok) { g_projectRefresh = true; if (!inPlace) strncpy_s(g_projName, name.c_str(), _TRUNCATE); }
+        return ok;
+    }
+    static void PublishProjectContext() {
+        core::ExportContext c; c.name = g_projName; c.placing = g_place.active;
+        // Empty publication invalidates object-only approvals when a mixed selection appears.
+        if (g_managedNpcSel.empty() && !(g_place.active && g_place.hasNpc)) c.selection.assign(g_sel.begin(), g_sel.end());
+        if (g_place.active) for (const auto& m : g_place.m) if (!m.npc) c.carried.push_back(m.uid);
+        core::PublishExportContext(c);
+    }
+    static void ResetExportApproval() { g_exportApproval = {}; g_exportObjects.clear(); g_exportStatus.clear(); g_exportAttempt = 0; }
+    static std::vector<SpawnedObj> ExportObjects() {
+        auto all = core::Spawned(); all.erase(std::remove_if(all.begin(), all.end(), [](const auto& o) { return !g_sel.count(o.uid); }), all.end()); return all;
+    }
+    static void RefreshExportApproval() {
+        if (!g_exportApproval.valid) return;
+        const auto& c = g_exportApproval.context; const auto all = ExportObjects();
+        bool same = g_managedNpcSel.empty() && !(g_place.active && g_place.hasNpc) && c.name == g_projName && c.selection == SelUids() &&
+            c.placing == g_place.active && g_exportApproval.overwriteApproved == g_exportOverwrite && all.size() == g_exportObjects.size();
+        std::vector<int> carried; if (g_place.active) for (const auto& m : g_place.m) if (!m.npc) carried.push_back(m.uid);
+        same &= c.carried == carried;
+        if (same) for (size_t i = 0; i < all.size(); ++i) {
+            const auto& a = all[i]; const auto& b = g_exportObjects[i];
+            if (a.uid != b.uid || a.gen != b.gen || a.poseGen != b.poseGen || a.hidden != b.hidden || a.proj != b.proj || a.group != b.group || a.note != b.note) { same = false; break; }
+        }
+        if (!same) { g_exportApproval.valid = false; g_exportStatus = "preflight-changed"; }
+    }
+    static bool ProjectExportPreflight() {
+        PublishProjectContext();
+        if (!g_managedNpcSel.empty() || (g_place.active && g_place.hasNpc)) { ResetExportApproval(); g_exportStatus = "Export supports objects only; NPC and mixed selections were not changed."; return false; }
+        const bool ok = core::PrepareGroupExport(SelUids(), g_projName, g_exportOverwrite, g_exportApproval);
+        g_exportObjects = ExportObjects(); g_exportStatus = ok ? "preflight-ready" : g_exportApproval.error;
+        g_exportAttempts.push_back({ g_exportApproval, {}, g_projName }); g_exportAttempt = g_exportAttempts.size(); return ok;
+    }
+    static bool ProjectExportWrite() {
+        PublishProjectContext(); RefreshExportApproval(); bool ok = false;
+        if (!g_exportApproval.valid) g_exportStatus = "preflight-changed";
+        else ok = core::WriteGroupExport(g_exportApproval, g_exportStatus);
+        if (ok) { g_exportStatus = "written"; g_projectRefresh = true; }
+        if (g_exportAttempt) g_exportAttempts[g_exportAttempt - 1].result = g_exportStatus;
+        g_exportApproval.valid = false; g_exportObjects.clear(); g_exportAttempt = 0; return ok;
+    }
+    static bool DispatchProjectAction(const ProjectFile& file, ProjectAction action, bool on = false) {
+        const bool group = file.kind == proj_codec::Kind::Group;
+        if (file.archived && action != ProjectAction::Read) { g_projectStatus = "invalid-action"; return false; }
+        const bool groupAction = action == ProjectAction::Place || action == ProjectAction::Overwrite;
+        if (action != ProjectAction::Read && group != groupAction) { g_projectStatus = "wrong-kind"; return false; }
+        if (action == ProjectAction::Autoload) {
+            const auto result = core::SetAutoload(file.name, on); g_projectStatus = core::FileReasonCode(result.reason);
+            if (result.ok()) g_projectAutoload = core::Autoload(); return result.ok();
+        }
+        if (action == ProjectAction::Save || action == ProjectAction::AddUnassigned || action == ProjectAction::SaveBack)
+            return SaveProjectAction(file.name, action == ProjectAction::Save ? core::SaveProjectOnly : core::SaveProjectAndNew, true);
+        if (action == ProjectAction::Unload) return SceneProjectMutation(file.name, 4);
+        if (action == ProjectAction::Load) return LoadProjectAction(file.name, false);
+        if (action == ProjectAction::Replace) return LoadProjectAction(file.name, true);
+        if (action == ProjectAction::Reload) return SceneProjectMutation(file.name, 1);
+        proj_codec::Document doc; if (action == ProjectAction::Read) g_projectReadValid = false;
+        if (!ReadProjectFile(file, doc)) { g_projectFileFailures.push_back({ action == ProjectAction::Read ? "Read" : "Place", ProjectFilePath(file), g_projectStatus }); return false; }
+        if (action == ProjectAction::Read) { g_projectRead = std::move(doc); g_projectReadPath = ProjectFilePath(file); g_projectReadValid = true; g_projectDetails.erase("read-preview"); return true; }
+        if (action == ProjectAction::Overwrite) { strncpy_s(g_projName, file.name.c_str(), _TRUNCATE); g_exportOpen = true; g_exportOverwrite = false; ResetExportApproval(); PublishProjectContext(); return true; }
+        if (g_place.active) { g_projectStatus = "placement-pending"; return false; }
+        const auto path = ProjectFilePath(file); core::SavedFile saved{ file.kind, false, path.substr(path.find_last_of("\\/") + 1), path };
+        core::FileSelectionHandle selected; const auto result = core::SelectSavedFile(saved, selected);
+        if (!result.ok()) { g_projectStatus = core::FileReasonCode(result.reason); return false; }
+        return PlaceGroupCopy(doc, InFront(1, 0), 0, 1, file.name, selected);
+    }
+    static void ProjectButtonWrap(const char* label) { SameLineOrWrap(true, ImGui::CalcTextSize(T(label)).x + ImGui::GetStyle().FramePadding.x * 2); }
+    static bool ProjectDisclosure(const std::string& caption, const std::string& key) {
+        ImGui::SetNextItemOpen(g_projectDetails.count(key) != 0, ImGuiCond_Always);
+        std::string shown = caption; const float available = ImGui::GetContentRegionAvail().x - ImGui::GetFrameHeight() - ImGui::GetStyle().FramePadding.x * 2;
+        if (ImGui::CalcTextSize(shown.c_str()).x > available) {
+            const float dots = ImGui::CalcTextSize("...").x;
+            do { size_t end = shown.size() - 1; while (end && ((unsigned char)shown[end] & 0xc0) == 0x80) --end; shown.resize(end); }
+            while (!shown.empty() && ImGui::CalcTextSize(shown.c_str()).x + dots > available);
+            shown += "...";
+        }
+        const bool open = ImGui::CollapsingHeader((shown + "###" + key).c_str());
+        if (shown != caption && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", caption.c_str());
+        if (open) g_projectDetails.insert(key); else g_projectDetails.erase(key); return open;
+    }
+    struct LibraryFileAction {
+        core::FileSelectionHandle selection; core::FileAction action = core::FileAction::Archive;
+        core::FileResult result; bool openConfirmation = false; char typed[1024] = {};
+    };
+    static LibraryFileAction g_libraryAction;
+    static const char* LibraryActionName(core::FileAction action) {
+        switch (action) {
+        case core::FileAction::Archive: return "Archive";
+        case core::FileAction::Restore: return "Restore";
+        case core::FileAction::Purge: return "Purge";
+        case core::FileAction::Delete: return "Permanent delete";
+        }
+        return "File action";
+    }
+    static core::FileReason GuardLibraryFile(const core::SavedFile& file) {
+        using R = core::FileReason;
+        if (!SameSavedFile(file, g_librarySelected)) return R::SelectionChanged;
+        const auto rows = core::FilterSavedLibrary(g_projectLibrary, (core::SavedLibraryKind)g_libraryKind, (core::SavedLibraryLocation)g_libraryLocation, g_librarySearch);
+        if (std::none_of(rows.begin(), rows.end(), [&](size_t i) { return SameSavedFile(g_projectLibrary.entries[i].file, file); })) return R::SelectionChanged;
+        if (g_deferredEditor.action || g_projectCommandPending || g_metadataPopupRequest || g_metadataEditing) return R::PendingOperation;
+        const bool group = file.kind == proj_codec::Kind::Group;
+        const std::string stem = file.filename.substr(0, file.filename.size() - (group ? 8 : 7));
+        if (group) {
+            const std::string name = g_projName; const auto first = name.find_first_not_of(" \t"), last = name.find_last_not_of(" \t");
+            if (g_exportOpen && first != std::string::npos && core::FileNameEqual(name.substr(first, last - first + 1), stem)) return R::InFlightExport;
+            for (const auto& report : g_projectPlacements) {
+                const auto source = core::SelectedFile(report.source);
+                const bool matches = report.source ? core::FileNameEqual(source.filename, file.filename) : core::FileNameEqual(report.name, stem);
+                if (matches && (!core::PlaceRequestState(report.request).settled || (g_place.active && g_place.req == report.request))) return R::InFlightPlace;
+            }
+            return R::None;
+        }
+        if (core::FileNameEqual(g_projectOverwriteName, stem) || BrushMutationPending()) return R::PendingOperation;
+        const auto objects = core::Spawned(); const auto npcs = core::ManagedNpcs();
+        const auto refers = [&](int pid) { return pid > 0 && core::FileNameEqual(core::ProjectNameOf(pid), stem); };
+        const auto uidRefers = [&](int uid, bool npc) {
+            if (npc) { const auto* n = FindManagedNpc(npcs, uid); return n && refers(n->proj); }
+            const auto* o = Find(objects, uid); return o && refers(o->proj);
+        };
+        for (int redo = 0; redo < 2; ++redo) for (const auto& entry : redo ? g_redo : g_undo) for (const auto& a : entry.acts) {
+            bool used = refers(a.proj);
+            if (a.kind != Act::GroupName && a.kind != Act::TerrainBatch && a.kind != Act::TerrainClear) used |= uidRefers(a.uid, NpcAct(a.kind));
+            for (int pid : a.projects) used |= refers(pid);
+            for (const auto& t : a.terrain) used |= refers(t.proj);
+            if (used) return redo ? R::RedoReference : R::UndoReference;
+        }
+        if (uidRefers(g_numericSceneUid, false) || uidRefers(g_numericNpcUid, true)) return R::PendingOperation;
+        for (const auto& op : g_pendingGround) for (const auto& m : core::GroundStateOf(op).members)
+            if (refers(m.before.proj) || refers(m.after.proj) || uidRefers(m.before.uid, false)) return R::PendingOperation;
+        for (const auto& report : g_projectPlacements) {
+            const auto v = core::PlaceRequestState(report.request);
+            if (!v.settled) for (const auto& r : v.rows) if (uidRefers(r.uid, false)) return R::PendingOperation;
+        }
+        if (g_place.active) for (const auto& m : g_place.m) if (uidRefers(m.uid, m.npc)) return R::PendingOperation;
+        return R::None;
+    }
+    static bool ExecuteLibraryAction() {
+        g_libraryAction.result = core::ExecuteFileAction(g_libraryAction.selection, g_libraryAction.action, g_libraryAction.typed, GuardLibraryFile);
+        if (!g_libraryAction.result.ok()) return false;
+        g_projectRefresh = true; g_projectStatus = T("File action completed. Scene objects and History were not changed."); return true;
+    }
+    static void BeginLibraryAction(const core::SavedFile& file, core::FileAction action) {
+        g_libraryAction = {}; g_libraryAction.action = action; g_projectStatus.clear();
+        g_libraryAction.result = core::SelectSavedFile(file, g_libraryAction.selection);
+        if (!g_libraryAction.result.ok()) return;
+        if (action == core::FileAction::Delete || action == core::FileAction::Purge) g_libraryAction.openConfirmation = true;
+        else ExecuteLibraryAction();
+    }
+    static void DrawLibraryFailure() {
+        const auto& r = g_libraryAction.result; if (r.ok()) return;
+        ImGui::TextWrapped("%s: %s (%lu)", T("File action failed"), core::FileReasonCode(r.reason), r.systemError);
+        if (r.reason == core::FileReason::AutoloadEnabled) ImGui::TextWrapped("%s", T("Turn autoload OFF explicitly before changing this file."));
+        else if (r.reason == core::FileReason::ConfirmationMismatch) ImGui::TextWrapped("%s", T("Type the exact full filename, including its extension and letter case."));
+        else ImGui::TextWrapped("%s", T("The file action failed. Check file access, then refresh and try again."));
+    }
+    static void DrawLibraryConfirmation() {
+        if (g_libraryAction.openConfirmation) { ImGui::OpenPopup("###file-confirm"); g_libraryAction.openConfirmation = false; }
+        const auto& style = ImGui::GetStyle(); const auto display = ImGui::GetIO().DisplaySize;
+        const float width = std::min(ImGui::GetFontSize() * 36, display.x - style.WindowPadding.x * 2);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0), ImVec2(width, display.y - style.WindowPadding.y * 2));
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (!ImGui::BeginPopupModal(TStable("Confirm permanent file deletion###file-confirm"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+        const auto file = core::SelectedFile(g_libraryAction.selection);
+        ImGui::TextWrapped("%s / %s / %s", T(LibraryActionName(g_libraryAction.action)), T(file.kind == proj_codec::Kind::Group ? "group" : "project"), T(file.archived ? "Archived" : "Active"));
+        ImGui::TextWrapped("%s", file.filename.c_str()); ImGui::TextWrapped("%s", file.path.c_str());
+        ImGui::TextWrapped("%s", T("Permanent file deletion cannot be recovered with Scene Undo. Scene objects and placed group copies will not be deleted."));
+        ImGui::TextWrapped("%s", T("Type the exact full filename, including its extension and letter case."));
+        ImGui::SetNextItemWidth(-1); InputTextI18n("##file-confirm-name", "", g_libraryAction.typed, sizeof g_libraryAction.typed); DrawLibraryFailure();
+        if (ImGui::Button(T("Cancel file action"))) { g_libraryAction.selection.reset(); ImGui::CloseCurrentPopup(); }
+        ImGui::SetItemDefaultFocus(); ProjectButtonWrap("Confirm permanent delete");
+        if (ImGui::Button(T("Confirm permanent delete")) && ExecuteLibraryAction()) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    static void DrawSavedLibrary() {
+        ImGui::SeparatorText(T("Saved library")); ImGui::SetNextItemWidth(-1);
+        if (InputTextI18n("##library-search", T("Search saved files"), g_librarySearch, sizeof g_librarySearch)) g_libraryFilterDirty = true;
+        const char* kinds[] = { "All kinds", "Projects", "Groups" }; const char* locations[] = { "Active", "Archived", "All locations" };
+        ImGui::SetNextItemWidth(-1); if (ComboT("##library-kind", &g_libraryKind, kinds, 3)) g_libraryFilterDirty = true;
+        ImGui::SetNextItemWidth(-1); if (ComboT("##library-location", &g_libraryLocation, locations, 3)) g_libraryFilterDirty = true;
+        if (g_libraryFilterDirty) { g_libraryRows = core::FilterSavedLibrary(g_projectLibrary, (core::SavedLibraryKind)g_libraryKind, (core::SavedLibraryLocation)g_libraryLocation, g_librarySearch); g_libraryFilterDirty = false; }
+        ImGui::TextWrapped(T("Active: %zu projects / %zu groups"), g_projectLibrary.active.projects, g_projectLibrary.active.groups);
+        ImGui::TextWrapped(T("Archived: %zu projects / %zu groups"), g_projectLibrary.archived.projects, g_projectLibrary.archived.groups);
+        ImGui::TextWrapped(T("Matches: %zu"), g_libraryRows.size());
+        if (!g_libraryResult.ok()) { ImGui::TextWrapped("%s: %s (%lu)", T("Library refresh failed"), core::FileReasonCode(g_libraryResult.reason), g_libraryResult.systemError); ImGui::TextWrapped("%s", T("Showing the last complete library snapshot. Refresh to retry.")); }
+        const float stride = ImGui::GetTextLineHeightWithSpacing();
+        if (ImGui::BeginChild("saved-library", ImVec2(0, stride * 8 + ImGui::GetStyle().WindowPadding.y * 2), ImGuiChildFlags_Borders)) {
+            ImGuiListClipper clipper; clipper.Begin((int)g_libraryRows.size(), stride);
+            while (clipper.Step()) for (int n = clipper.DisplayStart; n < clipper.DisplayEnd; ++n) {
+                const auto& row = g_projectLibrary.entries[g_libraryRows[n]]; const auto& file = row.file;
+                ImGui::PushID(file.path.c_str()); const auto label = file.filename + (row.ownership.dirty ? " *" : "") + (file.archived ? " [A]" : "");
+                if (ImGui::Selectable((label + "###saved-file").c_str(), SameSavedFile(file, g_librarySelected), 0, ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetTextLineHeight()))) g_librarySelected = file;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", file.path.c_str()); ImGui::PopID();
+            }
+            if (g_libraryRows.empty()) ImGui::TextWrapped("%s", T("No matching saved files"));
+        }
+        ImGui::EndChild();
+        for (size_t index : g_libraryRows) {
+            const auto row = g_projectLibrary.entries[index]; const auto& saved = row.file;
+            if (!SameSavedFile(saved, g_librarySelected)) continue;
+            const bool group = saved.kind == proj_codec::Kind::Group;
+            const ProjectFile file{ saved.filename.substr(0, saved.filename.size() - (group ? 8 : 7)), saved.kind, saved.archived, saved.path };
+            ImGui::TextWrapped("[%s / %s] %s", T(group ? "group" : "project"), T(saved.archived ? "Archived" : "Active"), saved.filename.c_str()); ImGui::TextWrapped("%s", saved.path.c_str());
+            const auto& o = row.ownership;
+            if (!group) {
+                ImGui::TextWrapped("%s: %zu / %s: %zu", T("Object"), o.visible, T("NPC"), o.visibleNpcs);
+                ImGui::TextWrapped(T("Hidden objects: %zu / hidden NPCs: %zu"), o.hidden, o.hiddenNpcs);
+                ImGui::TextWrapped(T("Terrain strokes at refresh: %zu"), o.terrain);
+                ImGui::TextWrapped(T("Pending objects: %zu / pending NPCs: %zu"), o.pendingObjects, o.pendingNpcs);
+            }
+            ImGui::PushID(group ? "group" : "project"); ImGui::PushID(file.name.c_str());
+            if (ImGui::SmallButton(T("Read"))) DispatchProjectAction(file, ProjectAction::Read);
+            if (!saved.archived) {
+                if (group) {
+                    ProjectButtonWrap("Place"); if (ImGui::SmallButton(T("Place"))) DispatchProjectAction(file, ProjectAction::Place);
+                    ProjectButtonWrap("Overwrite"); if (ImGui::SmallButton(T("Overwrite"))) DispatchProjectAction(file, ProjectAction::Overwrite);
+                } else {
+                    const bool loaded = o.visible || o.hidden || o.visibleNpcs || o.hiddenNpcs || o.terrain;
+                    ProjectButtonWrap("Load"); ImGui::BeginDisabled(loaded || g_projectCommandPending); if (ImGui::SmallButton(T("Load"))) DispatchProjectAction(file, ProjectAction::Load); ImGui::EndDisabled();
+                    ProjectButtonWrap("Reload"); ImGui::BeginDisabled(!loaded || g_projectCommandPending); if (ImGui::SmallButton(T("Reload"))) DispatchProjectAction(file, ProjectAction::Reload); ImGui::EndDisabled();
+                    ProjectButtonWrap("Save"); ImGui::BeginDisabled(!loaded || !o.dirty); if (ImGui::SmallButton(T("Save"))) DispatchProjectAction(file, ProjectAction::Save); ImGui::EndDisabled();
+                    ProjectButtonWrap("Unload"); ImGui::BeginDisabled(!loaded || g_projectCommandPending); if (ImGui::SmallButton(T("Unload"))) DispatchProjectAction(file, ProjectAction::Unload); ImGui::EndDisabled();
+                    const auto& unassigned = g_projectLibrary.unassigned;
+                    ProjectButtonWrap("Add unassigned"); ImGui::BeginDisabled(!loaded || !(unassigned.visible || unassigned.visibleNpcs || unassigned.terrain)); if (ImGui::SmallButton(T("Add unassigned"))) DispatchProjectAction(file, ProjectAction::AddUnassigned); ImGui::EndDisabled();
+                    ProjectButtonWrap("autoload"); bool on = std::any_of(g_projectAutoload.begin(), g_projectAutoload.end(), [&](const auto& name) { return core::FileNameEqual(name, file.name); });
+                    if (ImGui::Checkbox(T("autoload"), &on)) DispatchProjectAction(file, ProjectAction::Autoload, on);
+                }
+                ProjectButtonWrap("Archive"); if (ImGui::SmallButton(T("Archive"))) BeginLibraryAction(saved, core::FileAction::Archive);
+                ProjectButtonWrap("More file actions"); if (ImGui::SmallButton(T("More file actions"))) ImGui::OpenPopup("file-actions");
+                if (ImGui::BeginPopup("file-actions")) { if (ImGui::MenuItem(T("Permanent delete"))) BeginLibraryAction(saved, core::FileAction::Delete); ImGui::EndPopup(); }
+            } else {
+                ProjectButtonWrap("Restore"); if (ImGui::SmallButton(T("Restore"))) BeginLibraryAction(saved, core::FileAction::Restore);
+                ProjectButtonWrap("Purge"); if (ImGui::SmallButton(T("Purge"))) BeginLibraryAction(saved, core::FileAction::Purge);
+            }
+            ImGui::PopID(); ImGui::PopID(); break;
+        }
+        DrawLibraryFailure(); DrawLibraryConfirmation();
+    }
+    static void DrawPlacementReport(const report_projection::Placement& report) {
+        const auto& v = report.receipt; const std::string key = "placement-" + std::to_string(report.id); char summary[256];
+        snprintf(summary, sizeof summary, "#%llu%s %s | %d %s", (unsigned long long)report.id, report.attention() ? " !" : "", T(v.cleanupPending ? "Cleanup" : report.carrying ? "Carried" : report.final() ? "Final" : "Pending"), v.pending ? v.pending : v.attached, T(v.pending ? "pending" : "attached"));
+        const bool open = ProjectDisclosure(summary, key); ImGui::PushID(key.c_str());
+        if (!v.requestCanceled && report.active() && ImGui::SmallButton(T("Cancel placement"))) CancelProjectPlacement(report.request);
+        if (open) {
+            ImGui::TextWrapped("%s", report.name.c_str());
+            ImGui::TextWrapped(T("requested %d / attached %d / excluded %d / failed %d / canceled %d / pending %d"), v.requested, v.attached, report.displayedExcluded(), v.failed, v.canceled, v.pending);
+            ImGui::TextWrapped("%s", T("Attached during request; not current survivors."));
+            if (report.approximate) ImGui::TextWrapped("%s", T("Approximate bounds: unknown geometry uses a 2 m cube."));
+            static const char* states[] = { "Pending", "Attached", "Excluded", "Failed", "Canceled" };
+            for (const auto& row : v.rows) { ImGui::TextWrapped("#%d / UID %d: %s", row.rowId, row.uid, T(states[row.state])); ImGui::TextWrapped("%s", row.prefab.c_str()); if (!row.reason.empty()) ImGui::TextWrapped("%s", row.reason.c_str());
+                if (row.cleanupPending) ImGui::TextWrapped("%s", T("Cancellation cleanup pending")); if (row.removedAfterAttach) ImGui::TextWrapped("%s", T("Removed after attachment")); }
+        }
+        ImGui::PopID();
+    }
+    static void DrawGroundReport(const report_projection::Ground& report) {
+        const auto& v = report.receipt; char summary[256];
+        snprintf(summary, sizeof summary, "#%llu%s %s | %zu %s", (unsigned long long)v.id, report.attention() ? " !" : "", T(report.final() ? "Final" : "Pending"), report.pending ? report.pending : report.accepted, T(report.pending ? "pending" : "accepted"));
+        if (!ProjectDisclosure(summary, "ground-" + std::to_string(v.id))) return;
+        ImGui::TextWrapped(T("accepted %zu / not applied %zu / pending %zu"), report.accepted, report.notApplied, report.pending);
+        if (!v.reason.empty()) ImGui::TextWrapped("%s", v.reason.c_str());
+        for (const auto& row : v.members) { ImGui::TextWrapped("UID %d: %s", row.before.uid, T(!row.terminal ? "Pending" : row.accepted ? "Accepted" : "Not applied")); ImGui::TextWrapped("%s", row.before.prefab.c_str()); if (!row.reason.empty()) ImGui::TextWrapped("%s", row.reason.c_str()); }
+    }
+    static bool EarlierReports(const report_projection::Order& order, const char* key) {
+        if (order.earlierCompleted.empty()) return false;
+        char caption[256]; snprintf(caption, sizeof caption, "%zu / !%zu | %s", order.earlierCompleted.size(), order.earlierAttentionCount, T("Earlier reports")); return ProjectDisclosure(caption, key);
+    }
+    static void DrawProjectReports() {
+        const auto placements = g_placementReports.Snapshot(g_place.active ? g_place.req : core::PlaceRequestHandle{}); const auto grounds = g_groundReports.Snapshot();
+        if (!placements.reports.empty()) {
+            ImGui::SeparatorText(T("Placement reports")); DrawPlacementReport(placements.reports.back());
+            for (const auto& r : placements.reports) if (r.id != placements.order.newest && r.active()) DrawPlacementReport(r);
+            if (EarlierReports(placements.order, "placement-earlier")) for (const auto& r : placements.reports) if (r.id != placements.order.newest && !r.active()) DrawPlacementReport(r);
+        }
+        if (!grounds.reports.empty()) {
+            ImGui::SeparatorText(T("Grounding reports")); DrawGroundReport(grounds.reports.back());
+            for (const auto& r : grounds.reports) if (r.receipt.id != grounds.order.newest && r.active()) DrawGroundReport(r);
+            if (EarlierReports(grounds.order, "ground-earlier")) for (const auto& r : grounds.reports) if (r.receipt.id != grounds.order.newest && !r.active()) DrawGroundReport(r);
+        }
+    }
+    static void DrawProjectGrounding() {
+        ImGui::RadioButton(T("Rigid"), &g_groundMode, 0); ProjectButtonWrap("Per-object"); ImGui::RadioButton(T("Per-object"), &g_groundMode, 1);
+        ProjectButtonWrap("Start grounding"); if (ImGui::Button(T("Start grounding"))) {
+            if (g_place.active && g_groundMode == 1) g_projectStatus = "drop-before-per-object";
+            else { const auto c = GroundPlacementOf(g_place); BeginGrounding(c.generation ? c.members : SelUids(), g_groundMode == 0, c); }
+        }
+        ProjectButtonWrap("Cancel grounding"); if (ImGui::Button(T("Cancel grounding"))) for (const auto& op : g_pendingGround) core::GroundCancel(op);
+        if (g_deferredEditor.action) ImGui::TextWrapped("%s", T("Mutation pending; read-only controls remain available."));
+    }
+    static void DrawExportAttempts() {
+        if (g_exportAttempts.empty() || !ProjectDisclosure(std::string(T("Export attempts")) + " (" + std::to_string(g_exportAttempts.size()) + ")", "export-attempts")) return;
+        for (size_t i = 0; i < g_exportAttempts.size(); ++i) {
+            const auto& attempt = g_exportAttempts[i]; const auto& a = attempt.approval;
+            if (!ProjectDisclosure("#" + std::to_string(i + 1) + " " + T("Preflight"), "export-" + std::to_string(i + 1))) continue;
+            ImGui::TextWrapped("%s", a.path.empty() ? attempt.name.c_str() : a.path.c_str()); ImGui::TextWrapped(T("included %d / excluded %d"), (int)a.included.size(), (int)a.excluded.size());
+            if (!a.error.empty()) ImGui::TextWrapped("%s", a.error.c_str()); if (!attempt.result.empty()) ImGui::TextWrapped("%s", attempt.result.c_str());
+            for (const auto& ex : a.excluded) { ImGui::TextWrapped("UID %d: %s", ex.uid, ex.prefab.c_str()); ImGui::TextWrapped("%s", ex.reason.c_str()); }
+        }
+    }
+    static void DrawProjectExtras() {
+        if (!g_projectOverwriteName.empty()) {
+            ImGui::TextWrapped("%s: %s.cdproj", T("Overwrite project"), g_projectOverwriteName.c_str());
+            if (ImGui::Button(T("Approve project overwrite"))) { const auto name = g_projectOverwriteName; const int scope = g_projectOverwriteScope; g_projectOverwriteName.clear(); SaveProjectAction(name, scope, true); }
+            ProjectButtonWrap("Cancel overwrite"); if (ImGui::Button(T("Cancel overwrite"))) g_projectOverwriteName.clear();
+        }
+        if (ImGui::Button(T("Refresh"))) g_projectRefresh = true;
+        ProjectButtonWrap("Export Selection"); if (ImGui::Button(T("Export Selection"))) { g_exportOpen = true; g_exportOverwrite = false; ResetExportApproval(); }
+        RefreshExportApproval();
+        if (g_exportOpen) {
+            if (FittedCheckbox(T("Approve existing-file overwrite"), &g_exportOverwrite)) ResetExportApproval();
+            if (ImGui::Button(T("Preflight"))) ProjectExportPreflight(); ProjectButtonWrap("Write group"); ImGui::BeginDisabled(!g_exportApproval.valid);
+            if (ImGui::Button(T("Write group"))) ProjectExportWrite(); ImGui::EndDisabled(); ProjectButtonWrap("Cancel export");
+            if (ImGui::Button(T("Cancel export"))) { g_exportOpen = false; ResetExportApproval(); g_exportOverwrite = false; }
+            if (!g_exportStatus.empty()) ImGui::TextWrapped("%s: %s", T("Export status"), T(g_exportStatus.c_str()));
+        }
+        DrawExportAttempts(); DrawProjectGrounding();
+        if (!g_projectStatus.empty()) ImGui::TextWrapped("%s", T(g_projectStatus.c_str()));
+        if (!g_projectFileFailures.empty() && ProjectDisclosure(std::string(T("File attempt details")) + " (! " + std::to_string(g_projectFileFailures.size()) + ")", "file-attempts"))
+            for (const auto& f : g_projectFileFailures) { ImGui::TextWrapped("%s: %s", T(f.action.c_str()), f.path.c_str()); ImGui::TextWrapped("%s", f.reason.c_str()); }
+        if (g_projectReadValid && ProjectDisclosure(std::string(T("Read preview")) + ": " + g_projectReadPath.substr(g_projectReadPath.find_last_of("\\/") + 1), "read-preview")) {
+            const auto& d = g_projectRead; ImGui::TextWrapped("%s", g_projectReadPath.c_str());
+            ImGui::TextWrapped("%s: %zu / %s: %zu", T("Object"), d.records.size(), T("NPC"), d.npcs.size()); ImGui::TextWrapped(T("Terrain strokes in file: %zu"), d.terrain.size());
+            for (size_t i = 0; i < d.records.size(); ++i) { const auto& r = d.records[i]; ImGui::TextWrapped("#%zu: %s", i + 1, r.prefab.c_str()); ImGui::TextWrapped("%.6f %.6f %.6f | %.5f %.5f %.5f | x%.6f | %s %d", r.pos.x, r.pos.y, r.pos.z, r.yaw, r.pitch, r.roll, r.scale, T("Group"), r.group); if (!r.note.empty()) ImGui::TextWrapped("%s: %s", T("Note"), r.note.c_str()); }
+            for (const auto& n : d.npcs) { ImGui::TextWrapped("NPC %u: %s", n.key, n.label.c_str()); ImGui::TextWrapped("%.6f %.6f %.6f | %s %d | extra %u | AI %d | %s %d | %s %d", n.pos.x, n.pos.y, n.pos.z, T("type"), n.type, n.extra, n.aiEnabled ? 1 : 0, T("Behavior"), n.behavior, T("Group"), n.group); if (!n.note.empty()) ImGui::TextWrapped("%s: %s", T("Note"), n.note.c_str()); }
+            for (const auto& g : d.groupNames) ImGui::TextWrapped("%s %d: %s", T("Group"), g.first, g.second.c_str());
+            for (const auto& t : d.terrain) ImGui::TextWrapped("%s %d: %.3f %.3f r%.3f | %.3f %.3f | %.3f %.3f y%.3f", T("Terrain"), t.mode, t.x, t.z, t.r, t.amount, t.strength, t.ax, t.az, t.y);
+            if (d.hasBounds) ImGui::TextWrapped("%s: %.3f %.3f %.3f / %.3f %.3f %.3f / %.3f %.3f %.3f%s", T("Bounds"), d.bounds.anchor.x, d.bounds.anchor.y, d.bounds.anchor.z, d.bounds.min.x, d.bounds.min.y, d.bounds.min.z, d.bounds.max.x, d.bounds.max.y, d.bounds.max.z, d.bounds.approximate ? " ~" : "");
+        }
+    }
     static void DrawProject() {
-        static char s_name[64] = "mybuild";
-        static std::vector<std::string> s_list, s_auto; static DWORD s_listAt = 0;
-        if (GetTickCount() - s_listAt > 1200) { s_list = core::ListProjects(); s_auto = core::Autoload(); s_listAt = GetTickCount(); }
+        ImGui::PushOverrideID(ImHashStr("project-page"));
+        RefreshProjectLibrary();
+        auto& s_name = g_projName;
 
         const auto sceneObjects = core::Spawned();
         const int objectCount = (int)std::count_if(sceneObjects.begin(), sceneObjects.end(), [](const SpawnedObj& o) { return !o.hidden; });
@@ -2843,96 +3717,52 @@ namespace editor {
         const int newCount = core::ProjectObjectCount(0);
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.09f, 0.11f, 0.55f));
-        ImGui::BeginChild("project_status", ImVec2(0, 86), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+        ImGui::BeginChild("project_status", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY);
         bool autosave = core::g_projectAutoSave;
-        if (ImGui::Checkbox(T("real-time project auto-save"), &autosave)) { core::g_projectAutoSave = autosave; core::SaveSettings(); }
-        ImGui::SameLine();
-        if (core::g_projectAutoSave) ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.55f, 1), "%s", T("ON - every committed project edit is saved immediately"));
-        else ImGui::TextDisabled("%s", T("OFF - changes stay dirty until you save manually"));
+        if (ImGui::Checkbox("##project-autosave", &autosave)) { core::g_projectAutoSave = autosave; core::SaveSettings(); }
+        ImGui::SameLine(); ImGui::TextWrapped("%s", T("real-time project auto-save"));
+        ImGui::PushStyleColor(ImGuiCol_Text, autosave ? ImVec4(0.45f, 0.9f, 0.55f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("%s", T(autosave ? "ON - every committed project edit is saved immediately" : "OFF - changes stay dirty until you save manually"));
+        ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Only entities already belonging to a saved project are auto-saved. New unassigned entities are never attached automatically."));
-        ImGui::Text(T("Scene: %d entities"), totalCount); ImGui::SameLine();
-        ImGui::TextDisabled(T("%d objects, %d NPCs, %d unassigned"), objectCount, npcCount, newCount);
-        if (terrainCount) { ImGui::SameLine(); ImGui::TextDisabled(T("%d strokes"), terrainCount); }
-        if (core::PendingSpawns()) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.3f, 1), T("%d pending spawns"), core::PendingSpawns()); }
+        ImGui::TextWrapped(T("Scene: %d entities"), totalCount);
+        ImGui::TextWrapped(T("%d objects, %d NPCs, %d unassigned"), objectCount, npcCount, newCount);
+        if (terrainCount) ImGui::TextWrapped(T("%d strokes"), terrainCount);
+        if (core::PendingSpawns()) ImGui::TextWrapped(T("%d pending spawns"), core::PendingSpawns());
         ImGui::EndChild(); ImGui::PopStyleColor();
 
         ImGui::SeparatorText(T("Create or update a project"));
-        ImGui::SetNextItemWidth(260); ImGui::InputText(T("project name"), s_name, sizeof s_name);
-        ImGui::SameLine();
+        SetLabeledItemWidth("project name", 260); InputTextI18n(T("project name"), "", s_name, sizeof s_name);
+        ProjectButtonWrap(ICON_FLOPPY_DISK " Save whole scene as project");
         ImGui::BeginDisabled(!s_name[0] || totalCount == 0);
-        if (ImGui::Button(T(ICON_FLOPPY_DISK " Save whole scene as project"))) {
-            if (core::SaveProject(s_name, core::SaveWholeScene)) Note(T("saved %s (%d entities)"), s_name, totalCount); else Note(T("save failed"));
-            s_listAt = 0;
-        }
+        if (FittedButton(T(ICON_FLOPPY_DISK " Save whole scene as project"))) SaveProjectAction(s_name, core::SaveWholeScene);
         ImGui::EndDisabled();
-        ImGui::SameLine();
+        ProjectButtonWrap("Save unassigned entities as project");
         ImGui::BeginDisabled(!s_name[0] || newCount == 0);
-        if (ImGui::Button(T("Save unassigned entities as project"))) {
-            if (core::SaveProject(s_name, core::SaveNewOnly)) Note(T("saved %s (%d entities)"), s_name, newCount); else Note(T("save failed"));
-            s_listAt = 0;
-        }
+        if (FittedButton(T("Save unassigned entities as project"))) SaveProjectAction(s_name, core::SaveNewOnly);
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", T("Saves only entities that do not belong to any project yet. Loaded projects stay separate."));
 
-        if (ImGui::Button(T(ICON_CUBE " New empty scene"))) ImGui::OpenPopup("newproj");
-        ImGui::SameLine();
+        if (ImGui::Button(T(ICON_CUBE " New empty scene"))) ImGui::OpenPopup("###newproj");
+        ProjectButtonWrap("Import project file");
         if (ImGui::Button(T("Import project file"))) {
             char file[MAX_PATH] = { 0 }; OPENFILENAMEA ofn = {}; ofn.lStructSize = sizeof ofn; ofn.lpstrFilter = "World Builder project (*.cdproj)\0*.cdproj\0All files\0*.*\0"; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameA(&ofn)) { std::string src = file; std::string base = src.substr(src.find_last_of("\\/") + 1); std::string dst = core::ModDir() + "\\projects\\" + base; CreateDirectoryA((core::ModDir() + "\\projects").c_str(), nullptr); if (CopyFileA(src.c_str(), dst.c_str(), FALSE)) Note(T("imported %s"), base.c_str()); else Note(T("import failed")); s_listAt = 0; }
+            if (GetOpenFileNameA(&ofn)) { if (core::ImportProjectFile(file)) { Note(T("imported %s"), file); g_projectRefresh = true; } else { g_projectStatus = core::ProjectError(); Note(T("import failed")); } }
         }
-        ImGui::SameLine(); if (ImGui::Button(T("Open project folder"))) ShellExecuteA(nullptr, "open", (core::ModDir() + "\\projects").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ProjectButtonWrap("Open project folder"); if (ImGui::Button(T("Open project folder"))) ShellExecuteA(nullptr, "open", (core::ModDir() + "\\projects").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         if (ImGui::BeginPopupModal(TStable("New empty scene###newproj"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::TextWrapped(T("Remove all %d live entities from the World Builder scene?"), totalCount);
             ImGui::TextDisabled(T("Project files on disk are not deleted."));
-            if (ImGui::Button(T(ICON_TRASH " Clear scene"))) { core::DeleteAllSpawned(); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("scene cleared")); ImGui::CloseCurrentPopup(); }
+            if (ImGui::Button(T(ICON_TRASH " Clear scene"))) { ClearSceneAction(false); ImGui::CloseCurrentPopup(); }
             ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
 
-        ImGui::SeparatorText(T("Saved projects"));
-        if (g_compact) {
-            for (const auto& pr : s_list) {
-                const int pid = core::ProjectId(pr); const int inScene = core::ProjectObjectCount(pid); const bool dirty = inScene > 0 && core::ProjectDirty(pid);
-                ImGui::PushID(pr.c_str()); ImGui::SeparatorText(pr.c_str());
-                if (!inScene) ImGui::TextDisabled("%s", T("not loaded"));
-                else if (dirty) ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.3f, 1), T("%d entities, modified"), inScene);
-                else ImGui::TextDisabled(T("%d entities, saved"), inScene);
-                ImGui::BeginDisabled(inScene > 0); if (ImGui::SmallButton(T("Load"))) { core::LoadProject(pr, false); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("loaded %s"), pr.c_str()); } ImGui::EndDisabled(); ImGui::SameLine();
-                ImGui::BeginDisabled(inScene == 0); if (ImGui::SmallButton(T("Reload"))) { core::UnloadProject(pid); core::LoadProject(pr, false); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("reloaded %s"), pr.c_str()); } ImGui::EndDisabled(); ImGui::SameLine();
-                ImGui::BeginDisabled(inScene == 0 || !dirty); if (ImGui::SmallButton(T("Save"))) { if (core::SaveProject(pr, core::SaveProjectOnly)) Note(T("saved %s"), pr.c_str()); else Note(T("save failed")); } ImGui::EndDisabled(); ImGui::SameLine();
-                ImGui::BeginDisabled(inScene == 0); if (ImGui::SmallButton(T("Unload"))) { core::UnloadProject(pid); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("unloaded %s"), pr.c_str()); } ImGui::EndDisabled();
-                ImGui::BeginDisabled(inScene == 0 || newCount == 0); if (ImGui::SmallButton(T("Add unassigned"))) { if (core::SaveProject(pr, core::SaveProjectAndNew)) Note(T("saved %s (%d entities)"), pr.c_str(), inScene + newCount); else Note(T("save failed")); } ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(T("Adds the %d unassigned scene entities to this project and saves it."), newCount);
-                bool isAuto = std::find(s_auto.begin(), s_auto.end(), pr) != s_auto.end(); ImGui::SameLine(); if (ImGui::Checkbox(T("Autoload"), &isAuto)) { core::SetAutoload(pr, isAuto); s_auto = core::Autoload(); }
-                ImGui::PopID();
-            }
-        } else if (ImGui::BeginTable("projects_v2", 8, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn(T("Project"), ImGuiTableColumnFlags_WidthStretch, 2.2f);
-            ImGui::TableSetupColumn(T("Status"), ImGuiTableColumnFlags_WidthStretch, 1.5f);
-            ImGui::TableSetupColumn("##load", ImGuiTableColumnFlags_WidthFixed, 72);
-            ImGui::TableSetupColumn("##reload", ImGuiTableColumnFlags_WidthFixed, 78);
-            ImGui::TableSetupColumn("##save", ImGuiTableColumnFlags_WidthFixed, 72);
-            ImGui::TableSetupColumn("##add", ImGuiTableColumnFlags_WidthFixed, 104);
-            ImGui::TableSetupColumn("##unload", ImGuiTableColumnFlags_WidthFixed, 78);
-            ImGui::TableSetupColumn(T("Autoload"), ImGuiTableColumnFlags_WidthFixed, 92);
-            ImGui::TableHeadersRow();
-            for (const auto& pr : s_list) {
-                const int pid = core::ProjectId(pr); const int inScene = core::ProjectObjectCount(pid); const bool dirty = inScene > 0 && core::ProjectDirty(pid);
-                ImGui::PushID(pr.c_str()); ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); if (dirty) ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.35f, 1), "%s *", pr.c_str()); else ImGui::TextUnformatted(pr.c_str());
-                ImGui::TableSetColumnIndex(1); if (!inScene) ImGui::TextDisabled("%s", T("not loaded")); else if (dirty) ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.3f, 1), T("%d entities, modified"), inScene); else ImGui::TextDisabled(T("%d entities, saved"), inScene);
-                ImGui::TableSetColumnIndex(2); ImGui::BeginDisabled(inScene > 0); if (ImGui::SmallButton(T("Load"))) { core::LoadProject(pr, false); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("loaded %s"), pr.c_str()); } ImGui::EndDisabled();
-                ImGui::TableSetColumnIndex(3); ImGui::BeginDisabled(inScene == 0); if (ImGui::SmallButton(T("Reload"))) { core::UnloadProject(pid); core::LoadProject(pr, false); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("reloaded %s"), pr.c_str()); } ImGui::EndDisabled();
-                ImGui::TableSetColumnIndex(4); ImGui::BeginDisabled(inScene == 0 || !dirty); if (ImGui::SmallButton(T("Save"))) { if (core::SaveProject(pr, core::SaveProjectOnly)) Note(T("saved %s"), pr.c_str()); else Note(T("save failed")); } ImGui::EndDisabled();
-                ImGui::TableSetColumnIndex(5); ImGui::BeginDisabled(inScene == 0 || newCount == 0); if (ImGui::SmallButton(T("Add unassigned"))) { if (core::SaveProject(pr, core::SaveProjectAndNew)) Note(T("saved %s (%d entities)"), pr.c_str(), inScene + newCount); else Note(T("save failed")); } ImGui::EndDisabled(); if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(T("Adds the %d unassigned scene entities to this project and saves it."), newCount);
-                ImGui::TableSetColumnIndex(6); ImGui::BeginDisabled(inScene == 0); if (ImGui::SmallButton(T("Unload"))) { core::UnloadProject(pid); ClearSceneSelection(); g_undo.clear(); g_redo.clear(); Note(T("unloaded %s"), pr.c_str()); } ImGui::EndDisabled();
-                ImGui::TableSetColumnIndex(7); bool isAuto = std::find(s_auto.begin(), s_auto.end(), pr) != s_auto.end(); if (ImGui::Checkbox("##autoload", &isAuto)) { core::SetAutoload(pr, isAuto); s_auto = core::Autoload(); }
-                ImGui::PopID();
-            }
-            ImGui::EndTable();
-        }
-        if (s_list.empty()) ImGui::TextDisabled(T("No saved projects yet."));
-        ImGui::TextDisabled("%s", T("Loading a project creates both its objects and its managed NPCs. Unload removes both from the live scene but keeps the project file."));
+        DrawProjectExtras();
+        DrawSavedLibrary();
+        DrawProjectReports();
+        ImGui::TextWrapped("%s", T("Loading a project creates both its objects and its managed NPCs. Unload removes both from the live scene but keeps the project file."));
+        ImGui::PopID();
     }
 
     // ---- travel: saved points (bin64\cdmodkit\teleports.txt: name|x|y|z) ----
@@ -2996,6 +3826,33 @@ namespace editor {
     static Vec3 g_brushAt{}; static bool g_brushHave = false; static float g_brushY = 0; static bool g_brushYSet = false;
     static int g_brushTicket = 0; static DWORD g_brushProbeTick = 0, g_brushHitTick = 0; static bool g_brushLastHit = false; static float g_brushLastHitY = 0;
     static bool g_brushPainting = false; static size_t g_brushHistoryMark = 0; static Vec3 g_brushLast{}; static float g_brushAx = 0, g_brushAz = 0;
+    static bool BrushMutationPending() { return g_brushPainting || g_brushTicket != 0; }
+    static void FinishProjectSceneMutation() {
+        // Called only after core's true synchronous outcome. Surviving NPCs in other projects
+        // must leave the editor move lifecycle too; removed identities must never be recreated.
+        for (const auto& n : core::ManagedNpcs()) if (!n.hidden && n.editMoving &&
+            (n.uid == g_numericNpcUid || (g_place.active && std::any_of(g_place.m.begin(), g_place.m.end(),
+                [&](const Member& m) { return m.npc && m.uid == n.uid; })))) {
+            if (!core::EndManagedNpcMove(n.uid, n.liveMovePending ? n.liveMoveTarget : n.pos))
+                Note("NPC %d: could not finish the surviving editor move", n.uid);
+        }
+        if (g_place.active) FinishPlace();
+        g_deferredEditor = {};
+        // Unload can succeed while an unrelated operation is Applying. Keep its owned receipt
+        // for later reconciliation; only unapplied operations may be canceled here.
+        ReconcileGroundBatch(true);
+        g_snapJobs.clear();
+        ClearSceneSelection(); g_undo.clear(); g_redo.clear(); ++g_historyBranch;
+        g_numericSceneUid = g_numericNpcUid = 0; CancelNumericEdit();
+        // Success resets upstream History. Do not slice the newly admitted terrain with the old
+        // brush mark, or an earlier gesture would acquire the loaded document's strokes.
+        g_brushPainting = g_brushHave = g_brushLastHit = false; g_brushTicket = 0;
+        g_brushHistoryMark = 0; g_brushHitTick = 0;
+        g_browserDragPrefab = g_npcDragIndex = -1; g_browserDropJobs.clear(); g_npcDropJobs.clear();
+        g_boxSelecting = g_boxMoved = g_boxAdd = false; g_boxBase.clear(); g_boxNpcBase.clear();
+        g_rightGesture = g_rightMoved = g_worldPopupRequested = false; g_rightUid = 0;
+        g_projectRefresh = true; PublishProjectContext();
+    }
     static bool TerrainTabShown() {
         return g_open && (g_compact ? g_compactPage == TabTerrain : g_mainTab == TabTerrain);
     }
@@ -3089,7 +3946,7 @@ namespace editor {
     }
     static void BrushTick(const PosInfo& p, bool havePos) {
         if (!TerrainTabShown()) { CommitBrushHistory(); return; }
-        const CamFrame cf = CurrentCam(); if (!cf.ok) return;
+        const CamFrame cf = CurrentCam(); if (!cf.ok) { CommitBrushHistory(); return; }
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
         if (g_shapePreview) DrawShapePreview(dl, cf);
         else {   // painted strokes, newest on top (only the ones near the camera)
@@ -3105,14 +3962,26 @@ namespace editor {
         (void)p; (void)havePos;
         // the brush sits where a cast from the camera along the mouse ray hits (the game's own sphere cast, one per frame at most);
         // the last hit stays shown while the next cast is on its way, a miss (sky, beyond the loaded collision) hides the brush
-        if (g_brushTicket) { core::GroundHit gh; if (core::GroundResult(g_brushTicket, &gh)) {
-            g_brushLastHit = gh.hit; g_brushTicket = 0;
-            if (gh.hit && gh.fraction >= 0.0f) { g_brushAt = { gh.center.x, gh.center.y - core::g_probeRadius, gh.center.z }; g_brushY = g_brushAt.y; g_brushLastHitY = g_brushAt.y; g_brushHitTick = GetTickCount(); } } }
+        if (g_brushTicket) {
+            core::GroundHit gh; const auto status = core::GroundResultState(g_brushTicket, &gh);
+            if (status == core::GroundProbeStatus::Invalidated || status == core::GroundProbeStatus::Unknown) {
+                CommitBrushHistory(); // accepted strokes must survive invalidation of the next query
+                g_brushTicket = 0; g_brushLastHit = g_brushHave = false; g_brushHitTick = 0; return;
+            }
+            if (status != core::GroundProbeStatus::Pending) {
+                g_brushTicket = 0; g_brushLastHit = status == core::GroundProbeStatus::Hit && gh.fraction >= 0;
+                if (g_brushLastHit) { g_brushAt = { gh.center.x, gh.center.y - gh.radius, gh.center.z }; g_brushY = g_brushAt.y; g_brushLastHitY = g_brushAt.y; g_brushHitTick = GetTickCount(); }
+            }
+        }
         const bool overUi = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || ImGui::IsAnyItemHovered();
         const Vec3 rd = MouseRay(cf, io.MousePos);
         if (!overUi && !g_brushTicket && core::GroundProbeReady()) g_brushTicket = core::RayProbe(cf.pos, rd, 300.0f);
         g_brushHave = !overUi && g_brushLastHit && GetTickCount() - g_brushHitTick < 500;
-        if (g_brushHave && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { g_brushHistoryMark = core::TerrainStrokes().size(); g_brushPainting = true; g_brushAx = g_brushAt.x; g_brushAz = g_brushAt.z; AddBrushStroke(); }
+        if (g_brushHave && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            // A held pointer sample is not a deferred command: start only against current ground authority.
+            if (g_deferredEditor.action || !ReconcileGroundBatch(true)) return;
+            g_brushHistoryMark = core::TerrainStrokes().size(); g_brushPainting = true; g_brushAx = g_brushAt.x; g_brushAz = g_brushAt.z; AddBrushStroke();
+        }
         else if (g_brushPainting && g_brushHave && io.MouseDown[ImGuiMouseButton_Left]) {   // dragging paints a stroke every 40 % of the radius
             const float dx = g_brushAt.x - g_brushLast.x, dz = g_brushAt.z - g_brushLast.z, sp = std::max(0.5f, g_brushRadius * 0.4f);
             if (dx * dx + dz * dz >= sp * sp) AddBrushStroke();
@@ -3124,51 +3993,60 @@ namespace editor {
             ImVec2 c; if (WorldToScreen(cf, g_brushAt, &c)) dl->AddCircleFilled(c, 3.0f, col);
         }
     }
+    static void ClearTerrainAction() {
+        if (!PrepareHistoryMutation([]() { ClearTerrainAction(); })) return;
+        Act a{}; a.kind = Act::TerrainClear; a.terrain = core::TerrainStrokes();
+        core::TerrainClear(); Push({ std::move(a) });
+    }
     static void DrawTerrain(const PosInfo& p, bool havePos, bool compact = false) {
         if (!core::TerrainAvailable()) { ImGui::TextWrapped(T("Terrain editing is not available in this game build: %s"), core::TerrainStatus().c_str()); return; }
         core::TravelPrepare();
         const float ui = ImGui::GetFontSize() / 17.0f;
-        ImGui::Checkbox(T("Brush active (left mouse paints in the world)"), &g_brushOn);
-        if (!compact) ImGui::SameLine();
-        ImGui::Checkbox(T("Shape preview"), &g_shapePreview);
+        FittedCheckbox(T("Brush active (left mouse paints in the world)"), &g_brushOn);
+        SameLineForControl("Shape preview", true);
+        FittedCheckbox(T("Shape preview"), &g_shapePreview);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("The ground as it will be after Apply, as a shaded surface: orange tint = higher, blue tint = lower than now."));
         if (compact) {
             static const char* modes[] = { "Raise", "Lower", "Flatten" };
             ImGui::SetNextItemWidth(-1);
             ComboT("##terrain_mode", &g_brushMode, modes, 3);
         } else {
-            ImGui::RadioButton(T("Raise"), &g_brushMode, BrushRaise); ImGui::SameLine();
-            ImGui::RadioButton(T("Lower"), &g_brushMode, BrushLower); ImGui::SameLine();
+            ImGui::RadioButton(T("Raise"), &g_brushMode, BrushRaise); SameLineForControl("Lower", true);
+            ImGui::RadioButton(T("Lower"), &g_brushMode, BrushLower); SameLineForControl("Flatten", true);
             ImGui::RadioButton(T("Flatten"), &g_brushMode, BrushFlatten);
         }
-        ImGui::SetNextItemWidth(compact ? -1.0f : 260.0f * ui); ImGui::SliderFloat(T("radius (m)"), &g_brushRadius, 2.0f, 60.0f, "%.1f");
-        ImGui::SetNextItemWidth(compact ? -1.0f : 260.0f * ui);
+        SetLabeledItemWidth("radius (m)", compact ? ImGui::GetContentRegionAvail().x : 260.0f * ui); ImGui::SliderFloat(T("radius (m)"), &g_brushRadius, 2.0f, 60.0f, "%.1f");
+        SetLabeledItemWidth(g_brushMode == BrushFlatten ? "strength" : "height per stroke (m)", compact ? ImGui::GetContentRegionAvail().x : 260.0f * ui);
         if (g_brushMode == BrushFlatten) ImGui::SliderFloat(T("strength"), &g_brushFlat, 0.05f, 1.0f, "%.2f");
         else ImGui::SliderFloat(T("height per stroke (m)"), &g_brushAmount, 0.05f, 5.0f, "%.2f");
-        ImGui::TextDisabled(g_brushMode == BrushFlatten ? T("Flatten pulls the ground toward the height where the drag started.") : T("Dragging paints a stroke every 40 percent of the radius; strokes add up."));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("%s", g_brushMode == BrushFlatten ? T("Flatten pulls the ground toward the height where the drag started.") : T("Dragging paints a stroke every 40 percent of the radius; strokes add up."));
+        ImGui::PopStyleColor();
         const auto strokes = core::TerrainStrokes();
-        ImGui::Text(T("%d strokes"), (int)strokes.size()); ImGui::SameLine();
+        ImGui::Text(T("%d strokes"), (int)strokes.size()); SameLineForControl("Undo");
         ImGui::BeginDisabled(g_undo.empty());
         if (ImGui::SmallButton(T("Undo"))) Undo();
-        ImGui::EndDisabled(); ImGui::SameLine();
+        ImGui::EndDisabled(); SameLineForControl("Redo");
         ImGui::BeginDisabled(g_redo.empty());
         if (ImGui::SmallButton(T("Redo"))) Redo();
-        ImGui::EndDisabled(); ImGui::SameLine();
+        ImGui::EndDisabled(); SameLineForControl("Clear all");
         ImGui::BeginDisabled(strokes.empty());
-        if (ImGui::SmallButton(T("Clear all"))) { Act a{}; a.kind = Act::TerrainClear; a.terrain = strokes; core::TerrainClear(); Push({ std::move(a) }); }
+        if (ImGui::SmallButton(T("Clear all"))) ClearTerrainAction();
         ImGui::EndDisabled();
         ImGui::Separator();
         const std::string st = core::TerrainApplyState();
-        if (!st.empty()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Applying: %s"), st.c_str());
-        else if (core::TerrainNeedsApply()) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), T("Not applied yet: the shaded surface shows the new shape."));
-        else ImGui::TextDisabled(T("The ground shows every stroke."));
+        ImGui::PushStyleColor(ImGuiCol_Text, !st.empty() || core::TerrainNeedsApply() ? ImVec4(1.0f, 0.8f, 0.4f, 1.0f) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        if (!st.empty()) ImGui::TextWrapped(T("Applying: %s"), st.c_str());
+        else ImGui::TextWrapped("%s", T(core::TerrainNeedsApply() ? "Not applied yet: the shaded surface shows the new shape." : "The ground shows every stroke."));
+        ImGui::PopStyleColor();
         ImGui::BeginDisabled(!st.empty() || !havePos || !core::TravelAvailable() || strokes.empty() && !core::TerrainNeedsApply());
-        if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Apply (two loading screens)"), compact ? ImVec2(-1, 0) : ImVec2(0, 0))) { if (core::TerrainApply(p.world)) Note(T("applying the terrain: fast travel away and back")); }
+        if (FittedButton(T(ICON_LOCATION_CROSSHAIRS " Apply (two loading screens)"), compact)) { if (core::TerrainApply(p.world)) Note(T("applying the terrain: fast travel away and back")); }
         ImGui::EndDisabled();
         if (!compact || ImGui::CollapsingHeader(TStable("Terrain help"))) {
             ImGui::TextWrapped(T("Strokes change the ground and its collision right away. Apply (a fast travel 5 km away and back, about half a minute) is only needed when a stroke could not be shown live. Strokes are saved with the project and are there right away when the project is autoloaded."));
         }
-        ImGui::TextDisabled(T("travel: %s"), core::TravelStatus().c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped(T("travel: %s"), core::TravelStatus().c_str()); ImGui::PopStyleColor();
     }
 
     // screen rectangle of a placed object's (yaw-rotated) bounding box; depth = distance along the view direction
@@ -3212,7 +4090,7 @@ namespace editor {
         (void)p;(void)havePos;g_hoverUid=g_hoverNpcUid=0;ImGuiIO&io=ImGui::GetIO();if(g_browserDragPrefab>=0||g_npcDragIndex>=0)return;if(BrushActive())return;
         const bool overUi=ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)||ImGui::IsAnyItemHovered(),addSelect=CtrlHeld(io),addBox=CtrlHeld(io)||ShiftHeld(io),placing=g_place.active;if(g_playMode)return;
         auto objects=core::Spawned();auto npcs=core::ManagedNpcs();const int leftClicks=ImGui::GetMouseClickedCount(ImGuiMouseButton_Left);
-        if(g_rightGesture){if(io.MouseDown[ImGuiMouseButton_Right]){float dx=io.MousePos.x-g_rightStart.x,dy=io.MousePos.y-g_rightStart.y;if(dx*dx+dy*dy>16)g_rightMoved=true;}if(ImGui::IsMouseReleased(ImGuiMouseButton_Right)){if(!g_rightMoved&&g_rightUid){if(g_rightUid>0){if(IsCarried(g_rightUid)){ClearSceneSelection();for(const auto&m:g_place.m)g_sel.insert(m.uid);g_primary=g_lastClicked=g_rightUid;g_sceneLastEntity=g_rightUid;}else if(!g_sel.count(g_rightUid))SelectUid(g_rightUid,false,objects);}else{const int uid=-g_rightUid;if(!g_managedNpcSel.count(uid))SelectManagedNpc(uid,false);}g_worldPopupRequested=true;g_worldPopupPos=io.MousePos;}g_rightGesture=g_rightMoved=false;g_rightUid=0;}}
+        if(g_rightGesture){if(io.MouseDown[ImGuiMouseButton_Right]){float dx=io.MousePos.x-g_rightStart.x,dy=io.MousePos.y-g_rightStart.y;if(dx*dx+dy*dy>16)g_rightMoved=true;}if(ImGui::IsMouseReleased(ImGuiMouseButton_Right)){if(!g_rightMoved&&g_rightUid){if(g_rightUid>0){if(IsCarried(g_rightUid)){ClearSceneSelection();for(const auto&m:g_place.m){if(m.npc)g_managedNpcSel.insert(m.uid);else g_sel.insert(m.uid);}g_primary=g_lastClicked=g_rightUid;g_sceneLastEntity=g_rightUid;}else if(!g_sel.count(g_rightUid))SelectUid(g_rightUid,false,objects);}else{const int uid=-g_rightUid;if(!g_managedNpcSel.count(uid))SelectManagedNpc(uid,false);}g_worldPopupRequested=true;g_worldPopupPos=io.MousePos;}g_rightGesture=g_rightMoved=false;g_rightUid=0;}}
         if(overUi&&!g_boxSelecting)return;if(ImGui::IsMouseClicked(ImGuiMouseButton_Right)){g_rightGesture=true;g_rightMoved=false;g_rightStart=io.MousePos;g_rightUid=0;if(placing&&!g_place.m.empty()){const auto&m=g_place.m.front();g_rightUid=m.npc?-m.uid:m.uid;}}
         CamFrame cf=CurrentCam();if(!cf.ok){if(ImGui::IsMouseReleased(ImGuiMouseButton_Left)){g_boxSelecting=g_boxMoved=g_boxAdd=false;g_boxBase.clear();g_boxNpcBase.clear();}return;}
         if(g_boxSelecting){UpdateBoxSelection(cf,objects,npcs,io);if(g_boxSelecting||overUi)return;}if(placing&&(g_place.hover||g_place.drag))return;
@@ -3244,6 +4122,7 @@ namespace editor {
         *center = hit; if (onGroundPlane) *onGroundPlane = plane; return true;
     }
     static void SpawnBrowserDrop(int prefab, Vec3 center, float yaw, float scale) {
+        if (!PrepareHistoryMutation([=]() { SpawnBrowserDrop(prefab, center, yaw, scale); })) return;
         const auto& idx = core::PrefabIndex(); if (prefab < 0 || prefab >= (int)idx.size()) return;
         const auto& pi = idx[prefab]; g_selPrefab = prefab;
         if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
@@ -3259,16 +4138,15 @@ namespace editor {
         const auto& idx = core::PrefabIndex();
         for (size_t i = 0; i < g_browserDropJobs.size(); ) {
             BrowserDropJob& j = g_browserDropJobs[i]; core::GroundHit gh;
-            if (!core::GroundResult(j.ticket, &gh)) {
-                if (GetTickCount() - j.queuedAt < 1200) { ++i; continue; }
-                core::Log("[ground] browser drop probe timed out; using projected placement height");
-                SpawnBrowserDrop(j.prefab, j.center, j.yaw, j.scale);
-                g_browserDropJobs.erase(g_browserDropJobs.begin() + i);
-                continue;
+            if (g_deferredEditor.action || !ReconcileGroundBatch(false)) return;
+            const auto status = core::GroundResultState(j.ticket, &gh);
+            if (status == core::GroundProbeStatus::Pending) { ++i; continue; }
+            if (status == core::GroundProbeStatus::Invalidated || status == core::GroundProbeStatus::Unknown) {
+                g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
             }
             Vec3 center = j.center;
             if (j.prefab >= 0 && j.prefab < (int)idx.size() && gh.hit) {
-                const auto& pi = idx[j.prefab]; const float groundY = gh.centerY - core::g_probeRadius;
+                const auto& pi = idx[j.prefab]; const float groundY = gh.centerY - gh.radius;
                 // BrowserDropPoint stores a bbox center when bounds are known.  Put its lowest point exactly on the
                 // physical surface; the prefab pivot is recovered by SpawnBrowserDrop afterwards.
                 center.y = groundY + (pi.hasCenter ? std::max(0.0f, pi.sy) * j.scale * 0.5f : 0.0f);
@@ -3300,8 +4178,8 @@ namespace editor {
             const int ticket = core::GroundProbe({ center.x, startY, center.z }, 400.0f);
             if (ticket) {
                 g_browserDropJobs.push_back({ prefab, ticket, GetTickCount(), center, g_spawnYaw, g_spawnScale });
-                return;
-            }
+            } else Note("Browser surface request refused");
+            return;
         }
         // Physics may not be ready immediately after loading.  The fallback still places the measured bbox bottom on
         // the player-height plane; unlike the old path it does not spawn first and then cast through its own collision.
@@ -3329,15 +4207,14 @@ namespace editor {
     static void PumpNpcDropJobs() {
         for (size_t i = 0; i < g_npcDropJobs.size();) {
             NpcDropJob& j = g_npcDropJobs[i]; core::GroundHit gh;
-            if (!core::GroundResult(j.ticket, &gh)) {
-                if (GetTickCount() - j.queuedAt < 800) { ++i; continue; }
-                core::Log("[npc] ground probe timed out for character %u; spawning at requested height", j.key);
-                SpawnNpcFormation(j.key, j.at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz, j.ai, j.behavior);
-                g_npcDropJobs.erase(g_npcDropJobs.begin() + i);
-                continue;
+            if (g_deferredEditor.action || !ReconcileGroundBatch(false)) return;
+            const auto status = core::GroundResultState(j.ticket, &gh);
+            if (status == core::GroundProbeStatus::Pending) { ++i; continue; }
+            if (status == core::GroundProbeStatus::Invalidated || status == core::GroundProbeStatus::Unknown) {
+                g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
             }
             Vec3 at = j.at;
-            if (gh.hit) at.y = gh.centerY - core::g_probeRadius;
+            if (gh.hit) at.y = gh.centerY - gh.radius;
             SpawnNpcFormation(j.key, at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz, j.ai, j.behavior);
             g_npcDropJobs.erase(g_npcDropJobs.begin() + i);
         }
@@ -3374,7 +4251,7 @@ namespace editor {
             if(!g_managedNpcSel.empty()){ImGui::Separator();ImGui::BeginDisabled(!core::NpcAiControlAvailable());if(ImGui::MenuItem(T("Enable AI")))SetSelectedNpcAi(true);if(ImGui::MenuItem(T("Disable AI")))SetSelectedNpcAi(false);if(ImGui::BeginMenu(T("Behavior"))){if(ImGui::MenuItem(T("Normal autonomous")))SetSelectedNpcBehavior(0);if(ImGui::MenuItem(T("Hold position (AI paused)")))SetSelectedNpcBehavior(1);ImGui::EndMenu();}ImGui::EndDisabled();}
             ImGui::Separator();if(ImGui::MenuItem(T("Group selection")))GroupSceneSelection(true);if(ImGui::MenuItem(T("Ungroup"),nullptr,false,hasGroup))GroupSceneSelection(false);
             ImGui::BeginDisabled(!g_managedNpcSel.empty());if(ImGui::BeginMenu(T("Rotate"))){if(ImGui::MenuItem(T("Rotate left")))RotateSel(-g_rotationStep);if(ImGui::MenuItem(T("Rotate right")))RotateSel(g_rotationStep);ImGui::EndMenu();}if(ImGui::BeginMenu(T("Align to primary"))){if(ImGui::MenuItem(T("X")))AlignSel(0);if(ImGui::MenuItem(T("Y")))AlignSel(1);if(ImGui::MenuItem(T("Z")))AlignSel(2);ImGui::EndMenu();}ImGui::EndDisabled();
-            if(ImGui::MenuItem(T("Delete")))DeleteSceneSelection();ImGui::EndDisabled();ImGui::EndPopup();}
+            if(ImGui::MenuItem(T("Forget")))ForgetSelection();if(ImGui::MenuItem(T("Delete")))DeleteSceneSelection();ImGui::EndDisabled();ImGui::EndPopup();}
         ImGui::End();
     }
     static void DrawSelectionOutlines() {
@@ -3423,16 +4300,17 @@ namespace editor {
         const bool began = ImGui::Begin(title, &g_open, playAlpha ? ImGuiWindowFlags_NoInputs : 0);
         if (!g_open) { ImGui::End(); if (playAlpha) ImGui::PopStyleVar(); FinishCloseEditor(); return; }
         if (!began) { ImGui::End(); if (playAlpha) ImGui::PopStyleVar(); return; }
+        DrawFocusHud(true); if (g_place.active) DrawPlaceHud(true);
         HandleHotkeys(havePos);
         if (ImGui::SmallButton(T(ICON_LIST " full editor"))) { g_compact = false; g_mainTab = g_compactPage; g_selectMainTab = true; }
-        ImGui::SameLine();
+        SameLineForControl(g_cameraMode ? ICON_EYE " flying" : ICON_EYE " free camera");
         ImGui::BeginDisabled(!core::FreeCamAvailable());
         const bool flying = g_cameraMode;   // decided once: the click below toggles it
         if (flying) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f));
         if (ImGui::SmallButton(T(flying ? ICON_EYE " flying" : ICON_EYE " free camera"))) ToggleCameraMode();
         if (flying) ImGui::PopStyleColor();
         ImGui::EndDisabled();
-        ImGui::SameLine(0, 3); DrawCameraViewTool();
+        SameLineOrWrap(true, ImGui::GetFrameHeight(), 3); DrawCameraViewTool();
         ImGui::TextDisabled(T("%s = %s   %s = hide"), core::KeyName(core::g_keyMode), T(g_cameraMode ? "exit camera" : (g_playMode ? "edit" : "camera")), core::KeyName(core::g_keyToggle));
         struct DockPage { int id; const char* label; };
         static const DockPage dockPages[] = {
@@ -3445,10 +4323,10 @@ namespace editor {
         };
         for (int i = 0; i < (int)(sizeof(dockPages) / sizeof(dockPages[0])); ++i) {
             if (dockPages[i].id == TabTerrain && !core::TerrainAvailable()) continue;
-            if (i && i != 2 && i != 4) ImGui::SameLine(0, 4);
+            if (i) SameLineForControl(dockPages[i].label);
             const bool act = g_compactPage == dockPages[i].id;   // decided once: the click below may change the page
             if (act) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
-            if (ImGui::SmallButton(TStable(dockPages[i].label))) { g_compactPage = dockPages[i].id; g_mainTab = dockPages[i].id; }
+            if (ImGui::SmallButton(TStable(dockPages[i].label))) { g_compactPage = dockPages[i].id; g_mainTab = dockPages[i].id; ImGui::SetScrollY(0); }
             if (act) ImGui::PopStyleColor();
         }
         if (g_compactPage == TabScene) {
@@ -3576,26 +4454,43 @@ namespace editor {
 
 
     // one line that always says who gets the mouse and the keyboard right now (top left, no inputs)
-    static void DrawFocusHud() {
+    static void DrawFocusHud(bool embedded, float top) {
         if (!g_open && !g_place.active) return;
-        ImGuiIO& io = ImGui::GetIO();
-        const bool modMouse = g_open ? !g_playMode : MouseMode();
-        ImGui::SetNextWindowPos(ImVec2(10.0f, 8.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(g_playMode ? 0.18f : 0.75f);
-        if (ImGui::Begin("##focushud", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
-            const ImVec4 mod(0.95f, 0.62f, 0.35f, 1.0f), game(0.55f, 0.85f, 0.55f, 1.0f);
-            ImGui::TextColored(modMouse ? mod : game, T(modMouse ? "MOUSE: World Builder" : "MOUSE: game"));
-            ImGui::SameLine(); ImGui::TextDisabled("  |  ");
-            ImGui::SameLine(); ImGui::TextColored(g_cameraMode ? mod : game, T(g_cameraMode ? "KEYS: camera" : "KEYS: game"));
-            if (g_place.active) { ImGui::SameLine(); ImGui::TextColored(mod, T(core::g_keyboardPlacement ? "  placement: keyboard + gizmo" : "  placement: mouse gizmo")); }
-            if (g_open && !g_compact) { ImGui::SameLine(); ImGui::TextDisabled("     %s = %s", core::KeyName(core::g_keyMode), T(g_cameraMode ? "exit camera mode" : "camera mode")); }
-            if (g_open && !g_playMode && io.WantTextInput) { ImGui::SameLine(); ImGui::TextColored(mod, T("   typing: keys go to the text field")); }
+        g_focusHudDrawn = true; ImGuiIO& io = ImGui::GetIO(); const bool modMouse = (g_open && !g_playMode) || MouseMode();
+        if (!embedded) {
+            ImGui::SetNextWindowPos(ImVec2(ImGui::GetStyle().WindowPadding.x, top), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(std::min(io.DisplaySize.x - ImGui::GetStyle().WindowPadding.x * 2, ImGui::GetFontSize() * 42), 0), ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(g_playMode ? 0.18f : 0.75f);
         }
-        ImGui::End();
-        (void)io;
+        if (embedded || ImGui::Begin("##focushud", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
+            const ImVec4 mod(0.95f, 0.62f, 0.35f, 1.0f), game(0.55f, 0.85f, 0.55f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, modMouse ? mod : game); ImGui::TextWrapped("%s", T(modMouse ? "MOUSE: World Builder" : "MOUSE: game")); ImGui::PopStyleColor();
+            SameLineForControl(g_cameraMode ? "KEYS: camera" : "KEYS: game");
+            ImGui::PushStyleColor(ImGuiCol_Text, g_cameraMode ? mod : game); ImGui::TextWrapped("%s", T(g_cameraMode ? "KEYS: camera" : "KEYS: game")); ImGui::PopStyleColor();
+            if (g_place.active) ImGui::TextWrapped("%s", T(core::g_keyboardPlacement ? "  placement: keyboard + gizmo" : "  placement: mouse gizmo"));
+            if (g_open && !g_compact) ImGui::TextWrapped("%s = %s", core::KeyName(core::g_keyMode), T(g_cameraMode ? "exit camera mode" : "camera mode"));
+            if (g_open && !g_playMode && io.WantTextInput) ImGui::TextWrapped("%s", T("   typing: keys go to the text field"));
+        }
+        if (!embedded) { g_focusHudHeight = ImGui::GetWindowPos().y + ImGui::GetWindowHeight(); ImGui::End(); }
+    }
+    static bool EditorMutationPending() {
+        if (g_place.active || g_numericEditId || g_numericSceneUid || g_numericNpcUid || g_brushPainting || g_brushTicket ||
+            g_projectCommandPending || g_exportOpen || !g_projectOverwriteName.empty() || g_deferredEditor.action || !g_pendingGround.empty() || !g_browserDropJobs.empty() || !g_npcDropJobs.empty() || ImGui::IsAnyItemActive()) return true;
+        for (const auto& report : g_projectPlacements) if (!core::PlaceRequestState(report.request).settled) return true;
+        return false;
     }
     void Draw() {
-        AutoSaveTick();
+        ReconcileSpawnHistory();
+        g_placeHudDrawn = g_focusHudDrawn = false;
+        struct FrameCommit { ~FrameCommit() {
+            if (!TerrainTabShown()) CommitBrushHistory(); PumpGroundHistory();
+            float top = ImGui::GetStyle().WindowPadding.y;
+            if (g_open) if (auto* w = ImGui::FindWindowByID(ImHashStr(g_compact ? "###cdmodkit_dock" : "###cdmodkit")))
+                if (w->Collapsed) top = w->Pos.y + w->Size.y + ImGui::GetStyle().ItemSpacing.y;
+            if (!g_focusHudDrawn) DrawFocusHud(false, top);
+            if (g_place.active && !g_placeHudDrawn) DrawPlaceHud();
+            FinalizeNumericEdits(); PublishProjectContext(); AutoSaveTick();
+        } } frameCommit;
         {   // in-game names follow the UI language
             static std::string lastLang; std::string lang = i18n::ActiveLanguage();
             if (lang != lastLang) { lastLang = lang; thumbgen::WantNamesLanguage(lang); }
@@ -3603,13 +4498,11 @@ namespace editor {
         }
         SampleCamera();
         PosInfo p{}; bool havePos = core::PlayerPosInfo(&p);
-        DrawFocusHud();
         TrackFacing(p, havePos);
-        PlaceTick();                           // runs with the menu closed as well
         PumpSnapJobs();
+        PlaceTick();                           // runs with the menu closed as well
         PumpBrowserDropJobs();                 // a drop whose ground probe returns after the window was hidden still spawns
         PumpNpcDropJobs();
-        if (g_place.active) DrawPlaceHud();
         if (g_place.active && (g_place.hasNpc || g_gizmo || MouseMode())) { const bool one = g_place.m.size() == 1; const CamFrame cf = CurrentCam();
             DrawGizmo(g_place.center, one ? WrapYaw(g_place.m[0].rot0.yaw + g_place.yaw) : g_place.yaw, one ? WrapYaw(g_place.m[0].rot0.pitch + g_place.pitch) : g_place.pitch, GizmoScreenSize(cf, g_place.center, g_place.radius), g_place.drag ? g_place.drag : g_place.hover); }
         if (g_place.active && !g_open) ImGui::GetIO().MouseDrawCursor = MouseMode();
@@ -3625,6 +4518,8 @@ namespace editor {
         io.MouseDrawCursor = !g_playMode;
         BrushTick(p, havePos);
         ClickSelect(p, havePos); DrawWorldContextPopup(havePos); DrawSelectionOutlines();
+        if (SharedPage(g_mainTab)) g_compactPage = g_mainTab;
+        else if (!SharedPage(g_compactPage)) g_compactPage = TabBrowser;
         if (g_compact) { DrawCompact(p, havePos); DrawMetadataPopups(); CameraTick(); return; }
         {   // initial size follows the UI scale (style is scaled by screen height / 1080) and stays inside the screen
             const float ui = ImGui::GetFontSize() / 17.0f;
@@ -3639,9 +4534,10 @@ namespace editor {
         const bool began = ImGui::Begin(title, &g_open, playAlpha ? ImGuiWindowFlags_NoInputs : 0);
         if (!g_open) { ImGui::End(); if (playAlpha) ImGui::PopStyleVar(); FinishCloseEditor(); return; }
         if (!began) { ImGui::End(); if (playAlpha) ImGui::PopStyleVar(); CameraTick(); return; }
+        DrawFocusHud(true); if (g_place.active) DrawPlaceHud(true);
         HandleHotkeys(havePos);
         if (!core::BuildOk()) {
-            ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), T("Game functions not resolved: %s"), core::BuildMessage()[0] ? core::BuildMessage() : "verification pending");
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.4f, 0.3f, 1)); ImGui::TextWrapped(T("Game functions not resolved: %s"), core::BuildMessage()[0] ? core::BuildMessage() : "verification pending"); ImGui::PopStyleColor();
             ImGui::TextWrapped(T("Spawning is disabled to avoid crashes. See bin64\\cdmodkit\\cdmodkit.log (RESOLVE FAILED)."));
             ImGui::TextWrapped(T("Game build %s - a patch moves the game's functions; report that build number so the signatures can be updated."), core::GameVersion()[0] ? core::GameVersion() : "unknown");
         }
@@ -3651,11 +4547,7 @@ namespace editor {
             ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1), T(ICON_XMARK "  Prefab list not found: the browser and the search stay empty."));
             ImGui::EndChild(); ImGui::PopStyleColor();
         }
-        if (ImGui::SmallButton(T(ICON_COPY " dock"))) {
-            g_compactPage = (g_mainTab == TabScene || g_mainTab == TabNpcs || g_mainTab == TabProject ||
-                             g_mainTab == TabEnvironment || g_mainTab == TabTerrain) ? g_mainTab : TabBrowser;
-            g_compact = true;
-        }
+        if (ImGui::SmallButton(T(ICON_COPY " dock"))) g_compact = true;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T(
             g_mainTab == TabScene ? "narrow side window: Scene with the same editing controls" :
             g_mainTab == TabNpcs ? "narrow side window: NPC browser and spawning" :
@@ -3675,11 +4567,11 @@ namespace editor {
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", T(core::FreeCamAvailable()
                 ? "Free camera: W A S D move, E or Space up, Q down, Shift faster, mouse wheel forward. Ctrl remains available for multi-select and editor shortcuts. Drag with the right mouse button over the world to look around; a right click without moving opens the context menu. Your character stays where it is; new objects appear in front of the camera."
                 : "The free camera is not available in this game build (see the log)."));
-            ImGui::SameLine(); DrawCameraViewTool(); ImGui::SameLine();
+            SameLineOrWrap(false, ImGui::GetFrameHeight()); DrawCameraViewTool();
         }
-        if (havePos) ImGui::Text(T(ICON_LOCATION_DOT "  %.1f  %.1f  %.1f   tile %d,%d"), p.world.x, p.world.y, p.world.z, p.tileX, p.tileZ);
-        else ImGui::TextDisabled(T("player position not available (load a save)"));
-        ImGui::SameLine(ImGui::GetWindowWidth() - 330);
+        if (havePos) ImGui::TextWrapped(T(ICON_LOCATION_DOT "  %.1f  %.1f  %.1f   tile %d,%d"), p.world.x, p.world.y, p.world.z, p.tileX, p.tileZ);
+        else ImGui::TextWrapped("%s", T("player position not available (load a save)"));
+        SameLineOrWrap(false, 330);
         {   // game thread state: the mod runs its work on the game's simulation tick; the counter tells whether that tick is alive
             static long s_lastTicks = 0; static DWORD s_lastChange = 0; const long ticks = core::PumpTicks(); const DWORD now = GetTickCount();
             if (ticks != s_lastTicks) { s_lastTicks = ticks; s_lastChange = now; }
@@ -3712,7 +4604,7 @@ namespace editor {
                 const float width = ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
                 if (!firstNav) {
                     const float gap = ImGui::GetStyle().ItemSpacing.x;
-                    const float right = ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
+                    const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
                     if (ImGui::GetItemRectMax().x + gap + width <= right) ImGui::SameLine();
                 }
                 ImGui::PushID(page.id);
@@ -3885,4 +4777,35 @@ namespace editor {
         if (playAlpha) ImGui::PopStyleVar();
         CameraTick();
     }
+#ifdef WB_UNIFIED_HOST_TEST
+    namespace host_seam {
+        struct ActView { int kind = -1, uid = 0, group = 0, group1 = 0, proj = 0; };
+        int SpawnRecorded(const std::string& prefab, Vec3 pos, Rot rot, float scale, int group, int proj) {
+            if (!PrepareHistoryMutation([=]() { SpawnRecorded(prefab, pos, rot, scale, group, proj); })) return 0;
+            const int uid = core::SpawnAt(prefab, pos, rot, scale, group, proj);
+            std::vector<Act> acts; RecordSpawn(acts, uid, prefab, pos, rot, scale, group); Push(std::move(acts)); return uid;
+        }
+        bool UndoOne() { if (g_undo.empty()) return false; Undo(); return true; }
+        bool RedoOne() { if (g_redo.empty()) return false; Redo(); return true; }
+        size_t UndoSize() { return g_undo.size(); }
+        size_t RedoSize() { return g_redo.size(); }
+        bool HistoryView(bool redo, size_t entry, size_t act, ActView* out) {
+            const auto& stack = redo ? g_redo : g_undo;
+            if (entry >= stack.size() || act >= stack[entry].acts.size() || !out) return false;
+            const auto& a = stack[entry].acts[act]; *out = { (int)a.kind, a.uid, a.group, a.group1, a.proj }; return true;
+        }
+        void SelectUid(int uid) { ClearSceneSelection(); g_sel.insert(uid); g_primary = g_lastClicked = uid; }
+        void SelectAdd(int uid) { g_sel.insert(uid); g_primary = g_lastClicked = uid; }
+        void ClearSelection() { ClearSceneSelection(); }
+        int SelectionSize() { return (int)SceneSelectionCount(); }
+        bool IsSelected(int uid) { return g_sel.count(uid) != 0; }
+        void DeleteSelection() { DeleteSceneSelection(); }
+        void ForgetSelection() { ::editor::ForgetSelection(); }
+        void ResetHistory() { if (!PrepareHistoryMutation([]() { ResetHistory(); })) return; g_undo.clear(); g_redo.clear(); ClearSceneSelection(); }
+        bool LoadProjectAction(const std::string& name, bool clearFirst) { return ::editor::LoadProjectAction(name, clearFirst); }
+        bool PlaceGroupCopy(const proj_codec::Document& doc, Vec3 target, float yawDelta, float scale, const std::string& name) { return ::editor::PlaceGroupCopy(doc, target, yawDelta, scale, name); }
+        void ResetPlacement() { if (!PrepareHistoryMutation([]() { ResetPlacement(); })) return; if (g_place.active) CancelCarried(false); g_place = Place{}; core::g_placing = false; core::PublishGroundPlacement({}); }
+        void SetTickNow(DWORD tick) { g_tickOverride = tick; }
+    }
+#endif
 }

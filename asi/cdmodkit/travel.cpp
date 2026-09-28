@@ -13,6 +13,7 @@
 #include "guard.h"
 #include <windows.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -41,7 +42,12 @@ static bool MgrValid(uintptr_t m) { uintptr_t vt = 0; return m && ReadBytes(m, &
 // A fast travel of the player's own: remember the manager and the arguments the game uses right now.
 static void __fastcall HookStage(uintptr_t mgr, uint32_t key, uint32_t b, uint32_t c, const float* tf) {
     if (MgrValid(mgr)) { g_mgr = mgr; g_key = key; g_argB = b; g_argC = c; }
-    g_origStage(mgr, key, b, c, tf);
+    std::array<float, 10> transform{};
+    if (!ReadBytes((uintptr_t)tf, transform.data(), sizeof transform)) { Log("[travel] native stage transform unreadable; reload refused"); return; }
+    RunGroundWorldChange([mgr, key, b, c, transform]() {
+        if (!MgrValid(mgr)) { Log("[travel] native stage manager lost while waiting for grounding; reload refused"); return; }
+        g_origStage(mgr, key, b, c, transform.data());
+    }); // normally synchronous; an Applying ground member defers the copied request to a game tick
 }
 
 void TravelInstall() {
@@ -96,14 +102,14 @@ static bool CallStageGuarded(uintptr_t mgr, uint32_t key, uint32_t b, uint32_t c
 bool TravelTo(Vec3 pos, float yawDeg) {
     if (!g_travelOk) return false;
     if (!MgrValid(g_mgr)) { if (g_scan == 2) g_scan = 0; TravelPrepare(); return false; }   // a finished scan that found nothing may run again
-    RunOnGameThread([pos, yawDeg]() {
+    RunOnGameThread([pos, yawDeg]() { RunGroundWorldChange([pos, yawDeg]() {
         const uintptr_t mgr = g_mgr; if (!MgrValid(mgr)) { SetStatus("travel system lost, looking again"); g_mgr = 0; g_scan = 0; TravelPrepare(); return; }
         const float h = yawDeg * 3.14159265f / 360.0f;
         static float tf[10]; tf[0] = tf[1] = tf[2] = 1.0f; tf[3] = 0.0f; tf[4] = sinf(h); tf[5] = 0.0f; tf[6] = cosf(h); tf[7] = pos.x; tf[8] = pos.y; tf[9] = pos.z;   // scale, quat (x y z w), position
         const bool ok = CallStageGuarded(mgr, g_key, g_argB, g_argC, tf);
         Log("[travel] fast travel to (%.1f %.1f %.1f): %s", pos.x, pos.y, pos.z, ok ? "started" : "FAILED");
         SetStatus(ok ? "travelling" : "travel call failed");
-    });
+    }); }); // core holds world authority through any Applying-lease wait and the actual native call
     return true;
 }
 

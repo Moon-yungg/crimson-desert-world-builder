@@ -10,17 +10,26 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include "proj_codec.h"   // the C4 disk-value document a group copy is admitted from (values only, no handles)
+
+namespace core { struct PlaceRequest; }   // C5: caller-owned placement request (defined below)
 
 struct Vec3 { float x, y, z; };
 struct Rot { float yaw = 0, pitch = 0, roll = 0; };   // degrees; rotation = Ry(yaw) * Rx(pitch) * Rz(roll) (yaw about the up axis, then tilt, then roll)
 struct PosInfo { Vec3 tiled, world; int tileX, tileZ; };
 struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float scale; bool hidden; DWORD tick; Rot colRot; float colScale;
-                    int uid; int group; int proj; bool gimmick = false; uintptr_t actor = 0; bool standin = false; std::string note; };   // gimmick: spawned through the game's server path (obj = its server scene object, actor = its actor)   // uid: stable id for the editor (indices shift when entries are forgotten); group 0 = none;
-                                                        // proj: which project the object belongs to (0 = placed by hand, not part of a saved project yet)
+                    int uid; int group; int proj; bool gimmick = false; uintptr_t actor = 0; bool standin = false; uint64_t gen = 0; uint64_t poseGen = 0;
+                    std::weak_ptr<core::PlaceRequest> placeReq; int placeRow = -1; std::string note; };   // C5: the caller-owned request that owns this record's row (empty for editor-internal spawns). The record carries it, so a retry, a stand-in or a reversed completion always resolves its OWN row - never a basename or a global last-result lookup.   // gimmick: spawned through the game's server path (obj = its server scene object, actor = its actor)
+                                                       // proj: which project the object belongs to (0 = placed by hand, not part of a saved project yet)
+                                                       // gen: lifetime token of the record's current physical incarnation (C3). It is renewed when the physical object is
+                                                       // replaced (restore, re-create) or invalidated (hide/forget) so that engine work queued for an older incarnation can
+                                                       // never attach to a newer one; the record keeps its uid, project, group and pose across all of them.
 struct ManagedNpc { int uid = 0; uint32_t key = 0; Vec3 pos{}; int type = 1; uint32_t extra = 0; uintptr_t actor = 0; uint32_t actorId = 0;
                     uintptr_t transform = 0; DWORD spawnRequestTick = 0; bool editMoving = false; Vec3 liveMoveTarget{}; bool liveMovePending = false;   // runtime-only live binding/edit state; not serialized
                     bool aiEnabled = true; bool aiApplied = true; int behavior = 0; bool hidden = false; bool spawnPending = false; DWORD tick = 0;
-                    int group = 0; int proj = 0; std::string label, note; };
+                    int group = 0; int proj = 0; std::string label, note; uint64_t gen = 0; };
 
 namespace core {
     constexpr int kResourcePrefabs = 101;
@@ -108,11 +117,16 @@ namespace core {
     void RayTrace(int calls);                  // logs the next N ray casts of the game (reverse engineering aid)
     void ProbeGround(float above, float len);  // dev: logs three replayed casts from above the player
     // Ground queries: a sphere cast of the game (captured automatically from its own character probe) replayed downward.
-    struct GroundHit { bool done = false, hit = false; float centerY = 0; float fraction = 0; Vec3 normal{}; Vec3 center{}; };   // center: sphere centre at the hit
+    struct GroundHit { bool done = false, hit = false; float centerY = 0; float fraction = 0; Vec3 normal{}; Vec3 center{}; float radius = 0; };   // center: sphere centre at the hit
     bool GroundProbeReady();                   // a cast template was captured (the character has to be in the world for a moment)
     int  GroundProbe(Vec3 start, float len);   // queues a cast from start straight down on the game thread; ticket (0 = not possible)
     int  RayProbe(Vec3 start, Vec3 dir, float len);   // the same cast along any direction (result: GroundResult, center = hit sphere centre)
-    bool GroundResult(int ticket, GroundHit* out);
+    // Raw tickets have explicit terminal outcomes. Only Pending is retryable. Terminal results are consumed;
+    // Unknown means never admitted, already consumed, or evicted. Invalidated/Unknown must DISCARD a brush/drop
+    // action (no paint, spawn or old-position fallback). Hit/Miss alone carry a physical cast result in out.
+    enum class GroundProbeStatus { Pending, Hit, Miss, Invalidated, Unknown };
+    GroundProbeStatus GroundResultState(int ticket, GroundHit* out);
+    bool GroundResult(int ticket, GroundHit* out); // legacy: true only for Hit/Miss; raw UI consumers must use GroundResultState
     bool GroundGrid(float x0, float z0, int nx, int nz, float step, float top, float len, std::vector<float>* out);   // research: collision heights on a grid (NAN = none)   // true once the ticket finished (poll every frame)
     extern float g_probeRadius;                // sphere radius of the template, calibrated at the player's feet (ground = centerY - radius)
 
@@ -148,12 +162,69 @@ namespace core {
     void SetManagedNpcLabel(int uid, const std::string& label);
     int  NpcState();                                  // 0 = not available in this game build, 1 = walk a few steps first (player actor unknown), 2 = ready
     bool NpcAiControlAvailable();                      // native AI control-ownership request + actor registry resolved
+#ifdef WB_UNIFIED_HOST_TEST
+    // Native boundaries only; registry, generation, desired AI state, queues and persistence remain production.
+    struct ManagedNpcNativeTest {
+        std::function<int()> state;
+        std::function<bool(uint32_t, Vec3, int, uint32_t, uintptr_t*, uint32_t*)> spawn;
+        std::function<uintptr_t(uintptr_t)> transform;
+        std::function<bool(uint32_t)> toggleAi;
+    };
+    extern ManagedNpcNativeTest g_managedNpcNativeTest;
+#endif
     std::vector<SpawnedObj> Spawned();
     int  IndexOfUid(int uid);                   // -1 when the object was forgotten
     void SetGroup(int uid, int group); int NewGroupId();
     std::string GroupName(int group); void SetGroupName(int group, const std::string& name);
     void SetObjectNote(int uid, const std::string& note);
     struct MoveReq { int uid; Vec3 pos; Rot rot; float scale; };
+    // C7: one authority from probe through actual final movement. Handles own immutable terminal receipts;
+    // editor serial/branch reservation is separate from History insertion. No engine call holds the local
+    // operation mutex (lock order operation -> registry); Applying owns leases until all members finish.
+    enum GroundState { GroundProbing, GroundReady, GroundQueued, GroundApplying, GroundSettled,
+                       GroundReconciled, GroundCanceled, GroundInvalidated, GroundFailed };
+    struct GroundPlacement { uint64_t generation = 0, transform = 0; std::vector<int> members; };
+    struct GroundMemberResult {
+        SpawnedObj before, after;
+        MoveReq requested{};
+        bool terminal = false, accepted = false;
+        std::string reason;
+    };
+    struct GroundView {
+        uint64_t id = 0, serial = 0, branch = 0, epoch = 0;
+        GroundState state = GroundProbing;
+        int probe = 0; // most recent ticket identity; retained in the immutable terminal receipt
+        GroundPlacement carried;
+        std::vector<GroundMemberResult> members;
+        std::string reason;
+        bool terminal() const { return state >= GroundSettled; }
+    };
+    struct GroundOp;
+    using GroundHandle = std::shared_ptr<GroundOp>;
+    GroundHandle BeginGround(const std::vector<int>& uids, uint64_t serial, uint64_t branch,
+                             const GroundPlacement& carried = {});
+    GroundView GroundStateOf(const GroundHandle& op);
+    bool GroundValidate(const GroundHandle& op);
+    bool GroundBounds(const GroundHandle& op, proj_codec::Bounds& bounds);
+    void GroundCancel(const GroundHandle& op, const char* reason = "canceled");
+    // One virtual frame per Draw, independent of wall clock. 120 readiness/ticket; 240 total unapplied.
+    void GroundFrame();
+    int GroundTicket(const GroundHandle& op, Vec3 start, float length);
+    bool GroundPoll(const GroundHandle& op, GroundHit* hit);
+    bool GroundApply(const GroundHandle& op, const std::vector<MoveReq>& moves);
+    // Atomically cancel unapplied members and observe the WHOLE batch. Applying is never called canceled.
+    std::vector<GroundView> GroundBarrier(const std::vector<GroundHandle>& batch, bool cancelUnapplied);
+    bool GroundReconcile(const std::vector<GroundHandle>& batch);
+    uint64_t GroundNotice();                  // terminal publication event sequence, not UI delivery authority
+    bool PublishGroundPlacement(const GroundPlacement& placement);
+    // Validates the carried context AND actual member identities/poses under the admission mutex, then
+    // performs a state-only editor update. The callback must not call core/engine functions.
+    bool GroundUpdateCarried(const GroundHandle& op, const GroundPlacement& next, std::function<void()> update);
+    void InvalidateGroundWorld();             // world/template replacement (teleport uses the same epoch)
+    // Game-thread native world transition. Invalidates unapplied work immediately; Applying keeps its leases.
+    // If a lease is live, copies of the callback wait behind it and resume on the GAME thread. The same world
+    // authority rejects new probes/Apply until the callback finishes (also on failure); no mutex crosses native code.
+    void RunGroundWorldChange(std::function<void()> change);
     bool MoveMany(const std::vector<MoveReq>& reqs, bool final);   // all moves in one game-thread job; false = dropped (live, queue lagging)
     bool HideUid(int uid); void ForgetUid(int uid);
     // SceneObject::setWorldTransform on the game thread. final=false uses flags (0,0) (update without re-insert, for dragging),
@@ -161,7 +232,13 @@ namespace core {
     bool MoveSpawned(size_t idx, Vec3 pos, Rot rot, float scale, bool final = true);
     bool HideSpawned(size_t idx);               // scale ~0 and far below the world
     void ForgetSpawned(size_t idx);
+    // C3: bring a hidden logical record back to life with a fresh physical generation. The uid and every
+    // record-owned value (project, group, pose, prefab) are kept exactly as the record carries them - never an
+    // older History snapshot, so a later AssignProject/SaveProject adoption survives undo/redo. false when the
+    // record was explicitly forgotten, is already materialized, or the game thread is not ready yet.
+    bool RestoreUid(int uid);
     extern bool g_recreateOnMove;               // false: disable/setTransform/enable in place; true: remove + re-create
+    extern bool g_liveDrag;                     // live drag in the details pane (editor details checkbox + console "livedrag on/off")
     extern int  g_liveMode;                     // live-drag method, see DoLiveMove
     extern bool g_uiTextInput, g_uiMouseOverUi;  // a text field is active / the cursor is over a World Builder window (finer than g_uiWants*: edit mode claims all input)
     extern int  g_keyToggle, g_keyMode;         // configurable hotkeys (virtual key codes), settings.txt in the mod folder
@@ -252,19 +329,264 @@ namespace core {
     enum SaveScope { SaveWholeScene = 0, SaveProjectAndNew = 1, SaveNewOnly = 2, SaveProjectOnly = 3 };
     int  ProjectId(const std::string& name);       // id for a project name, creating one on first use (0 for an empty name)
     std::string ProjectNameOf(int id);             // "" for 0 / unknown
-    int  ProjectObjectCount(int id);               // visible entities (objects + managed NPCs) belonging to the project; 0 = new/unassigned
+    int  ProjectObjectCount(int id);               // visible objects + visible managed NPCs + terrain strokes (upstream scene-count semantics); 0 = new/unassigned
     bool ProjectDirty(int id);                     // an entity/metadata item changed since the last load/save
     void AssignProject(int uid, int proj);
+    // Save is validate-first and transactional: the whole document (values, copy envelopes, bounds) is built
+    // from the live records and re-parsed before the destination is replaced through a same-directory temporary
+    // file. A failure leaves the previous bytes, the membership and the dirty stars untouched. Adoption (the
+    // written records becoming members) is skipped for any record whose project changed while the file was being
+    // written, so a newer adoption is never overwritten by the captured snapshot; that project then stays dirty.
     bool SaveProject(const std::string& name, int scope = SaveWholeScene);   // saved objects become members of that project
-    bool LoadProject(const std::string& name, bool clearFirst);   // spawns are queued one per game tick
-    bool UnloadProject(int id);                     // removes this project's live objects and managed NPCs without touching its file
+    // Load validates the full document - parse, metadata, float and tiled-int16 narrowing - BEFORE anything
+    // changes: no DeleteAllSpawned, no ProjectId allocation, no queue/selection/History mutation happens for a
+    // document that is rejected. Group files are never loaded here. Spawns are queued one per game tick; rows
+    // the legacy state wrapper marked hidden/missing are reported as named exclusions (see ProjectLoadReportFor).
+    bool PreflightProject(const std::string& name); // validate-only, before the editor History barrier
+    // Synchronous outcome: false (including busy) performs no scene mutation and schedules no deferred load.
+    // true means validated registry/terrain admission finished and its report is available; native spawns may
+    // still be queued or later refused. Inspect report counts, never infer native attachment success from this bool.
+    bool LoadProject(const std::string& name, bool clearFirst);
+    // C4/C6: the last successful admission of that name reports queued objects and named exclusions.
+    // Failure publishes no NEW receipt; check the bool first (an older successful receipt may still exist).
+    // ProjectError names validation/busy failure; valid exclusions are not malformed parse success.
+    struct ProjectLoadReport { bool valid = false; int requested = 0; int queued = 0; int excluded = 0; std::vector<std::string> excludedPrefabs;
+                               int requestedNpcs = 0, queuedNpcs = 0, excludedNpcs = 0, terrainStrokes = 0; std::vector<uint32_t> excludedNpcKeys; };
+    ProjectLoadReport ProjectLoadReportFor(const std::string& name);
+    std::string ProjectError();                    // last save/load failure ("" = none); names the data-record ordinal
+    // validate-first copy of a shared .cdproj into bin64\cdmodkit\projects: malformed bytes are refused and
+    // nothing appears on disk (the previous file of that name, if any, is untouched)
+    bool ImportProjectFile(const std::string& path);
+    bool UnloadProject(int id); // false = busy/empty/invalid, no deferred unload; true = logical removal done, native cleanup may remain queued
+    bool ReloadProject(const std::string& name); // same synchronous outcome as Load; ONE snapshot validated before any old entities are removed
+    bool ProjectMutationPending(int id); // live AUTOSAVE/readiness gate only; false is NOT a success/completion receipt
     std::vector<std::string> ListProjects();
-    void DeleteAllSpawned();
+    // Clear's synchronous success authority for the editor: false = busy, no scene mutation or deferred action;
+    // true = all logical objects/NPCs/terrain removed (including an already-empty scene). Native cleanup may be queued.
+    // Only true authorizes the caller's selection/History cleanup. ProjectMutationPending is never an outcome.
+    bool ClearScene();
+    void DeleteAllSpawned(); // compatibility only: calls ClearScene and logs refusal; NEVER defers. UI must use the bool.
     // Autoload: bin64\cdmodkit\autoload.txt, one project name per line (without .cdproj), '#' at the line start = comment.
     // Several projects can be active at once; they are all loaded, in file order, once the player is in the world.
-    void SetAutoload(const std::string& name, bool on);   // adds or removes one project; the file is deleted when none are left
+    // File lifecycle never unloads objects, clears History, or implicitly switches autoload OFF.
+    enum class FileReason {
+        None, InvalidName, InvalidAction, NotFound, StaleTarget, ConfirmationMismatch, GuardMissing,
+        SelectionChanged, VisibleReference, HiddenReference, UndoReference, RedoReference, DirtyProject,
+        PendingOperation, InFlightExport, InFlightPlace, AutoloadEnabled, AutoloadReadFailed,
+        Collision, UnsafePath, ReadFailed, WriteFailed, MoveFailed, DeleteFailed, VerifyFailed
+    };
+    struct FileResult {
+        FileReason reason = FileReason::None;
+        DWORD systemError = 0;
+        bool ok() const { return reason == FileReason::None; }
+    };
+    const char* FileReasonCode(FileReason reason); // stable machine code; UI localizes separately
+    bool FileNameEqual(const std::string& a, const std::string& b); // Windows ordinal casefold, also for the editor's reference guard
+    struct SavedFile { proj_codec::Kind kind = proj_codec::Kind::Project; bool archived = false; std::string filename, path; };
+    struct FileSelection; // immutable file identity + exact bytes captured when the action/modal opens
+    using FileSelectionHandle = std::shared_ptr<const FileSelection>;
+    FileResult ListSavedFiles(proj_codec::Kind kind, bool archived, std::vector<SavedFile>& files);
+    // Caller-owned library cache. Refresh is read-only and publishes only on success; a failure preserves
+    // the previous snapshot. All four locations are listed, then ownership is counted in ONE registry pass.
+    // visible/hidden count OBJECTS only; NPCs and terrain have separate components. Pending is a subset of visible, not an added entity.
+    // Windows-equivalent project names share counts; groups have none. These are display values, NOT an
+    // archive/delete authority: SelectSavedFile and the live execution guard are still required.
+    struct ProjectOwnership { size_t visible = 0, hidden = 0; bool dirty = false; size_t terrain = 0;
+                              size_t visibleNpcs = 0, hiddenNpcs = 0, pendingObjects = 0, pendingNpcs = 0; };
+    struct SavedLibraryEntry { SavedFile file; ProjectOwnership ownership; };
+    struct SavedLibraryTotals { size_t projects = 0, groups = 0; };
+    struct SavedLibrarySnapshot {
+        std::vector<SavedLibraryEntry> entries;
+        SavedLibraryTotals active, archived;
+        ProjectOwnership unassigned;
+    };
+    enum class SavedLibraryKind { All, Projects, Groups };
+    enum class SavedLibraryLocation { Active, Archived, All };
+    // Order: ordinal case-insensitive full filename, exact ordinal case, kind, active before archived,
+    // exact path. No filesystem enumeration order or allocated ProjectId participates in the tie-break.
+    FileResult RefreshSavedLibrary(SavedLibrarySnapshot& snapshot);
+    // Case-insensitive ordinal substring search of the full filename; empty search matches all names.
+    // Returns indices into this snapshot in its sorted order. Filtering performs no file or scene reads.
+    std::vector<size_t> FilterSavedLibrary(const SavedLibrarySnapshot& snapshot, SavedLibraryKind kind,
+                                          SavedLibraryLocation location, const std::string& search);
+#ifdef WB_UNIFIED_HOST_TEST
+    // Observes Spawned, ProjectObjectCount and library refresh, under the registry lock. Tests reset only
+    // while quiescent, so a per-row fallback to either older enumeration API cannot escape the work bound.
+    struct SceneEnumerationStats { size_t calls = 0, records = 0; };
+    extern SceneEnumerationStats g_sceneEnumerationStats;
+#endif
+    FileResult SelectSavedFile(const SavedFile& file, FileSelectionHandle& selection);
+    SavedFile SelectedFile(const FileSelectionHandle& selection);
+    enum class FileAction { Archive, Restore, Purge, Delete };
+    // Required execution-time editor authority, NOT a cached boolean from the rendered row. Called on the
+    // editor thread immediately before the protected core check/mutation. It must compare the CURRENT selected
+    // kind/archive/filename/path and inspect BOTH History stacks (act.proj AND current record ownership),
+    // deferred intents, pending reports and carried Place for this file. Return SelectionChanged / UndoReference /
+    // RedoReference / PendingOperation / InFlightPlace / InFlightExport, or None. No editor mutation or pumping
+    // inside the callback. An absent authority fails closed. Core independently guards registry/dirty/autoload
+    // and in-flight core file work. Task 13 owns wiring this authority to its UI state.
+    using FileExecutionGuard = std::function<FileReason(const SavedFile&)>;
+    FileResult ExecuteFileAction(const FileSelectionHandle& selection, FileAction action,
+                                 const std::string& typedFilename, const FileExecutionGuard& guard);
+#ifdef WB_UNIFIED_HOST_TEST
+    enum class FileMutationFault { None, Move, Delete };
+    extern FileMutationFault g_fileMutationFault; // one-shot OS-boundary refusal, after all production guards
+#endif
+    FileResult SetAutoload(const std::string& name, bool on); // atomic, reopened verification; empty list deletes autoload.txt
     std::vector<std::string> Autoload();
     int  PendingSpawns();
+
+    // ---- C5: per-request caller-owned terminal placement results ----------------------------------------
+    // One placement REQUEST owns a fixed set of rows (original row id + prefab). The caller (editor UI) holds
+    // the shared handle and reads its receipt; every callback resolves the row through the record it created
+    // (SpawnedObj::placeReq/placeRow), never through a basename or a global "last result". A row moves from
+    // Pending to exactly one terminal state - Attached (a real engine attachment on a FINAL lane), Excluded
+    // (preflight missing/hidden/nonplaceable), Failed (actual final engine failure) or Canceled - so
+    //     requested == attached + excluded + failed + canceled + pending
+    // holds at every observation. An intermediate stand-in during a retry is NOT a terminal attachment and
+    // stays Pending; the accepted plain-object fallback after the retry budget is spent records its own lane.
+    // Hide/Undo after completion never rewrites a settled receipt. PendingSpawns() is a queue diagnostic only.
+    enum PlaceRowState { PlacePending = 0, PlaceAttached = 1, PlaceExcluded = 2, PlaceFailed = 3, PlaceCanceled = 4 };
+    enum PlaceLane {
+        PlaceLaneNone    = 0,   // no engine attachment (excluded / failed / canceled)
+        PlaceLaneGeneric = 1,   // the plain client-object lane (SpawnAt -> DoSpawn)
+        PlaceLaneDirect  = 2,   // the template-free server builder
+        PlaceLaneReplay  = 3,   // the captured-template server replay
+        PlaceLanePlain   = 4,   // the accepted plain-object fallback after the interactive retry budget was spent
+        PlaceLaneStandin = 5    // an intermediate client stand-in during a retry: observed, never a terminal attachment
+    };
+    struct PlaceRow {
+        int rowId = 0;                    // fixed original row id inside the request
+        std::string prefab;
+        int state = PlacePending;         // PlaceRowState
+        int lane = PlaceLaneNone;         // the lane that actually attached the row
+        int uid = 0;                      // logical record uid once admitted (0 = never admitted)
+        int attachObservations = 0;       // diagnostic: every real engine attach callback seen for this row (a stand-in counts; the terminal transition happens once)
+        bool removedAfterAttach = false;  // a cancel removed this row's already attached member
+        int cleanupObligations = 0;       // counted cleanup obligations: every queued engine removal that must precede finality holds one, released by its own lane completion after dispatch
+        bool cleanupPending = false;      // derived mirror of (cleanupObligations > 0), kept for existing observers
+        std::string reason;               // named exclusion/failure reason (empty for Attached)
+    };
+    struct PlaceRequestView {
+        int requested = 0, attached = 0, excluded = 0, failed = 0, canceled = 0, pending = 0;
+        bool settled = false;             // no pending rows and no cancel cleanup left
+        bool requestCanceled = false;
+        bool cleanupPending = false;
+        std::vector<PlaceRow> rows;
+        // the existing C5 UI projection (four totals); Failed and Canceled are displayed under excluded
+        int displayedPlaced()   const { return attached; }
+        int displayedExcluded() const { return excluded + failed + canceled; }
+        int displayedPending()  const { return pending; }
+    };
+    // Opaque, caller-owned. The UI holds one handle and reads its own receipt; callbacks use the row identity
+    // carried by the record, so two requests can share a basename without sharing a result.
+    struct PlaceRequest {
+        std::vector<PlaceRow> rows;
+        bool canceled = false;
+        int cleanupOutstanding = 0;       // queued engine removals that must precede finality: always the sum of the rows' cleanupObligations
+        std::mutex m;                     // serializes row settlement; never held while the registry lock is taken
+    };
+    typedef std::shared_ptr<PlaceRequest> PlaceRequestHandle;
+    // The requested count is fixed here (one row per prefab, row ids 0..n-1).
+    PlaceRequestHandle BeginPlaceRequest(const std::vector<std::string>& prefabs);
+    // Spawn one row through the production lanes and bind the record to this request+row. `group` is the
+    // already-remapped session partition (0 = ungrouped). Returns the logical uid (0 when the row was
+    // terminally excluded before any spawn).
+    int  SubmitPlaceRow(const PlaceRequestHandle& req, int rowId, Vec3 world, Rot rot = Rot(), float scale = 1.0f, int group = 0);
+#ifdef WB_UNIFIED_HOST_TEST
+    // B2-R1 deterministic admission-interrupt seam: SubmitPlaceRow invokes this after the record and its
+    // executable work are published but before the row UID is written, so a test can deterministically cancel
+    // inside the actual in-flight native boundary with row.uid == 0. Null by default: admission is
+    // uninterrupted. Never set outside host tests.
+    extern std::function<void()> g_admissionInterrupt;
+#endif
+    // Preflight (caller-side) exclusion: missing/hidden/nonplaceable rows never spawn.
+    bool PlaceRowExclude(const PlaceRequestHandle& req, int rowId, const std::string& reason);
+    bool PlaceRowCancel(const PlaceRequestHandle& req, int rowId);
+    // Cancel invalidates every unapplied row and removes the already attached members through the existing
+    // HideUid semantics, keeping their terminal Attached receipts. Returns how many rows it moved/cleaned.
+    int  PlaceRequestCancel(const PlaceRequestHandle& req);
+    PlaceRequestView PlaceRequestState(const PlaceRequestHandle& req);
+
+    // ---- C4/C5: validated group admission (independent copies) ------------------------------------------
+    // One parsed group document becomes ONE independent copy in the scene. Every destination value (record
+    // pose, envelope bounds, pivot anchor) is computed by the saved-anchor geometry BEFORE any registry/queue/
+    // History mutation, so a rejected admission mutates nothing. Partitions are remapped per copy: every
+    // nonzero source group id gets a fresh nonzero session id (zero stays zero), so two admitted copies of the
+    // same source never share a partition. The saved anchor is the pivot and every envelope is carried per copy
+    // - never recomputed from the receiver's measurements, not even when a single member survives. Records are
+    // spawned through the caller-owned C5 request, so each row settles from its actual engine outcome; `uids`
+    // and `pivot` feed the existing camera-aware grab. A prefab the receiver does not know is a NAMED
+    // exclusion, never a parse failure.
+    struct GroupAdmissionReport {
+        bool valid = false;                        // true only when a copy was admitted (even with named exclusions)
+        int requested = 0, admitted = 0, excluded = 0;
+        std::vector<std::string> excludedPrefabs;  // named exclusions (missing prefab / refused admission)
+        std::string error;                         // named failure ("" = none)
+        PlaceRequestHandle request;                // the caller-owned per-record C5 receipt
+    };
+    // Admit one validated group copy: `uids` receives the admitted logical records and `pivot` the saved
+    // anchor's destination (the placement center the existing grab must use).
+    GroupAdmissionReport AdmitGroupCopy(const proj_codec::Document& doc, Vec3 target, double deltaYaw, double factor,
+                                        std::vector<int>& uids, Vec3& pivot);
+
+    // File-backed Place: rechecks the selected file's identity/bytes, parses it, then uses AdmitGroupCopy.
+    // Core tracks this file until the request settles INCLUDING cleanup. Carried-after-settlement is still
+    // editor-owned and must be rejected by FileExecutionGuard. Previously placed copies never block the file.
+    GroupAdmissionReport AdmitGroupFileCopy(const FileSelectionHandle& selection, Vec3 target, double deltaYaw,
+                                            double factor, std::vector<int>& uids, Vec3& pivot);
+
+    // ---- C6: protected group export ---------------------------------------------------------------------
+    // One selection becomes one .cdgroup document through the SAME authoritative value builder SaveProject
+    // uses (never a second builder and never cached bytes) and one transactional file write. The approval
+    // binds what the write must still observe: the selected UIDs, the selection/project/placement context the
+    // editor PUBLISHED, every inclusion/exclusion with its named reason, and the full values and envelopes.
+    // There is no global revision counter: each final boundary re-derives the semantic values from the live
+    // registry and compares them, and the protected replacement holds BOTH authorities - the selection
+    // publication and the registry - so neither can change between the last comparison and the atomic rename.
+    // A live final=false move, a changed selection/name/placement, a changed inclusion/exclusion or a changed
+    // envelope therefore rejects a stale approval; a rejected write leaves the previous file bytes untouched
+    // and removes only its own temporary.
+    struct ExportContext {
+        std::vector<int> selection;   // selected logical uids (order-insensitive; duplicates are tolerated)
+        std::string name;             // the destination name this context exports under
+        bool placing = false;         // a placement/grab is in progress
+        std::vector<int> carried;     // the uids that placement carries (order-insensitive)
+    };
+    // The editor publishes its live context on every selection/context mutation (including the destination
+    // name it would export under) and at the end of every frame that can mutate it, so the export guard always
+    // reads a fresh authority. PrepareGroupExport requires the passed selection AND name to be that published
+    // context. Publication touches nothing else and never takes the registry lock.
+    void PublishExportContext(const ExportContext& context);
+    ExportContext PublishedExportContext();
+
+    // One named exclusion: the uid, the prefab and the reason the selected object is not part of the group.
+    struct ExportExclusion { int uid = 0; std::string prefab; std::string reason; };
+    // What the editor holds between preflight and confirmation. `document` is the approved value document
+    // (kind=Group); WriteGroupExport re-derives everything from the live state and refuses an approval the
+    // live state no longer matches, so a tampered or stale approval can never replace the destination.
+    struct GroupExportApproval {
+        bool valid = false;                        // prepared from authoritative values and a fresh publication
+        std::string name;                          // destination group name (no extension)
+        std::string path;                          // full destination path (<moddir>\Groups\<name>.cdgroup)
+        bool overwriteApproved = false;            // explicit approval to replace an existing file
+        proj_codec::Document document;             // the approved semantic values/envelopes (kind=Group)
+        std::vector<int> included;                 // included uids, registry order
+        std::vector<int> projects;                 // parallel to included: each record's project id
+        std::vector<ExportExclusion> excluded;     // named exclusions, registry order (forgotten uids appended)
+        ExportContext context;                     // the published context this approval is bound to
+        std::string error;                         // named failure ("" = none)
+    };
+    // PREFLIGHT: builds the document from the authoritative value builder, names every inclusion/exclusion and
+    // rejects an empty selection, an all-excluded selection, an invalid name/path, an unpublished selection or
+    // context, and an existing destination without explicit overwrite approval. Mutates nothing.
+    bool PrepareGroupExport(const std::vector<int>& selection, const std::string& name, bool overwriteApproved,
+                            GroupExportApproval& approval);
+    // WRITE: validates the approval against the live registry and the published context BEFORE writing, writes
+    // a same-directory temporary and re-parses it, then validates again immediately before the protected
+    // replacement (both authorities held across the rename). Returns true only when the destination was
+    // actually replaced; every failure leaves the previous bytes and removes only the owned temporary.
+    bool WriteGroupExport(const GroupExportApproval& approval, std::string& error);
 }
 
 namespace overlay { void Install(); }

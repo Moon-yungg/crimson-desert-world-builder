@@ -43,9 +43,74 @@ void AssignProject(int uid, int proj) { int i = IndexOfUid(uid); if (i >= 0) obj
 void DeleteAllSpawned() { objects.clear(); }
 std::vector<std::string> ListProjects() { return {}; }
 std::vector<std::string> Autoload() { return {}; }
-void SetAutoload(const std::string&, bool) {}
+FileResult SetAutoload(const std::string&, bool) { return {}; }
 bool SaveProject(const std::string&, int) { return true; }
 bool LoadProject(const std::string&, bool) { return true; }
+// The upstream fixture predates the v0.97 core surface; these stubs only satisfy http_api.cpp's links for the
+// routes the upstream test does not exercise (camera/freecam, time, travel, NPC, research, terrain). Each one
+// keeps the production route's own unavailable/empty semantics; no upstream case is changed, skipped or added.
+bool CameraPose(Vec3* fwd, Vec3* pos) { *fwd = { 0, 0, 1 }; *pos = { 0, 0, 0 }; return true; }
+bool FreeCamAvailable() { return true; }
+bool FreeCamActive() { return false; }
+void SetFreeCam(bool) {}
+bool FreeCamPose(Vec3*, Vec3*) { return false; }
+void FreeCamFocus(Vec3, float) {}
+void FreeCamViewPreset(int) {}
+void FreeCamDolly(float) {}
+void FreeCamTurn(float, float) {}
+bool FreeCamSetPosition(Vec3) { return false; }
+bool FreeCamMove(float, float, float) { return false; }
+bool TimeControlAvailable() { return false; }
+bool TimeHour(float*) { return false; }
+bool TimeFrozen() { return false; }
+void SetTimeHour(float) {}
+void SetTimeFrozen(bool) {}
+void ResetTimeControl() {}
+bool ReadMem(uintptr_t, void*, size_t) { return false; }
+bool WriteMem(uintptr_t, const void*, size_t) { return false; }
+void ResearchPeek(uintptr_t, int, bool) {}
+void ResearchFind(const std::vector<uint8_t>&, int) {}
+void SetFallWatch(bool, uintptr_t, bool, uintptr_t, unsigned) {}
+void ResearchFindPos() {}
+void GroundTrace(int) {}
+int LoadDebugPoints(bool) { return 0; }
+void GeoTraceInstall(uintptr_t, int) {}
+void GeoTraceArm() {}
+void FnTraceInstall(uintptr_t) {}
+void IoTraceSet(const std::string&) {}
+void IoHeightDelta(int) {}
+void IoStreamDelta(int) {}
+void GpuTrace(int) {}
+std::string TerrainStatus() { return "unavailable in the HTTP contract test"; }
+std::vector<TerrainStroke> TerrainStrokes() { return {}; }
+bool PlayerPosInfo(PosInfo*) { return false; }
+bool TerrainApply(Vec3) { return false; }
+int TerrainEditDisc(float, float, float, float) { return 0; }
+void TerrainEditClear() {}
+void TerrainSyncTrace() {}
+void TerrainJobTrace(uintptr_t) {}
+void TerrainLoadTrace(int) {}
+void TerrainTexTrace(uintptr_t) {}
+void TeleTraceInstall(uintptr_t) {}
+void ReloadStageTrace(uintptr_t) {}
+void RsSendTrace(uintptr_t) {}
+void ClientReloadTrace(uintptr_t) {}
+void ClientReloadReplay(float, float, float) {}
+void ReloadStageReplay(float, float, float) {}
+bool ResearchWatchWrites(const uintptr_t*, int) { return false; }
+void TerrainTileTaskTrace(uintptr_t) {}
+void TerrainRetTrace(uintptr_t) {}
+void TerrainTexReload(int, int, uintptr_t, uintptr_t) {}
+void TerrainReloadCall(uintptr_t, int, const std::string&) {}
+void ResearchVtScan(const std::string&, int, int) {}
+void CamWatch(int, int) {}
+bool GroundGrid(float, float, int, int, float, float, float, std::vector<float>*) { return false; }
+bool TravelAvailable() { return false; }
+std::string TravelStatus() { return "unavailable in the HTTP contract test"; }
+bool TravelTo(Vec3, float) { return false; }
+bool SetPlayerPos(Vec3) { return false; }
+int NpcState() { return 0; }
+bool SpawnNpc(uint32_t, Vec3, int, uint32_t) { return false; }
 }
 
 static std::string Request(const std::string& method, const std::string& path, const std::string& body = "", const std::string& host = "127.0.0.1", const std::string& extra = "") {
