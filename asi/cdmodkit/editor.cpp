@@ -1638,7 +1638,7 @@ namespace editor {
             g_pendingGround.push_back(op); added.push_back(op);
             proj_codec::Bounds bounds;
             if (!core::GroundBounds(op, bounds)) { core::GroundCancel(op, "refused"); continue; }
-            SnapJob j; j.op = op; j.bottom = (float)bounds.min.y; j.top = (float)bounds.max.y; j.startY = j.top + 5.0f;
+            SnapJob j; j.op = op; j.bottom = (float)bounds.min.y; j.top = (float)bounds.max.y; j.startY = j.top + 0.5f;
             // Probe under the measured geometry, not its prefab pivot, which may sit well outside the visible mesh.
             j.x = (float)((bounds.min.x + bounds.max.x) * 0.5);
             j.z = (float)((bounds.min.z + bounds.max.z) * 0.5);
