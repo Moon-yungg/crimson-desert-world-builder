@@ -5398,8 +5398,6 @@ namespace editor {
                 ImGui::TextDisabled(T("objects %d  |  %s"), (int)core::Spawned().size(), T(state));
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Spawning and moving happen on the game's simulation tick (%ld ticks so far).\nPaused = loading screen, menu or pause; queued actions run once it continues."), ticks);
             }
-            ImGui::Separator();
-
             const bool inBrowser = g_mainTab == TabBrowser;
             if (g_mainTab == TabBrowser) DrawBrowser(p, havePos);
             else if (g_mainTab == TabNpcs) DrawNpcs(p, havePos);
