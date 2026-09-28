@@ -217,7 +217,7 @@ namespace editor {
     // collections: named prefab lists kept in bin64\cdmodkit\collections.txt (name, then paths, tab separated)
     struct Collection { std::string name; std::vector<std::string> paths; };
     static std::vector<Collection> g_colls; static int g_selColl = -1; static bool g_collsLoaded = false; static char g_newColl[48] = "";
-    static char g_projName[64] = "mybuild", g_blueprintName[64] = "myblueprint";
+    static char g_projName[64] = "", g_blueprintName[64] = "myblueprint";
     static std::string g_projectStatus;
     static bool g_projectRefresh = true, g_projectCommandPending = false;
     static bool SceneProjectMutation(const std::string& name, int mode);
@@ -234,7 +234,7 @@ namespace editor {
     static int   g_editUid = 0; static bool g_live = true;
     static std::vector<std::string> g_log;
     static std::set<int> g_managedNpcSel; static int g_managedNpcPrimary = 0, g_managedNpcLast = 0;
-    static int g_projTab = -1;   // -1 = whole scene, 0/new = unassigned, >0 = loaded project
+    static int g_projTab = 0;    // project currently shown in Scene; 0 = no editing project
     static const ManagedNpc* FindManagedNpc(const std::vector<ManagedNpc>& list, int uid);
     static Vec3 ManagedNpcDisplayPos(const ManagedNpc& n);
     static void SelectAllManagedNpcs(const std::vector<ManagedNpc>& list, int projectFilter = -1);
@@ -1644,9 +1644,6 @@ namespace editor {
         for (int uid : g_sel) core::ForgetUid(uid);
         for (int uid : g_managedNpcSel) core::ForgetManagedNpc(uid);
         ClearSceneSelection();
-    }
-    static void ClearSceneAction(bool newProject) {
-        if (SceneProjectMutation({}, 3) && newProject) g_projName[0] = 0;
     }
     static void DeleteSel() {
         if (!PrepareHistoryMutation([]() { DeleteSel(); })) return;
@@ -3406,75 +3403,26 @@ namespace editor {
             if(!closed) grid(mem); ImGui::PopID(); ImGui::Spacing(); }
         ImGui::EndChild();
     }
-    // Scene tabs: one per project whose objects are in the world, plus "new" for everything placed by hand since the last
-    // save. Clicking through them shows only that project's objects, so a loaded project can be edited and written back
-    // without touching the others. -1 = everything.
-    static void DrawProjectTabs(const std::vector<SpawnedObj>& all, bool compact = false) {
-        std::vector<int> ids; int newCount = 0, visible = 0;          // project ids present, in first-appearance order
-        std::map<int, int> entryCounts;
-        for (const auto& o : all) {
-            if (o.hidden) continue;
-            visible++; entryCounts[o.proj]++;
-            if (o.proj == 0) { newCount++; continue; }
-            if (std::find(ids.begin(), ids.end(), o.proj) == ids.end()) ids.push_back(o.proj);
+    // The scene list follows the project selected for editing; other loaded projects remain in the game world.
+    static void DrawEditingProjectHeader(bool compact = false) {
+        const std::string name = core::EditingProject();
+        g_projTab = name.empty() ? 0 : core::ProjectId(name);
+        if (name.empty()) {
+            ImGui::TextDisabled("%s", T("No project selected; placing creates a numbered Untitled project."));
+            return;
         }
-        const auto npcs = core::ManagedNpcs();
-        for (const auto& n : npcs) {
-            if (n.hidden) continue;
-            visible++; entryCounts[n.proj]++;
-            if (n.proj == 0) { newCount++; continue; }
-            if (std::find(ids.begin(), ids.end(), n.proj) == ids.end()) ids.push_back(n.proj);
-        }
-        for (const auto& tile : SceneTerrainTiles(-1)) {
-            ++visible; entryCounts[tile.project]++;
-            if (tile.project == 0) { ++newCount; continue; }
-            if (std::find(ids.begin(), ids.end(), tile.project) == ids.end()) ids.push_back(tile.project);
-        }
-        if (ids.empty() && !newCount) { g_projTab = -1; return; }   // no project-owned or unassigned scene content to filter
-        // the selected project can disappear (deleted, or the scene was emptied); without this the scene would stay blank
-        if (g_projTab > 0 && std::find(ids.begin(), ids.end(), g_projTab) == ids.end()) g_projTab = -1;
-        if (g_projTab == 0 && !newCount) g_projTab = -1;
-        if (!ImGui::BeginTabBar("projtabs")) return;   // no AutoSelectNewTabs: loading a project must not drag the view away
-        char lbl[96];
-        snprintf(lbl, sizeof lbl, T("all (%d)###ptall"), visible);
-        if (ImGui::BeginTabItem(lbl)) { g_projTab = -1; ImGui::EndTabItem(); }
-        if (newCount) {
-            snprintf(lbl, sizeof lbl, T(ICON_STAR " new (%d)###ptnew"), newCount);
-            if (ImGui::BeginTabItem(lbl)) {
-                g_projTab = 0; ImGui::EndTabItem();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("placed by hand and not part of a saved project yet - the Project tab saves exactly these under a new name"));
-            }
-        }
-        for (int id : ids) {
-            const std::string name = core::ProjectNameOf(id);
-            const bool dirty = core::ProjectDirty(id);   // a star means: entities of it changed since the load / save
-            snprintf(lbl, sizeof lbl, "%s%s (%d)###pt%d", name.c_str(), dirty ? " *" : "", entryCounts[id], id);
-            if (dirty) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.82f, 0.35f, 1));
-            const bool open = ImGui::BeginTabItem(lbl);
-            if (dirty) ImGui::PopStyleColor();
-            if (open) { g_projTab = id; ImGui::EndTabItem(); }
-        }
-        ImGui::EndTabBar();
-        if (g_projTab > 0) {   // acting on the project that is currently shown
-            const std::string name = core::ProjectNameOf(g_projTab);
-            const int n = entryCounts[g_projTab];
-            const bool dirty = core::ProjectDirty(g_projTab);
-            if (dirty) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.33f, 0.12f, 1));
-            if (ImGui::Button(T(dirty ? ICON_FLOPPY_DISK " Save the changes" : ICON_FLOPPY_DISK " Overwrite this project"))) {
-                if (SaveProjectAction(name, core::SaveProjectOnly, true)) Note(T("overwrote %s (%d entities)"), name.c_str(), n);
-                else Note(T("save failed"));
-            }
-            if (dirty) ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("writes exactly the %d entities shown here back to %s.cdproj.\nEntities of other projects and new entities are not touched."), n, name.c_str());
-            SameLineOrWrap(compact, ImGui::CalcTextSize(name.c_str()).x); ImGui::TextDisabled("%s", name.c_str());
-        }
+        ImGui::Text("%s: %s%s", T("Editing project"), name.c_str(), core::ProjectDirty(g_projTab) ? " *" : "");
+        SameLineOrWrap(compact, ImGui::CalcTextSize(T("Save")).x + ImGui::GetStyle().FramePadding.x * 2);
+        ImGui::BeginDisabled(!core::ProjectDirty(g_projTab));
+        if (ImGui::Button(T("Save"))) SaveProjectAction(name, core::SaveProjectOnly, true);
+        ImGui::EndDisabled();
     }
     static void DrawScene(const PosInfo& p, bool havePos, bool compact = false) {
         auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); const auto chars = thumbgen::Characters();
         const float ui = ImGui::GetFontSize() / 17.0f;
-        DrawProjectTabs(objects, compact);
-        const auto entities = BuildSceneEntities(objects, npcs, g_projTab);
-        const auto terrainTiles = SceneTerrainTiles(g_projTab);
+        DrawEditingProjectHeader(compact);
+        const auto entities = g_projTab > 0 ? BuildSceneEntities(objects, npcs, g_projTab) : std::vector<SceneEntityRef>{};
+        const auto terrainTiles = g_projTab > 0 ? SceneTerrainTiles(g_projTab) : std::vector<SceneTerrainTile>{};
         auto selectedTerrain = std::find_if(terrainTiles.begin(), terrainTiles.end(), [](const SceneTerrainTile& tile) { return TerrainTileSelected(tile); });
         if (g_terrainTileSelected && selectedTerrain == terrainTiles.end()) g_terrainTileSelected = false;
 
@@ -3618,7 +3566,6 @@ namespace editor {
         }
         SameLineForControl("Forget");if(FittedButton(T("Forget")))ForgetSelection();
         SameLineForControl(ICON_TRASH " Delete");ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.55f,0.15f,0.12f,1));if(ImGui::Button(T(ICON_TRASH " Delete")))DeleteSceneSelection();ImGui::PopStyleColor();
-        if(!compact){ImGui::Separator();ImGui::TextWrapped("%s",T("Ctrl+Z and Ctrl+Y undo and redo   Ctrl+G group   Ctrl+A select all   Delete removes selection   Ctrl-click and Shift-click multi-select"));}
     }
     static void DrawPropertiesWindow(const PosInfo& p, bool havePos) {
         const char* title = TStable("Properties###selection-properties");
@@ -3734,6 +3681,7 @@ namespace editor {
                         mode == 2 ? core::LoadProject(name, true) :
                         mode == 3 ? core::ClearScene() : core::UnloadProject(core::ProjectId(name));
         if (!ok) { g_projectStatus = core::ProjectError(); Note("%s", g_projectStatus.c_str()); return false; }
+        if (mode == 3 || (mode == 4 && core::FileNameEqual(core::EditingProject(), name))) core::SetEditingProject("");
         FinishProjectSceneMutation();
         g_projectStatus = mode < 3 ? "load-admitted" : mode == 3 ? "scene cleared" : "unloaded";
         Note("%s: %s", ProjectUiStatus(g_projectStatus.c_str()), name.c_str());
@@ -4178,7 +4126,6 @@ namespace editor {
                         g_librarySelected = saved;
                         if (!saved.archived) {
                             if (ImGui::MenuItem(T("Place"))) DispatchProjectAction(file, ProjectAction::Place);
-                            if (ImGui::MenuItem(T("Overwrite"))) DispatchProjectAction(file, ProjectAction::Overwrite);
                             ImGui::Separator();
                             if (ImGui::MenuItem(T("Archive"))) BeginLibraryAction(saved, core::FileAction::Archive);
                             if (ImGui::MenuItem(T("Delete"))) BeginLibraryAction(saved, core::FileAction::Delete);
@@ -4227,11 +4174,19 @@ namespace editor {
             ImGui::PushID("project"); ImGui::PushID(file.name.c_str());
             if (ImGui::Button(T("Read"))) DispatchProjectAction(file, ProjectAction::Read);
             if (!saved.archived) {
-                const bool loaded = o.visible || o.hidden || o.visibleNpcs || o.hiddenNpcs || o.terrain;
-                ProjectButtonWrap("Load"); ImGui::BeginDisabled(loaded || g_projectCommandPending); if (ImGui::Button(T("Load"))) DispatchProjectAction(file, ProjectAction::Load); ImGui::EndDisabled();
+                const bool editing = core::FileNameEqual(core::EditingProject(), file.name);
+                if (ImGui::RadioButton(T("Edit project"), editing)) {
+                    const bool wasLoaded = core::IsProjectLoaded(file.name);
+                    if (core::SetEditingProject(file.name)) { if (!wasLoaded) FinishProjectSceneMutation(); else ClearSceneSelection(); g_projectRefresh = true; }
+                    else g_projectStatus = core::ProjectError();
+                }
+                ProjectButtonWrap("Load project"); bool loaded = core::IsProjectLoaded(file.name);
+                ImGui::BeginDisabled(g_projectCommandPending || (editing && loaded));
+                if (ImGui::Checkbox(T("Load project"), &loaded))
+                    DispatchProjectAction(file, loaded ? ProjectAction::Load : ProjectAction::Unload);
+                ImGui::EndDisabled();
                 ProjectButtonWrap("Reload"); ImGui::BeginDisabled(!loaded || g_projectCommandPending); if (ImGui::Button(T("Reload"))) DispatchProjectAction(file, ProjectAction::Reload); ImGui::EndDisabled();
                 ProjectButtonWrap("Save"); ImGui::BeginDisabled(!loaded || !o.dirty); if (ImGui::Button(T("Save"))) DispatchProjectAction(file, ProjectAction::Save); ImGui::EndDisabled();
-                ProjectButtonWrap("Unload"); ImGui::BeginDisabled(!loaded || g_projectCommandPending); if (ImGui::Button(T("Unload"))) DispatchProjectAction(file, ProjectAction::Unload); ImGui::EndDisabled();
                 const auto& unassigned = g_projectLibrary.unassigned;
                 ProjectButtonWrap("Add unassigned"); ImGui::BeginDisabled(!loaded || !(unassigned.visible || unassigned.visibleNpcs || unassigned.terrain)); if (ImGui::Button(T("Add unassigned"))) DispatchProjectAction(file, ProjectAction::AddUnassigned); ImGui::EndDisabled();
                 ProjectButtonWrap("autoload"); bool on = std::any_of(g_projectAutoload.begin(), g_projectAutoload.end(), [&](const auto& name) { return core::FileNameEqual(name, file.name); });
@@ -4328,60 +4283,51 @@ namespace editor {
     }
     static void DrawProjectsPage() {
         auto& name = g_projName;
-        const auto sceneObjects = core::Spawned();
-        const int objectCount = (int)std::count_if(sceneObjects.begin(), sceneObjects.end(), [](const SpawnedObj& o) { return !o.hidden; });
-        const auto managed = core::ManagedNpcs();
-        const int npcCount = (int)std::count_if(managed.begin(), managed.end(), [](const ManagedNpc& n) { return !n.hidden; });
-        const int terrainCount = (int)core::TerrainStrokes().size();
-        const auto terrainTiles = SceneTerrainTiles(-1);
-        const int totalCount = objectCount + npcCount + (int)terrainTiles.size();
-        const int unassigned = (int)std::count_if(sceneObjects.begin(), sceneObjects.end(), [](const SpawnedObj& o) { return !o.hidden && o.proj == 0; }) +
-            (int)std::count_if(managed.begin(), managed.end(), [](const ManagedNpc& n) { return !n.hidden && n.proj == 0; }) +
-            (int)std::count_if(terrainTiles.begin(), terrainTiles.end(), [](const SceneTerrainTile& t) { return t.project == 0; });
-        const int pending = core::PendingSpawns();
-
+        const std::string editing = core::EditingProject();
+        ImGui::Text("%s: %s", T("Editing project"), editing.empty() ? T("None") : editing.c_str());
         bool autosave = core::g_projectAutoSave;
         if (ImGui::Checkbox("##project-autosave", &autosave)) { core::g_projectAutoSave = autosave; core::SaveSettings(); }
         SameLineForControl("Auto-save");
         ImGui::PushStyleColor(ImGuiCol_Text, autosave ? ImVec4(0.45f, 0.9f, 0.55f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::Text("%s: %s", T("Auto-save"), T(autosave ? "ON" : "OFF")); ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Only changes to already saved projects are auto-saved. Unassigned entities remain separate until you save them."));
-        SameLineOrWrap(true, ImGui::CalcTextSize("99999 live | 99999 unassigned").x); ImGui::TextDisabled(T("%d live | %d unassigned"), totalCount, unassigned);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Objects: %d | NPCs: %d | terrain strokes: %d | pending spawns: %d"), objectCount, npcCount, terrainCount, pending);
-
-        ImGui::SeparatorText(T("Create or update a project"));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("New objects, NPCs and terrain are saved to their editing project."));
+        ImGui::SeparatorText(T("Create project"));
         SetLabeledItemWidth("project name", 260); InputTextI18n(TStable("project name"), "", name, sizeof name);
-        ProjectButtonWrap(ICON_FLOPPY_DISK " Save whole scene as project");
-        ImGui::BeginDisabled(!name[0] || totalCount == 0);
-        if (FittedButton(T(ICON_FLOPPY_DISK " Save whole scene as project"))) SaveProjectAction(name, core::SaveWholeScene);
+        ImGui::BeginDisabled(!name[0]);
+        if (ImGui::Button(T("Create project"))) {
+            const std::string project = name;
+            const std::string path = core::ModDir() + "\\projects\\" + project + ".cdproj";
+            if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) g_projectStatus = "Collision";
+            else if (core::SaveProject(project, core::SaveProjectOnly) && core::SetEditingProject(project)) {
+                name[0] = 0; g_projectRefresh = true; ClearSceneSelection(); g_projectStatus = "saved";
+            } else g_projectStatus = core::ProjectError();
+        }
         ImGui::EndDisabled();
-        ProjectButtonWrap("Save unassigned entities as project");
-        ImGui::BeginDisabled(!name[0] || unassigned == 0);
-        if (FittedButton(T("Save unassigned entities as project"))) SaveProjectAction(name, core::SaveNewOnly);
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", T("Saves only entities that do not belong to any project yet. Loaded projects stay separate."));
-
-        if (ImGui::Button(T(ICON_CUBE " New empty scene"))) ImGui::OpenPopup("###newproj");
         ProjectButtonWrap("Import project file");
         if (ImGui::Button(T("Import project file"))) {
             char file[MAX_PATH] = { 0 }; OPENFILENAMEA ofn = {}; ofn.lStructSize = sizeof ofn; ofn.lpstrFilter = "World Builder project (*.cdproj)\0*.cdproj\0All files\0*.*\0"; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
             if (GetOpenFileNameA(&ofn)) { if (core::ImportProjectFile(file)) { Note(T("imported %s"), file); g_projectRefresh = true; } else { g_projectStatus = core::ProjectError(); Note(T("import failed")); } }
         }
         ProjectButtonWrap("Open project folder"); if (ImGui::Button(T("Open project folder"))) ShellExecuteA(nullptr, "open", (core::ModDir() + "\\projects").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        if (ImGui::BeginPopupModal(TStable("New empty scene###newproj"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::TextWrapped(T("Remove all %d live entities from the World Builder scene?"), totalCount);
-            ImGui::TextDisabled(T("Project files on disk are not deleted."));
-            if (ImGui::Button(T(ICON_TRASH " Clear scene"))) { ClearSceneAction(false); ImGui::CloseCurrentPopup(); }
-            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
-        }
-
         DrawProjectExtras();
         DrawSavedLibrary(false);
         DrawProjectReports();
     }
     static void DrawBlueprintsPage() {
         ImGui::TextDisabled("%s", T("Blueprints are reusable object groups. They are stored separately from projects and do not load into the scene until placed."));
+        ImGui::TextWrapped("%s", T("Double-click or drag a blueprint into the world to place it in the editing project."));
+        DrawSavedLibrary(true);
+        ImGui::SeparatorText(T("Create blueprint"));
+        if (ImGui::Button(T("Export selection as blueprint"))) { g_exportOpen = true; g_exportOverwrite = false; ResetExportApproval(); }
+        if (g_exportOpen) {
+            SetLabeledItemWidth("Blueprint name", 300); InputTextI18n(T("Blueprint name"), "", g_blueprintName, sizeof g_blueprintName);
+            if (FittedCheckbox(T("Approve existing-file overwrite"), &g_exportOverwrite)) ResetExportApproval();
+            ProjectButtonWrap("Write blueprint");
+            if (ImGui::Button(T("Write blueprint")) && ProjectExportPreflight()) ProjectExportWrite();
+            ProjectButtonWrap("Cancel export"); if (ImGui::Button(T("Cancel export"))) { g_exportOpen = false; ResetExportApproval(); g_exportOverwrite = false; }
+        }
+        if (!g_exportStatus.empty()) ImGui::TextWrapped("%s: %s", T("Export status"), ProjectUiStatus(g_exportStatus.c_str()));
+        ImGui::SeparatorText(T("Blueprint file"));
         if (ImGui::Button(T("Import blueprint"))) {
             char path[MAX_PATH] = {};
             OPENFILENAMEA ofn = {}; ofn.lStructSize = sizeof ofn;
@@ -4396,24 +4342,10 @@ namespace editor {
                 } else { g_projectStatus = core::ProjectError(); Note(T("blueprint import failed")); }
             }
         }
-        ProjectButtonWrap("Refresh"); if (ImGui::Button(T("Refresh"))) g_projectRefresh = true;
-        ProjectButtonWrap("Export selection as blueprint");
-        if (ImGui::Button(T("Export selection as blueprint"))) { g_exportOpen = true; g_exportOverwrite = false; ResetExportApproval(); }
-        RefreshExportApproval();
-        if (g_exportOpen) {
-            SetLabeledItemWidth("Blueprint name", 300); InputTextI18n(T("Blueprint name"), "", g_blueprintName, sizeof g_blueprintName);
-            if (FittedCheckbox(T("Approve existing-file overwrite"), &g_exportOverwrite)) ResetExportApproval();
-            ProjectButtonWrap("Preflight"); if (ImGui::Button(T("Preflight"))) ProjectExportPreflight();
-            ProjectButtonWrap("Write blueprint"); ImGui::BeginDisabled(!g_exportApproval.valid);
-            if (ImGui::Button(T("Write blueprint"))) ProjectExportWrite(); ImGui::EndDisabled();
-            ProjectButtonWrap("Cancel export"); if (ImGui::Button(T("Cancel export"))) { g_exportOpen = false; ResetExportApproval(); g_exportOverwrite = false; }
-        }
         ProjectButtonWrap("Open blueprint folder");
         if (ImGui::Button(T("Open blueprint folder"))) ShellExecuteA(nullptr, "open", (core::ModDir() + "\\groups").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        if (!g_exportStatus.empty()) ImGui::TextDisabled("%s: %s", T("Export status"), ProjectUiStatus(g_exportStatus.c_str()));
+        ProjectButtonWrap("Refresh"); if (ImGui::Button(T("Refresh"))) g_projectRefresh = true;
         if (!g_projectStatus.empty()) ImGui::TextWrapped("%s", ProjectUiStatus(g_projectStatus.c_str()));
-        DrawExportAttempts();
-        DrawSavedLibrary(true);
     }
     static void DrawProject() {
         ImGui::PushOverrideID(ImHashStr("project-page"));
@@ -4582,11 +4514,7 @@ namespace editor {
     }
     static bool BrushActive() { return TerrainTabShown() && g_brushOn && core::TerrainAvailable() && !g_playMode; }
     static int TerrainBrushProject() {
-        if (g_projTab <= 0) return 0;
-        for (const auto& stroke : core::TerrainStrokes()) if (stroke.proj == g_projTab) return g_projTab;
-        for (const auto& object : core::Spawned()) if (object.proj == g_projTab) return g_projTab;
-        for (const auto& npc : core::ManagedNpcs()) if (npc.proj == g_projTab) return g_projTab;
-        return 0;
+        return core::EnsureEditingProject();
     }
     static void AddBrushStroke() {
         core::TerrainStroke t{};
@@ -4594,6 +4522,7 @@ namespace editor {
         t.x = g_brushAt.x; t.z = g_brushAt.z; t.r = g_brushRadius; t.y = g_brushAt.y;
         t.amount = g_brushMode == BrushLower ? -g_brushAmount : g_brushAmount; t.strength = g_brushFlat;
         t.ax = g_brushAx; t.az = g_brushAz; t.proj = TerrainBrushProject();
+        if (!t.proj) return;
         core::TerrainAddStroke(t); g_brushLast = g_brushAt;
     }
     static void CommitBrushHistory() {
@@ -5466,7 +5395,7 @@ namespace editor {
                 }
                 ImGui::Separator();
                 if (ImGui::Checkbox(T("project auto-save"), &core::g_projectAutoSave)) core::SaveSettings();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Save dirty loaded projects immediately after each committed edit. New unassigned objects are left alone."));
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("New objects, NPCs and terrain are saved to their editing project."));
                 if (ImGui::Checkbox(T("show selected item details panel"), &core::g_showSelectionDetails)) core::SaveSettings();
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Turn this off to hide the information box that appears below the Browser after selecting an item."));
                 ImGui::Separator();

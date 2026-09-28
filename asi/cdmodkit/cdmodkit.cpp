@@ -1387,6 +1387,7 @@ static int SpawnAtLinked(const std::string& prefab, Vec3 world, Rot rot, float s
     if (!GameThreadReady()) { Log("spawn: game thread pump not active yet"); return 0; }
     // a character appearance is assembled by the game's actor system; as a scene object it would spawn nothing visible
     if (prefab.size() > 8 && prefab.compare(prefab.size() - 8, 8, ".app_xml") == 0) { Log("spawn: %s is a character appearance, characters cannot be spawned yet", prefab.c_str()); return 0; }
+    if (!proj && !g_loading) { proj = EnsureEditingProject(); if (!proj) { Log("spawn: no editable project is available"); return 0; } }
     const bool gim =g_gimmickSpawn && kRva_GimmickSpawn_ && IsGimmickPrefab(prefab);
     int uid; uint64_t gen = 0;
     { std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextUid++; gen = NewGenLocked();
@@ -1541,10 +1542,13 @@ void PreviewSet(const std::string& prefab, Vec3 pos, float yawDeg, float scale, 
     });
 }
 int PreviewCommit() {
+    { std::lock_guard<std::mutex> l(g_prevMutex); if (!g_prev.obj) return 0; }
+    const int project = EnsureEditingProject();
+    if (!project) return 0;
     std::lock_guard<std::mutex> l(g_prevMutex);
     if (!g_prev.obj) return 0;
     int uid = 0;
-    { std::lock_guard<std::mutex> r(g_regMutex); uid = g_nextUid++; g_reg.push_back({ g_prev.obj, g_prev.prefab, g_prev.pos, Rot{ g_prev.yaw }, g_prev.scale, false, GetTickCount(), Rot{ g_prev.yaw }, g_prev.scale, uid, 0, 0, false, 0, false, NewGenLocked() }); }
+    { std::lock_guard<std::mutex> r(g_regMutex); uid = g_nextUid++; g_reg.push_back({ g_prev.obj, g_prev.prefab, g_prev.pos, Rot{ g_prev.yaw }, g_prev.scale, false, GetTickCount(), Rot{ g_prev.yaw }, g_prev.scale, uid, 0, project, false, 0, false, NewGenLocked() }); MarkDirtyLocked(project); }
     Log("preview committed: %s at (%.2f %.2f %.2f)", g_prev.prefab.c_str(), g_prev.pos.x, g_prev.pos.y, g_prev.pos.z);
     g_prev.obj = 0; g_prev.prefab.clear();
     return uid;
@@ -1713,6 +1717,9 @@ SavedFile SelectedFile(const FileSelectionHandle& selection) { return selection 
 // per session and only name the .cdproj files; the file format itself does not change.
 static std::mutex g_projMutex;                 // guards g_projNames only - never taken while g_regMutex is held
 static std::vector<std::string> g_projNames{ "" };   // index 0 = "no project"
+static std::string g_editProjectName;
+static std::recursive_mutex g_editEnsureMutex;
+static std::set<int> g_loadedProjectIds;       // guarded by g_regMutex; empty projects are loaded too
 int ProjectId(const std::string& name) {
     if (name.empty()) return 0;
     std::lock_guard<std::mutex> l(g_projMutex);
@@ -1723,6 +1730,38 @@ int ProjectId(const std::string& name) {
 std::string ProjectNameOf(int id) {
     std::lock_guard<std::mutex> l(g_projMutex);
     return (id > 0 && id < (int)g_projNames.size()) ? g_projNames[id] : std::string();
+}
+std::string EditingProject() { std::lock_guard<std::mutex> l(g_projMutex); return g_editProjectName; }
+bool IsProjectLoaded(const std::string& name) {
+    if (name.empty()) return false;
+    const int id = ProjectId(name);
+    REG_LOCK; return g_loadedProjectIds.count(id) != 0;
+}
+bool SetEditingProject(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> ensure(g_editEnsureMutex);
+    if (FileNameEqual(EditingProject(), name) && (name.empty() || IsProjectLoaded(name))) return true;
+    if (!name.empty()) {
+        if (!ValidFileName(name + ".cdproj", proj_codec::Kind::Project)) { g_projectError = "record 0: invalid project name"; return false; }
+        const DWORD attrs = GetFileAttributesA(ProjPath(name).c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) { g_projectError = "record 0: project file not found"; return false; }
+        if (!IsProjectLoaded(name) && !LoadProject(name, false)) return false;
+    }
+    { std::lock_guard<std::mutex> l(g_projMutex); g_editProjectName = name; }
+    SaveSettings();
+    return true;
+}
+int EnsureEditingProject() {
+    std::lock_guard<std::recursive_mutex> ensure(g_editEnsureMutex);
+    std::string name = EditingProject();
+    if (!name.empty() && ValidFileName(name + ".cdproj", proj_codec::Kind::Project) && GetFileAttributesA(ProjPath(name).c_str()) != INVALID_FILE_ATTRIBUTES)
+        return SetEditingProject(name) ? ProjectId(name) : 0;
+    for (int n = 1; n < 100000; ++n) {
+        name = "Untitled " + std::to_string(n);
+        if (GetFileAttributesA(ProjPath(name).c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+        if (!SaveProject(name, SaveProjectOnly) || !SetEditingProject(name)) return 0;
+        return ProjectId(name);
+    }
+    return 0;
 }
 int ProjectObjectCount(int id) {
     int n = 0;
@@ -2473,7 +2512,7 @@ static void ClearSceneContents(std::unique_lock<std::mutex>& operation) {
     // v0.97 TerrainClear marks projects dirty after releasing its own lock. Never call it under the registry lock.
     TerrainClear();
     std::vector<SpawnedObj> removed; std::vector<ManagedNpc> npcs;
-    { REG_LOCK; removed.swap(g_reg); npcs.swap(g_npcReg); for (const auto& n : npcs) if (!n.hidden) RememberUnboundNpcCleanupLocked(n); g_copyMembers.clear(); g_groupNames.clear(); g_projDirty.clear(); }
+    { REG_LOCK; removed.swap(g_reg); npcs.swap(g_npcReg); for (const auto& n : npcs) if (!n.hidden) RememberUnboundNpcCleanupLocked(n); g_copyMembers.clear(); g_groupNames.clear(); g_projDirty.clear(); g_loadedProjectIds.clear(); }
     operation.unlock();
     for (const auto& o : removed) {
         SettleRowOnce(o.placeReq, o.placeRow, PlaceCanceled, PlaceLaneNone, o.uid, "the scene was cleared before attachment");
@@ -2512,6 +2551,7 @@ static bool UnloadProjectImpl(int id, bool ownsWorld) {
     if (!ids.empty()) for (auto& weak : g_groundOps) if (auto op = weak.lock())
         if (GroundTouches(op, ids)) GroundEndLocked(op, GroundInvalidated, "epoch-invalidated");
     std::vector<SpawnedObj> removed; std::vector<ManagedNpc> npcs;
+    bool wasLoaded = false;
     int terrainCount = 0; for (const auto& t : TerrainStrokes()) if (t.proj == id) ++terrainCount;
     { REG_LOCK;
       for (auto it = g_reg.begin(); it != g_reg.end();) {
@@ -2523,6 +2563,7 @@ static bool UnloadProjectImpl(int id, bool ownsWorld) {
           if (!it->hidden) RememberUnboundNpcCleanupLocked(*it);
           npcs.push_back(*it); it = g_npcReg.erase(it);
       }
+      wasLoaded = g_loadedProjectIds.erase(id) != 0;
       if (!removed.empty() || !npcs.empty() || terrainCount) g_projDirty.erase(id);
     }
     if (terrainCount) TerrainReplaceProject(id, {});
@@ -2533,7 +2574,7 @@ static bool UnloadProjectImpl(int id, bool ownsWorld) {
         else if (!o.hidden && o.obj) RunOnGameThread([obj = o.obj, work]() { DoRemove(obj); });
     }
     for (const auto& n : npcs) if (!n.hidden && n.actor) RunOnServerTick([actor = n.actor, work]() { RemoveSpawnedActor(actor); });
-    const bool changed = !removed.empty() || !npcs.empty() || terrainCount != 0;
+    const bool changed = wasLoaded || !removed.empty() || !npcs.empty() || terrainCount != 0;
     g_projectError = changed ? std::string() : "record 0: project has no loaded entities";
     Log("unload project %d: %zu objects, %zu NPCs, %d terrain strokes", id, removed.size(), npcs.size(), terrainCount);
     return changed;
@@ -2576,7 +2617,6 @@ static bool AdmitProjectDocument(const std::string& name, const proj_codec::Docu
       ++g_groundWorldWriting; GroundEpochLocked();
     }
     struct WorldWrite { ~WorldWrite() { std::lock_guard<std::mutex> lock(g_groundOpMutex); --g_groundWorldWriting; } } worldWrite;
-    g_autoDone = true;   // a validated manual load (or replace) counts: the autoload must not add a second copy later
     if (clearFirst) { std::unique_lock<std::mutex> operation(g_groundOpMutex); ClearSceneContents(operation); }
     const int pid = ProjectId(name);
     if (replace) UnloadProjectImpl(pid, true); // this call owns the world reservation; an empty old project is valid
@@ -2622,6 +2662,7 @@ static bool AdmitProjectDocument(const std::string& name, const proj_codec::Docu
         report.queuedNpcs = report.requestedNpcs - report.excludedNpcs; report.excludedNpcKeys = excludedNpcs;
         report.terrainStrokes = (int)doc.terrain.size();
         g_projectLoads[name] = report;
+        g_loadedProjectIds.insert(pid);
         g_projDirty.erase(pid);   // freshly loaded = in sync with the file
     }
     g_projectError.clear();
@@ -2852,7 +2893,10 @@ FileResult SetAutoload(const std::string& rawName, bool on) {
 static void PreloadAutoloadTerrain() {
     if (!TerrainAvailable()) return;
     int total = 0;
-    for (const auto& name : Autoload()) {
+    auto names = Autoload();
+    const std::string editing = EditingProject();
+    if (!editing.empty() && std::none_of(names.begin(), names.end(), [&](const auto& name) { return FileNameEqual(name, editing); })) names.push_back(editing);
+    for (const auto& name : names) {
         proj_codec::Document doc; std::vector<proj_codec::EngineRow> rows; std::string error;
         if (!ReadProjectDocument(ProjPath(name), doc, rows, error)) { Log("terrain preload: %s: %s", name.c_str(), error.c_str()); continue; }
         if (!doc.terrain.empty()) {
@@ -2929,6 +2973,7 @@ FileResult ExecuteFileAction(const FileSelectionHandle& selection, FileAction ac
         // multiple session ids; ALL aliases must be checked, not just the first (possibly empty) identity.
         std::set<int> ids;
         for (size_t i = 1; i < g_projNames.size(); ++i) if (FileNameEqual(g_projNames[i], name)) ids.insert((int)i);
+        for (int pid : ids) if (g_loadedProjectIds.count(pid)) return { FileReason::VisibleReference };
         for (const auto& o : g_reg) if (ids.count(o.proj)) {
             if (!o.hidden && (!o.obj || o.standin)) return { FileReason::PendingOperation };
             return { o.hidden ? FileReason::HiddenReference : FileReason::VisibleReference };
@@ -3153,12 +3198,17 @@ PlaceRequestView PlaceRequestState(const PlaceRequestHandle& req) {
 // copy of the scene. Returns true when this call was the one that settled the listing.
 static bool AutoloadProjects() {
     std::lock_guard<std::recursive_mutex> lifecycle(g_fileMutex); // bind the persisted list to its load admissions
-    if (g_autoDone) return false;   // a manual load/replace already settled this session
+    if (g_autoDone) return false;
     g_autoDone = true;
     // several projects are loaded into the same scene: every LoadProject only queues spawns and hands out fresh group ids,
     // so the lists simply add up
     std::vector<std::string> names = Autoload();
-    for (auto& name : names) { Log("autoload: loading project %s", name.c_str()); LoadProject(name, false); }
+    const std::string editing = EditingProject();
+    if (!editing.empty() && std::none_of(names.begin(), names.end(), [&](const auto& name) { return FileNameEqual(name, editing); })) names.push_back(editing);
+    for (auto& name : names) {
+        if (IsProjectLoaded(name)) continue;
+        Log("autoload: loading project %s", name.c_str()); LoadProject(name, false);
+    }
     return true;
 }
 static void AutoloadTick() {
@@ -5302,6 +5352,7 @@ static bool QueueManagedNpcIfReady(int uid) {
 }
 int SpawnManagedNpc(uint32_t key, Vec3 pos, int type, uint32_t extra, bool aiEnabled, int behavior, int group, int proj, const std::string& label, const std::string& note) {
     if (NpcState() == 0 || !key) return 0;
+    if (!proj && !g_loading) { proj = EnsureEditingProject(); if (!proj) { Log("[npc] spawn: no editable project is available"); return 0; } }
     if (type < 1 || type > 255) type = 1; behavior = behavior == 1 ? 1 : 0; if (behavior == 1) aiEnabled = false;
     int uid = 0;
     {
@@ -6072,6 +6123,7 @@ static void LoadSettings() {
         if (k == "freecam_sens") { const float s = (float)atof(v.c_str()); if (s >= 0.01f && s <= 2.0f) g_fcSens = s; continue; }
         if (k == "keyboard_placement") { g_keyboardPlacement = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "project_autosave") { g_projectAutoSave = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "editing_project") { if (v.empty() || ValidFileName(v + ".cdproj", proj_codec::Kind::Project)) { std::lock_guard<std::mutex> l(g_projMutex); g_editProjectName = v; } continue; }
         if (k == "project_autosave_seconds") continue;   // legacy timed-auto-save setting; real-time auto-save no longer uses an interval
         if (k == "auto_freecam_on_open") { g_autoFreeCamOnOpen = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "show_selection_details") { g_showSelectionDetails = v != "0" && v != "off" && v != "false"; continue; }
@@ -6096,7 +6148,9 @@ void SaveSettings() {
     fprintf(f, "# gimmick_spawn=0: place gimmick prefabs (/object/cd_gimmick/...) as plain objects instead of through the game spawn path\ngimmick_spawn=%d\n", g_gimmickSpawn ? 1 : 0);
     fprintf(f, "# free camera (camera mode, key_mode in the editor): speed in m/s, mouse sensitivity in degrees per count\nfreecam_speed=%.1f\nfreecam_sens=%.3f\n", g_fcSpeed, g_fcSens);
     fprintf(f, "# Optional keyboard object placement. Off by default; enable in Settings or set keyboard_placement=1.\nkeyboard_placement=%d\n", g_keyboardPlacement ? 1 : 0);
-    fprintf(f, "# Save dirty loaded projects immediately after each committed edit. New/unassigned objects are not attached to a project automatically.\nproject_autosave=%d\n", g_projectAutoSave ? 1 : 0);
+    fprintf(f, "# Save dirty projects after committed edits. New objects, NPCs and terrain belong to the editing project.\nproject_autosave=%d\n", g_projectAutoSave ? 1 : 0);
+    const std::string editingProject = EditingProject();
+    fprintf(f, "# Last project selected for editing; loaded independently of autoload.txt.\nediting_project=%s\n", editingProject.c_str());
     fprintf(f, "# Editor UI behavior.\nauto_freecam_on_open=%d\nshow_selection_details=%d\n", g_autoFreeCamOnOpen ? 1 : 0, g_showSelectionDetails ? 1 : 0);
     for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
     fprintf(f, "# Interface language: auto, en, zh-CN, zh-TW, de, fr, ko, ja, es, pt-BR, ru, tr\nlanguage=%s\n", i18n::Preference());

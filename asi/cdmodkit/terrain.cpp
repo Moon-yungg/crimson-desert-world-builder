@@ -320,7 +320,9 @@ static void QueueLive(const std::vector<std::pair<int, int>>& tiles) {
     }).detach();
 }
 void TerrainAddStroke(const TerrainStroke& s) {
-    const auto parts = SplitStroke(s);
+    TerrainStroke owned = s;
+    if (!owned.proj) { owned.proj = EnsureEditingProject(); if (!owned.proj) { Log("[terrain] stroke refused: no editable project is available"); return; } }
+    const auto parts = SplitStroke(owned);
     std::vector<std::pair<int, int>> t;
     { std::lock_guard<std::mutex> l(g_mx); for (const auto& part : parts) {
           g_strokes.push_back(part); TilesOf(part, &t);
@@ -328,7 +330,7 @@ void TerrainAddStroke(const TerrainStroke& s) {
           auto it = g_cpu.find(tile); if (it != g_cpu.end() && it->second.ok) ApplyStrokeCpu(it->second.edit, tile.first, tile.second, part);
       }
       g_needsApply = true; g_gen++; }
-    if (s.proj) MarkProjectDirty(s.proj);
+    MarkProjectDirty(owned.proj);
     FetchTables();
     QueueLive(UniqueTiles(t));
 }

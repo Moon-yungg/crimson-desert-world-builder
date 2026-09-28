@@ -334,6 +334,10 @@ namespace core {
     enum SaveScope { SaveWholeScene = 0, SaveProjectAndNew = 1, SaveNewOnly = 2, SaveProjectOnly = 3 };
     int  ProjectId(const std::string& name);       // id for a project name, creating one on first use (0 for an empty name)
     std::string ProjectNameOf(int id);             // "" for 0 / unknown
+    std::string EditingProject();                 // persisted editing target; independent of the autoload list
+    bool IsProjectLoaded(const std::string& name);
+    bool SetEditingProject(const std::string& name); // loads the chosen project before making it editable; empty closes editing
+    int  EnsureEditingProject();                  // creates and loads a numbered Untitled project on first new edit
     int  ProjectObjectCount(int id);               // visible objects + visible managed NPCs + terrain strokes (upstream scene-count semantics); 0 = new/unassigned
     bool ProjectDirty(int id);                     // an entity/metadata item changed since the last load/save
     void AssignProject(int uid, int proj);
