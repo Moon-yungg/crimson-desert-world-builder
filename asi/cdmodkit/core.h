@@ -380,7 +380,7 @@ namespace core {
     // Autoload: bin64\cdmodkit\autoload.txt, one project name per line (without .cdproj), '#' at the line start = comment.
     // Several projects can be active at once; they are all loaded, in file order, once the player is in the world.
     // File lifecycle never unloads objects, clears History, or implicitly switches autoload OFF.
-    void AutoloadFrame(); // called from the overlay frame, including while the editor window is closed
+    void AutoloadFrame(); // called from the game-thread pump, including while the editor window is closed
     enum class FileReason {
         None, InvalidName, InvalidAction, NotFound, StaleTarget, ConfirmationMismatch, GuardMissing,
         SelectionChanged, VisibleReference, HiddenReference, UndoReference, RedoReference, DirtyProject,

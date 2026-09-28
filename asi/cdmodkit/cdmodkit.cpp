@@ -1361,6 +1361,7 @@ static void PumpJobs() {
 #ifndef WB_UNIFIED_HOST_TEST   // host runs are deterministic: the tick duties need the game's own state
     if ((g_pumpTicks & 31) == 0) CheckReplayWatchdog();
     if (g_trace) TraceTick();
+    AutoloadFrame();
 #endif
     std::function<void()> job;
     if (InterlockedCompareExchange(&g_queueCount, 0, 0) != 0) {
@@ -3199,7 +3200,7 @@ PlaceRequestView PlaceRequestState(const PlaceRequestHandle& req) {
     v.settled = (v.pending == 0 && req->cleanupOutstanding == 0);
     return v;
 }
-// Called from the overlay frame: server-lane projects can load even before the optional movement pump first fires.
+// Called from the game-thread pump, independently of the editor window and render overlay.
 // A single failed position read (loading screen, camera cut, mount transition) only sets the counter back a little, so the
 // load happens seconds after the world is up, not minutes later when the user may already have loaded the scene by hand.
 // The settled autoload action: every listed project is loaded in file order. LoadProject validates before it
