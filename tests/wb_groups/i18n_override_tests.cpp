@@ -495,6 +495,57 @@ static void RunCases(const std::string& dir) {
         Check(std::string(i18n::Translate("Cancel")) == "Cancel", "en answers the source text");
     }
     EndCase();
+
+    // -------------------------------------------------------------------------------------------------
+    // Format contract: a valid-width personal row whose cell placeholders differ from the key's is
+    // rejected at the merge boundary (embedded fallback, diagnostic, file untouched), while a
+    // placeholder-matching cell in the same row still merges. A literal "%%" (even "%%s"/"%%d")
+    // carries no placeholder; a lone '%' or a "%q" sequence is rejected.
+    // -------------------------------------------------------------------------------------------------
+    BeginCase("I18N-FORMAT-MISMATCH");
+    {
+        const std::string mod = (std::filesystem::path(modBase) / "format").string();
+        std::filesystem::create_directories(mod);
+        const std::string path = (std::filesystem::path(mod) / "locales.tsv").string();
+        // Row 1: key "Scene: %d entities" (variadic sink: the editor Project page passes an int).
+        // The en cell "%s" is valid-width but the wrong spec; the de cell keeps the "%d" contract;
+        // the fr cell "%d %q" is rejected for its unrecognized "%q" tail.
+        const std::string badRow = std::string("Scene: %d entities\t%s\t\t\tSzene: %d Entit\xC3\xA4ten\t%d %q") +
+            "\t\t\t\t\t\t\n";
+        // Row 2: installed-only key whose literal "%%" must not count as a placeholder.
+        const std::string percentRow = std::string("wb080-percent-label\t100%% (done)\t\t\t\t\t100%% \xEC\x99\x84\xEB\xA3\x8C") +
+            "\t\t\t\t\t\n";
+        // Row 3: installed-only key whose "%%s" and "%%d" are literals, not "%s"/"%d" placeholders.
+        const std::string specRow = std::string("wb080-percent-spec-label\tshow 100%%s here\t\t\t\t\t50%%d \xED\x91\x9C\xEC\x8B\x9C") +
+            "\t\t\t\t\t\n";
+        Check(WriteBytes(path, std::string(kHeader) + "\n" + badRow + percentRow + specRow),
+              "the synthetic personal file is written");
+        const std::string before = ReadBytes(path);
+        Boot(mod, "en");
+        Check(std::string(i18n::Translate("Scene: %d entities")) == ShippedCell("Scene: %d entities", "en"),
+              "a wrong-spec personal en cell is rejected, embedded en answers");
+        Check(std::string(i18n::Translate("wb080-percent-label")) == "100%% (done)",
+              "a literal-%% installed-only en cell carries no placeholder and merges");
+        Check(std::string(i18n::Translate("wb080-percent-spec-label")) == "show 100%%s here",
+              "a literal-%%s installed-only en cell carries no placeholder and merges");
+        Check(i18n::SetPreference("de"), "switching to de is accepted");
+        Check(std::string(i18n::Translate("Scene: %d entities")) == "Szene: %d Entit\xC3\xA4ten",
+              "the placeholder-matching de cell in the same row still merges");
+        Check(i18n::SetPreference("fr"), "switching to fr is accepted");
+        Check(std::string(i18n::Translate("Scene: %d entities")) == ShippedCell("Scene: %d entities", "fr"),
+              "a personal fr cell with a stray %q sequence is rejected, embedded fr answers");
+        Check(i18n::SetPreference("ko"), "switching to ko is accepted");
+        Check(std::string(i18n::Translate("Scene: %d entities")) == ShippedCell("Scene: %d entities", "ko"),
+              "an empty personal ko cell keeps the embedded translation");
+        Check(std::string(i18n::Translate("wb080-percent-label")) == "100%% \xEC\x99\x84\xEB\xA3\x8C",
+              "a literal-%% installed-only ko cell merges too");
+        Check(std::string(i18n::Translate("wb080-percent-spec-label")) == "50%%d \xED\x91\x9C\xEC\x8B\x9C",
+              "a literal-%%d installed-only ko cell merges too");
+        Check(ReadBytes(path) == before, "the personal file bytes are unchanged by the read");
+        Check(LogHas("locales.tsv"), "the rejection names the personal file in the log");
+        Check(LogHas("Scene: %d entities"), "the rejection names the offending key in the log");
+    }
+    EndCase();
 }
 
 static void WriteEvidence(const std::string& dir) {

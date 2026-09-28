@@ -159,6 +159,43 @@ namespace i18n {
         for (int i = 0; i < 11; ++i) if (header[(size_t)i + 1] != kLocaleIds[i]) return false;
         return true;
     }
+    // Printf placeholder tokens of one locale cell, plus whether the cell carries a stray
+    // '%' that is neither a valid placeholder nor a literal "%%" (a lone '%' or a sequence
+    // like "%q"). A personal cell must carry exactly the key's sequence and no stray '%',
+    // or it would reach a variadic sink with an incompatible argument (e.g. the editor
+    // Project page passes an int to T("Scene: %d entities")). This mirrors the shipped
+    // scripts/check_locales.py PRINTF expression; a literal "%%" contributes no token.
+    struct PrintfScan { std::vector<std::string> tokens; bool stray = false; };
+    static PrintfScan ScanPrintf(const std::string& text) {
+        static const char* kConversions = "diuoxXfFeEgGaAcspn";
+        PrintfScan out;
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (text[i] != '%') continue;
+            if (i + 1 < text.size() && text[i + 1] == '%') { ++i; continue; }   // literal "%%": consume both
+            size_t j = i + 1;
+            while (j < text.size() && (text[j] == '-' || text[j] == '+' || text[j] == '#' || text[j] == '0' || text[j] == ' ')) ++j;
+            if (j < text.size() && text[j] == '*') ++j;
+            else while (j < text.size() && text[j] >= '0' && text[j] <= '9') ++j;
+            if (j < text.size() && text[j] == '.') {
+                const size_t dot = j++;
+                if (j < text.size() && text[j] == '*') ++j;
+                else {
+                    const size_t digits = j;
+                    while (j < text.size() && text[j] >= '0' && text[j] <= '9') ++j;
+                    if (j == digits) j = dot;   // '.' without a width is not precision: the conversion check below fails
+                }
+            }
+            bool matched = false;
+            if (j < text.size()) {
+                if (text.compare(j, 3, "I64") == 0 || text.compare(j, 3, "I32") == 0) j += 3;
+                else if (text.compare(j, 2, "hh") == 0 || text.compare(j, 2, "ll") == 0) j += 2;
+                else if (text[j] == 'h' || text[j] == 'l' || text[j] == 'z' || text[j] == 't' || text[j] == 'j' || text[j] == 'L') ++j;
+                if (j < text.size() && strchr(kConversions, text[j])) { out.tokens.push_back(text.substr(i, j - i + 1)); i = j; matched = true; }
+            }
+            if (!matched) { out.stray = true; i = j > i + 1 ? j - 1 : i; }
+        }
+        return out;
+    }
     // Optional personal translations (bin64\cdmodkit\locales.tsv). The embedded resource-103 table stays
     // the base: a personal row only replaces the cells that are nonempty, empty cells keep the embedded
     // value, and keys the embedded table lacks are retained as installed-only rows. The file is opened
@@ -193,15 +230,40 @@ namespace i18n {
             if (line.empty() || line[0] == '#') continue;
             auto fields = SplitRow(line);
             if (fields.size() != 12 || fields[0].empty()) { ++skipped; continue; }
+            // Formatting contract: a translated format keeps its printf placeholders (check_locales.py
+            // enforces this for the shipped table). A personal cell whose placeholder sequence differs
+            // from the key's — or that carries a stray '%' — would reach a variadic sink with an
+            // incompatible argument, so that cell is rejected with a diagnostic and the embedded
+            // fallback is kept. The user's file is never written back.
+            const PrintfScan keyScan = ScanPrintf(fields[0]);
+            auto cellAccepted = [&](const std::string& cell) {
+                if (cell.empty()) return true;
+                const PrintfScan cellScan = ScanPrintf(cell);
+                return !cellScan.stray && cellScan.tokens == keyScan.tokens;
+            };
             auto it = g_pack.find(fields[0]);
             if (it == g_pack.end()) {
                 PackRow row;
-                for (size_t i = 0; i < row.size(); ++i) row[i] = std::move(fields[i + 1]);
+                for (size_t i = 0; i < row.size(); ++i) {
+                    if (!fields[i + 1].empty() && !cellAccepted(fields[i + 1])) {
+                        core::Log("[i18n] personal locale cell rejected: placeholder mismatch for key '%s' (%s) (%s)",
+                                  fields[0].c_str(), kLocaleIds[i], path.c_str());
+                        continue;
+                    }
+                    row[i] = std::move(fields[i + 1]);
+                }
                 g_pack.emplace(std::move(fields[0]), std::move(row));
                 ++added;
             } else {
-                for (size_t i = 0; i < it->second.size(); ++i)
-                    if (!fields[i + 1].empty()) it->second[i] = std::move(fields[i + 1]);
+                for (size_t i = 0; i < it->second.size(); ++i) {
+                    if (fields[i + 1].empty()) continue;
+                    if (!cellAccepted(fields[i + 1])) {
+                        core::Log("[i18n] personal locale cell rejected: placeholder mismatch for key '%s' (%s) (%s)",
+                                  fields[0].c_str(), kLocaleIds[i], path.c_str());
+                        continue;
+                    }
+                    it->second[i] = std::move(fields[i + 1]);
+                }
             }
             ++merged;
         }
