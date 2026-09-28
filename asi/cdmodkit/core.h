@@ -87,6 +87,7 @@ namespace core {
     void TerrainRestoreStrokes(const std::vector<TerrainStroke>& strokes, const std::vector<size_t>& positions);
     void TerrainSetProject(int from, int to);                                     // strokes saved into a project become its members
     void TerrainReplaceProject(int proj, const std::vector<TerrainStroke>& strokes); // a project's strokes as loaded from its file
+    bool TerrainRemoveProject(int proj, std::vector<TerrainStroke>& removed, std::vector<size_t>& positions);
     bool TerrainNeedsApply(); void TerrainMarkApplied();
     bool TerrainApply(Vec3 back);        // fast travel 5 km away and back to 'back': the edited tiles stream again (async)
     std::string TerrainApplyState();     // "" when idle
@@ -379,6 +380,7 @@ namespace core {
     // Autoload: bin64\cdmodkit\autoload.txt, one project name per line (without .cdproj), '#' at the line start = comment.
     // Several projects can be active at once; they are all loaded, in file order, once the player is in the world.
     // File lifecycle never unloads objects, clears History, or implicitly switches autoload OFF.
+    void AutoloadFrame(); // called from the overlay frame, including while the editor window is closed
     enum class FileReason {
         None, InvalidName, InvalidAction, NotFound, StaleTarget, ConfirmationMismatch, GuardMissing,
         SelectionChanged, VisibleReference, HiddenReference, UndoReference, RedoReference, DirtyProject,

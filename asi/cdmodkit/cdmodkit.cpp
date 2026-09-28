@@ -1361,7 +1361,6 @@ static void PumpJobs() {
 #ifndef WB_UNIFIED_HOST_TEST   // host runs are deterministic: the tick duties need the game's own state
     if ((g_pumpTicks & 31) == 0) CheckReplayWatchdog();
     if (g_trace) TraceTick();
-    if ((g_pumpTicks & 15) == 0) AutoloadTick();
 #endif
     std::function<void()> job;
     if (InterlockedCompareExchange(&g_queueCount, 0, 0) != 0) {
@@ -1384,11 +1383,11 @@ static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uin
 // still resolves the row identity.
 static int SpawnAtLinked(const std::string& prefab, Vec3 world, Rot rot, float scale, int group, int proj,
                          const std::shared_ptr<PlaceRequest>& req, int rowId) {
-    if (!GameThreadReady()) { Log("spawn: game thread pump not active yet"); return 0; }
     // a character appearance is assembled by the game's actor system; as a scene object it would spawn nothing visible
     if (prefab.size() > 8 && prefab.compare(prefab.size() - 8, 8, ".app_xml") == 0) { Log("spawn: %s is a character appearance, characters cannot be spawned yet", prefab.c_str()); return 0; }
-    if (!proj && !g_loading) { proj = EnsureEditingProject(); if (!proj) { Log("spawn: no editable project is available"); return 0; } }
     const bool gim =g_gimmickSpawn && kRva_GimmickSpawn_ && IsGimmickPrefab(prefab);
+    if (!gim && !GameThreadReady()) { Log("spawn: game thread pump not active yet"); return 0; }
+    if (!proj && !g_loading) { proj = EnsureEditingProject(); if (!proj) { Log("spawn: no editable project is available"); return 0; } }
     int uid; uint64_t gen = 0;
     { std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextUid++; gen = NewGenLocked();
       SpawnedObj o{ 0, prefab, world, rot, scale, false, GetTickCount(), rot, scale, uid, group, proj, gim, 0, false, gen };
@@ -1744,7 +1743,10 @@ bool SetEditingProject(const std::string& name) {
         if (!ValidFileName(name + ".cdproj", proj_codec::Kind::Project)) { g_projectError = "record 0: invalid project name"; return false; }
         const DWORD attrs = GetFileAttributesA(ProjPath(name).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) { g_projectError = "record 0: project file not found"; return false; }
-        if (!IsProjectLoaded(name) && !LoadProject(name, false)) return false;
+        if (!IsProjectLoaded(name) && !LoadProject(name, false)) {
+            if (g_projectError != "record 0: game thread pump not active yet") return false;
+            Log("editing project %s: waiting for the game thread before loading", name.c_str());
+        }
     }
     { std::lock_guard<std::mutex> l(g_projMutex); g_editProjectName = name; }
     SaveSettings();
@@ -2609,6 +2611,14 @@ bool PreflightProject(const std::string& name) {
 static bool AdmitProjectDocument(const std::string& name, const proj_codec::Document& doc,
                                  const std::vector<proj_codec::EngineRow>& rows, bool clearFirst, bool replace) {
     std::string error;
+    const bool needsGameThread = std::any_of(doc.records.begin(), doc.records.end(), [](const auto& record) {
+        return !(g_gimmickSpawn && kRva_GimmickSpawn_ && IsGimmickPrefab(record.prefab));
+    });
+    if (needsGameThread && !GameThreadReady()) {
+        g_projectError = "record 0: game thread pump not active yet";
+        Log("load: %s (%s)", g_projectError.c_str(), name.c_str());
+        return false;
+    }
     // Bool is a synchronous mutation outcome, never deferred admission. Busy leaves the scene and allocators untouched.
     { std::lock_guard<std::mutex> operation(g_groundOpMutex);
       if (g_groundWorldWriting || !g_groundLeases.empty() || !g_groundMutationPending.empty()) {
@@ -3189,36 +3199,41 @@ PlaceRequestView PlaceRequestState(const PlaceRequestHandle& req) {
     v.settled = (v.pending == 0 && req->cleanupOutstanding == 0);
     return v;
 }
-// called from the pump: once the player has been in the world for ~3 s, load the autoload projects once per session.
+// Called from the overlay frame: server-lane projects can load even before the optional movement pump first fires.
 // A single failed position read (loading screen, camera cut, mount transition) only sets the counter back a little, so the
 // load happens seconds after the world is up, not minutes later when the user may already have loaded the scene by hand.
 // The settled autoload action: every listed project is loaded in file order. LoadProject validates before it
 // changes anything (and rejects a group file), so a bad entry never spawns, clears or allocates. The per-session
-// marker is checked and set here, so a manual LoadProject (which sets it too) keeps autoload from adding a second
-// copy of the scene. Returns true when this call was the one that settled the listing.
+// marker is set after admissions; a transiently unavailable game thread leaves the remaining names pending.
 static bool AutoloadProjects() {
     std::lock_guard<std::recursive_mutex> lifecycle(g_fileMutex); // bind the persisted list to its load admissions
     if (g_autoDone) return false;
-    g_autoDone = true;
     // several projects are loaded into the same scene: every LoadProject only queues spawns and hands out fresh group ids,
     // so the lists simply add up
     std::vector<std::string> names = Autoload();
     const std::string editing = EditingProject();
     if (!editing.empty() && std::none_of(names.begin(), names.end(), [&](const auto& name) { return FileNameEqual(name, editing); })) names.push_back(editing);
+    bool pending = false;
     for (auto& name : names) {
         if (IsProjectLoaded(name)) continue;
         Log("autoload: loading project %s", name.c_str()); LoadProject(name, false);
+        if (!IsProjectLoaded(name) && g_projectError == "record 0: game thread pump not active yet") pending = true;
     }
-    return true;
+    g_autoDone = !pending;
+    return g_autoDone;
 }
 static void AutoloadTick() {
     if (g_autoDone) return;
     const DWORD now = GetTickCount();
+    static DWORD lastAttempt = 0;
+    if (lastAttempt && now - lastAttempt < 2000) return;
     Vec3 p; if (!PlayerWorldPos(&p)) { if (now - g_worldLast > 2000) g_worldSince = 0; return; }   // a dropout of up to 2 s keeps the clock
     g_worldLast = now; if (!g_worldSince) g_worldSince = now;
     if (now - g_worldSince < 3000) return;
+    lastAttempt = now;
     AutoloadProjects();
 }
+void AutoloadFrame() { AutoloadTick(); }
 
 
 

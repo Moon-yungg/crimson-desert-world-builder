@@ -1720,7 +1720,7 @@ namespace editor {
                 CaptureProvenance(a); // retain adoption before removing the last live reference
                 for (size_t i = 0; i < a.terrain.size(); ++i) core::TerrainUndo();
             }
-            else if (a.kind == Act::TerrainClear) { for (const auto& t : a.terrain) core::TerrainAddStroke(t); }
+            else if (a.kind == Act::TerrainClear) { core::TerrainRestoreStrokes(a.terrain, a.terrainIndices); }
             else if (a.kind == Act::TerrainTileRemove) { CaptureProvenance(a); core::TerrainRestoreStrokes(a.terrain, a.terrainIndices); }
         }
         if (!moves.empty()) core::MoveMany(moves, true);
@@ -1753,7 +1753,7 @@ namespace editor {
             else if (a.kind == Act::NpcLabel) core::SetManagedNpcLabel(a.uid, a.text1);
             else if (a.kind == Act::GroupName) core::SetGroupName(a.group, a.text1);
             else if (a.kind == Act::TerrainBatch) { for (const auto& t : a.terrain) core::TerrainAddStroke(t); }
-            else if (a.kind == Act::TerrainClear) { a.terrain = core::TerrainStrokes(); CaptureProvenance(a); core::TerrainClear(); }
+            else if (a.kind == Act::TerrainClear) { core::TerrainRemoveProject(a.proj, a.terrain, a.terrainIndices); CaptureProvenance(a); }
             else if (a.kind == Act::TerrainTileRemove) core::TerrainRemoveTile(a.tileX, a.tileZ, a.proj, a.terrain, a.terrainIndices);
         }
         if (!moves.empty()) core::MoveMany(moves, true);
@@ -1775,7 +1775,7 @@ namespace editor {
         if (k == Act::NpcLabel) return T("Rename NPC");
         if (k == Act::GroupName) return T("Rename group");
         if (k == Act::TerrainBatch) return T("Terrain");
-        if (k == Act::TerrainClear) return T("Clear all");
+        if (k == Act::TerrainClear) return T("Clear project terrain");
         if (k == Act::TerrainTileRemove) return T("Remove terrain tile");
         bool pos = false, rot = false, scale = false;
         for (const auto& a : entry.acts) {
@@ -2413,32 +2413,34 @@ namespace editor {
             ImGui::OpenPopup(title(g_metadataPopupRequest)); g_metadataPopupRequest = 0;
         }
         if (ImGui::BeginPopupModal(title(1), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::SetNextItemWidth(460); if (ImGui::InputTextMultiline("##npcnote", g_npcNoteEdit, sizeof g_npcNoteEdit, ImVec2(460, 110))) i18n::AddGlyphText(g_npcNoteEdit);
+            const float width = std::min(460.0f, std::max(120.0f, ImGui::GetIO().DisplaySize.x - 80.0f));
+            if (ImGui::InputTextMultiline("##npcnote", g_npcNoteEdit, sizeof g_npcNoteEdit, ImVec2(width, 110))) i18n::AddGlyphText(g_npcNoteEdit);
             if (ImGui::Button(T("Save"))) {
                 SaveMetadata(Act::NpcNote, g_npcNoteEditUid, g_npcNoteEdit); ImGui::CloseCurrentPopup();
             }
-            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
+            SameLineForControl("Cancel"); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
         if (ImGui::BeginPopupModal(title(2), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::SetNextItemWidth(360); InputTextI18n("##npclabel", "", g_npcLabelEdit, sizeof g_npcLabelEdit);
+            ImGui::SetNextItemWidth(std::min(360.0f, std::max(120.0f, ImGui::GetIO().DisplaySize.x - 80.0f))); InputTextI18n("##npclabel", "", g_npcLabelEdit, sizeof g_npcLabelEdit);
             if (ImGui::Button(T("Save"))) {
                 SaveMetadata(Act::NpcLabel, g_npcLabelEditUid, g_npcLabelEdit); ImGui::CloseCurrentPopup();
             }
-            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
+            SameLineForControl("Cancel"); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
         if (ImGui::BeginPopupModal(title(3), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::SetNextItemWidth(360); InputTextI18n("##groupname", "", g_groupNameEdit, sizeof g_groupNameEdit);
+            ImGui::SetNextItemWidth(std::min(360.0f, std::max(120.0f, ImGui::GetIO().DisplaySize.x - 80.0f))); InputTextI18n("##groupname", "", g_groupNameEdit, sizeof g_groupNameEdit);
             if (ImGui::Button(T("Save"))) {
                 SaveMetadata(Act::GroupName, g_groupNameEditId, g_groupNameEdit); ImGui::CloseCurrentPopup();
             }
-            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
+            SameLineForControl("Cancel"); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
         if (ImGui::BeginPopupModal(title(4), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::SetNextItemWidth(460); if (ImGui::InputTextMultiline("##objectnote", g_objectNoteEdit, sizeof g_objectNoteEdit, ImVec2(460, 110))) i18n::AddGlyphText(g_objectNoteEdit);
+            const float width = std::min(460.0f, std::max(120.0f, ImGui::GetIO().DisplaySize.x - 80.0f));
+            if (ImGui::InputTextMultiline("##objectnote", g_objectNoteEdit, sizeof g_objectNoteEdit, ImVec2(width, 110))) i18n::AddGlyphText(g_objectNoteEdit);
             if (ImGui::Button(T("Save"))) {
                 SaveMetadata(Act::ObjectNote, g_objectNoteEditUid, g_objectNoteEdit); ImGui::CloseCurrentPopup();
             }
-            ImGui::SameLine(); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
+            SameLineForControl("Cancel"); if (ImGui::Button(T("Cancel"))) ImGui::CloseCurrentPopup(); ImGui::EndPopup();
         }
     }
     // tiles like the prefab browser's cards: the appearance preview, the in-game name below, a double-click spawns
@@ -2870,26 +2872,40 @@ namespace editor {
     static void DrawBrowser(const PosInfo& p, bool havePos) {
         const auto& idx = core::PrefabIndex();
         const float browserWidth = ImGui::GetContentRegionAvail().x;
-        const float categoryWidth = std::min(g_catW, std::max(90.0f, browserWidth - 220.0f));
-        ImGui::BeginChild("cats", ImVec2(categoryWidth, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
-        g_catW = ImGui::GetWindowSize().x;
-        ImGui::TextDisabled(T(ICON_FOLDER_TREE "  CATEGORIES")); if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("drag the right edge of this pane to resize it"));
-        DrawCatNode(0);
-        ImGui::Separator();
-        LoadColls();
-        ImGui::TextDisabled(T(ICON_STAR "  COLLECTIONS")); if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("your own named prefab lists; add the selected prefab from the details panel"));
-        for (int i = 0; i < (int)g_colls.size(); i++) {
-            ImGui::PushID(i);
-            char lbl[120]; snprintf(lbl, sizeof lbl, "%s  (%d)", g_colls[i].name.c_str(), (int)g_colls[i].paths.size());
-            if (ImGui::Selectable(lbl, g_selColl == i)) { g_selColl = g_selColl == i ? -1 : i; }
-            if (ImGui::BeginPopupContextItem("collctx")) { if (ImGui::MenuItem(T("delete collection"))) { g_colls.erase(g_colls.begin() + i); SaveColls(); if (g_selColl == i) g_selColl = -1; ImGui::EndPopup(); ImGui::PopID(); break; } ImGui::EndPopup(); }
-            ImGui::PopID();
+        const auto drawCategories = [&]() {
+            ImGui::TextDisabled(T(ICON_FOLDER_TREE "  CATEGORIES"));
+            DrawCatNode(0);
+            ImGui::Separator();
+            LoadColls();
+            ImGui::TextDisabled(T(ICON_STAR "  COLLECTIONS"));
+            for (int i = 0; i < (int)g_colls.size(); i++) {
+                ImGui::PushID(i);
+                char lbl[120]; snprintf(lbl, sizeof lbl, "%s  (%d)", g_colls[i].name.c_str(), (int)g_colls[i].paths.size());
+                if (ImGui::Selectable(lbl, g_selColl == i)) g_selColl = g_selColl == i ? -1 : i;
+                if (ImGui::BeginPopupContextItem("collctx")) { if (ImGui::MenuItem(T("delete collection"))) { g_colls.erase(g_colls.begin() + i); SaveColls(); if (g_selColl == i) g_selColl = -1; ImGui::EndPopup(); ImGui::PopID(); break; } ImGui::EndPopup(); }
+                ImGui::PopID();
+            }
+            ImGui::SetNextItemWidth(std::max(60.0f, ImGui::GetContentRegionAvail().x - 60));
+            const bool enter = InputTextI18n("##newcoll", T("new collection"), g_newColl, sizeof g_newColl, ImGuiInputTextFlags_EnterReturnsTrue);
+            SameLineForControl("add");
+            if ((ImGui::Button(T("add")) || enter) && g_newColl[0]) { g_colls.push_back({ g_newColl, {} }); SaveColls(); g_newColl[0] = 0; }
+        };
+        if (browserWidth >= 400.0f) {
+            const float categoryWidth = std::min(g_catW, browserWidth - 230.0f);
+            ImGui::BeginChild("cats", ImVec2(categoryWidth, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
+            g_catW = ImGui::GetWindowSize().x;
+            drawCategories();
+            ImGui::EndChild();
+            ImGui::SameLine();
+        } else {
+            if (FittedButton(T(ICON_FOLDER_TREE "  CATEGORIES"))) ImGui::OpenPopup("browser-categories");
+            if (ImGui::BeginPopup("browser-categories")) {
+                ImGui::BeginChild("cats-popup", ImVec2(std::max(170.0f, browserWidth - 30.0f), 340.0f), ImGuiChildFlags_Borders);
+                drawCategories();
+                ImGui::EndChild();
+                ImGui::EndPopup();
+            }
         }
-        ImGui::SetNextItemWidth(std::max(60.0f, ImGui::GetContentRegionAvail().x - 60));
-        bool enter = InputTextI18n("##newcoll", T("new collection"), g_newColl, sizeof g_newColl, ImGuiInputTextFlags_EnterReturnsTrue); ImGui::SameLine();
-        if ((ImGui::Button(T("add")) || enter) && g_newColl[0]) { g_colls.push_back({ g_newColl, {} }); SaveColls(); g_newColl[0] = 0; }
-        ImGui::EndChild();
-        ImGui::SameLine();
         ImGui::BeginChild("right", ImVec2(0, 0));
         const float ui = ImGui::GetFontSize() / 17.0f;
         {   // view switch: list or tiles
@@ -3007,7 +3023,7 @@ namespace editor {
             else ImGui::TextDisabled(T("meshes %d    %s"), pi.meshes, shownTags.c_str());
             ImGui::BeginDisabled(!havePos || !core::GameThreadReady());
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
-            if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS "   PLACE   "), ImVec2(150 * ui, 0))) StartPlaceNew(p, havePos);
+            if (FittedButton(T(ICON_LOCATION_CROSSHAIRS "   PLACE   "))) StartPlaceNew(p, havePos);
             ImGui::PopStyleColor(2);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("puts the object in front of you and lets you move it with the mouse gizmo"));
             SameLineForControl("spawn only"); if (ImGui::Button(T("spawn only"))) SpawnSelected(p);
@@ -3416,6 +3432,7 @@ namespace editor {
         ImGui::BeginDisabled(!core::ProjectDirty(g_projTab));
         if (ImGui::Button(T("Save"))) SaveProjectAction(name, core::SaveProjectOnly, true);
         ImGui::EndDisabled();
+        if (!core::IsProjectLoaded(name)) ImGui::TextWrapped("%s", T("The editing project is not loaded yet. Enter the game world, move your character, then load it."));
     }
     static void DrawScene(const PosInfo& p, bool havePos, bool compact = false) {
         auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); const auto chars = thumbgen::Characters();
@@ -3662,6 +3679,7 @@ namespace editor {
             { "unloaded", "Project unloaded" },
             { "saved", "Project saved" },
             { "preflight-ready", "Blueprint ready to export" },
+            { "record 0: game thread pump not active yet", "The game world is not ready for project objects yet. Move your character, then load the project again." },
         };
         for (const auto& entry : labels) if (strcmp(raw, entry.code) == 0) return T(entry.label);
         const char* translated = T(raw);
@@ -3680,7 +3698,7 @@ namespace editor {
                         mode == 1 ? core::ReloadProject(name) :
                         mode == 2 ? core::LoadProject(name, true) :
                         mode == 3 ? core::ClearScene() : core::UnloadProject(core::ProjectId(name));
-        if (!ok) { g_projectStatus = core::ProjectError(); Note("%s", g_projectStatus.c_str()); return false; }
+        if (!ok) { g_projectStatus = core::ProjectError(); Note("%s", ProjectUiStatus(g_projectStatus.c_str())); return false; }
         if (mode == 3 || (mode == 4 && core::FileNameEqual(core::EditingProject(), name))) core::SetEditingProject("");
         FinishProjectSceneMutation();
         g_projectStatus = mode < 3 ? "load-admitted" : mode == 3 ? "scene cleared" : "unloaded";
@@ -3943,7 +3961,7 @@ namespace editor {
         PublishProjectContext(); RefreshExportApproval(); bool ok = false;
         if (!g_exportApproval.valid) g_exportStatus = "preflight-changed";
         else ok = core::WriteGroupExport(g_exportApproval, g_exportStatus);
-        if (ok) { g_exportStatus = "written"; GenerateBlueprintThumbnail({ g_blueprintName, proj_codec::Kind::Group, false, g_exportApproval.path }, g_exportApproval.document); g_projectRefresh = true; }
+        if (ok) { g_exportStatus = "written"; GenerateBlueprintThumbnail({ g_blueprintName, proj_codec::Kind::Group, false, g_exportApproval.path }, g_exportApproval.document); g_projectRefresh = true; g_exportOpen = false; }
         if (g_exportAttempt) g_exportAttempts[g_exportAttempt - 1].result = g_exportStatus;
         g_exportApproval.valid = false; g_exportObjects.clear(); g_exportAttempt = 0; return ok;
     }
@@ -4176,8 +4194,7 @@ namespace editor {
             if (!saved.archived) {
                 const bool editing = core::FileNameEqual(core::EditingProject(), file.name);
                 if (ImGui::RadioButton(T("Edit project"), editing)) {
-                    const bool wasLoaded = core::IsProjectLoaded(file.name);
-                    if (core::SetEditingProject(file.name)) { if (!wasLoaded) FinishProjectSceneMutation(); else ClearSceneSelection(); g_projectRefresh = true; }
+                    if (core::SetEditingProject(file.name)) { ClearSceneSelection(); g_projectRefresh = true; }
                     else g_projectStatus = core::ProjectError();
                 }
                 ProjectButtonWrap("Load project"); bool loaded = core::IsProjectLoaded(file.name);
@@ -4323,7 +4340,7 @@ namespace editor {
             SetLabeledItemWidth("Blueprint name", 300); InputTextI18n(T("Blueprint name"), "", g_blueprintName, sizeof g_blueprintName);
             if (FittedCheckbox(T("Approve existing-file overwrite"), &g_exportOverwrite)) ResetExportApproval();
             ProjectButtonWrap("Write blueprint");
-            if (ImGui::Button(T("Write blueprint")) && ProjectExportPreflight()) ProjectExportWrite();
+            if (FittedButton(T("Write blueprint")) && ProjectExportPreflight()) ProjectExportWrite();
             ProjectButtonWrap("Cancel export"); if (ImGui::Button(T("Cancel export"))) { g_exportOpen = false; ResetExportApproval(); g_exportOverwrite = false; }
         }
         if (!g_exportStatus.empty()) ImGui::TextWrapped("%s: %s", T("Export status"), ProjectUiStatus(g_exportStatus.c_str()));
@@ -4379,19 +4396,19 @@ namespace editor {
         ImGui::TextDisabled(T("status: %s"), core::TravelStatus().c_str());
         ImGui::Separator();
         if (!g_tpTargetSet && havePos) { g_tpTarget = p.world; g_tpTargetSet = true; }
-        ImGui::SetNextItemWidth(330); ImGui::InputFloat3(T("##tptarget"), &g_tpTarget.x, "%.1f"); ImGui::SameLine();
+        ImGui::SetNextItemWidth(std::min(330.0f, ImGui::GetContentRegionAvail().x)); ImGui::InputFloat3(T("##tptarget"), &g_tpTarget.x, "%.1f"); SameLineForControl(ICON_LOCATION_CROSSHAIRS " Travel");
         ImGui::BeginDisabled(!core::TravelAvailable());
         if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " Travel"))) TravelGo(g_tpTarget, T("the coordinates"));
-        ImGui::EndDisabled(); ImGui::SameLine();
+        ImGui::EndDisabled(); SameLineForControl("current position");
         ImGui::BeginDisabled(!havePos); if (ImGui::Button(T("current position"))) g_tpTarget = p.world; ImGui::EndDisabled();
         ImGui::TextDisabled(T("x  y (height)  z - the height only needs to be roughly right, the game puts you on the ground"));
         ImGui::Separator();
-        ImGui::SetNextItemWidth(220); InputTextI18n("##tpname", T("name for the current spot"), g_tpName, sizeof g_tpName); ImGui::SameLine();
+        ImGui::SetNextItemWidth(std::min(220.0f, ImGui::GetContentRegionAvail().x)); InputTextI18n("##tpname", T("name for the current spot"), g_tpName, sizeof g_tpName); SameLineForControl(ICON_LOCATION_DOT " Save current position");
         ImGui::BeginDisabled(!havePos || !g_tpName[0]);
         if (ImGui::Button(T(ICON_LOCATION_DOT " Save current position"))) { g_tp.push_back({ g_tpName, p.world }); SaveTp(); g_tpName[0] = 0; }
         ImGui::EndDisabled();
-        if (ImGui::BeginTable("tp", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-            ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthStretch); ImGui::TableSetupColumn(T("position"), ImGuiTableColumnFlags_WidthFixed, 230);
+        if (ImGui::BeginTable("tp", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollX)) {
+            ImGui::TableSetupColumn(T("name"), ImGuiTableColumnFlags_WidthFixed, 150); ImGui::TableSetupColumn(T("position"), ImGuiTableColumnFlags_WidthFixed, 230);
             ImGui::TableSetupColumn(T("distance"), ImGuiTableColumnFlags_WidthFixed, 80);
             ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize(T("Go")).x + ImGui::GetStyle().FramePadding.x * 2);
             ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize(T("Delete")).x + ImGui::GetStyle().FramePadding.x * 2);
@@ -4601,8 +4618,11 @@ namespace editor {
     }
     static void ClearTerrainAction() {
         if (!PrepareHistoryMutation([]() { ClearTerrainAction(); })) return;
-        Act a{}; a.kind = Act::TerrainClear; a.terrain = core::TerrainStrokes();
-        core::TerrainClear(); Push({ std::move(a) });
+        const std::string name = core::EditingProject();
+        if (name.empty()) return;
+        Act a{}; a.kind = Act::TerrainClear; a.proj = core::ProjectId(name);
+        if (!core::TerrainRemoveProject(a.proj, a.terrain, a.terrainIndices)) return;
+        CaptureProvenance(a); Push({ std::move(a) });
     }
     static void DrawTerrain(const PosInfo& p, bool havePos, bool compact = false) {
         if (!core::TerrainAvailable()) { ImGui::TextWrapped(T("Terrain editing is not available in this game build: %s"), core::TerrainStatus().c_str()); return; }
@@ -4628,26 +4648,29 @@ namespace editor {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         ImGui::TextWrapped("%s", g_brushMode == BrushFlatten ? T("Flatten pulls the ground toward the height where the drag started.") : T("Dragging paints a stroke every 40 percent of the radius; strokes add up."));
         ImGui::PopStyleColor();
-        const auto strokes = core::TerrainStrokes();
-        ImGui::Text(T("%d strokes"), (int)strokes.size()); SameLineForControl("Undo");
+        const std::string editing = core::EditingProject();
+        const int project = editing.empty() ? 0 : core::ProjectId(editing);
+        const auto allStrokes = core::TerrainStrokes();
+        const int strokeCount = (int)std::count_if(allStrokes.begin(), allStrokes.end(), [project](const auto& stroke) { return project > 0 && stroke.proj == project; });
+        ImGui::Text(T("%d strokes"), strokeCount); SameLineForControl("Undo");
         ImGui::BeginDisabled(g_undo.empty());
         if (ImGui::Button(T("Undo"))) Undo();
         ImGui::EndDisabled(); SameLineForControl("Redo");
         ImGui::BeginDisabled(g_redo.empty());
         if (ImGui::Button(T("Redo"))) Redo();
-        ImGui::EndDisabled(); SameLineForControl("Clear all");
-        ImGui::BeginDisabled(strokes.empty());
-        if (ImGui::Button(T("Clear all"))) ClearTerrainAction();
+        ImGui::EndDisabled(); SameLineForControl("Clear project terrain");
+        ImGui::BeginDisabled(strokeCount == 0);
+        if (FittedButton(T("Clear project terrain"))) ClearTerrainAction();
         ImGui::EndDisabled();
         ImGui::Separator();
         const std::string st = core::TerrainApplyState();
         ImGui::PushStyleColor(ImGuiCol_Text, !st.empty() || core::TerrainNeedsApply() ? ImVec4(1.0f, 0.8f, 0.4f, 1.0f) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         if (!st.empty()) ImGui::TextWrapped(T("Applying: %s"), st.c_str());
         else if (core::TerrainNeedsApply()) ImGui::TextWrapped("%s", T("Not applied yet: the shaded surface shows the new shape."));
-        else if (strokes.empty()) ImGui::TextDisabled("%s", T("No terrain strokes yet. Enable the brush and paint on the ground."));
+        else if (strokeCount == 0) ImGui::TextDisabled("%s", T("No terrain strokes yet. Enable the brush and paint on the ground."));
         else ImGui::TextWrapped("%s", T("The ground shows every stroke."));
         ImGui::PopStyleColor();
-        ImGui::BeginDisabled(!st.empty() || !havePos || !core::TravelAvailable() || strokes.empty() && !core::TerrainNeedsApply());
+        ImGui::BeginDisabled(!st.empty() || !havePos || !core::TravelAvailable() || allStrokes.empty() && !core::TerrainNeedsApply());
         if (FittedButton(T(ICON_LOCATION_CROSSHAIRS " Apply (two loading screens)"), compact)) { if (core::TerrainApply(p.world)) Note(T("applying the terrain: fast travel away and back")); }
         ImGui::EndDisabled();
         if (!compact || ImGui::CollapsingHeader(TStable("Terrain help"))) {
@@ -4998,9 +5021,9 @@ namespace editor {
         ImGui::TextDisabled("%s", ShownName(pi).c_str());
         ImGui::BeginDisabled(!havePos || !core::GameThreadReady());
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
-        if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS " PLACE "), ImVec2(130 * ui, 0))) StartPlaceNew(p, havePos);
-        ImGui::PopStyleColor(2); ImGui::SameLine();
-        if (ImGui::Button(T("spawn only"), ImVec2(-1, 0))) SpawnSelected(p);
+        if (FittedButton(T(ICON_LOCATION_CROSSHAIRS " PLACE "))) StartPlaceNew(p, havePos);
+        ImGui::PopStyleColor(2); SameLineForControl("spawn only");
+        if (FittedButton(T("spawn only"))) SpawnSelected(p);
         ImGui::EndDisabled();
         if (ImGui::CollapsingHeader(TStable("Spawn options: offset, yaw, scale, direction"))) {
             ImGui::SetNextItemWidth(-1); DragFloat3Edit(T("offset forward, up, side"), g_off, 0.1f, -50, 50, "%.1f");
@@ -5058,7 +5081,7 @@ namespace editor {
             if (i) SameLineForControl(dockPages[i].label);
             const bool act = g_compactPage == dockPages[i].id;   // decided once: the click below may change the page
             if (act) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
-            if (ImGui::Button(TStable(dockPages[i].label))) { g_compactPage = dockPages[i].id; g_mainTab = dockPages[i].id; ImGui::SetScrollY(0); }
+            if (FittedButton(TStable(dockPages[i].label))) { g_compactPage = dockPages[i].id; g_mainTab = dockPages[i].id; ImGui::SetScrollY(0); }
             if (act) ImGui::PopStyleColor();
         }
         if (g_compactPage == TabScene) {
@@ -5214,6 +5237,7 @@ namespace editor {
             g_gameNames = thumbgen::GameNames();
         }
         PosInfo p{}; bool havePos = core::PlayerPosInfo(&p);
+        core::AutoloadFrame();
         TrackFacing(p, havePos);
         SampleCamera();
         PumpSnapJobs();
@@ -5332,7 +5356,7 @@ namespace editor {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_HeaderHovered));
                 }
-                if (ImGui::Button(label)) g_mainTab = page.id;
+                if (FittedButton(label)) g_mainTab = page.id;
                 if (active) ImGui::PopStyleColor(2);
                 ImGui::PopID();
                 firstNav = false;
