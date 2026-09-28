@@ -1511,7 +1511,7 @@ namespace editor {
         g_primary = uid; g_lastClicked = uid; g_sceneLastEntity = uid;
     }
     // snap to ground for placed objects: one probe per object, results applied as they arrive (undoable move)
-    struct SnapJob { core::GroundHandle op; int ticket = 0, iter = 0, scan = 0; float bottom = 0, top = 0, startY = 0, x = 0, z = 0; };
+    struct SnapJob { core::GroundHandle op; int ticket = 0, iter = 0; float bottom = 0, top = 0, startY = 0, x = 0, z = 0; };
     static std::vector<SnapJob> g_snapJobs;
     static void SceneNumericApply(int uid, Vec3 pos, Rot rot, float scale, bool final);
     static std::vector<core::GroundHandle> BeginGrounding(const std::vector<int>& uids, bool rigid, const core::GroundPlacement& carried) {
@@ -1550,10 +1550,10 @@ namespace editor {
             proj_codec::Bounds bounds;
             if (!core::GroundBounds(op, bounds)) { core::GroundCancel(op, "refused"); continue; }
             SnapJob j; j.op = op; j.bottom = (float)bounds.min.y; j.top = (float)bounds.max.y; j.startY = j.top + 5.0f;
-            const auto view = core::GroundStateOf(op);
-            j.x = context.generation ? g_place.center.x : rigid ? (float)bounds.anchor.x : view.members[0].before.pos.x;
-            j.z = context.generation ? g_place.center.z : rigid ? (float)bounds.anchor.z : view.members[0].before.pos.z;
-            j.ticket = core::GroundTicket(op, { j.x, j.startY, j.z }, 30.0f); g_snapJobs.push_back(j);
+            // Probe under the measured geometry, not its prefab pivot, which may sit well outside the visible mesh.
+            j.x = (float)((bounds.min.x + bounds.max.x) * 0.5);
+            j.z = (float)((bounds.min.z + bounds.max.z) * 0.5);
+            j.ticket = core::GroundTicket(op, { j.x, j.startY, j.z }, 400.0f); g_snapJobs.push_back(j);
         }
         for (const auto& op : g_pendingGround) g_groundReports.Observe(core::GroundStateOf(op));
         return added;
@@ -1564,16 +1564,11 @@ namespace editor {
         for (size_t i = 0; i < g_snapJobs.size();) {
             auto& j = g_snapJobs[i];
             if (!core::GroundValidate(j.op)) { g_snapJobs.erase(g_snapJobs.begin() + i); continue; }
-            if (!j.ticket) { j.ticket = core::GroundTicket(j.op, { j.x, j.startY, j.z }, 30.0f); ++i; continue; }
+            if (!j.ticket) { j.ticket = core::GroundTicket(j.op, { j.x, j.startY, j.z }, 400.0f); ++i; continue; }
             core::GroundHit hit; if (!core::GroundPoll(j.op, &hit)) { ++i; continue; }
             j.ticket = 0; float groundY = 0;
-            if (!hit.hit && j.scan++ < 14) {
-                j.startY = j.scan == 1 ? j.top + 25.0f : j.startY - 28.0f;
-                j.ticket = core::GroundTicket(j.op, { j.x, j.startY, j.z }, 30.0f);
-                ++i; continue;
-            }
             const int step = std::isfinite(hit.centerY) && std::isfinite(hit.fraction) ? GroundStep(hit, j.x, j.z, j.bottom, j.top, j.startY, j.iter, &groundY) : -1;
-            if (!step && j.iter < 40) { j.ticket = core::GroundTicket(j.op, { j.x, j.startY, j.z }, 30.0f); ++i; continue; }
+            if (!step && j.iter < 40) { j.ticket = core::GroundTicket(j.op, { j.x, j.startY, j.z }, 400.0f); ++i; continue; }
             if (step == 1) {
                 std::vector<core::MoveReq> moves; const auto v = core::GroundStateOf(j.op);
                 for (const auto& m : v.members) { Vec3 pos = m.before.pos; pos.y += groundY - j.bottom; moves.push_back({ m.before.uid, pos, m.before.rot, m.before.scale }); }
