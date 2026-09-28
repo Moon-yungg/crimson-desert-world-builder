@@ -201,7 +201,7 @@ namespace editor {
     struct BrowserDropJob { int prefab = -1, ticket = 0; DWORD queuedAt = 0; Vec3 center{}; float yaw = 0, scale = 1; };
     static std::vector<BrowserDropJob> g_browserDropJobs;   // ground is probed before spawning, so a new object's own collision cannot be mistaken for the surface
     static int   g_npcDragIndex = -1;        // character row/card being dragged out into the game view
-    struct NpcDropJob { uint32_t key = 0; int ticket = 0; DWORD queuedAt = 0; Vec3 at{}; int count = 1, formation = 0; float spacing = 1.5f, radius = 8.0f, fx = 0, fz = 1; bool ai = true; int behavior = 0; };
+    struct NpcDropJob { uint32_t key = 0; int ticket = 0; DWORD queuedAt = 0; Vec3 at{}; int count = 1, formation = 1; float spacing = 1.5f, radius = 8.0f, fx = 0, fz = 1; bool ai = true; int behavior = 0; };
     static std::vector<NpcDropJob> g_npcDropJobs;
     static std::set<std::string> g_tagFilter;
     static std::vector<int> g_matches; static std::string g_lastKey;
@@ -2094,7 +2094,7 @@ namespace editor {
     // request so they can be selected, moved in-place through TransformSync when safe (respawn fallback), deleted,
     // AI-controlled and persisted in .cdproj files.
     static char g_npcFilter[128] = ""; static int g_npcCat = 0, g_npcSel = -1, g_npcCount = 1; static float g_npcDist = 5.0f;
-    static int g_npcFormation = 0; static float g_npcSpacing = 1.5f, g_npcRadius = 8.0f;
+    static int g_npcFormation = 1; static float g_npcSpacing = 1.5f, g_npcRadius = 8.0f;
     static bool g_npcSpawnAi = true; static int g_npcSpawnBehavior = 0;
     static int g_npcNoteEditUid = 0, g_npcLabelEditUid = 0, g_groupNameEditId = 0, g_objectNoteEditUid = 0;
     static bool g_metadataEditing = false;
