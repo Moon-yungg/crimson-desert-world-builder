@@ -3887,15 +3887,29 @@ namespace editor {
         return R::None;
     }
     static bool ExecuteLibraryAction() {
+        const core::SavedFile file = core::SelectedFile(g_libraryAction.selection);
         g_libraryAction.result = core::ExecuteFileAction(g_libraryAction.selection, g_libraryAction.action, g_libraryAction.typed, GuardLibraryFile);
         if (!g_libraryAction.result.ok()) return false;
+        if (file.kind == proj_codec::Kind::Group) {
+            const ProjectFile blueprint{ file.filename.substr(0, file.filename.size() - 8), file.kind, file.archived, file.path };
+            const std::string thumbnail = BlueprintThumbnailPath(blueprint);
+            if (!DeleteFileA(thumbnail.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND)
+                core::Log("[blueprint] could not remove obsolete thumbnail %s (error %lu)", thumbnail.c_str(), GetLastError());
+            overlay::InvalidateThumb(thumbnail);
+            g_badBlueprintThumbnailStamps.erase(file.path);
+            if (g_projectReadPath == file.path) g_projectReadValid = false;
+        }
         g_projectRefresh = true; g_projectStatus = T("File action completed. Scene objects and History were not changed."); return true;
     }
     static void BeginLibraryAction(const core::SavedFile& file, core::FileAction action) {
         g_libraryAction = {}; g_libraryAction.action = action; g_projectStatus.clear();
         g_libraryAction.result = core::SelectSavedFile(file, g_libraryAction.selection);
         if (!g_libraryAction.result.ok()) return;
-        if (action == core::FileAction::Delete || action == core::FileAction::Purge) g_libraryAction.openConfirmation = true;
+        if ((action == core::FileAction::Delete || action == core::FileAction::Purge) && file.kind == proj_codec::Kind::Group) {
+            strncpy_s(g_libraryAction.typed, file.filename.c_str(), _TRUNCATE);
+            ExecuteLibraryAction();
+        }
+        else if (action == core::FileAction::Delete || action == core::FileAction::Purge) g_libraryAction.openConfirmation = true;
         else ExecuteLibraryAction();
     }
     static void DrawLibraryFailure() {
@@ -4003,11 +4017,15 @@ namespace editor {
                     if (ImGui::Checkbox(T("autoload"), &on)) DispatchProjectAction(file, ProjectAction::Autoload, on);
                 }
                 ProjectButtonWrap("Archive"); if (ImGui::Button(T("Archive"))) BeginLibraryAction(saved, core::FileAction::Archive);
-                ProjectButtonWrap("More file actions"); if (ImGui::Button(T("More file actions"))) ImGui::OpenPopup("file-actions");
-                if (ImGui::BeginPopup("file-actions")) { if (ImGui::MenuItem(T("Permanent delete"))) BeginLibraryAction(saved, core::FileAction::Delete); ImGui::EndPopup(); }
+                if (groupKind) {
+                    ProjectButtonWrap("Delete"); if (ImGui::Button(T("Delete"))) BeginLibraryAction(saved, core::FileAction::Delete);
+                } else {
+                    ProjectButtonWrap("More file actions"); if (ImGui::Button(T("More file actions"))) ImGui::OpenPopup("file-actions");
+                    if (ImGui::BeginPopup("file-actions")) { if (ImGui::MenuItem(T("Permanent delete"))) BeginLibraryAction(saved, core::FileAction::Delete); ImGui::EndPopup(); }
+                }
             } else {
                 ProjectButtonWrap("Restore"); if (ImGui::Button(T("Restore"))) BeginLibraryAction(saved, core::FileAction::Restore);
-                ProjectButtonWrap("Purge"); if (ImGui::Button(T("Purge"))) BeginLibraryAction(saved, core::FileAction::Purge);
+                ProjectButtonWrap(groupKind ? "Delete" : "Purge"); if (ImGui::Button(T(groupKind ? "Delete" : "Purge"))) BeginLibraryAction(saved, core::FileAction::Purge);
             }
             ImGui::PopID(); ImGui::PopID(); break;
         }
