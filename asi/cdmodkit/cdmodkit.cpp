@@ -985,7 +985,7 @@ static void DoLiveMove(uintptr_t obj, Vec3 pos, Rot rot, float scale, DWORD queu
 static void DoReplace(int uid, uint64_t gen, MoveCompletion done = {}, const MoveReq* target = nullptr) {
     uintptr_t old = 0;
     { REG_LOCK; if (!GenCurrentLocked(uid, gen)) return; old = g_reg[(size_t)IndexOfUidLocked(uid)].obj; }
-    if (old && !DoRemove(old) && done) { done(false); return; } // actual refusal; no fictitious replacement
+    if (old && !DoRemove(old)) { if (done) done(false); return; } // never spawn a duplicate while the old object survives
     uint64_t next = 0;
     { REG_LOCK; if (!GenCurrentLocked(uid, gen)) return;   // a forget/hide/restore replaced the incarnation while removing
       SpawnedObj& e = g_reg[(size_t)IndexOfUidLocked(uid)];
@@ -1157,6 +1157,7 @@ static void HideUidDeferred(int uid, std::function<void()> removed) {
 static bool HideUidInternal(int uid, std::function<void()> removed) {
     std::unique_lock<std::mutex> operation(g_groundOpMutex);
     if (!GroundBeforeMutationLocked({ uid }, [uid, removed]() { HideUidDeferred(uid, removed); })) return true;
+    if (!GameThreadReady()) return false;
     uintptr_t obj = 0, actor = 0, standinObj = 0; bool gimmick = false; std::weak_ptr<PlaceRequest> reqw; int rowId = -1;
     {   // an interactive object: its actor is removed on the server tick, the way the game removes a picked-up item
         REG_LOCK; const int idx = IndexOfUidLocked(uid); if (idx < 0 || g_reg[(size_t)idx].hidden) return false;
@@ -1179,7 +1180,6 @@ static bool HideUidInternal(int uid, std::function<void()> removed) {
         } else if (!serverLane && removed) removed();   // nothing visible to remove: the cleanup is already complete
         return true;
     }
-    if (!GameThreadReady()) return false;
     if (obj) RunOnGameThread([obj, removed]() { DoRemove(obj); if (removed) removed(); });
     else if (removed) removed();                        // hidden record with no materialized object: nothing to remove
     return true;

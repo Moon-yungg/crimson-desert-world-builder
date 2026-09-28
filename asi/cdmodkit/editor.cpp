@@ -3793,6 +3793,7 @@ namespace editor {
             elements.push_back({ r.pos.x, r.pos.y, r.pos.z, u, v, size, core::ThumbFile(r.prefab), r.prefab, 0 });
         }
         const auto chars = thumbgen::Characters();
+        bool pending = !doc.npcs.empty() && !chars;
         for (const auto& n : doc.npcs) {
             std::string app;
             if (chars) for (const auto& c : *chars) if (c.key == n.key) { app = c.app; break; }
@@ -3822,7 +3823,6 @@ namespace editor {
         std::stable_sort(elements.begin(), elements.end(), [](const Element& a, const Element& b) { return a.kind == 2 && b.kind != 2 ? true : a.kind != 2 && b.kind == 2 ? false : a.v < b.v; });
         struct Sprite { std::vector<unsigned char> rgba; int w = 0, h = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0; };
         std::unordered_map<std::string, Sprite> sprites;
-        bool pending = false;
         for (const auto& e : elements) {
             if (e.kind == 2) {
                 const ImVec2 center = screen(e.u, e.v);
