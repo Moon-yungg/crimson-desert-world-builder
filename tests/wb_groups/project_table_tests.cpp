@@ -572,11 +572,23 @@ void LibraryScale() {
     editor::g_projectRefresh=true;Frame();Frame();Check(editor::SameSavedFile(archived,editor::g_librarySelected)&&editor::g_librarySelected.archived,"refresh-retains-exact-archived-not-active-namesake");
     core::g_sceneEnumerationStats={};LibraryInput("no-matching-file");Check(editor::g_libraryRows.empty()&&LibraryDrawn()==0&&LibraryWindow()->Size.y==height,"empty-results-retain-fixed-height-and-submit-no-rows");
     Check(core::g_sceneEnumerationStats.calls==0,"search-filter-render-zero-scene-enumerations");
-    const std::string groups=dir+"\\Groups",parked=dir+"\\Groups-parked";Require(MoveFileA(groups.c_str(),parked.c_str())!=0,"park-synthetic-groups");Write(groups,"not a directory");
-    editor::g_projectRefresh=true;Frame();Frame();
+    // Deterministic refresh-failure injection (r2 flake fix): the previous mechanism renamed the real 2051-entry
+    // Groups directory (an exclusive-subtree rename, transiently blockable by an external holder - the one-off
+    // E/10 r2 1306/2 failure) and dropped a file named Groups in its place. The injected production fault is
+    // unchanged - the active mod root's Groups path is not a directory, which OpenFileDirectory rejects as
+    // UnsafePath - but the precondition is now created without renaming any occupied tree: a parked root holding
+    // that file, selected through the existing host::SetModDir seam.
+    const std::string parked=dir+"\\parked-root";
+    const bool parkedRoot=CreateDirectoryA(parked.c_str(),nullptr)!=0;const DWORD parkError=parkedRoot?0:GetLastError();
+    Require(parkedRoot,"park-synthetic-groups");
+    Write(parked+"\\Groups","not a directory");
+    const DWORD groupsAttr=GetFileAttributesA((parked+"\\Groups").c_str());
+    printf("PARK root=%s parkError=%lu parkedGroupsAttr=0x%lX realGroupsAttr=0x%lX\n",parked.c_str(),(unsigned long)parkError,(unsigned long)groupsAttr,(unsigned long)GetFileAttributesA((dir+"\\Groups").c_str()));
+    Require(groupsAttr!=INVALID_FILE_ATTRIBUTES&&(groupsAttr&FILE_ATTRIBUTE_DIRECTORY)==0,"park-groups-path-is-file");
+    host::SetModDir(parked);editor::g_projectRefresh=true;Frame();Frame();
     Check(editor::g_libraryResult.reason==core::FileReason::UnsafePath&&editor::g_projectLibrary.entries.size()==4104&&editor::SameSavedFile(archived,editor::g_librarySelected),"failed-refresh-preserves-snapshot-selection-and-core-error");
     Check(core::g_sceneEnumerationStats.calls==0,"failed-refresh-no-scene-pass-or-automatic-retry");
-    Require(DeleteFileA(groups.c_str())&&MoveFileA(parked.c_str(),groups.c_str()),"restore-synthetic-groups");
+    host::SetModDir(dir);
     editor::g_projectRefresh=true;Frame();Frame();Check(editor::g_libraryResult.ok(),"explicit-retry-clears-refresh-error");
     Require(DeleteFileA(archived.path.c_str())!=0,"remove-selected-synthetic-file");editor::g_projectRefresh=true;Frame();Frame();Check(editor::g_librarySelected.path.empty(),"missing-exact-selection-cleared-not-retargeted");
     Check(Read(ProjectPath())==projectBytes&&Read(GroupPath())==groupBytes,"browsing-preserves-fixture-document-bytes");
