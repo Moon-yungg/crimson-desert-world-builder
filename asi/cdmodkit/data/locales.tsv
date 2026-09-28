@@ -573,6 +573,29 @@ Disable AI	Disable AI	禁用 AI	停用 AI	KI deaktivieren	Désactiver l’IA	AI 
 Edit note	Edit note	编辑备注	編輯備註	Notiz bearbeiten	Modifier la note	메모 편집	メモを編集	Editar nota	Editar nota	Изменить заметку	Notu düzenle
 Edit NPC note	Edit NPC note	编辑 NPC 备注	編輯 NPC 備註	NPC-Notiz bearbeiten	Modifier la note du PNJ	NPC 메모 편집	NPCのメモを編集	Editar nota del PNJ	Editar nota do NPC	Изменить заметку NPC	NPC notunu düzenle
 Edit object note	Edit object note	编辑物品备注	編輯物品備註	Objektnotiz bearbeiten	Modifier la note de l’objet	물품 메모 편집	オブジェクトのメモを編集	Editar nota del objeto	Editar nota do objeto	Изменить заметку объекта	Nesne notunu düzenle
+Mesh	Mesh	网格	網格	Mesh	Maillage	메시	メッシュ	Malla	Malha	Сетка	Mesh
+SkinnedMesh	SkinnedMesh	蒙皮网格	蒙皮網格	Skinned Mesh	Maillage avec squelette	스킨 메시	スキンメッシュ	Malla esquelética	Malha com esqueleto	Скелетная сетка	İskeletli mesh
+Gimmick	Gimmick	互动机关	互動機關	Interaktives Objekt	Objet interactif	상호작용 장치	ギミック	Mecanismo interactivo	Mecanismo interativo	Интерактивный объект	Etkileşimli nesne
+Socket	Socket	挂接点	掛接點	Anschlusspunkt	Point d’ancrage	소켓	ソケット	Punto de anclaje	Ponto de encaixe	Точка крепления	Bağlantı noktası
+SubPrefab	SubPrefab	子预制体	子預製體	Unter-Prefab	Sous-préfabriqué	하위 프리팹	サブプレハブ	Subprefab	Subprefab	Дочерний префаб	Alt prefab
+Character	Character	人物	人物	Charakter	Personnage	캐릭터	キャラクター	Personaje	Personagem	Персонаж	Karakter
+Appearance	Appearance	外观	外觀	Erscheinungsbild	Apparence	외형	外見	Apariencia	Aparência	Внешний вид	Görünüm
+Spline	Spline	样条	樣條	Spline	Courbe spline	스플라인	スプライン	Curva spline	Curva spline	Сплайн	Eğri
+Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini
+Head	Head	头部	頭部	Kopf	Tête	머리	頭	Cabeza	Cabeça	Голова	Baş
+Armor	Armor	护甲	護甲	Rüstung	Armure	방어구	防具	Armadura	Armadura	Броня	Zırh
+Hair	Hair	头发	頭髮	Haare	Cheveux	머리카락	髪	Cabello	Cabelo	Волосы	Saç
+GameData	GameData	游戏数据	遊戲資料	Spieldaten	Données du jeu	게임 데이터	ゲームデータ	Datos del juego	Dados do jogo	Игровые данные	Oyun verileri
+Effect	Effect	特效	特效	Effekt	Effet	효과	エフェクト	Efecto	Efeito	Эффект	Efekt
+Tree	Tree	树木	樹木	Baum	Arbre	나무	木	Árbol	Árvore	Дерево	Ağaç
+Decal	Decal	贴花	貼花	Decal	Décalcomanie	데칼	デカール	Calcomanía	Decalque	Декаль	Çıkartma
+Collision	Collision	碰撞	碰撞	Kollision	Collision	충돌	コリジョン	Colisión	Colisão	Коллизия	Çarpışma
+Trigger	Trigger	触发器	觸發器	Trigger	Déclencheur	트리거	トリガー	Activador	Gatilho	Триггер	Tetikleyici
+Light	Light	灯光	燈光	Licht	Lumière	조명	ライト	Luz	Luz	Освещение	Işık
+Physics	Physics	物理	物理	Physik	Physique	물리	物理	Física	Física	Физика	Fizik
+Navigation	Navigation	导航	導航	Navigation	Navigation	내비게이션	ナビゲーション	Navegación	Navegação	Навигация	Gezinme
+Other	Other	其他	其他	Sonstiges	Autres	기타	その他	Otros	Outros	Прочее	Diğer
+Camera	Camera	相机	相機	Kamera	Caméra	카메라	カメラ	Cámara	Câmera	Камера	Kamera
 Enable AI	Enable AI	启用 AI	啟用 AI	KI aktivieren	Activer l’IA	AI 활성화	AIを有効化	Activar IA	Ativar IA	Включить ИИ	AI'ı etkinleştir
 Group %d	Group %d	组 %d	群組 %d	Gruppe %d	Groupe %d	그룹 %d	グループ %d	Grupo %d	Grupo %d	Группа %d	Grup %d
 Hold	Hold	驻留	駐留	Halten	Maintien	고정	待機	Mantener	Manter	Удержание	Beklet

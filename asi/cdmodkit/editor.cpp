@@ -2886,14 +2886,15 @@ namespace editor {
         for (auto& t : tags) {
             if (shown++ >= 14) break;
             bool on = g_tagFilter.count(t.first) > 0;
+            const char* translated = T(t.first == "Nude" ? "Character" : t.first.c_str());
+            if (shown > 1) SameLineOrWrap(true, ImGui::CalcTextSize(translated).x + ImGui::GetStyle().FramePadding.x * 2);
+            ImGui::PushID(t.first.c_str());
             if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
-            char lbl[80]; snprintf(lbl, sizeof lbl, "%s##tag", t.first.c_str());
-            if (ImGui::Button(lbl)) { if (on) g_tagFilter.erase(t.first); else g_tagFilter.insert(t.first); }
+            if (ImGui::Button(translated)) { if (on) g_tagFilter.erase(t.first); else g_tagFilter.insert(t.first); }
             if (on) ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("%d prefabs with %s"), t.second, t.first.c_str());
-            ImGui::SameLine();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("%d prefabs with %s"), t.second, translated);
+            ImGui::PopID();
         }
-        ImGui::NewLine();
         RefreshMatches();
         ImGui::TextDisabled(T("%d results"), (int)g_matches.size());
         if (idx.empty()) {
