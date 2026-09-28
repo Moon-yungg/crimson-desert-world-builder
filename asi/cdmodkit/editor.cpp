@@ -533,6 +533,21 @@ namespace editor {
         while (p <= tags.size()) { size_t q = tags.find(',', p); std::string t = tags.substr(p, q == std::string::npos ? std::string::npos : q - p); size_t c = t.find(':'); if (c != std::string::npos) t = t.substr(0, c); if (t == tag) return true; if (q == std::string::npos) break; p = q + 1; }
         return false;
     }
+    static std::string LocalizedTags(const std::string& tags) {
+        std::string shown;
+        for (size_t p = 0; p < tags.size();) {
+            const size_t q = tags.find(',', p);
+            const std::string part = tags.substr(p, q == std::string::npos ? std::string::npos : q - p);
+            const size_t colon = part.find(':');
+            const std::string key = part.substr(0, colon);
+            if (!shown.empty()) shown += ", ";
+            shown += T(key == "Nude" ? "Character" : key.c_str());
+            if (colon != std::string::npos) shown += part.substr(colon);
+            if (q == std::string::npos) break;
+            p = q + 1;
+        }
+        return shown;
+    }
     static bool InCat(int cat, int sel) { const auto& cats = core::Categories(); for (int n = cat; n >= 0; n = cats[n].parent) if (n == sel) return true; return false; }
     static bool IsVariantToken(const std::string& t) {
         if (t.empty()) return false;
@@ -1444,6 +1459,13 @@ namespace editor {
         g_terrainTileSelected = false;
         g_sceneLastEntity = 0; g_editUid = 0;
     }
+    static void RefreshSelectionPrimary() {
+        if (!g_sel.count(g_primary)) g_primary = g_sel.empty() ? 0 : *g_sel.begin();
+        if (!g_managedNpcSel.count(g_managedNpcPrimary)) g_managedNpcPrimary = g_managedNpcSel.empty() ? 0 : *g_managedNpcSel.begin();
+        if (!g_sel.count(g_lastClicked)) g_lastClicked = 0;
+        if (!g_managedNpcSel.count(g_managedNpcLast)) g_managedNpcLast = 0;
+        g_sceneLastEntity = g_primary ? g_primary : g_managedNpcPrimary ? -g_managedNpcPrimary : 0;
+    }
     static void ClearDeletedSelectionUi(bool deletedObject) {
         g_propertiesOpen = g_propertiesPopupRequested = false;
         g_numericSceneUid = g_numericNpcUid = 0; CancelNumericEdit();
@@ -1508,7 +1530,9 @@ namespace editor {
             for (const auto& n : core::ManagedNpcs()) if (n.group == o->group && !n.hidden) g_managedNpcSel.insert(n.uid);
         }
         else addOne(uid);
-        g_primary = uid; g_lastClicked = uid; g_sceneLastEntity = uid;
+        if (g_sel.count(uid)) g_primary = g_lastClicked = uid;
+        RefreshSelectionPrimary();
+        if (g_sel.count(uid)) g_sceneLastEntity = uid;
     }
     // snap to ground for placed objects: one probe per object, results applied as they arrive (undoable move)
     struct SnapJob { core::GroundHandle op; int ticket = 0, iter = 0; float bottom = 0, top = 0, startY = 0, x = 0, z = 0; };
@@ -1627,9 +1651,10 @@ namespace editor {
     static void DeleteSel() {
         if (!PrepareHistoryMutation([]() { DeleteSel(); })) return;
         auto list = core::Spawned(); std::vector<Act> acts;
-        for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; Act a; a.kind = Act::Delete; a.uid = uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale; a.group = o->group; a.proj = o->proj; a.text0 = o->note; acts.push_back(a); core::HideUid(uid); }
+        std::set<int> failed;
+        for (int uid : g_sel) { const SpawnedObj* o = Find(list, uid); if (!o || o->hidden) continue; Act a; a.kind = Act::Delete; a.uid = uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale; a.group = o->group; a.proj = o->proj; a.text0 = o->note; if (core::HideUid(uid)) acts.push_back(a); else failed.insert(uid); }
         if (!acts.empty()) { Note(T("deleted %d objects"), (int)acts.size()); Push(acts); }
-        g_sel.clear(); g_primary = 0;
+        g_sel = std::move(failed); g_primary = g_sel.empty() ? 0 : *g_sel.begin();
         if (!SceneHasSelection()) ClearDeletedSelectionUi(!acts.empty());
     }
     // objects that sit exactly on an earlier identical one (same prefab, position, rotation and scale), as after a project
@@ -2097,6 +2122,7 @@ namespace editor {
                     dl->AddRectFilled(t0, t1, IM_COL32(0, 0, 0, 70), 3.0f);
                     const char* st = "no preview";
                     if (thumbgen::Ready() && !thumbgen::Processed(pi.path)) { thumbgen::Request(pi.path); st = thumbgen::Pending(pi.path) ? "rendering..." : "queued"; }
+                    st = T(st);
                     const ImVec2 ts = ImGui::CalcTextSize(st);
                     dl->AddText({ t0.x + (tile - ts.x) * 0.5f, t0.y + (tile - ts.y) * 0.5f }, ImGui::GetColorU32(ImGuiCol_TextDisabled), st);
                 }
@@ -2105,7 +2131,7 @@ namespace editor {
                 dl->PushClipRect({ p0.x + pad, t1.y }, { p1.x - pad, p1.y }, true);
                 dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), { p0.x + pad, t1.y + 2 }, ImGui::GetColorU32(ImGuiCol_Text), ShownName(pi).c_str(), nullptr, tile);
                 dl->PopClipRect();
-                if (hov && !ImGui::IsPopupOpen("cardctx")) ImGui::SetTooltip("%s\n%s\n%s\n%s%s", ShownName(pi).c_str(), pi.path.c_str(), core::Categories()[pi.cat].name.c_str(), pi.tags.c_str(), onStar ? (std::string("\n") + T("(click: favorite)")).c_str() : "");
+                if (hov && !ImGui::IsPopupOpen("cardctx")) ImGui::SetTooltip("%s\n%s\n%s\n%s%s", ShownName(pi).c_str(), pi.path.c_str(), core::Categories()[pi.cat].name.c_str(), LocalizedTags(pi.tags).c_str(), onStar ? (std::string("\n") + T("(click: favorite)")).c_str() : "");
                 ImGui::PopID();
             }
         }
@@ -2234,7 +2260,10 @@ namespace editor {
         } else {
             if (add && g_managedNpcSel.count(uid)) g_managedNpcSel.erase(uid); else g_managedNpcSel.insert(uid);
         }
-        g_managedNpcPrimary = uid; g_managedNpcLast = uid; g_primary = 0; g_sceneLastEntity = -uid; g_editUid = 0;
+        if (g_managedNpcSel.count(uid)) g_managedNpcPrimary = g_managedNpcLast = uid;
+        RefreshSelectionPrimary();
+        if (g_managedNpcSel.count(uid)) g_sceneLastEntity = -uid;
+        g_editUid = 0;
     }
     static void SelectAllManagedNpcs(const std::vector<ManagedNpc>& list, int projectFilter) {
         g_managedNpcSel.clear(); for (const auto& n : list) if (!n.hidden && (projectFilter < 0 || n.proj == projectFilter)) g_managedNpcSel.insert(n.uid);
@@ -2246,7 +2275,7 @@ namespace editor {
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
             const int afterBehavior = enabled && n->behavior == 1 ? 0 : n->behavior;
             Act a; a.kind = Act::NpcControl; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.flag0 = n->aiEnabled; a.flag1 = enabled; a.behavior0 = n->behavior; a.behavior1 = afterBehavior;
-            core::SetManagedNpcControl(uid, enabled, afterBehavior); acts.push_back(std::move(a));
+            if (core::SetManagedNpcControl(uid, enabled, afterBehavior)) acts.push_back(std::move(a));
         }
         Push(std::move(acts));
     }
@@ -2256,7 +2285,7 @@ namespace editor {
         const auto list = core::ManagedNpcs(); std::vector<Act> acts;
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
             Act a; a.kind = Act::NpcControl; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.flag0 = n->aiEnabled; a.flag1 = enabled; a.behavior0 = n->behavior; a.behavior1 = behavior;
-            core::SetManagedNpcControl(uid, enabled, behavior); acts.push_back(std::move(a));
+            if (core::SetManagedNpcControl(uid, enabled, behavior)) acts.push_back(std::move(a));
         }
         Push(std::move(acts));
     }
@@ -2266,7 +2295,8 @@ namespace editor {
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) {
             const Vec3 before = ManagedNpcDisplayPos(*n);
             const Vec3 after{ before.x + delta.x, before.y + delta.y, before.z + delta.z };
-            Act a; a.kind = Act::NpcMove; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = before; a.pos1 = after; core::MoveManagedNpc(uid, after); acts.push_back(std::move(a));
+            Act a; a.kind = Act::NpcMove; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = before; a.pos1 = after;
+            if (core::MoveManagedNpc(uid, after)) acts.push_back(std::move(a));
         }
         Push(std::move(acts));
     }
@@ -2275,12 +2305,12 @@ namespace editor {
         if (g_place.active && std::any_of(g_place.m.begin(), g_place.m.end(), [](const Member& m) { return m.npc && g_managedNpcSel.count(m.uid); })) {
             DropCarried(); if (g_place.active) return;
         }
-        const auto list = core::ManagedNpcs(); std::vector<Act> acts;
+        const auto list = core::ManagedNpcs(); std::vector<Act> acts; std::set<int> failed;
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(list, uid)) if (!n->hidden) {
             Act a; a.kind = Act::NpcDelete; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = n->pos; a.flag0 = n->aiEnabled; a.behavior0 = n->behavior; a.group = n->group; a.text0 = n->label;
-            acts.push_back(a); core::HideManagedNpc(uid);
+            if (core::HideManagedNpc(uid)) acts.push_back(a); else failed.insert(uid);
         }
-        Push(std::move(acts)); g_managedNpcSel.clear(); g_managedNpcPrimary = 0;
+        Push(std::move(acts)); g_managedNpcSel = std::move(failed); g_managedNpcPrimary = g_managedNpcSel.empty() ? 0 : *g_managedNpcSel.begin();
         if (!SceneHasSelection()) ClearDeletedSelectionUi(false);
     }
     static void GroupSelectedNpcs(bool makeGroup) {
@@ -2301,18 +2331,22 @@ namespace editor {
         if (g_place.active && std::any_of(g_place.m.begin(), g_place.m.end(), [](const Member& m) { return m.npc ? g_managedNpcSel.count(m.uid) != 0 : g_sel.count(m.uid) != 0; })) {
             DropCarried(); if (g_place.active) return;
         }
-        auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); std::vector<Act> acts;
+        auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); std::vector<Act> acts; std::set<int> failedObjects, failedNpcs;
         for (int uid : g_sel) if (const auto* o = Find(objects, uid)) if (!o->hidden) {
             Act a; a.kind = Act::Delete; a.uid = uid; a.prefab = o->prefab; a.pos0 = o->pos; a.rot0 = o->rot; a.sc0 = o->scale; a.group = o->group; a.proj = o->proj; a.text0 = o->note;
-            acts.push_back(a); core::HideUid(uid);
+            if (core::HideUid(uid)) acts.push_back(a); else failedObjects.insert(uid);
         }
         for (int uid : g_managedNpcSel) if (const auto* n = FindManagedNpc(npcs, uid)) if (!n->hidden) {
             Act a; a.kind = Act::NpcDelete; a.uid = uid; a.prefab = ManagedNpcHistoryName(*n); a.pos0 = n->pos; a.flag0 = n->aiEnabled; a.behavior0 = n->behavior; a.group = n->group; a.proj = n->proj; a.text0 = n->label;
-            acts.push_back(a); core::HideManagedNpc(uid);
+            if (core::HideManagedNpc(uid)) acts.push_back(a); else failedNpcs.insert(uid);
         }
         const bool deletedObject = std::any_of(acts.begin(), acts.end(), [](const Act& a) { return a.kind == Act::Delete; });
         if (!acts.empty()) Push(std::move(acts));
-        ClearSceneSelection(); ClearDeletedSelectionUi(deletedObject);
+        ClearSceneSelection();
+        g_sel = std::move(failedObjects); g_managedNpcSel = std::move(failedNpcs);
+        if (!g_sel.empty()) { g_primary = *g_sel.begin(); g_sceneLastEntity = g_primary; }
+        else if (!g_managedNpcSel.empty()) { g_managedNpcPrimary = *g_managedNpcSel.begin(); g_sceneLastEntity = -g_managedNpcPrimary; }
+        else ClearDeletedSelectionUi(deletedObject);
     }
     static void GroupSceneSelection(bool makeGroup) {
         if (!PrepareHistoryMutation([makeGroup]() { GroupSceneSelection(makeGroup); })) return;
@@ -2940,7 +2974,7 @@ namespace editor {
                 if (row.head == 2) ImGui::Unindent(18.0f);
                 ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", pi.name.c_str());
                 ImGui::TableSetColumnIndex(3); ImGui::TextDisabled("%s", core::Categories()[pi.cat].name.c_str());
-                ImGui::TableSetColumnIndex(4); ImGui::TextDisabled("%s", pi.tags.c_str());
+                ImGui::TableSetColumnIndex(4); ImGui::TextDisabled("%s", LocalizedTags(pi.tags).c_str());
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -2971,8 +3005,9 @@ namespace editor {
                 ImGui::EndCombo();
             }
             ImGui::TextDisabled("%s", pi.path.c_str());
-            if (pi.sx > 0 || pi.sy > 0 || pi.sz > 0) ImGui::TextDisabled(T(ICON_RULER_COMBINED "  %.1f x %.1f x %.1f m    meshes %d    %s"), pi.sx, pi.sy, pi.sz, pi.meshes, pi.tags.c_str());
-            else ImGui::TextDisabled(T("meshes %d    %s"), pi.meshes, pi.tags.c_str());
+            const std::string shownTags = LocalizedTags(pi.tags);
+            if (pi.sx > 0 || pi.sy > 0 || pi.sz > 0) ImGui::TextDisabled(T(ICON_RULER_COMBINED "  %.1f x %.1f x %.1f m    meshes %d    %s"), pi.sx, pi.sy, pi.sz, pi.meshes, shownTags.c_str());
+            else ImGui::TextDisabled(T("meshes %d    %s"), pi.meshes, shownTags.c_str());
             ImGui::BeginDisabled(!havePos || !core::GameThreadReady());
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.45f, 0.28f, 1.0f));
             if (ImGui::Button(T(ICON_LOCATION_CROSSHAIRS "   PLACE   "), ImVec2(150 * ui, 0))) StartPlaceNew(p, havePos);
@@ -3615,6 +3650,7 @@ namespace editor {
     static std::vector<size_t> g_libraryRows;
     static std::map<std::string, ULONGLONG> g_badBlueprintThumbnailStamps;
     static std::map<std::string, DWORD> g_pendingBlueprintThumbnailTicks;
+    static std::map<std::string, DWORD> g_blueprintThumbAuditTicks;
     static std::set<std::string> g_currentBlueprintThumbnails;
     static char g_librarySearch[256] = {};
     static int g_libraryLocation = 0;
@@ -3883,7 +3919,26 @@ namespace editor {
         const auto pending = g_pendingBlueprintThumbnailTicks.find(path);
         if (pending != g_pendingBlueprintThumbnailTicks.end() && GetTickCount() - pending->second < 2000) return;
         if (haveThumb && g_currentBlueprintThumbnails.count(path) && pending == g_pendingBlueprintThumbnailTicks.end() &&
-            CompareFileTime(&thumbInfo.ftLastWriteTime, &sourceInfo.ftLastWriteTime) >= 0) return;
+            CompareFileTime(&thumbInfo.ftLastWriteTime, &sourceInfo.ftLastWriteTime) >= 0) {
+            const DWORD now = GetTickCount();
+            const auto audited = g_blueprintThumbAuditTicks.find(path);
+            if (audited != g_blueprintThumbAuditTicks.end() && now - audited->second < 10000) return;
+            g_blueprintThumbAuditTicks[path] = now;
+            proj_codec::Document current;
+            if (!ReadProjectFile(file, current, false)) return;
+            std::set<std::string> previews;
+            for (const auto& r : current.records) if (r.state == proj_codec::Record::State::Placeable) previews.insert(core::ThumbFile(r.prefab));
+            if (const auto chars = thumbgen::Characters()) for (const auto& n : current.npcs)
+                for (const auto& c : *chars) if (c.key == n.key && !c.app.empty()) { previews.insert(core::ThumbFile(c.app)); break; }
+            bool stale = false;
+            for (const auto& preview : previews) {
+                WIN32_FILE_ATTRIBUTE_DATA info{};
+                if (GetFileAttributesExA(preview.c_str(), GetFileExInfoStandard, &info) &&
+                    CompareFileTime(&info.ftLastWriteTime, &thumbInfo.ftLastWriteTime) > 0) { stale = true; break; }
+            }
+            if (!stale) return;
+            if (GenerateBlueprintThumbnail(file, current)) return;
+        }
         const ULONGLONG stamp = ((ULONGLONG)sourceInfo.ftLastWriteTime.dwHighDateTime << 32) | sourceInfo.ftLastWriteTime.dwLowDateTime;
         if (const auto it = g_badBlueprintThumbnailStamps.find(source); it != g_badBlueprintThumbnailStamps.end() && it->second == stamp) return;
         proj_codec::Document doc;
