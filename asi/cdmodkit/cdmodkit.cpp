@@ -3228,6 +3228,9 @@ static void AutoloadTick() {
     const DWORD now = GetTickCount();
     static DWORD lastAttempt = 0;
     if (lastAttempt && now - lastAttempt < 2000) return;
+    static DWORD lastProbe = 0;
+    if (lastProbe && now - lastProbe < 250) return;
+    lastProbe = now;
     Vec3 p; if (!PlayerWorldPos(&p)) { if (now - g_worldLast > 2000) g_worldSince = 0; return; }   // a dropout of up to 2 s keeps the clock
     g_worldLast = now; if (!g_worldSince) g_worldSince = now;
     if (now - g_worldSince < 3000) return;

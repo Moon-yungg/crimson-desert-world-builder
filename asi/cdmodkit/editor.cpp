@@ -3969,6 +3969,7 @@ namespace editor {
         core::FileResult result;
     };
     static LibraryFileAction g_libraryAction;
+    static bool g_libraryDeleteConfirmPending = false;
     static core::FileReason GuardLibraryFile(const core::SavedFile& file) {
         using R = core::FileReason;
         if (!SameSavedFile(file, g_librarySelected)) return R::SelectionChanged;
@@ -4034,7 +4035,26 @@ namespace editor {
         g_libraryAction = {}; g_libraryAction.action = action; g_projectStatus.clear();
         g_libraryAction.result = core::SelectSavedFile(file, g_libraryAction.selection);
         if (!g_libraryAction.result.ok()) return;
+        if (action == core::FileAction::Delete || action == core::FileAction::Purge) {
+            g_libraryDeleteConfirmPending = true;
+            return;
+        }
         ExecuteLibraryAction();
+    }
+    static void DrawLibraryDeleteConfirmation() {
+        const std::string title = std::string(T("Confirm deletion")) + "###saved-file-delete-confirmation";
+        if (g_libraryDeleteConfirmPending) { ImGui::OpenPopup(title.c_str()); g_libraryDeleteConfirmPending = false; }
+        if (!ImGui::BeginPopupModal(title.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+        const core::SavedFile file = core::SelectedFile(g_libraryAction.selection);
+        ImGui::TextWrapped("%s", T("Delete this file permanently?"));
+        ImGui::TextWrapped("%s", file.filename.c_str());
+        if (ImGui::Button(T("Cancel")) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            g_libraryAction = {}; ImGui::CloseCurrentPopup();
+        }
+        ImGui::SetItemDefaultFocus();
+        SameLineForControl("Delete");
+        if (ImGui::Button(T("Delete"))) { ExecuteLibraryAction(); ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
     }
     static void DrawLibraryFailure() {
         const auto& r = g_libraryAction.result; if (r.ok()) return;
@@ -4165,6 +4185,7 @@ namespace editor {
             }
             ImGui::PopID(); ImGui::PopID(); break;
         }
+        DrawLibraryDeleteConfirmation();
         DrawLibraryFailure();
     }
     static void DrawPlacementReport(const report_projection::Placement& report) {
