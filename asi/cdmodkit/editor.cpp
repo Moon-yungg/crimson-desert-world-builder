@@ -208,11 +208,11 @@ namespace editor {
     static bool  g_showSpawnOpts = false, g_showMass = false; static int g_hoverUid = 0, g_hoverNpcUid = 0;
     static bool  g_cardView = false; static float g_cardSize = 96.0f;   // browser: tile view instead of the list (same matches / filters)
     static int   g_browserDragPrefab = -1;   // browser row/card being dragged out into the game view
-    struct BrowserDropJob { int prefab = -1, ticket = 0; DWORD queuedAt = 0; Vec3 center{}; float yaw = 0, scale = 1; };
+    struct BrowserDropJob { int prefab = -1, ticket = 0; DWORD queuedAt = 0; Vec3 center{}; float yaw = 0, scale = 1, probeTop = 0; int retry = 0; };
     static std::vector<BrowserDropJob> g_browserDropJobs;   // ground is probed before spawning, so a new object's own collision cannot be mistaken for the surface
     static int   g_npcDragIndex = -1;        // character row/card being dragged out into the game view
     struct NpcDropJob { uint32_t key = 0; int ticket = 0; DWORD queuedAt = 0; Vec3 at{}; int count = 1, formation = 1; float spacing = 1.5f, radius = 8.0f, fx = 0, fz = 1; bool ai = true; int behavior = 0;
-        bool centerResolved = false; std::vector<Vec3> positions; std::vector<int> memberTickets; };
+        float probeTop = 0; int retry = 0; bool centerResolved = false; std::vector<Vec3> positions; std::vector<int> memberTickets; std::vector<uint8_t> memberRetries; };
     static std::vector<NpcDropJob> g_npcDropJobs;
     static std::set<std::string> g_tagFilter;
     static std::vector<int> g_matches; static std::string g_lastKey;
@@ -2272,13 +2272,15 @@ namespace editor {
             g_npcDropJobs.push_back({ key, 0, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
             return;
         }
-        const float startY = center.y + 0.5f;
-        const int ticket = core::GroundProbe({ center.x, startY, center.z }, 30.0f);
+        const CamFrame cf = CurrentCam();
+        const float startY = std::max(center.y, cf.ok ? cf.pos.y : center.y) + 150.0f;
+        const int ticket = core::GroundProbe({ center.x, startY, center.z }, 500.0f);
         if (!ticket) {
             g_npcDropJobs.push_back({ key, 0, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
             return;
         }
         g_npcDropJobs.push_back({ key, ticket, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
+        g_npcDropJobs.back().probeTop = startY;
     }
     static int NpcCategory(const std::string& n) {   // from the internal name's first token: NHM_ = human male, NGW_ = goblin female, ...
         const std::string t = n.substr(0, n.find('_'));
@@ -4928,6 +4930,10 @@ namespace editor {
                 g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
             }
             if (status != core::GroundProbeStatus::Hit || !gh.hit || !std::isfinite(gh.centerY)) {
+                if (j.retry++ == 0) {
+                    j.ticket = core::GroundProbe({ j.center.x, j.probeTop + 300.0f, j.center.z }, 1000.0f);
+                    if (j.ticket) { ++i; continue; }
+                }
                 SpawnBrowserDrop(j.prefab, j.center, j.yaw, j.scale);
                 g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
             }
@@ -4966,14 +4972,15 @@ namespace editor {
             g_browserDropJobs.push_back({ prefab, 0, GetTickCount(), center, g_spawnYaw, g_spawnScale });
             return;
         }
-        const float halfHeight = pi.hasCenter ? std::max(0.0f, pi.sy) * g_spawnScale * 0.5f : 0.0f;
-        const float startY = center.y - halfHeight + 0.5f;
-        const int ticket = core::GroundProbe({ center.x, startY, center.z }, 30.0f);
+        const CamFrame cf = CurrentCam();
+        const float startY = std::max(center.y, cf.ok ? cf.pos.y : center.y) + 150.0f;
+        const int ticket = core::GroundProbe({ center.x, startY, center.z }, 500.0f);
         if (!ticket) {
             g_browserDropJobs.push_back({ prefab, 0, GetTickCount(), center, g_spawnYaw, g_spawnScale });
             return;
         }
         g_browserDropJobs.push_back({ prefab, ticket, GetTickCount(), center, g_spawnYaw, g_spawnScale });
+        g_browserDropJobs.back().probeTop = startY;
     }
     static bool NpcDropPoint(ImVec2 mouse, Vec3* at, bool* onGroundPlane) {
         CamFrame cf = CurrentCam(); if (!cf.ok) return false;
@@ -5032,6 +5039,10 @@ namespace editor {
                     g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
                 }
                 if (status != core::GroundProbeStatus::Hit || !gh.hit || !std::isfinite(gh.centerY)) {
+                    if (j.retry++ == 0) {
+                        j.ticket = core::GroundProbe({ j.at.x, j.probeTop + 300.0f, j.at.z }, 1000.0f);
+                        if (j.ticket) { ++i; continue; }
+                    }
                     SpawnNpcFormation(j.key, j.at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz, j.ai, j.behavior);
                     g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
                 }
@@ -5042,13 +5053,14 @@ namespace editor {
                     g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
                 }
                 j.memberTickets.assign(j.positions.size(), 0);
+                j.memberRetries.assign(j.positions.size(), 0);
                 j.centerResolved = true;
             }
             int issued = 0; bool pending = false, invalidated = false;
             for (size_t k = 0; k < j.positions.size(); ++k) {
                 int& ticket = j.memberTickets[k];
                 if (ticket == 0 && issued < 16) {
-                    ticket = core::GroundProbe({ j.positions[k].x, j.at.y + 0.5f, j.positions[k].z }, 30.0f);
+                    ticket = core::GroundProbe({ j.positions[k].x, j.probeTop, j.positions[k].z }, 500.0f);
                     ++issued;
                     if (!ticket) { invalidated = true; break; }
                 }
@@ -5061,6 +5073,10 @@ namespace editor {
                 if (status == core::GroundProbeStatus::Hit && memberHit.hit && std::isfinite(memberHit.centerY)) {
                     j.positions[k].y = memberHit.centerY - memberHit.radius;
                     ticket = -1;
+                } else if (j.memberRetries[k]++ == 0) {
+                    ticket = core::GroundProbe({ j.positions[k].x, j.probeTop + 300.0f, j.positions[k].z }, 1000.0f);
+                    if (!ticket) { invalidated = true; break; }
+                    pending = true;
                 } else ticket = -2;
             }
             if (invalidated) { SpawnNpcPositions(j.key, j.positions, j.ai, j.behavior); g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue; }
