@@ -12,6 +12,7 @@
 #include <sstream>
 #include <map>
 #include <set>
+#include <limits>
 #include <algorithm>
 #include <intrin.h>
 #include <winver.h>
@@ -26,10 +27,22 @@ thread_local GuardFrame* t_guardTop = nullptr;
 }
 #include "thumbgen.h"
 #include "input.h"
+#include "overlay_discovery.h"
 #include "http_api.h"
+#include "proj_codec.h"
+#include "wb_group_math.h"
+#ifdef WB_UNIFIED_HOST_TEST
+// Host seam (plan wb079-unified-77f68967): production_core_host.cpp includes this TU once with
+// WB_UNIFIED_HOST_TEST and the boundaries marked below call through host::Seam(). Nothing else changes
+// meaning: registry, queues, pump dispatch, lifecycle, projects and History stay production code.
+#include "../../tests/wb_groups/production_host.h"
+#endif
 
 namespace core {
 
+#ifdef WB_UNIFIED_HOST_TEST
+ManagedNpcNativeTest g_managedNpcNativeTest;
+#endif
 uintptr_t g_base = 0;
 bool      g_menuOpen = false;
 bool      g_uiWantsMouse = false;
@@ -85,14 +98,12 @@ bool ReadBytes(uintptr_t a, void* out, size_t n) {
     CDK_GUARD_BEGIN memcpy(out, (const void*)a, n); t_guardedRead = false; return true;
     CDK_GUARD_FAIL t_guardedRead = false; return false;
     CDK_GUARD_END
-    return false;
 }
 bool WriteBytes(uintptr_t a, const void* src, size_t n) {
     if (a < 0x10000 || (a >> 47) != 0) return false;
     CDK_GUARD_BEGIN memcpy((void*)a, src, n); return true;
     CDK_GUARD_FAIL return false;
     CDK_GUARD_END
-    return false;
 }
 static bool ReadPtr(uintptr_t a, uintptr_t* out) {
     uintptr_t v = 0; if (!ReadBytes(a, &v, 8)) return false;
@@ -233,6 +244,9 @@ bool ReadPos(uintptr_t actor, PosInfo* out) {
     return ReadTransformPos(tf, out, true);
 }
 static uintptr_t FindActorTransform(uintptr_t actor) {
+#ifdef WB_UNIFIED_HOST_TEST
+    if (g_managedNpcNativeTest.transform) return g_managedNpcNativeTest.transform(actor);
+#endif
     if (!actor) return 0;
     uintptr_t comps = Deref(actor, kOff_Ent_Comps), tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
     const char* n = tf ? RttiName(tf) : nullptr;
@@ -248,7 +262,16 @@ static uintptr_t FindActorTransform(uintptr_t actor) {
     }
     return 0;
 }
-bool PlayerPosInfo(PosInfo* out) { uintptr_t a = PlayerActor(); return a && ReadPos(a, out); }
+bool PlayerPosInfo(PosInfo* out) {
+#ifdef WB_UNIFIED_HOST_TEST
+    if (host::Seam().playerWorldPos) {   // OS/engine boundary: the game-memory transform read is unavailable in a host run
+        Vec3 w{}; if (!host::Seam().playerWorldPos(&w)) return false;
+        out->world = w; out->tiled = w; out->tileX = (int)floorf(w.x / kTileSize); out->tileZ = (int)floorf(w.z / kTileSize);
+        return true;
+    }
+#endif
+    uintptr_t a = PlayerActor(); return a && ReadPos(a, out);
+}
 // Research: fall watcher. Polls the player every 50 ms; a drop of more than 3 m below the last stable height counts as a fall
 // (logged with position), then hardware write breakpoints on the transform snapshot's local x/y/z and tile words show which code
 // moves the character (physics integration vs. a rescue teleport). A jump of more than 20 m afterwards is logged as a respawn.
@@ -353,10 +376,10 @@ static std::map<uintptr_t, std::string> g_callerReason;   // return address -> s
 // interactive objects (gimmick prefabs spawned through the game's server spawn path); see the gimmick section below
 bool g_gimmickSpawn = true; static bool g_traceHooks = false;
 static bool IsGimmickPrefab(const std::string& p) { return p.rfind("/object/cd_gimmick/", 0) == 0; }
-static void EnqueueGimmick(int uid, const std::string& prefab, Vec3 pos, Rot rot, float scale);
+using MoveCompletion = std::function<void(bool)>;
+static void EnqueueGimmick(int uid, uint64_t gen, const std::string& prefab, Vec3 pos, Rot rot, float scale, MoveCompletion done = {});
 static void RunOnServerTick(std::function<void()> f);
-static void RemoveSpawnedActor(uintptr_t actor);
-static bool MoveGimmick(size_t idx, Vec3 pos, Rot rot, float scale, bool final);
+static bool RemoveSpawnedActor(uintptr_t actor);
 static void* __fastcall HookCreate(void* mgr, void* tag, void* b, void* c, void* d, void* transform, uint8_t f1, uint8_t f2, uint8_t f3) {
     long n = InterlockedIncrement(&g_createCalls);
     bool log = g_createLogged < 20 || g_inOurSpawn || g_trace;
@@ -383,7 +406,29 @@ static std::set<uintptr_t> g_managedNpcActors;
 static std::map<int, std::string> g_groupNames;
 static int g_nextUid = 1, g_nextNpcUid = 1, g_nextGroup = 1;
 static void ReconcileManagedNpcActors();
-std::vector<SpawnedObj> Spawned() { std::lock_guard<std::mutex> l(g_regMutex); return g_reg; }
+#ifdef WB_UNIFIED_HOST_TEST
+// Host-only lock discipline instrumentation (never compiled into the shipped ASI): the ObjectLifetime
+// suite asserts that engine/server work is queued with the registry lock released. REG_LOCK is the
+// registry lock plus the depth note the queue helpers read.
+static thread_local int t_regLockDepth = 0;
+struct RegLockNote { RegLockNote() { ++t_regLockDepth; } ~RegLockNote() { --t_regLockDepth; } };
+#define REG_LOCK std::lock_guard<std::mutex> l(g_regMutex); RegLockNote regLockNote_
+static void NoteWorkQueued() { if (t_regLockDepth > 0) host::NoteWorkQueued(true); }
+#else
+#define REG_LOCK std::lock_guard<std::mutex> l(g_regMutex)
+static void NoteWorkQueued() {}
+#endif
+#ifdef WB_UNIFIED_HOST_TEST
+SceneEnumerationStats g_sceneEnumerationStats;
+#endif
+std::vector<SpawnedObj> Spawned() {
+    REG_LOCK;
+#ifdef WB_UNIFIED_HOST_TEST
+    ++g_sceneEnumerationStats.calls; g_sceneEnumerationStats.records += g_reg.size();
+#endif
+    return g_reg;
+}
+void ForgetSpawned(size_t idx) { int uid = 0; { REG_LOCK; if (idx < g_reg.size()) uid = g_reg[idx].uid; } if (uid) ForgetUid(uid); }
 std::vector<ManagedNpc> ManagedNpcs() { ReconcileManagedNpcActors(); std::lock_guard<std::mutex> l(g_regMutex); return g_npcReg; }
 bool ManagedNpcLivePosition(const ManagedNpc& npc, Vec3* out) {
     if (!out || npc.hidden || !npc.actor) return false;
@@ -392,16 +437,226 @@ bool ManagedNpcLivePosition(const ManagedNpc& npc, Vec3* out) {
     if (ReadPos(npc.actor, &p)) { *out = p.world; return true; }
     return false;
 }
-void ForgetSpawned(size_t idx) { std::lock_guard<std::mutex> l(g_regMutex); if (idx < g_reg.size()) g_reg.erase(g_reg.begin() + idx); }
 // A project is "dirty" once one of its objects was moved, deleted or regrouped since it was loaded or saved; the scene
 // tabs mark that with a star. Guarded by g_regMutex together with the registry it describes.
 static std::set<int> g_projDirty;
 static bool g_loading = false;          // LoadProject is running: the objects it spawns must not mark the project dirty
 static void MarkDirtyLocked(int proj) { if (proj > 0) g_projDirty.insert(proj); }
+static void ForgetCopyValueLocked(int uid);   // record-owned copy provenance (defined next to the project value builder)
+static thread_local std::string g_projectError;   // the last save/load validation failure ("" = none), named by data-record ordinal
+static std::shared_ptr<void> TrackProjectNativeWork(int proj); // file activity spanning native work even after its record is unloaded
+#ifdef WB_UNIFIED_HOST_TEST
+// Host-only file-fault seam for the ProjectLifecycle suite (never compiled into the shipped ASI): the production
+// save/import path consults these while the fixture drives real files through it, and each fault is one-shot.
+static int g_saveFaultStage = 0;                      // 0 none, 1 write abort, 2 short write, 3 flush abort, 4 replace abort, 5 close abort
+static std::function<void()> g_beforeReplaceCallback;  // runs after a successful readback, before the replace (C6 approval seam)
+#endif
 static int IndexOfUidLocked(int uid) { for (size_t i = 0; i < g_reg.size(); i++) if (g_reg[i].uid == uid) return (int)i; return -1; }
 static int NpcIndexOfUidLocked(int uid) { for (size_t i = 0; i < g_npcReg.size(); i++) if (g_npcReg[i].uid == uid) return (int)i; return -1; }
 static bool IsManagedNpcActor(uintptr_t actor) { std::lock_guard<std::mutex> l(g_regMutex); return g_managedNpcActors.count(actor) != 0; }
+// C3: a logical record (uid) outlives every physical object it ever had. `gen` is the lifetime token of the
+// record's current materialization: it is allocated when the record is created and renewed whenever the physical
+// object is replaced or invalidated (restore, re-create on a final move, the stand-in/server lane switch) and
+// when it is hidden or forgotten. Every queued engine/server job carries (uid, gen) and rechecks it at the engine
+// boundary, so a completion that arrives after such a change can never attach to a newer incarnation; it is
+// disposed on the thread that created it instead.
+static uint64_t g_nextGen = 1;
+static uint64_t NewGenLocked() { return g_nextGen++; }
+static bool NpcGenCurrentLocked(int uid, uint64_t gen) {
+    const int i = NpcIndexOfUidLocked(uid);
+    return i >= 0 && g_npcReg[(size_t)i].gen == gen && !g_npcReg[(size_t)i].hidden;
+}
+static bool GenCurrentLocked(int uid, uint64_t gen) {
+    const int i = IndexOfUidLocked(uid);
+    return i >= 0 && g_reg[(size_t)i].gen == gen && !g_reg[(size_t)i].hidden;
+}
 int IndexOfUid(int uid) { std::lock_guard<std::mutex> l(g_regMutex); return IndexOfUidLocked(uid); }
+
+// ---- C7: grounding-local authority. Never held across an engine call or queue dispatch. ----------------
+struct GroundOp {
+    GroundView view;
+    uint64_t born = 0, ticketAt = 0;
+    int ticket = 0;
+    bool ready = false;
+};
+static std::mutex g_groundOpMutex;
+static void PruneGroundTickets(); // queue cleanup is always outside the operation lock
+static uint64_t g_groundEpoch = 1, g_groundId = 0, g_groundFrame = 0, g_groundNotice = 0;
+static unsigned g_groundWorldWriting = 0;
+static GroundPlacement g_groundPlacement;
+static std::vector<std::weak_ptr<GroundOp>> g_groundOps;
+static std::map<int, GroundHandle> g_groundLeases;
+struct GroundDeferred { std::vector<int> targets; std::function<void()> action; };
+static std::vector<GroundDeferred> g_groundDeferred;
+static std::map<int, int> g_groundMutationPending;
+static bool GroundSamePlacement(const GroundPlacement& a, const GroundPlacement& b) {
+    return a.generation == b.generation && a.transform == b.transform && a.members == b.members;
+}
+static void GroundEndLocked(const GroundHandle& op, GroundState state, const char* reason) {
+    if (op->view.terminal() || op->view.state == GroundApplying) return;
+    op->view.state = state; op->view.reason = reason;
+    for (auto& m : op->view.members) { m.terminal = true; m.after = m.before; m.reason = reason; }
+    ++g_groundNotice;
+}
+static bool GroundTouches(const GroundHandle& op, const std::vector<int>& ids) {
+    if (ids.empty()) return true; // scene-wide mutation
+    for (const auto& m : op->view.members) if (std::find(ids.begin(), ids.end(), m.before.uid) != ids.end()) return true;
+    return false;
+}
+// Caller keeps the operation mutex until its registry mutation is admitted. A deferred core action owns
+// copied values/UIDs, never an index or a borrowed UI pointer. Leases protect Applying, not just enqueue.
+static bool GroundBeforeMutationLocked(const std::vector<int>& ids, std::function<void()> action) {
+    bool busy = false;
+    for (auto& w : g_groundOps) if (auto op = w.lock()) if (GroundTouches(op, ids)) {
+        if (op->view.state == GroundApplying) busy = true;
+        else GroundEndLocked(op, GroundInvalidated, "epoch-invalidated");
+    }
+    if (!busy) return true;
+    std::vector<int> targets = ids;
+    if (targets.empty()) for (const auto& pair : g_groundLeases) targets.push_back(pair.first);
+    for (int uid : targets) ++g_groundMutationPending[uid];
+    g_groundDeferred.push_back({ targets, std::move(action) });
+    return false;
+}
+static bool GroundValidLocked(const GroundHandle& op) { // operation -> registry
+    if (op->view.terminal() || op->view.state == GroundApplying) return false;
+    bool valid = !g_groundWorldWriting && op->view.epoch == g_groundEpoch;
+    if (op->view.carried.generation) valid &= GroundSamePlacement(op->view.carried, g_groundPlacement);
+    { REG_LOCK;
+      for (const auto& m : op->view.members) {
+          const int i = IndexOfUidLocked(m.before.uid);
+          valid &= i >= 0 && !g_groundMutationPending.count(m.before.uid) && !g_groundLeases.count(m.before.uid);
+          if (i >= 0) { const auto& e = g_reg[(size_t)i]; valid &= !e.hidden && e.gen == m.before.gen && e.poseGen == m.before.poseGen; }
+      }
+    }
+    if (!valid) GroundEndLocked(op, GroundInvalidated, "epoch-invalidated");
+    return valid;
+}
+GroundHandle BeginGround(const std::vector<int>& uids, uint64_t serial, uint64_t branch, const GroundPlacement& carried) {
+    std::lock_guard<std::mutex> lock(g_groundOpMutex);
+    auto op = std::make_shared<GroundOp>();
+    op->view.id = ++g_groundId; op->view.serial = serial; op->view.branch = branch;
+    op->view.epoch = g_groundEpoch; op->view.carried = carried; op->born = g_groundFrame;
+    bool busy = false;
+    for (auto& w : g_groundOps) if (auto old = w.lock()) if (GroundTouches(old, uids)) {
+        if (old->view.state == GroundApplying) busy = true;
+        else GroundEndLocked(old, GroundCanceled, "canceled");
+    }
+    g_groundOps.erase(std::remove_if(g_groundOps.begin(), g_groundOps.end(), [](const auto& w) { return w.expired(); }), g_groundOps.end());
+    g_groundOps.push_back(op);
+    { REG_LOCK;
+      for (int uid : uids) { const int i = IndexOfUidLocked(uid); if (i < 0) { busy = true; continue; }
+          GroundMemberResult m; m.before = m.after = g_reg[(size_t)i]; op->view.members.push_back(m);
+          if (m.before.hidden || !m.before.obj || m.before.standin) busy = true;
+      }
+    }
+    if (busy || uids.empty() || std::set<int>(uids.begin(), uids.end()).size() != uids.size()) GroundEndLocked(op, GroundFailed, "refused");
+    else GroundValidLocked(op);
+    return op;
+}
+GroundView GroundStateOf(const GroundHandle& op) { std::lock_guard<std::mutex> lock(g_groundOpMutex); return op->view; }
+bool GroundValidate(const GroundHandle& op) { std::lock_guard<std::mutex> lock(g_groundOpMutex); return GroundValidLocked(op); }
+void GroundCancel(const GroundHandle& op, const char* reason) {
+    std::lock_guard<std::mutex> lock(g_groundOpMutex);
+    GroundEndLocked(op, strcmp(reason, "canceled") == 0 ? GroundCanceled : GroundFailed, reason);
+}
+void GroundFrame() {
+    { std::lock_guard<std::mutex> lock(g_groundOpMutex); ++g_groundFrame;
+    for (auto& w : g_groundOps) if (auto op = w.lock()) {
+        if (op->view.terminal() || op->view.state == GroundApplying) continue;
+        if (g_groundFrame - op->born >= 240) GroundEndLocked(op, GroundFailed, "result-timeout");
+        else if (!op->ready && g_groundFrame - op->born >= 120) GroundEndLocked(op, GroundFailed, "ready-timeout");
+        else if (op->ticket && g_groundFrame - op->ticketAt >= 120) GroundEndLocked(op, GroundFailed, "ticket-timeout");
+    } }
+    PruneGroundTickets();
+}
+std::vector<GroundView> GroundBarrier(const std::vector<GroundHandle>& batch, bool cancelUnapplied) {
+    std::lock_guard<std::mutex> lock(g_groundOpMutex); std::vector<GroundView> views;
+    for (auto& op : batch) { if (cancelUnapplied) GroundEndLocked(op, GroundCanceled, "canceled"); views.push_back(op->view); }
+    return views;
+}
+bool GroundReconcile(const std::vector<GroundHandle>& batch) {
+    std::lock_guard<std::mutex> lock(g_groundOpMutex);
+    for (auto& op : batch) if (!op->view.terminal()) return false;
+    for (auto& op : batch) op->view.state = GroundReconciled;
+    return true;
+}
+uint64_t GroundNotice() { std::lock_guard<std::mutex> lock(g_groundOpMutex); return g_groundNotice; }
+bool PublishGroundPlacement(const GroundPlacement& placement) {
+    std::lock_guard<std::mutex> lock(g_groundOpMutex);
+    if (GroundSamePlacement(placement, g_groundPlacement)) return true;
+    for (auto& w : g_groundOps) if (auto op = w.lock())
+        if (op->view.carried.generation && op->view.state == GroundApplying) return false;
+    for (auto& w : g_groundOps) if (auto op = w.lock())
+        if (op->view.carried.generation) GroundEndLocked(op, GroundInvalidated, "epoch-invalidated");
+    g_groundPlacement = placement; return true;
+}
+bool GroundUpdateCarried(const GroundHandle& op, const GroundPlacement& next, std::function<void()> update) {
+    std::lock_guard<std::mutex> operation(g_groundOpMutex);
+    if (op->view.state != GroundSettled || !GroundSamePlacement(op->view.carried, g_groundPlacement)) return false;
+    { REG_LOCK; for (const auto& m : op->view.members) {
+        const int i = IndexOfUidLocked(m.after.uid); if (i < 0) return false;
+        const auto& e = g_reg[(size_t)i];
+        if (e.gen != m.after.gen || e.poseGen != m.after.poseGen || e.hidden != m.after.hidden) return false;
+    } }
+    update(); g_groundPlacement = next; return true;
+}
+static void GroundEpochLocked() {
+    ++g_groundEpoch;
+    for (auto& w : g_groundOps) if (auto op = w.lock()) GroundEndLocked(op, GroundInvalidated, "epoch-invalidated");
+}
+void InvalidateGroundWorld() { std::lock_guard<std::mutex> lock(g_groundOpMutex); GroundEpochLocked(); }
+void RunGroundWorldChange(std::function<void()> change) {
+    // Reservation outlives deferral AND the game-queue hop; a server-lane completion must never run the reload.
+    struct Reservation {
+        bool active = false;
+        ~Reservation() { if (active) { std::lock_guard<std::mutex> lock(g_groundOpMutex); --g_groundWorldWriting; } }
+    };
+    auto reservation = std::make_shared<Reservation>();
+    auto run = [reservation, change = std::move(change)]() { change(); };
+    { std::lock_guard<std::mutex> lock(g_groundOpMutex);
+      ++g_groundWorldWriting; reservation->active = true; GroundEpochLocked();
+      if (!GroundBeforeMutationLocked({}, [run]() { RunOnGameThread(run); })) return;
+    }
+    run(); // already on the game thread; reservation releases even if the callback throws
+}
+
+// ---- C5: per-request caller-owned terminal placement results -------------------------------------------
+// struct PlaceRequest lives in core.h; these two helpers are the ONLY place a row changes state. They are
+// called from the real attach/cancel paths, never while g_regMutex is held (lock order: registry lock is
+// released before req->m), so no engine call and no queue push happens under a request lock.
+// NoteAttachOnce records every real engine attachment seen for the row (a stand-in counts as an observation)
+// and performs the single Pending -> Attached transition. It returns true only for that transition.
+static void NoteAttachObservation(const std::weak_ptr<PlaceRequest>& w, int rowId) {
+    std::shared_ptr<PlaceRequest> req = w.lock();
+    if (!req) return;
+    std::lock_guard<std::mutex> l(req->m);
+    for (auto& r : req->rows) if (r.rowId == rowId) { ++r.attachObservations; return; }
+}
+static bool NoteAttachOnce(const std::weak_ptr<PlaceRequest>& w, int rowId, int lane, int uid) {
+    std::shared_ptr<PlaceRequest> req = w.lock();
+    if (!req) return false;
+    std::lock_guard<std::mutex> l(req->m);
+    for (auto& r : req->rows) if (r.rowId == rowId) {
+        ++r.attachObservations;
+        if (r.state != PlacePending) return false;      // no second terminal settlement
+        r.state = PlaceAttached; r.lane = lane; r.uid = uid; r.reason.clear();
+        return true;
+    }
+    return false;
+}
+// Settle one row out of Pending exactly once (Excluded/Failed/Canceled). Returns true only for the transition.
+static bool SettleRowOnce(const std::weak_ptr<PlaceRequest>& w, int rowId, int state, int lane, int uid, const std::string& reason) {
+    std::shared_ptr<PlaceRequest> req = w.lock();
+    if (!req) return false;
+    std::lock_guard<std::mutex> l(req->m);
+    for (auto& r : req->rows) if (r.rowId == rowId) {
+        if (r.state != PlacePending) return false;      // no second terminal settlement
+        r.state = state; r.lane = lane; r.uid = uid; r.reason = reason;
+        return true;
+    }
+    return false;
+}
 void SetGroup(int uid, int group) { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(uid); if (i >= 0) { g_reg[i].group = group; MarkDirtyLocked(g_reg[i].proj); } }
 int NewGroupId() { std::lock_guard<std::mutex> l(g_regMutex); return g_nextGroup++; }
 std::string GroupName(int group) { std::lock_guard<std::mutex> l(g_regMutex); auto it = g_groupNames.find(group); return it == g_groupNames.end() ? std::string() : it->second; }
@@ -416,7 +671,18 @@ void SetObjectNote(int uid, const std::string& note) { std::lock_guard<std::mute
 void SetManagedNpcGroup(int uid, int group) { std::lock_guard<std::mutex> l(g_regMutex); int i = NpcIndexOfUidLocked(uid); if (i >= 0) { g_npcReg[i].group = group; MarkDirtyLocked(g_npcReg[i].proj); } }
 void SetManagedNpcNote(int uid, const std::string& note) { std::lock_guard<std::mutex> l(g_regMutex); int i = NpcIndexOfUidLocked(uid); if (i >= 0) { g_npcReg[i].note = note; MarkDirtyLocked(g_npcReg[i].proj); } }
 void SetManagedNpcLabel(int uid, const std::string& label) { std::lock_guard<std::mutex> l(g_regMutex); int i = NpcIndexOfUidLocked(uid); if (i >= 0) { g_npcReg[i].label = label; MarkDirtyLocked(g_npcReg[i].proj); } }
-void ForgetUid(int uid) { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(uid); if (i >= 0) g_reg.erase(g_reg.begin() + i); }
+// Forget is explicit removal: the record and its uid are gone, and any queued work that still refers to the uid is
+// invalidated automatically because the lifetime lookup can no longer find it. The engine object itself is NOT
+// removed - the existing semantics (the object stays in the world, untracked) are preserved.
+void ForgetUid(int uid) {
+    std::unique_lock<std::mutex> operation(g_groundOpMutex);
+    if (!GroundBeforeMutationLocked({ uid }, [uid]() { ForgetUid(uid); })) return;
+    std::weak_ptr<PlaceRequest> reqw; int rowId = -1;
+    { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(uid);
+      if (i >= 0) { reqw = g_reg[(size_t)i].placeReq; rowId = g_reg[(size_t)i].placeRow; g_reg[(size_t)i].gen = NewGenLocked(); g_reg.erase(g_reg.begin() + i); ForgetCopyValueLocked(uid); } }
+    operation.unlock();
+    if (rowId >= 0) SettleRowOnce(reqw, rowId, PlaceCanceled, PlaceLaneNone, uid, "the record was forgotten before it attached");
+}
 void ForgetManagedNpc(int uid) { std::lock_guard<std::mutex> l(g_regMutex); int i = NpcIndexOfUidLocked(uid); if (i >= 0) g_npcReg.erase(g_npcReg.begin() + i); }
 
 // The game's SceneObject API takes a TiledTransform (44 bytes): scale3, quat4, pos3 (relative to the tile), int16 tile x/z.
@@ -444,28 +710,39 @@ using SetWorldTransformFn = void (*)(void* obj, const float* xf, uint8_t a, uint
 // instances. The housing system calls it with 1 after placing a part and with 0 before tearing it down (67 callers).
 using SetEnableFn = void (*)(void* obj, uint8_t enable);
 bool g_recreateOnMove = true;
+bool g_liveDrag = true;   // editor details live drag: the Log tab checkbox and the console "livedrag on/off" both drive this
 static bool CheckSO(uintptr_t obj, const char* what) {
     const char* n = RttiName(obj);
     if (!n || !strstr(n, "SceneObject")) { Log("%s: %p is not a SceneObject any more (%s)", what, (void*)obj, n ? n : "?"); return false; }
     return true;
 }
 static bool DoRemove(uintptr_t obj) {
+#ifdef WB_UNIFIED_HOST_TEST
+    return obj && host::Seam().remove ? host::Seam().remove(obj) : false;
+#else
     if (!CheckSO(obj, "remove")) return false;
     ((SetEnableFn)(g_base + kRva_SetEnable))((void*)obj, 0);
     uint8_t fl = 0; ReadBytes(obj + 0xFD, &fl, 1);
     Log("remove: %p setEnable(0) done, flags+0xFD=0x%02x", (void*)obj, fl);
     return true;
+#endif
 }
-static void* DoSpawn(std::string prefab, Vec3 pos, Rot rot, float scale, int registerUid);
+static void* DoSpawn(int uid, uint64_t gen, int lane = PlaceLaneGeneric, MoveCompletion done = {}, const MoveReq* target = nullptr, bool retryStandin = false);
+static bool C5RowDead(const std::weak_ptr<PlaceRequest>& req, int rowId);
 // Move variant A: disable, set transform, enable (the housing sequence). Variant B: remove + re-create.
-static void DoMoveInPlace(uintptr_t obj, Vec3 pos, Rot rot, float scale) {
-    if (!CheckSO(obj, "move")) return;
+static bool DoMoveInPlace(uintptr_t obj, Vec3 pos, Rot rot, float scale) {
+#ifdef WB_UNIFIED_HOST_TEST
+    return host::Seam().moveInPlace && host::Seam().moveInPlace(obj, pos, rot, scale);
+#else
+    if (!CheckSO(obj, "move")) return false;
     alignas(16) float xf[12]; MakeTransform(xf, pos, rot, scale);
     auto setEnable = (SetEnableFn)(g_base + kRva_SetEnable);
     setEnable((void*)obj, 0);
     ((SetWorldTransformFn)(g_base + kRva_SetWorldTransform))((void*)obj, xf, 0, 1);
     setEnable((void*)obj, 1);
     Log("move: %p -> (%.2f %.2f %.2f) yaw %.0f tilt %.0f/%.0f scale %.2f (disable/set/enable)", (void*)obj, pos.x, pos.y, pos.z, rot.yaw, rot.pitch, rot.roll, scale);
+    return true; // native transform is void: completion, not mere queue admission
+#endif
 }
 extern volatile LONG g_queueCount;
 
@@ -602,7 +879,6 @@ static bool GameReadFileGuarded(void* pathObj, std::vector<uint8_t>* out, char* 
         return ok;
     CDK_GUARD_FAIL return false;
     CDK_GUARD_END
-    return false;
 }
 bool GameReadAvailable() { return g_resLoader && g_origResLoad && kRva_StringDataAlloc && kRva_PathNormalizeCtor; }
 bool GameReadFileRange(const std::string& path, std::vector<uint8_t>& out, uint32_t offset, uint32_t length, uint32_t* storedTotal, bool* notFound);
@@ -677,6 +953,11 @@ bool Trace() { return g_trace; }
 // re-inserted; 0 = disable/enable hides it (async re-add). Release/drop always re-creates.
 int g_liveMode = 2;
 static void DoLiveMove(uintptr_t obj, Vec3 pos, Rot rot, float scale, DWORD queuedAt) {
+#ifdef WB_UNIFIED_HOST_TEST
+    const DWORD wait = GetTickCount() - queuedAt;
+    if (wait > 100) Log("live move: job waited %lu ms in the game-thread queue (pump ticks %ld)", wait, g_pumpTicks);
+    if (host::Seam().liveMove) host::Seam().liveMove(obj, pos, rot, scale);
+#else
     if (!CheckSO(obj, "live")) return;
     const DWORD wait = GetTickCount() - queuedAt;
     if (wait > 100) Log("live move: job waited %lu ms in the game-thread queue (pump ticks %ld)", wait, g_pumpTicks);
@@ -689,59 +970,242 @@ static void DoLiveMove(uintptr_t obj, Vec3 pos, Rot rot, float scale, DWORD queu
     case 3: setXf((void*)obj, xf, 0, 0); setEnable((void*)obj, 1); break;
     default: setEnable((void*)obj, 0); setXf((void*)obj, xf, 0, 1); setEnable((void*)obj, 1); break;
     }
+#endif
 }
-static void DoReplace(size_t idx, Vec3 pos, Rot rot, float scale) {
-    uintptr_t obj = 0; std::string prefab;
-    { std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size()) return; obj = g_reg[idx].obj; prefab = g_reg[idx].prefab; }
-    if (obj) DoRemove(obj);
-    void* r = DoSpawn(prefab, pos, rot, scale, 0);
-    std::lock_guard<std::mutex> l(g_regMutex);
-    if (idx < g_reg.size()) { g_reg[idx].obj = (uintptr_t)r; g_reg[idx].hidden = (r == nullptr); g_reg[idx].colRot = rot; g_reg[idx].colScale = scale; }
+// A final move that must re-create: remove the record's current handle and materialize its next incarnation.
+// The renewal of the generation invalidates every older completion of this record (including the caller's own).
+// The handle stays registered until this job runs, so a hide/forget/restore that happens in between still disposes
+// it (and makes the generation stale, dropping this job).
+static void DoReplace(int uid, uint64_t gen, MoveCompletion done = {}, const MoveReq* target = nullptr) {
+    uintptr_t old = 0;
+    { REG_LOCK; if (!GenCurrentLocked(uid, gen)) return; old = g_reg[(size_t)IndexOfUidLocked(uid)].obj; }
+    if (old && !DoRemove(old) && done) { done(false); return; } // actual refusal; no fictitious replacement
+    uint64_t next = 0;
+    { REG_LOCK; if (!GenCurrentLocked(uid, gen)) return;   // a forget/hide/restore replaced the incarnation while removing
+      SpawnedObj& e = g_reg[(size_t)IndexOfUidLocked(uid)];
+      e.obj = 0; e.gen = next = NewGenLocked(); }
+    DoSpawn(uid, next, PlaceLaneGeneric, std::move(done), target); // same production attachment path, carrying the lease
 }
-// final=false: live drag, visual only (disable/setTransform/enable). final=true: if rotation or scale changed since the
-// object was created, re-create it so the collision shape (built at creation) matches; otherwise move in place.
+// game thread: apply the record's own pose to its current handle. A move admitted before a hide/restore/
+// re-create is dropped here instead of touching a newer incarnation.
+static void ApplyMove(int uid, uint64_t gen, bool final, MoveCompletion done = {}, const MoveReq* target = nullptr) {
+    uintptr_t obj = 0; Vec3 pos; Rot rot; float scale = 1;
+    { REG_LOCK; const int i = IndexOfUidLocked(uid);
+      if (i < 0 || g_reg[(size_t)i].gen != gen || g_reg[(size_t)i].hidden) return;
+      const SpawnedObj& e = g_reg[(size_t)i]; obj = e.obj; pos = e.pos; rot = e.rot; scale = e.scale; }
+    if (!obj) { if (done) done(false); return; }
+    if (target) { pos = target->pos; rot = target->rot; scale = target->scale; }
+    if (final) { const bool accepted = DoMoveInPlace(obj, pos, rot, scale); if (done) done(accepted); }
+    else DoLiveMove(obj, pos, rot, scale, GetTickCount());
+}
+static void MoveGimmickJob(int uid, uint64_t gen, bool final, MoveCompletion done = {}, const MoveReq* target = nullptr);   // interactive lane (defined below)
 static bool RotDiffers(const Rot& a, const Rot& b) { return fabsf(a.yaw - b.yaw) > 0.01f || fabsf(a.pitch - b.pitch) > 0.01f || fabsf(a.roll - b.roll) > 0.01f; }
-bool MoveSpawned(size_t idx, Vec3 pos, Rot rot, float scale, bool final) {
-    if (MoveGimmick(idx, pos, rot, scale, final)) return true;
-    uintptr_t obj = 0; bool needRecreate = false;
-    { std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size()) return false; obj = g_reg[idx].obj;
-      g_reg[idx].pos = pos; g_reg[idx].rot = rot; g_reg[idx].scale = scale; if (final) MarkDirtyLocked(g_reg[idx].proj);
-      needRecreate = RotDiffers(g_reg[idx].colRot, rot) || fabsf(g_reg[idx].colScale - scale) > 0.001f; }
-    if (!GameThreadReady()) return false;
-    if (final && (g_recreateOnMove || needRecreate || !obj)) RunOnGameThread([idx, pos, rot, scale]() { DoReplace(idx, pos, rot, scale); });
-    else if (obj && final) RunOnGameThread([obj, pos, rot, scale]() { DoMoveInPlace(obj, pos, rot, scale); });
-    else if (obj) { if (InterlockedCompareExchange(&g_queueCount, 0, 0) > 2) return true;   // drop live updates when the game thread lags
-                    const DWORD now = GetTickCount();
-                    RunOnGameThread([obj, pos, rot, scale, now]() { DoLiveMove(obj, pos, rot, scale, now); }); }
+// Admission of one move on the caller thread, with the registry lock held: the record's pose becomes the
+// requested one and the returned job runs on the game thread. Only a move that replaces the physical object
+// (final re-create, or the interactive lane switching between server object and stand-in) renews the
+// generation; a pose-only move keeps it, and its job still rechecks it at execution.
+static std::function<void()> AdmitMoveLocked(size_t i, Vec3 pos, Rot rot, float scale, bool final, MoveCompletion done = {}) {
+    SpawnedObj& e = g_reg[i];
+    const int uid = e.uid;
+    // Ordinary edits retain their upstream admission semantics. A GroundOp publishes no successful
+    // pose until its actual engine outcome: the same lanes carry a private target under its lease.
+    if (!done) { e.pos = pos; e.rot = rot; e.scale = scale; }
+    ++e.poseGen;
+    const MoveReq target{ uid, pos, rot, scale };
+    if (final && !done) MarkDirtyLocked(e.proj);
+    if (e.gimmick) {
+        if (final || !e.standin) e.gen = NewGenLocked();
+        const uint64_t gen = e.gen;
+        return [uid, gen, final, done, target]() { MoveGimmickJob(uid, gen, final, done, done ? &target : nullptr); };
+    }
+    const bool recreate = final && (g_recreateOnMove || RotDiffers(e.colRot, rot) || fabsf(e.colScale - scale) > 0.001f || !e.obj);
+    const uint64_t gen = e.gen;
+    const uint64_t pose = e.poseGen;
+    return [uid, gen, pose, final, recreate, done, target]() {
+        { REG_LOCK; const int ix = IndexOfUidLocked(uid);
+          if (ix < 0 || g_reg[(size_t)ix].poseGen != pose || !GenCurrentLocked(uid, gen)) return; }
+        if (recreate) DoReplace(uid, gen, done, done ? &target : nullptr); else ApplyMove(uid, gen, final, done, done ? &target : nullptr);
+    };
+}
+static bool GroundDestinationValid(const GroundHandle& op, const std::vector<MoveReq>& moves);
+static void GroundMovementFinished(const GroundHandle& op, size_t member, bool accepted) {
+    std::vector<GroundDeferred> dispatch;
+    { std::lock_guard<std::mutex> lock(g_groundOpMutex);
+      auto& m = op->view.members[member];
+      if (op->view.state != GroundApplying || m.terminal) return;
+      { REG_LOCK; const int i = IndexOfUidLocked(m.before.uid);
+        if (i >= 0) {
+            auto& e = g_reg[(size_t)i];
+            if (accepted) { e.pos = m.requested.pos; e.rot = m.requested.rot; e.scale = m.requested.scale; }
+            else if (!e.obj) e.hidden = true; // removal completed but re-materialization failed/faulted
+            if (accepted || e.hidden != m.before.hidden) MarkDirtyLocked(e.proj);
+            m.after = e; // failure retains real hidden/handle/materialization outcome, not a fake successful pose
+        }
+      }
+      m.terminal = true; m.accepted = accepted; m.reason = accepted ? "applied" : "move-refused";
+      size_t finished = 0, moved = 0;
+      for (const auto& row : op->view.members) { finished += row.terminal; moved += row.accepted; }
+      if (finished != op->view.members.size()) return;
+      op->view.state = GroundSettled;
+      op->view.reason = moved == finished ? "applied" : moved ? "partial" : "move-refused";
+      ++g_groundNotice; // publish the ACTUAL result before lease release, dispatch or optional UI delivery
+      for (const auto& row : op->view.members) g_groundLeases.erase(row.before.uid);
+      for (auto it = g_groundDeferred.begin(); it != g_groundDeferred.end();) {
+          bool busy = false; for (int uid : it->targets) busy |= g_groundLeases.count(uid) != 0;
+          if (busy) { ++it; continue; }
+          dispatch.push_back(std::move(*it)); it = g_groundDeferred.erase(it);
+      }
+    }
+    for (auto& d : dispatch) {
+        d.action(); // no operation, registry or queue lock; target reservation prevents overtaking GroundOps
+        std::lock_guard<std::mutex> lock(g_groundOpMutex);
+        for (int uid : d.targets) if (--g_groundMutationPending[uid] == 0) g_groundMutationPending.erase(uid);
+    }
+}
+static bool RunGroundMemberGuarded(std::function<void()>* job) {
+    CDK_GUARD_BEGIN (*job)(); return true;
+    CDK_GUARD_FAIL Log("[ground] member engine call faulted 0x%08lx", cdk::GuardCode()); return false;
+    CDK_GUARD_END
+}
+bool GroundApply(const GroundHandle& op, const std::vector<MoveReq>& moves) {
+    { std::lock_guard<std::mutex> lock(g_groundOpMutex);
+      if (op->view.state != GroundProbing || !GroundValidLocked(op)) return false;
+      bool valid = GameThreadReady() && moves.size() == op->view.members.size();
+      float dy = 0;
+      for (size_t i = 0; valid && i < moves.size(); ++i) {
+          const auto& r = moves[i]; const auto& b = op->view.members[i].before;
+          if (!i) dy = r.pos.y - b.pos.y;
+          valid = r.uid == b.uid && std::isfinite(r.pos.y) && std::isfinite(dy) &&
+                  r.pos.x == b.pos.x && r.pos.z == b.pos.z && r.scale == b.scale &&
+                  r.rot.yaw == b.rot.yaw && r.rot.pitch == b.rot.pitch && r.rot.roll == b.rot.roll &&
+                  fabsf((r.pos.y - b.pos.y) - dy) < 0.001f;
+      }
+      if (!valid || !GroundDestinationValid(op, moves)) { GroundEndLocked(op, GroundFailed, "refused"); return false; }
+      for (size_t i = 0; i < moves.size(); ++i) op->view.members[i].requested = moves[i];
+      op->view.state = GroundReady;
+      op->view.state = GroundQueued;
+    }
+    RunOnGameThread([op]() {
+        std::vector<std::function<void()>> jobs;
+        { std::lock_guard<std::mutex> lock(g_groundOpMutex);
+          if (op->view.state != GroundQueued || !GroundValidLocked(op)) return;
+          // FINAL authority: the whole rigid set is checked before ANY member is admitted. A teleport,
+          // live move, hide/restore, new carried transform or replaced member invalidates this point.
+          op->view.state = GroundApplying;
+          for (const auto& m : op->view.members) g_groundLeases[m.before.uid] = op;
+          { REG_LOCK;
+            for (size_t i = 0; i < op->view.members.size(); ++i) {
+                const auto& r = op->view.members[i].requested;
+                jobs.push_back(AdmitMoveLocked((size_t)IndexOfUidLocked(r.uid), r.pos, r.rot, r.scale, true,
+                    [op, i](bool accepted) { GroundMovementFinished(op, i, accepted); }));
+            }
+          }
+        }
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            if (!RunGroundMemberGuarded(&jobs[i])) GroundMovementFinished(op, i, false);
+        } // existing generic/recreate/server lanes carry the same lease to completion
+    });
     return true;
 }
-static void ApplyMove(size_t idx, Vec3 pos, Rot rot, float scale, bool final) {   // game thread
-    if (MoveGimmick(idx, pos, rot, scale, final)) return;
-    uintptr_t obj = 0; bool needRecreate = false;
-    { std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size()) return; obj = g_reg[idx].obj;
-      g_reg[idx].pos = pos; g_reg[idx].rot = rot; g_reg[idx].scale = scale; if (final) MarkDirtyLocked(g_reg[idx].proj);
-      needRecreate = RotDiffers(g_reg[idx].colRot, rot) || fabsf(g_reg[idx].colScale - scale) > 0.001f; }
-    if (final && (g_recreateOnMove || needRecreate || !obj)) DoReplace(idx, pos, rot, scale);
-    else if (obj && final) DoMoveInPlace(obj, pos, rot, scale);
-    else if (obj) DoLiveMove(obj, pos, rot, scale, GetTickCount());
+
+// final=false: live drag, visual only (disable/setTransform/enable). final=true: if rotation or scale changed since the
+// object was created, re-create it so the collision shape (built at creation) matches; otherwise move in place.
+// Legacy index entry point: the index resolves to the logical identity HERE, and only (uid, generation) is
+// queued, so a registry shift after this call can never move a different record.
+bool MoveSpawned(size_t idx, Vec3 pos, Rot rot, float scale, bool final) {
+    if (!GameThreadReady()) return false;
+    if (!final && InterlockedCompareExchange(&g_queueCount, 0, 0) > 2) return true; // upstream index API: dropped live update is true
+    std::unique_lock<std::mutex> operation(g_groundOpMutex);
+    int uid;
+    { REG_LOCK; if (idx >= g_reg.size() || g_reg[idx].hidden) return false; uid = g_reg[idx].uid; }
+    if (!GroundBeforeMutationLocked({ uid }, [uid, pos, rot, scale, final]() { MoveMany({ { uid, pos, rot, scale } }, final); })) return true;
+    std::function<void()> job;
+    { REG_LOCK; job = AdmitMoveLocked((size_t)IndexOfUidLocked(uid), pos, rot, scale, final); }
+    operation.unlock(); RunOnGameThread(std::move(job)); return true;
 }
 bool MoveMany(const std::vector<MoveReq>& reqs, bool final) {
     if (!GameThreadReady() || reqs.empty()) return false;
     if (!final && InterlockedCompareExchange(&g_queueCount, 0, 0) > 2) return false;   // drop live updates when the game thread lags
-    std::vector<MoveReq> copy = reqs;
-    RunOnGameThread([copy, final]() { for (auto& r : copy) { int i = IndexOfUid(r.uid); if (i >= 0) ApplyMove((size_t)i, r.pos, r.rot, r.scale, final); } });
+    std::unique_lock<std::mutex> operation(g_groundOpMutex);
+    std::vector<int> ids; for (const auto& r : reqs) ids.push_back(r.uid);
+    if (!GroundBeforeMutationLocked(ids, [reqs, final]() { MoveMany(reqs, final); })) return true;
+    std::vector<std::function<void()>> jobs;
+    { REG_LOCK; for (const auto& r : reqs) { const int i = IndexOfUidLocked(r.uid); if (i >= 0 && !g_reg[(size_t)i].hidden) jobs.push_back(AdmitMoveLocked((size_t)i, r.pos, r.rot, r.scale, final)); } }
+    operation.unlock();
+    RunOnGameThread([jobs]() { for (auto& job : jobs) job(); });
     return true;
 }
-bool HideUid(int uid) { int i = IndexOfUid(uid); return i >= 0 && HideSpawned((size_t)i); }
-bool HideSpawned(size_t idx) {
+bool HideSpawned(size_t idx) { int uid = 0; { REG_LOCK; if (idx < g_reg.size()) uid = g_reg[idx].uid; } return uid && HideUid(uid); }
+// HideUid with an optional completion that runs on the SAME lane as the actual removal, AFTER it dispatched.
+// When the hide is deferred behind an Applying lease the completion travels with the deferred action, so a
+// caller-visible cleanup can never settle before the member's engine removal has executed.
+static bool HideUidInternal(int uid, std::function<void()> removed = {});
+// A deferred hide that can no longer perform the removal must still complete the caller's cleanup, otherwise
+// the outstanding mark could never clear. Returns true only when the hide actually ran or was deferred again.
+static void HideUidDeferred(int uid, std::function<void()> removed) {
+    const bool hid = HideUidInternal(uid, removed);
+    if (!hid && removed) removed();
+}
+static bool HideUidInternal(int uid, std::function<void()> removed) {
+    std::unique_lock<std::mutex> operation(g_groundOpMutex);
+    if (!GroundBeforeMutationLocked({ uid }, [uid, removed]() { HideUidDeferred(uid, removed); })) return true;
+    uintptr_t obj = 0, actor = 0, standinObj = 0; bool gimmick = false; std::weak_ptr<PlaceRequest> reqw; int rowId = -1;
     {   // an interactive object: its actor is removed on the server tick, the way the game removes a picked-up item
-        std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size() || g_reg[idx].hidden) return false;
-        if (g_reg[idx].gimmick) { const uintptr_t actor = g_reg[idx].actor, so = g_reg[idx].standin ? g_reg[idx].obj : 0; g_reg[idx].hidden = true; g_reg[idx].obj = 0; g_reg[idx].actor = 0; g_reg[idx].standin = false; MarkDirtyLocked(g_reg[idx].proj); if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); if (so && GameThreadReady()) RunOnGameThread([so]() { DoRemove(so); }); return true; }
+        REG_LOCK; const int idx = IndexOfUidLocked(uid); if (idx < 0 || g_reg[(size_t)idx].hidden) return false;
+        SpawnedObj& e = g_reg[(size_t)idx];
+        gimmick = e.gimmick; actor = e.gimmick ? e.actor : 0; obj = e.obj; standinObj = e.standin ? e.obj : 0;
+        reqw = e.placeReq; rowId = e.placeRow; uid = e.uid;
+        e.hidden = true; e.obj = 0; e.actor = 0; e.standin = false;
+        e.gen = NewGenLocked();   // every in-flight completion of the hidden incarnation is invalidated
+        MarkDirtyLocked(e.proj); }
+    operation.unlock();
+    // C5: a row hidden before it attached is a cancel of that unapplied row (an already Attached row keeps its receipt)
+    if (rowId >= 0) SettleRowOnce(reqw, rowId, PlaceCanceled, PlaceLaneNone, uid, "the placement was cancelled or hidden before it attached");
+    // engine and server calls happen outside the registry lock; the completion runs right after the removal on its own lane
+    if (gimmick) {
+        const bool serverLane = actor != 0;   // the actor removal is the visible member, so its lane owns the completion
+        if (serverLane) RunOnServerTick([actor, removed]() { RemoveSpawnedActor(actor); if (removed) removed(); });
+        if (standinObj && GameThreadReady()) {
+            if (!serverLane) RunOnGameThread([standinObj, removed]() { DoRemove(standinObj); if (removed) removed(); });
+            else RunOnGameThread([standinObj]() { DoRemove(standinObj); });
+        } else if (!serverLane && removed) removed();   // nothing visible to remove: the cleanup is already complete
+        return true;
     }
-    uintptr_t obj = 0;
-    { std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size() || g_reg[idx].hidden) return false; obj = g_reg[idx].obj; g_reg[idx].hidden = true; g_reg[idx].obj = 0; MarkDirtyLocked(g_reg[idx].proj); }
     if (!GameThreadReady()) return false;
-    RunOnGameThread([obj]() { DoRemove(obj); });
+    if (obj) RunOnGameThread([obj, removed]() { DoRemove(obj); if (removed) removed(); });
+    else if (removed) removed();                        // hidden record with no materialized object: nothing to remove
+    return true;
+}
+bool HideUid(int uid) { return HideUidInternal(uid); }
+// C3: bring a hidden logical record back to life with a fresh physical generation. The uid and every record-owned
+// value (project, group, pose, prefab, interactive lane) stay exactly as the record carries them - never an older
+// History snapshot - so a later AssignProject/SaveProject adoption survives undo/redo. false when the record was
+// explicitly forgotten, is already materialized, or the game thread is not ready.
+bool RestoreUid(int uid) {
+    if (!GameThreadReady()) return false;
+    std::unique_lock<std::mutex> operation(g_groundOpMutex);
+    if (!GroundBeforeMutationLocked({ uid }, [uid]() { RestoreUid(uid); })) return true;
+    uint64_t gen = 0; bool gim = false; std::string prefab; Vec3 pos; Rot rot; float scale = 1;
+    std::weak_ptr<PlaceRequest> request; int row = -1;
+    { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(uid);
+      if (i < 0) return false;
+      SpawnedObj& e = g_reg[(size_t)i];
+      if (!e.hidden) return false;                 // still materialized (or never hidden): nothing to restore
+      e.hidden = false; e.standin = false; e.actor = 0; e.obj = 0;
+      e.gen = gen = NewGenLocked();                // fresh physical generation for this incarnation
+      MarkDirtyLocked(e.proj);
+      gim = e.gimmick; prefab = e.prefab; pos = e.pos; rot = e.rot; scale = e.scale; request = e.placeReq; row = e.placeRow; }
+    operation.unlock();
+    if (C5RowDead(request, row)) {
+        // A restored incarnation is new work, not a resurrection of its canceled/failed placement receipt.
+        REG_LOCK; const int i = IndexOfUidLocked(uid);
+        if (i >= 0 && g_reg[(size_t)i].gen == gen) { g_reg[(size_t)i].placeReq.reset(); g_reg[(size_t)i].placeRow = -1; }
+    }
+    if (gim && IsGimmickPrefab(prefab)) {
+        EnqueueGimmick(uid, gen, prefab, pos, rot, scale);   // server tick, once a template exists
+        return true;
+    }
+    RunOnGameThread([uid, gen]() { DoSpawn(uid, gen); });
     return true;
 }
 
@@ -753,18 +1217,23 @@ static uintptr_t SceneObjectMgr() {
 }
 static uint8_t g_flags[3] = { 1, 1, 0 };   // middle flag = schedule the add-to-level task (what every dynamic spawner in the game uses)
 
-static void* DoSpawn(std::string prefab, Vec3 pos, Rot rot, float scale, int registerUid) {
-    if (!g_origCreate) { Log("spawn: hook not installed"); return nullptr; }
+// Raw engine creation of one scene object (the createSceneObjectFrom call). Only this boundary is
+// substituted by a host fixture; the spawn lifecycle around it stays production code.
+static uintptr_t CreateGenericSceneObject(const std::string& prefab, Vec3 pos, Rot rot, float scale) {
+#ifdef WB_UNIFIED_HOST_TEST
+    return host::Seam().createGeneric ? host::Seam().createGeneric(prefab, pos, rot, scale) : 0;
+#else
+    if (!g_origCreate) { Log("spawn: hook not installed"); return 0; }
     uintptr_t mgr = SceneObjectMgr();
     if (!mgr && g_lastMgr) mgr = (uintptr_t)g_lastMgr;
-    if (!mgr) { Log("spawn: no SceneObjectManager"); return nullptr; }
+    if (!mgr) { Log("spawn: no SceneObjectManager"); return 0; }
     auto rrpCtor = (void*(*)(void*, const void*))(g_base + kRva_PrefabPathCtor);
     auto sdAlloc = (uintptr_t(*)(int))(g_base + kRva_StringDataAlloc);
     auto normalize = (void*(*)(void*, const void*))(g_base + kRva_PathNormalizeCtor);
     alignas(16) uint8_t tag[32] = {0}, pathStr[32] = {0}, rrp[0x100] = {0}, arg3[64] = {0}, arg4[64] = {0}, tagBlock[0x80] = {0};
     *(uintptr_t*)tag = (uintptr_t)tagBlock;                    // tag = pointer to zeroed block (what the sector loader passes)
     uintptr_t sd = sdAlloc((int)prefab.size());                // game StringData: {char* str; i32 len; i32 hash=-1; i32 rc=1; ...}
-    if (!sd) { Log("spawn: StringData alloc failed"); return nullptr; }
+    if (!sd) { Log("spawn: StringData alloc failed"); return 0; }
     strncpy_s((char*)*(uintptr_t*)sd, prefab.size() + 1, prefab.c_str(), _TRUNCATE);
     uintptr_t holder = sd;
     normalize(pathStr, &holder);
@@ -774,14 +1243,64 @@ static void* DoSpawn(std::string prefab, Vec3 pos, Rot rot, float scale, int reg
     void* r = g_origCreate((void*)mgr, tag, arg3, arg4, rrp, xf, g_flags[0], g_flags[1], g_flags[2]);
     g_inOurSpawn = false;
     Log("spawn: \"%s\" at (%.2f %.2f %.2f) yaw %.0f tilt %.0f/%.0f scale %.2f -> %p (%s)", prefab.c_str(), pos.x, pos.y, pos.z, rot.yaw, rot.pitch, rot.roll, scale, r, r && RttiName((uintptr_t)r) ? RttiName((uintptr_t)r) : "?");
-    if (registerUid) {
-        bool discarded = false;
-        { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(registerUid);
-          if (i >= 0 && !g_reg[i].hidden && !(g_reg[i].gimmick && !g_reg[i].standin)) { g_reg[i].obj = (uintptr_t)r; if (!r) g_reg[i].hidden = true; }
-          else discarded = true; }
-        if (discarded && r) DoRemove((uintptr_t)r);   // a queued spawn may finish after an HTTP client hides or forgets it, or a stand-in after the drag already ended
+    return (uintptr_t)r;
+#endif
+}
+// Materialize one registered record on the game/engine thread: the record's own metadata is read under the lock
+// and the created handle attaches only while the record still carries the generation the work was admitted with.
+// A handle whose record changed generation (hidden, forgotten, restored, re-created) is disposed here - the
+// physical object of a rejected completion never survives. C5: `lane` names the lane this materialization is
+// for; a genuine attachment (or a real create refusal) settles the record's placement row exactly once, while
+// an intermediate stand-in during a retry is only observed and stays Pending.
+static void C5AddObligation(const std::shared_ptr<PlaceRequest>& req, int rowId);
+static void C5ReleaseObligation(const std::shared_ptr<PlaceRequest>& req, int rowId);
+static void* DoSpawn(int uid, uint64_t gen, int lane, MoveCompletion done, const MoveReq* target, bool retryStandin) {
+    std::string prefab; Vec3 pos; Rot rot; float scale = 1; int proj = 0;
+    std::weak_ptr<PlaceRequest> reqw; int rowId = -1;
+    { REG_LOCK; const int i = IndexOfUidLocked(uid);
+      if (i < 0 || g_reg[(size_t)i].gen != gen || g_reg[(size_t)i].hidden) return nullptr;
+      const SpawnedObj& e = g_reg[(size_t)i]; prefab = e.prefab; pos = e.pos; rot = e.rot; scale = e.scale; proj = e.proj; reqw = e.placeReq; rowId = e.placeRow; }
+    const auto flight = reqw.lock(); C5AddObligation(flight, rowId);
+    struct FlightEnd { std::shared_ptr<PlaceRequest> request; int row; ~FlightEnd() { C5ReleaseObligation(request, row); } } flightEnd{ flight, rowId };
+    auto nativeWork = TrackProjectNativeWork(proj);
+    { REG_LOCK; if (!GenCurrentLocked(uid, gen)) return nullptr; }
+    if (target) { pos = target->pos; rot = target->rot; scale = target->scale; }
+    const uintptr_t r = CreateGenericSceneObject(prefab, pos, rot, scale);
+    bool attached = false;
+    { REG_LOCK; const int i = IndexOfUidLocked(uid);
+      if (i >= 0 && g_reg[(size_t)i].gen == gen && !g_reg[(size_t)i].hidden) {
+          SpawnedObj& e = g_reg[(size_t)i]; e.obj = r; e.colRot = rot; e.colScale = scale; e.hidden = (r == 0); attached = true;
+          // B1: a refused retry-backed stand-in keeps the visible record (same generation, request
+          // identity and triedTemplates untouched) so the requeued request retries the replay path
+          // instead of stranding Pending on a hidden record the next server step discards. No row
+          // settlement here: the row stays Pending until a genuine final lane or the fallback. A live-drag
+          // stand-in (retryStandin=false) keeps the previous hide-on-refusal behavior.
+          if (lane == PlaceLaneStandin && r == 0 && retryStandin) { e.hidden = false; e.standin = false; }
+          reqw = e.placeReq; rowId = e.placeRow; } }
+    if (!attached && r) DoRemove(r);   // rejected new physical object: disposed on the thread that created it
+    if (attached && rowId >= 0) {      // C5: settle the caller's row (outside the registry lock)
+        // C5-SETTLE-BEGIN
+        if (lane == PlaceLaneStandin) {
+            if (r) NoteAttachObservation(reqw, rowId);   // an intermediate stand-in is observed, never terminal
+        } else if (r) {
+            NoteAttachOnce(reqw, rowId, lane, uid);       // a genuine final attachment (generic/direct/replay/plain)
+        } else {
+            SettleRowOnce(reqw, rowId, PlaceFailed, PlaceLaneNone, uid, lane == PlaceLanePlain ? "the fallback object could not be created" : "the engine refused the create");
+        }
+        // C5-SETTLE-END
+        if (C5RowDead(reqw, rowId)) { // cancellation during admission can precede publication of row.uid
+            bool dispose = false;
+            { REG_LOCK; const int i = IndexOfUidLocked(uid);
+              if (i >= 0 && g_reg[(size_t)i].gen == gen && g_reg[(size_t)i].obj == r) {
+                  auto& e = g_reg[(size_t)i]; e.obj = 0; e.hidden = true; e.gen = NewGenLocked(); dispose = true;
+              }
+            }
+            if (dispose && r) DoRemove(r);
+            attached = false;
+        }
     }
-    return r;
+    if (done && (lane != PlaceLaneStandin || !r)) done(attached && r != 0); // a refused stand-in cannot wait forever for a retry that requires it
+    return attached ? (void*)r : nullptr;
 }
 
 // ---- game-thread pump: movement tick (pattern from master-looter / Trinity) ----
@@ -789,27 +1308,47 @@ static std::vector<int> ParsePattern(const char* s) {
     std::vector<int> out; for (const char* p = s; *p; ) { while (*p == ' ') p++; if (!*p) break; if (*p == '?') { out.push_back(-1); while (*p == '?') p++; } else { out.push_back((int)strtoul(p, (char**)&p, 16)); } }
     return out;
 }
-static uintptr_t FindPattern(const char* pat) {
-    auto p = ParsePattern(pat);
-    if (p.empty()) return 0;
-    auto dos = (IMAGE_DOS_HEADER*)g_base; auto nt = (IMAGE_NT_HEADERS64*)(g_base + dos->e_lfanew); auto sec = IMAGE_FIRST_SECTION(nt);
-    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-        uint8_t* s = (uint8_t*)(g_base + sec[i].VirtualAddress); size_t n = sec[i].Misc.VirtualSize;
-        for (size_t k = 0; k + p.size() <= n; k++) {
-            if (p[0] >= 0 && s[k] != p[0]) continue;   // a wildcard as the first byte matches anything (as in FindPatternCount)
-            bool ok = true; for (size_t j = 1; j < p.size(); j++) if (p[j] >= 0 && s[k + j] != p[j]) { ok = false; break; }
-            if (ok) return (uintptr_t)(s + k);
-        }
+// The pattern scanners read the main image only through the bounded PE reader extracted into
+// overlay_discovery (the same reader the overlay's discovery uses), but they do NOT inherit that consumer's
+// eligibility: a scan needs a readable image with an executable section, not the binding route's import
+// directory, containing section or fixed section/file alignment (overlay::discovery::ImageCoreBounds vs
+// ImageBounds). Every scan is a bounds-checked, chunked read, so an unmapped or malformed image can never be walked.
+static const overlay::discovery::ImageInfo& ScanImage() {
+    static overlay::discovery::ImageInfo img;   // only a SUCCESSFUL validation is cached; a rejected image is retried
+    if (!img.base && g_base) {
+        overlay::discovery::ImageInfo fresh = {};
+        if (overlay::discovery::ImageCoreBounds(g_base, &fresh)) img = fresh;
     }
-    return 0;
+    return img;
 }
+static uintptr_t ScanPattern(const std::vector<int>& p, int* count) {
+    if (count) *count = 0;
+    if (p.empty() || p.size() > 64) {                  // the bounded reader takes patterns up to 64 bytes
+        if (p.size() > 64) Log("[scan] pattern_tokens_rejected tokens=%d limit=64: the bounded reader would be overrun, so the pattern is not scanned - raise the reader's limit instead of letting a longer pattern miss silently", (int)p.size());
+        return 0;
+    }
+    unsigned char val[64] = {}, mask[64] = {};
+    for (size_t i = 0; i < p.size(); i++) { val[i] = p[i] < 0 ? 0 : (unsigned char)p[i]; mask[i] = p[i] < 0 ? 0 : 0xFF; }
+    const overlay::discovery::ImageInfo& img = ScanImage();
+    if (!img.base) return 0;
+    int hits = 0; bool complete = false;
+    const uintptr_t rva = overlay::discovery::GameBoundaryScan(img, true, val, mask, (int)p.size(), &hits, &complete);
+    if (!complete) return 0;                           // a partial scan can never prove a match
+    if (count) *count = hits > 64 ? 65 : hits;         // caps the LOGGED count: the pre-extraction scanner kept its raw per-section count,
+                                                       // which could exceed 65 across sections; every uniqueness decision compares against 1
+    return rva ? img.base + rva : 0;
+}
+static uintptr_t FindPattern(const char* pat) { return ScanPattern(ParsePattern(pat), nullptr); }
 using PumpFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 static PumpFn g_origPump = nullptr;
 static std::mutex g_qMutex; static std::deque<std::function<void()>> g_queue;
 volatile LONG g_queueCount = 0;
-void RunOnGameThread(std::function<void()> f) { std::lock_guard<std::mutex> l(g_qMutex); g_queue.push_back(std::move(f)); InterlockedIncrement(&g_queueCount); }
+void RunOnGameThread(std::function<void()> f) { NoteWorkQueued(); std::lock_guard<std::mutex> l(g_qMutex); g_queue.push_back(std::move(f)); InterlockedIncrement(&g_queueCount); }
+#ifdef WB_UNIFIED_HOST_TEST
+bool GameThreadReady() { return host::Seam().ready; }
+#else
 bool GameThreadReady() { return g_origPump && g_gameThread; }
+#endif
 long PumpTicks() { return g_pumpTicks; }
 long CreateCalls() { return g_createCalls; }
 bool HooksReady() { return g_origCreate && g_origPump; }
@@ -827,9 +1366,11 @@ static void AutoloadTick();
 static void CheckReplayWatchdog();   // gimmick replay watchdog (below): the game thread keeps running when the server thread is stuck
 static void PumpJobs() {
     g_pumpTicks++; g_gameThread = GetCurrentThreadId();
+#ifndef WB_UNIFIED_HOST_TEST   // host runs are deterministic: the tick duties need the game's own state
     if ((g_pumpTicks & 31) == 0) CheckReplayWatchdog();
     if (g_trace) TraceTick();
     if ((g_pumpTicks & 15) == 0) AutoloadTick();
+#endif
     std::function<void()> job;
     if (InterlockedCompareExchange(&g_queueCount, 0, 0) != 0) {
         std::lock_guard<std::mutex> l(g_qMutex);
@@ -846,19 +1387,26 @@ static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uin
     return r;
 }
 
-int SpawnAt(const std::string& prefab, Vec3 world, Rot rot, float scale, int group, int proj) {
+// SpawnAt, optionally binding the new record to a caller-owned placement row (C5). The binding is written in
+// the SAME registry-lock section that publishes the record, so a pump that runs before this function returns
+// still resolves the row identity.
+static int SpawnAtLinked(const std::string& prefab, Vec3 world, Rot rot, float scale, int group, int proj,
+                         const std::shared_ptr<PlaceRequest>& req, int rowId) {
     if (!GameThreadReady()) { Log("spawn: game thread pump not active yet"); return 0; }
     // a character appearance is assembled by the game's actor system; as a scene object it would spawn nothing visible
     if (prefab.size() > 8 && prefab.compare(prefab.size() - 8, 8, ".app_xml") == 0) { Log("spawn: %s is a character appearance, characters cannot be spawned yet", prefab.c_str()); return 0; }
     const bool gim =g_gimmickSpawn && kRva_GimmickSpawn_ && IsGimmickPrefab(prefab);
-    int uid; { std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextUid++; g_reg.push_back({ 0, prefab, world, rot, scale, false, GetTickCount(), rot, scale, uid, group, proj, gim, 0 }); if (!g_loading) MarkDirtyLocked(proj); }
-    if (gim) { EnqueueGimmick(uid, prefab, world, rot, scale); return uid; }   // spawned by the server tick once a template capture exists
-    std::string p = prefab;
-    RunOnGameThread([p, world, rot, scale, uid]() {
-        { std::lock_guard<std::mutex> l(g_regMutex); int i = IndexOfUidLocked(uid); if (i < 0 || g_reg[i].hidden) return; }
-        DoSpawn(p, world, rot, scale, uid);
-    });
+    int uid; uint64_t gen = 0;
+    { std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextUid++; gen = NewGenLocked();
+      SpawnedObj o{ 0, prefab, world, rot, scale, false, GetTickCount(), rot, scale, uid, group, proj, gim, 0, false, gen };
+      o.placeReq = req; o.placeRow = req ? rowId : -1;
+      g_reg.push_back(std::move(o)); if (!g_loading) MarkDirtyLocked(proj); }
+    if (gim) { EnqueueGimmick(uid, gen, prefab, world, rot, scale); return uid; }   // spawned by the server tick once a template capture exists
+    RunOnGameThread([uid, gen]() { DoSpawn(uid, gen); });
     return uid;
+}
+int SpawnAt(const std::string& prefab, Vec3 world, Rot rot, float scale, int group, int proj) {
+    return SpawnAtLinked(prefab, world, rot, scale, group, proj, nullptr, -1);
 }
 
 // ---- prefab index ----
@@ -991,8 +1539,7 @@ void PreviewSet(const std::string& prefab, Vec3 pos, float yawDeg, float scale, 
         if (same) { DoLiveMove(obj, pos, Rot{ yawDeg }, scale, GetTickCount()); }
         else {
             if (obj) DoRemove(obj);
-            void* r = DoSpawn(prefab, pos, Rot{ yawDeg }, scale, 0);
-            obj = (uintptr_t)r;
+            obj = CreateGenericSceneObject(prefab, pos, Rot{ yawDeg }, scale);   // the preview is not a registry record
         }
         std::lock_guard<std::mutex> l(g_prevMutex);
         g_prev.obj = obj; g_prev.prefab = prefab; g_prev.pos = pos; g_prev.yaw = yawDeg; g_prev.scale = scale; g_prev.pending = false;
@@ -1002,7 +1549,7 @@ int PreviewCommit() {
     std::lock_guard<std::mutex> l(g_prevMutex);
     if (!g_prev.obj) return 0;
     int uid = 0;
-    { std::lock_guard<std::mutex> r(g_regMutex); uid = g_nextUid++; g_reg.push_back({ g_prev.obj, g_prev.prefab, g_prev.pos, Rot{ g_prev.yaw }, g_prev.scale, false, GetTickCount(), Rot{ g_prev.yaw }, g_prev.scale, uid, 0 }); }
+    { std::lock_guard<std::mutex> r(g_regMutex); uid = g_nextUid++; g_reg.push_back({ g_prev.obj, g_prev.prefab, g_prev.pos, Rot{ g_prev.yaw }, g_prev.scale, false, GetTickCount(), Rot{ g_prev.yaw }, g_prev.scale, uid, 0, 0, false, 0, false, NewGenLocked() }); }
     Log("preview committed: %s at (%.2f %.2f %.2f)", g_prev.prefab.c_str(), g_prev.pos.x, g_prev.pos.y, g_prev.pos.z);
     g_prev.obj = 0; g_prev.prefab.clear();
     return uid;
@@ -1011,6 +1558,160 @@ int PreviewCommit() {
 // ---- projects (save / load / autoload) ----
 static std::string ProjDir() { return g_modDir + "\\projects"; }
 static std::string ProjPath(const std::string& name) { return ProjDir() + "\\" + name + ".cdproj"; }
+// A group file is placed through the group path, never loaded or autoloaded as a project.
+static bool IsGroupFileName(const std::string& name) {
+    return name.size() > 8 && _stricmp(name.c_str() + name.size() - 8, ".cdgroup") == 0;
+}
+// Lifecycle serializes core file admission with file mutation, never engine callbacks. Activity leases
+// survive deferred LoadProject admission. The recursive mutex lets a host boundary probe the REAL gate while
+// a same-thread save/export is in flight; the activity, not recursive acquisition, decides the refusal.
+static std::recursive_mutex g_fileMutex;
+#ifdef WB_UNIFIED_HOST_TEST
+FileMutationFault g_fileMutationFault = FileMutationFault::None;
+#endif
+static std::wstring FileWide(const std::string& s) {
+    const int n = MultiByteToWideChar(CP_ACP, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring out((size_t)n, L'\0');
+    if (n) MultiByteToWideChar(CP_ACP, 0, s.data(), (int)s.size(), &out[0], n);
+    return out;
+}
+bool FileNameEqual(const std::string& a, const std::string& b) {
+    const auto x = FileWide(a), y = FileWide(b);
+    if (x.empty() || y.empty()) return a == b;
+    return CompareStringOrdinal(x.data(), (int)x.size(), y.data(), (int)y.size(), TRUE) == CSTR_EQUAL;
+}
+struct FileActivityRow { proj_codec::Kind kind; std::string name; FileReason reason; };
+static std::vector<const FileActivityRow*> g_fileActivities;
+struct FileActivity {
+    FileActivityRow row;
+    FileActivity(proj_codec::Kind kind, const std::string& name, FileReason reason) : row{ kind, name, reason } {
+        std::lock_guard<std::recursive_mutex> l(g_fileMutex); g_fileActivities.push_back(&row);
+    }
+    ~FileActivity() {
+        std::lock_guard<std::recursive_mutex> l(g_fileMutex);
+        g_fileActivities.erase(std::find(g_fileActivities.begin(), g_fileActivities.end(), &row));
+    }
+};
+static std::shared_ptr<void> TrackProjectNativeWork(int proj) {
+    if (!proj) return {};
+    return std::make_shared<FileActivity>(proj_codec::Kind::Project, ProjectNameOf(proj), FileReason::PendingOperation);
+}
+struct FilePlaceUse { std::string name; std::weak_ptr<PlaceRequest> request; };
+static std::vector<FilePlaceUse> g_filePlaces; // weak ownership only; never changes/prunes the caller's receipts
+struct FileHandle {
+    HANDLE h = INVALID_HANDLE_VALUE;
+    FileHandle() = default;
+    FileHandle(const FileHandle&) = delete;
+    FileHandle& operator=(const FileHandle&) = delete;
+    ~FileHandle() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    bool close() { const HANDLE old = h; h = INVALID_HANDLE_VALUE; return old == INVALID_HANDLE_VALUE || CloseHandle(old) != 0; }
+};
+struct FileSelection { SavedFile file; BY_HANDLE_FILE_INFORMATION info{}; std::string bytes; };
+static const char* FileExtension(proj_codec::Kind kind) { return kind == proj_codec::Kind::Project ? ".cdproj" : ".cdgroup"; }
+static std::string FileDirectory(proj_codec::Kind kind, bool archived) {
+    return g_modDir + (kind == proj_codec::Kind::Project ? "\\projects" : "\\Groups") + (archived ? "\\.archive" : "");
+}
+static bool ValidFileName(const std::string& filename, proj_codec::Kind kind) {
+    if (kind != proj_codec::Kind::Project && kind != proj_codec::Kind::Group) return false;
+    const size_t ext = strlen(FileExtension(kind));
+    if (filename.size() <= ext || filename.size() > 255 || filename.find_first_of("\\/:*?\"<>|") != std::string::npos) return false;
+    for (unsigned char c : filename) if (c < 32) return false;
+    if (!FileNameEqual(filename.substr(filename.size() - ext), FileExtension(kind))) return false;
+    const std::string stem = filename.substr(0, filename.size() - ext);
+    const std::string device = stem.substr(0, stem.find('.'));
+    if (FileNameEqual(device, "CON") || FileNameEqual(device, "PRN") || FileNameEqual(device, "AUX") || FileNameEqual(device, "NUL")) return false;
+    if (device.size() == 4 && (FileNameEqual(device.substr(0, 3), "COM") || FileNameEqual(device.substr(0, 3), "LPT")) && device[3] >= '1' && device[3] <= '9') return false;
+    return true;
+}
+static FileResult ValidateSavedFile(const SavedFile& file) {
+    if (!ValidFileName(file.filename, file.kind)) return { FileReason::InvalidName };
+    if (file.path != FileDirectory(file.kind, file.archived) + "\\" + file.filename) return { FileReason::StaleTarget };
+    return {};
+}
+static FileResult OpenFileDirectory(const std::string& path, FileHandle& handle) {
+    handle.h = CreateFileA(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                          FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle.h == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        return { e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ? FileReason::NotFound : FileReason::UnsafePath, e };
+    }
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(handle.h, &info)) return { FileReason::UnsafePath, GetLastError() };
+    if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) return { FileReason::UnsafePath };
+    return {};
+}
+struct FileDirectories { FileHandle root, active, archive; };
+static FileResult OpenFileDirectories(const SavedFile& file, bool createArchive, FileDirectories& dirs) {
+    FileResult r = OpenFileDirectory(g_modDir, dirs.root); if (!r.ok()) return r;
+    r = OpenFileDirectory(FileDirectory(file.kind, false), dirs.active); if (!r.ok()) return r;
+    if (file.archived || createArchive) {
+        const std::string path = FileDirectory(file.kind, true);
+        if (createArchive && !CreateDirectoryA(path.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return { FileReason::MoveFailed, GetLastError() };
+        r = OpenFileDirectory(path, dirs.archive); if (!r.ok()) return r;
+        BY_HANDLE_FILE_INFORMATION a{}, b{};
+        if (!GetFileInformationByHandle(dirs.active.h, &a) || !GetFileInformationByHandle(dirs.archive.h, &b)) return { FileReason::UnsafePath, GetLastError() };
+        if (a.dwVolumeSerialNumber != b.dwVolumeSerialNumber) return { FileReason::UnsafePath };
+    }
+    return {};
+}
+static bool ReadHandleBytes(HANDLE h, std::string& bytes) {
+    LARGE_INTEGER zero{}; if (!SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) return false;
+    bytes.clear(); char block[8192]; DWORD got = 0;
+    for (;;) {
+        if (!ReadFile(h, block, sizeof block, &got, nullptr)) return false;
+        if (!got) return true;
+        bytes.append(block, got);
+    }
+}
+static FileResult ReadSelectedFile(const SavedFile& file, DWORD access, DWORD sharing, FileHandle& handle, FileSelection& out) {
+    WIN32_FIND_DATAA fd{}; HANDLE find = FindFirstFileA(file.path.c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return { FileReason::NotFound, GetLastError() };
+    FindClose(find);
+    if (file.filename != fd.cFileName) return { FileReason::StaleTarget }; // exact selected filename, not an alias
+    handle.h = CreateFileA(file.path.c_str(), access, sharing, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle.h == INVALID_HANDLE_VALUE) return { FileReason::ReadFailed, GetLastError() };
+    if (!GetFileInformationByHandle(handle.h, &out.info)) return { FileReason::ReadFailed, GetLastError() };
+    if (out.info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) return { FileReason::UnsafePath };
+    if (!ReadHandleBytes(handle.h, out.bytes)) return { FileReason::ReadFailed, GetLastError() };
+    out.file = file;
+    return {};
+}
+static bool SameFileSelection(const FileSelection& a, const FileSelection& b) {
+    return a.info.dwVolumeSerialNumber == b.info.dwVolumeSerialNumber && a.info.nFileIndexHigh == b.info.nFileIndexHigh &&
+        a.info.nFileIndexLow == b.info.nFileIndexLow && a.info.nFileSizeHigh == b.info.nFileSizeHigh && a.info.nFileSizeLow == b.info.nFileSizeLow &&
+        CompareFileTime(&a.info.ftLastWriteTime, &b.info.ftLastWriteTime) == 0 && a.bytes == b.bytes;
+}
+FileResult ListSavedFiles(proj_codec::Kind kind, bool archived, std::vector<SavedFile>& files) {
+    std::lock_guard<std::recursive_mutex> l(g_fileMutex);
+    files.clear();
+    if (kind != proj_codec::Kind::Project && kind != proj_codec::Kind::Group) return { FileReason::InvalidName };
+    SavedFile file; file.kind = kind; file.archived = archived;
+    FileDirectories dirs; FileResult r = OpenFileDirectories(file, false, dirs);
+    if (r.reason == FileReason::NotFound) return {};
+    if (!r.ok()) return r;
+    const std::string path = FileDirectory(kind, archived);
+    WIN32_FIND_DATAA fd{}; HANDLE h = FindFirstFileA((path + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) { const DWORD e = GetLastError(); return e == ERROR_FILE_NOT_FOUND ? FileResult{} : FileResult{ FileReason::ReadFailed, e }; }
+    do {
+        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        if (!ValidFileName(fd.cFileName, kind)) continue;
+        file.filename = fd.cFileName; file.path = path + "\\" + file.filename; files.push_back(file);
+    } while (FindNextFileA(h, &fd));
+    const DWORD e = GetLastError(); FindClose(h);
+    if (e != ERROR_NO_MORE_FILES) { files.clear(); return { FileReason::ReadFailed, e }; }
+    return {};
+}
+FileResult SelectSavedFile(const SavedFile& file, FileSelectionHandle& selection) {
+    std::lock_guard<std::recursive_mutex> l(g_fileMutex);
+    selection.reset(); FileResult r = ValidateSavedFile(file); if (!r.ok()) return r;
+    FileDirectories dirs; r = OpenFileDirectories(file, false, dirs); if (!r.ok()) return r;
+    FileHandle h; auto value = std::make_shared<FileSelection>();
+    r = ReadSelectedFile(file, GENERIC_READ, FILE_SHARE_READ, h, *value);
+    if (r.ok()) selection = value;
+    return r;
+}
+SavedFile SelectedFile(const FileSelectionHandle& selection) { return selection ? selection->file : SavedFile{}; }
+
 // ---- project membership -----------------------------------------------------------------------------------------
 // Every spawned object carries the id of the project it came from (0 = placed by hand and not saved yet). That is what
 // lets one project be overwritten with exactly its own objects while other loaded projects stay untouched. The ids are
@@ -1032,6 +1733,9 @@ int ProjectObjectCount(int id) {
     int n = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex);
+#ifdef WB_UNIFIED_HOST_TEST
+        ++g_sceneEnumerationStats.calls; g_sceneEnumerationStats.records += g_reg.size() + g_npcReg.size();
+#endif
         for (auto& o : g_reg) if (!o.hidden && o.proj == id) n++;
         for (auto& npc : g_npcReg) if (!npc.hidden && npc.proj == id) n++;
     }
@@ -1044,24 +1748,443 @@ void AssignProject(int uid, int proj) {
     std::lock_guard<std::mutex> l(g_regMutex);
     int i = IndexOfUidLocked(uid); if (i >= 0) g_reg[i].proj = proj;
 }
-static void AssignNpcProject(int uid, int proj) {
-    std::lock_guard<std::mutex> l(g_regMutex);
-    const int i = NpcIndexOfUidLocked(uid); if (i >= 0) g_npcReg[i].proj = proj;
+
+struct LibraryNameLess {
+    bool operator()(const std::wstring& a, const std::wstring& b) const {
+        return CompareStringOrdinal(a.data(), (int)a.size(), b.data(), (int)b.size(), TRUE) == CSTR_LESS_THAN;
+    }
+};
+FileResult RefreshSavedLibrary(SavedLibrarySnapshot& snapshot) {
+    std::lock_guard<std::recursive_mutex> filesLock(g_fileMutex);
+    SavedLibrarySnapshot next;
+    for (bool archived : { false, true }) for (auto kind : { proj_codec::Kind::Project, proj_codec::Kind::Group }) {
+        std::vector<SavedFile> files;
+        const auto result = ListSavedFiles(kind, archived, files);
+        if (!result.ok()) return result;
+        auto& totals = archived ? next.archived : next.active;
+        (kind == proj_codec::Kind::Project ? totals.projects : totals.groups) = files.size();
+        for (auto& file : files) next.entries.push_back({ std::move(file), {} });
+    }
+    std::vector<std::string> names;
+    std::map<int, ProjectOwnership> byId;
+    {
+        // Same lock order as the lifecycle gate; never acquire project names from inside a registry scan.
+        std::lock_guard<std::mutex> projectsLock(g_projMutex);
+        std::lock_guard<std::mutex> registryLock(g_regMutex);
+        names = g_projNames;
+#ifdef WB_UNIFIED_HOST_TEST
+        ++g_sceneEnumerationStats.calls; g_sceneEnumerationStats.records += g_reg.size();
+#endif
+        for (const auto& object : g_reg) {
+            auto& counts = byId[object.proj];
+            ++(object.hidden ? counts.hidden : counts.visible);
+            if (!object.hidden && (!object.obj || object.standin)) ++counts.pendingObjects;
+        }
+        for (const auto& npc : g_npcReg) {
+            auto& counts = byId[npc.proj];
+            ++(npc.hidden ? counts.hiddenNpcs : counts.visibleNpcs);
+            if (!npc.hidden && (npc.spawnPending || !npc.actor)) ++counts.pendingNpcs;
+        }
+        for (const auto& stroke : TerrainStrokes()) ++byId[stroke.proj].terrain;
+        for (int id : g_projDirty) byId[id].dirty = true;
+    }
+    next.unassigned = byId[0];
+    std::map<std::wstring, ProjectOwnership, LibraryNameLess> byName;
+    for (size_t id = 1; id < names.size(); ++id) {
+        const auto found = byId.find((int)id);
+        if (found == byId.end()) continue;
+        auto& counts = byName[FileWide(names[id])];
+        counts.visible += found->second.visible; counts.hidden += found->second.hidden;
+        counts.terrain += found->second.terrain;
+        counts.visibleNpcs += found->second.visibleNpcs; counts.hiddenNpcs += found->second.hiddenNpcs;
+        counts.pendingObjects += found->second.pendingObjects; counts.pendingNpcs += found->second.pendingNpcs;
+        counts.dirty |= found->second.dirty;
+    }
+    for (auto& entry : next.entries) if (entry.file.kind == proj_codec::Kind::Project) {
+        const auto stem = entry.file.filename.substr(0, entry.file.filename.size() - strlen(FileExtension(entry.file.kind)));
+        const auto found = byName.find(FileWide(stem));
+        if (found != byName.end()) entry.ownership = found->second;
+    }
+    std::sort(next.entries.begin(), next.entries.end(), [](const SavedLibraryEntry& a, const SavedLibraryEntry& b) {
+        const auto x = FileWide(a.file.filename), y = FileWide(b.file.filename);
+        const int folded = CompareStringOrdinal(x.data(), (int)x.size(), y.data(), (int)y.size(), TRUE);
+        if (folded != CSTR_EQUAL) return folded == CSTR_LESS_THAN;
+        const int exact = CompareStringOrdinal(x.data(), (int)x.size(), y.data(), (int)y.size(), FALSE);
+        if (exact != CSTR_EQUAL) return exact == CSTR_LESS_THAN;
+        if (a.file.kind != b.file.kind) return a.file.kind < b.file.kind;
+        if (a.file.archived != b.file.archived) return !a.file.archived;
+        return a.file.path < b.file.path;
+    });
+    snapshot = std::move(next);
+    return {};
 }
-static std::string HexText(const std::string& s) {
-    static const char* d = "0123456789ABCDEF"; std::string out; out.reserve(s.size() * 2);
-    for (unsigned char c : s) { out.push_back(d[c >> 4]); out.push_back(d[c & 15]); } return out;
+std::vector<size_t> FilterSavedLibrary(const SavedLibrarySnapshot& snapshot, SavedLibraryKind kind,
+                                      SavedLibraryLocation location, const std::string& search) {
+    const auto needle = FileWide(search);
+    std::vector<size_t> rows;
+    for (size_t i = 0; i < snapshot.entries.size(); ++i) {
+        const auto& file = snapshot.entries[i].file;
+        if (kind == SavedLibraryKind::Projects && file.kind != proj_codec::Kind::Project) continue;
+        if (kind == SavedLibraryKind::Groups && file.kind != proj_codec::Kind::Group) continue;
+        if (location == SavedLibraryLocation::Active && file.archived) continue;
+        if (location == SavedLibraryLocation::Archived && !file.archived) continue;
+        if (!needle.empty()) {
+            const auto name = FileWide(file.filename);
+            bool match = false;
+            for (size_t start = 0; start + needle.size() <= name.size(); ++start) {
+                if (CompareStringOrdinal(name.data() + start, (int)needle.size(), needle.data(), (int)needle.size(), TRUE) == CSTR_EQUAL) { match = true; break; }
+            }
+            if (!match) continue;
+        }
+        rows.push_back(i);
+    }
+    return rows;
 }
-static std::string UnhexText(const std::string& s) {
-    auto nib = [](char c)->int { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'A' && c <= 'F') return c - 'A' + 10; if (c >= 'a' && c <= 'f') return c - 'a' + 10; return -1; };
-    if (s.size() & 1) return {}; std::string out; out.reserve(s.size() / 2);
-    for (size_t i = 0; i < s.size(); i += 2) { int a = nib(s[i]), b = nib(s[i + 1]); if (a < 0 || b < 0) return {}; out.push_back((char)((a << 4) | b)); } return out;
+
+// ---- record-owned copy provenance (C4) ------------------------------------------------------------------
+// A copy owns values, never a group id and never a shared prototype: the saved envelope (pivot anchor, bounds,
+// quality), the narrowed values every member had when the copy was admitted, and the receiver box hints used
+// to recompute a changed copy. Row ordinals survive project persistence, so a record keeps its envelope across
+// save -> reload -> re-export. g_regMutex guards this map together with the registry it describes.
+struct CopyEnvelope {
+    proj_codec::Bounds bounds;
+    std::vector<proj_codec::Record> source;
+    std::vector<wb_group_math::PrefabBox> hints;
+};
+struct CopyMember { std::shared_ptr<CopyEnvelope> copy; size_t ordinal = 0; };
+static std::map<int, CopyMember> g_copyMembers;
+static void ForgetCopyValueLocked(int uid) { g_copyMembers.erase(uid); }
+static proj_codec::Record ValueRecord(const SpawnedObj& o) {
+    proj_codec::Record r;
+    r.prefab = o.prefab; r.pos = { o.pos.x, o.pos.y, o.pos.z };
+    r.yaw = o.rot.yaw; r.pitch = o.rot.pitch; r.roll = o.rot.roll; r.scale = o.scale; r.group = o.group; r.note = o.note;
+    return r;
 }
-static std::vector<std::string> SplitPipe(std::string s) {
-    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
-    std::vector<std::string> out; size_t p = 0;
-    for (;;) { size_t q = s.find('|', p); out.push_back(s.substr(p, q == std::string::npos ? std::string::npos : q - p)); if (q == std::string::npos) break; p = q + 1; }
-    return out;
+static wb_group_math::PrefabBox BoxHint(const std::string& prefab) {
+    wb_group_math::PrefabBox box;
+    for (const auto& p : g_index) if (p.path == prefab) {
+        if (p.hasCenter && p.sx > 0 && p.sy > 0 && p.sz > 0) { box.known = true; box.size = { p.sx, p.sy, p.sz }; box.center = { p.cx, p.cy, p.cz }; }
+        break;
+    }
+    return box;
+}
+static bool SamePose(const proj_codec::Record& a, const proj_codec::Record& b) {
+    return a.prefab == b.prefab && a.pos.x == b.pos.x && a.pos.y == b.pos.y && a.pos.z == b.pos.z &&
+        a.yaw == b.yaw && a.pitch == b.pitch && a.roll == b.roll && a.scale == b.scale;
+}
+static bool NearEngine(double a, double b) {
+    return std::abs(a - b) <= 1e-4 + 4 * (std::numeric_limits<float>::epsilon)() * (std::max)(std::abs(a), std::abs(b));
+}
+// The envelope of one saved copy: the saved bounds are authoritative while the copy is unchanged, and a rigid
+// yaw/positive uniform scale/translation preserves them through the same transform math - the receiver never
+// recenters and never overrides saved values. Anything else is recomputed from the member boxes and marked
+// approximate, because a reduced or explicitly edited copy cannot claim measured bounds.
+static bool CopyBounds(const std::vector<wb_group_math::Member>& members,
+                       const std::vector<size_t>& ordinals, const CopyEnvelope* copy, proj_codec::Bounds& bounds) {
+    bool usable = copy && members.size() == copy->source.size();
+    if (usable) for (size_t ordinal : ordinals) if (ordinal >= copy->source.size()) { usable = false; break; }
+    if (usable) {
+        bool same = true;
+        for (size_t i = 0; i < members.size(); ++i) same &= SamePose(members[i].record, copy->source[ordinals[i]]);
+        if (same) return wb_group_math::ComputeBounds(members, &copy->bounds, bounds);
+        // A whole-copy yaw/scale/translation preserves the saved envelope, even without receiver boxes; member
+        // tilt or a non-rigid edit must recompute.
+        const auto& a = copy->source[ordinals[0]]; const auto& b = members[0].record;
+        const double factor = b.scale / a.scale, yaw = b.yaw - a.yaw;
+        std::vector<proj_codec::Record> turned;
+        if (wb_group_math::AnchorTransform({ a }, copy->bounds, {}, yaw, factor, turned)) {
+            proj_codec::Point target{ b.pos.x - turned[0].pos.x, b.pos.y - turned[0].pos.y, b.pos.z - turned[0].pos.z };
+            if (wb_group_math::AnchorTransform(copy->source, copy->bounds, target, yaw, factor, turned)) {
+                bool rigid = true;
+                for (size_t i = 0; i < members.size(); ++i) {
+                    const auto& expected = turned[ordinals[i]]; const auto& actual = members[i].record;
+                    rigid &= expected.prefab == actual.prefab && NearEngine(expected.pos.x, actual.pos.x) && NearEngine(expected.pos.y, actual.pos.y) &&
+                        NearEngine(expected.pos.z, actual.pos.z) && NearEngine(expected.yaw, actual.yaw) && NearEngine(expected.scale, actual.scale) &&
+                        expected.pitch == actual.pitch && expected.roll == actual.roll;
+                }
+                if (rigid) {
+                    const auto& old = copy->bounds; wb_group_math::Member envelope;
+                    envelope.record.pos = target; envelope.record.yaw = yaw; envelope.record.scale = factor;
+                    envelope.box.known = true;
+                    envelope.box.center = { (old.min.x + old.max.x) * .5 - old.anchor.x, (old.min.y + old.max.y) * .5 - old.anchor.y, (old.min.z + old.max.z) * .5 - old.anchor.z };
+                    envelope.box.size = { old.max.x - old.min.x, old.max.y - old.min.y, old.max.z - old.min.z };
+                    if (wb_group_math::ComputeBounds({ envelope }, nullptr, bounds)) {
+                        bounds.anchor = target; bounds.approximate = old.approximate; return true;
+                    }
+                }
+            }
+        }
+    }
+    if (!wb_group_math::ComputeBounds(members, nullptr, bounds)) return false;
+    if (copy) bounds.approximate = true;
+    return true;
+}
+// The authoritative value builder (C6): one document for a captured object list, one envelope per copy, records
+// without provenance get a fresh one-member envelope (never a shared null identity). Runs under g_regMutex.
+static bool ValueDocumentLocked(const std::vector<SpawnedObj>& objects, proj_codec::Document& doc, std::string& error) {
+    doc = proj_codec::Document();
+    doc.kind = proj_codec::Kind::Project;
+    if (objects.empty()) return true;
+    std::map<const CopyEnvelope*, int> ids;
+    std::vector<std::vector<wb_group_math::Member>> members;
+    std::vector<std::vector<size_t>> ordinals;
+    std::vector<const CopyEnvelope*> copies;
+    for (const auto& o : objects) {
+        const auto name = g_groupNames.find(o.group);
+        if (name != g_groupNames.end()) doc.groupNames.emplace(name->first, name->second);
+        const auto saved = g_copyMembers.find(o.uid);
+        const CopyEnvelope* copy = saved == g_copyMembers.end() ? nullptr : saved->second.copy.get();
+        int id = (int)members.size() + 1;
+        if (copy) id = ids.emplace(copy, id).first->second;
+        if (id == (int)members.size() + 1) { members.emplace_back(); ordinals.emplace_back(); copies.push_back(copy); }
+        wb_group_math::Member member; member.record = ValueRecord(o); member.record.envelope = id;
+        const size_t ordinal = copy ? saved->second.ordinal : 0;
+        member.box = copy && ordinal < copy->hints.size() ? copy->hints[ordinal] : BoxHint(o.prefab);
+        members[(size_t)id - 1].push_back(member); ordinals[(size_t)id - 1].push_back(ordinal); doc.records.push_back(member.record);
+    }
+    for (size_t i = 0; i < members.size(); ++i) {
+        proj_codec::Bounds bounds;
+        if (!CopyBounds(members[i], ordinals[i], copies[i], bounds)) { error = "record 0: invalid copy bounds or transform"; return false; }
+        doc.envelopes.push_back(proj_codec::Envelope{ (int)i + 1, bounds });
+    }
+    doc.hasBounds = true; doc.bounds = doc.envelopes.front().bounds;
+    if (doc.envelopes.size() > 1) {
+        for (const auto& envelope : doc.envelopes) {
+            const auto& bounds = envelope.bounds;
+            doc.bounds.min.x = (std::min)(doc.bounds.min.x, bounds.min.x); doc.bounds.max.x = (std::max)(doc.bounds.max.x, bounds.max.x);
+            doc.bounds.min.y = (std::min)(doc.bounds.min.y, bounds.min.y); doc.bounds.max.y = (std::max)(doc.bounds.max.y, bounds.max.y);
+            doc.bounds.min.z = (std::min)(doc.bounds.min.z, bounds.min.z); doc.bounds.max.z = (std::max)(doc.bounds.max.z, bounds.max.z);
+            doc.bounds.approximate |= bounds.approximate;
+        }
+        doc.bounds.anchor = { doc.bounds.min.x * .5 + doc.bounds.max.x * .5, doc.bounds.min.y, doc.bounds.min.z * .5 + doc.bounds.max.z * .5 };
+    }
+    return true;
+}
+static bool GroundDestinationValid(const GroundHandle& op, const std::vector<MoveReq>& moves) {
+    std::vector<SpawnedObj> objects;
+    for (size_t i = 0; i < moves.size(); ++i) { auto o = op->view.members[i].before; o.pos = moves[i].pos; objects.push_back(o); }
+    proj_codec::Document doc; std::string error;
+    { REG_LOCK; if (!ValueDocumentLocked(objects, doc, error)) return false; }
+    std::vector<proj_codec::EngineRow> rows; return proj_codec::NarrowForEngine(doc, rows, error);
+}
+bool GroundBounds(const GroundHandle& op, proj_codec::Bounds& bounds) {
+    std::lock_guard<std::mutex> operation(g_groundOpMutex);
+    if (!GroundValidLocked(op)) return false;
+    std::vector<SpawnedObj> objects; for (const auto& m : op->view.members) objects.push_back(m.before);
+    proj_codec::Document doc; std::string error;
+    { REG_LOCK; if (!ValueDocumentLocked(objects, doc, error) || !doc.hasBounds) return false; }
+    std::vector<proj_codec::EngineRow> rows;
+    if (!proj_codec::NarrowForEngine(doc, rows, error)) return false;
+    bounds = doc.bounds; return true;
+}
+// Bind loaded/admitted records to the document's copy envelopes: the document's bounds and values become the
+// record's provenance, so the pivot is never recomputed from receiver measurements. Runs under g_regMutex.
+static bool RetainGroupValues(const proj_codec::Document& doc, const std::vector<int>& uids, std::string& error) {
+    std::string bytes;
+    if (doc.records.size() != uids.size() || !proj_codec::Serialize(doc, bytes, error)) return false;
+    std::lock_guard<std::mutex> lock(g_regMutex);
+    std::set<int> unique;
+    for (int uid : uids) if (uid && (!unique.insert(uid).second || IndexOfUidLocked(uid) < 0)) { error = "record 0: invalid copy binding"; return false; }
+    std::map<int, std::shared_ptr<CopyEnvelope>> copies;
+    for (const auto& envelope : doc.envelopes) {
+        std::shared_ptr<CopyEnvelope> copy = std::make_shared<CopyEnvelope>();
+        copy->bounds = envelope.bounds;
+        copies.emplace(envelope.id, copy);
+    }
+    for (size_t i = 0; i < doc.records.size(); ++i) {
+        const auto found = copies.find(doc.records[i].envelope);
+        if (found == copies.end()) { error = "record 0: invalid copy binding"; return false; }
+        const std::shared_ptr<CopyEnvelope>& copy = found->second;
+        const size_t ordinal = copy->source.size();
+        proj_codec::Record record = doc.records[i];
+        const int index = IndexOfUidLocked(uids[i]);
+        if (index >= 0) record = ValueRecord(g_reg[(size_t)index]);   // the actual narrowed value is the unchanged-pose baseline
+        copy->source.push_back(record);
+        copy->hints.push_back(BoxHint(record.prefab));
+        if (uids[i]) g_copyMembers[uids[i]] = CopyMember{ copy, ordinal };
+    }
+    return true;
+}
+
+// ---- C4/C5: validated group admission (independent copies) ----------------------------------------------
+// The receiver's prefab cache: a prefab the index does not know is a named exclusion at admission, never a
+// late engine refusal mislabeled as a missing-prefab parse success.
+static bool PrefabKnown(const std::string& prefab) {
+    for (const auto& p : g_index) if (p.path == prefab) return true;
+    return false;
+}
+// Rigid transform of one saved envelope about the document's saved anchor: the box is yaw-rotated and
+// uniformly scaled (member tilt is irrelevant for the envelope box), its AABB is recomputed and the exact
+// rigid anchor is kept. This is the same math the per-copy envelope transform uses - no second transform engine.
+static bool TransformGroupBounds(const proj_codec::Bounds& source, const proj_codec::Bounds& document,
+                                proj_codec::Point target, double deltaYaw, double factor, proj_codec::Bounds& out) {
+    proj_codec::Record one; one.prefab = "point"; one.pos = source.anchor; one.scale = 1;
+    std::vector<proj_codec::Record> moved;
+    if (!wb_group_math::AnchorTransform({ one }, document, target, deltaYaw, factor, moved) || moved.size() != 1) return false;
+    const proj_codec::Point anchor = moved[0].pos;
+    wb_group_math::Member box;
+    box.record.pos = anchor; box.record.yaw = deltaYaw; box.record.scale = factor;
+    box.box.known = true;
+    box.box.center = { (source.min.x + source.max.x) * .5 - source.anchor.x,
+                       (source.min.y + source.max.y) * .5 - source.anchor.y,
+                       (source.min.z + source.max.z) * .5 - source.anchor.z };
+    box.box.size = { source.max.x - source.min.x, source.max.y - source.min.y, source.max.z - source.min.z };
+    proj_codec::Bounds computed;
+    if (!wb_group_math::ComputeBounds({ box }, nullptr, computed)) return false;
+    computed.anchor = anchor;                  // the rigid anchor, not the recomputed AABB bottom center
+    computed.approximate = source.approximate;
+    out = computed;
+    return true;
+}
+GroupAdmissionReport AdmitGroupCopy(const proj_codec::Document& doc, Vec3 target, double deltaYaw, double factor,
+                                    std::vector<int>& uids, Vec3& pivot) {
+    GroupAdmissionReport rep;
+    uids.clear();
+    auto fail = [&](const std::string& why) { rep.valid = false; rep.error = why; Log("group admission: %s", why.c_str()); return rep; };
+    if (!GameThreadReady()) return fail("record 0: game thread pump not active yet");
+    if (!std::isfinite(target.x) || !std::isfinite(target.y) || !std::isfinite(target.z) ||
+        !std::isfinite(deltaYaw) || !std::isfinite(factor) || factor <= 0) return fail("record 0: invalid placement transform");
+    if (doc.kind != proj_codec::Kind::Group) return fail("record 0: not a group document");
+    if (!doc.hasBounds || doc.envelopes.empty() || doc.records.empty()) return fail("record 0: incomplete group metadata");
+    // Every destination value is computed here, BEFORE any UID/group/queue mutation.
+    const proj_codec::Point dest{ target.x, target.y, target.z };
+    // C4-TRANSFORM-BEGIN
+    std::vector<proj_codec::Record> moved;
+    if (!wb_group_math::AnchorTransform(doc.records, doc.bounds, dest, deltaYaw, factor, moved)) return fail("record 0: invalid destination transform");
+    proj_codec::Document placed = doc;
+    for (size_t i = 0; i < moved.size(); ++i) { placed.records[i].pos = moved[i].pos; placed.records[i].yaw = moved[i].yaw; placed.records[i].scale = moved[i].scale; }
+    // C4-TRANSFORM-END
+    // C4-ENVELOPE-BEGIN
+    for (auto& envelope : placed.envelopes) {
+        proj_codec::Bounds transformed;
+        if (!TransformGroupBounds(envelope.bounds, doc.bounds, dest, deltaYaw, factor, transformed)) return fail("record 0: invalid envelope transform");
+        envelope.bounds = transformed;
+    }
+    { proj_codec::Bounds transformed;
+      if (!TransformGroupBounds(doc.bounds, doc.bounds, dest, deltaYaw, factor, transformed)) return fail("record 0: invalid document transform");
+      placed.bounds = transformed; }
+    // C4-ENVELOPE-END
+    std::string error;
+    // C4-VALIDATE-BEGIN
+    if (!proj_codec::Validate(placed, error)) return fail(error);
+    std::vector<proj_codec::EngineRow> narrowed;   // double->float and tiled-int16 representability before any mutation
+    if (!proj_codec::NarrowForEngine(placed, narrowed, error)) return fail(error);
+    // C4-VALIDATE-END
+    // One C5 row per data record: the caller-owned receipt of the actual engine outcomes.
+    std::vector<std::string> prefabs;
+    prefabs.reserve(placed.records.size());
+    for (const auto& record : placed.records) prefabs.push_back(record.prefab);
+    rep.request = BeginPlaceRequest(prefabs);
+    rep.requested = (int)placed.records.size();
+    std::map<int, int> groups;   // source partition -> fresh independent session id (zero stays zero)
+    std::vector<int> admitted(placed.records.size(), 0);
+    for (size_t i = 0; i < placed.records.size(); ++i) {
+        const std::string& prefab = placed.records[i].prefab;
+        if (!PrefabKnown(prefab)) {   // a valid missing prefab is a NAMED exclusion
+            PlaceRowExclude(rep.request, (int)i, "missing prefab");
+            rep.excludedPrefabs.push_back(prefab);
+            continue;
+        }
+        // C4-PARTITION-BEGIN
+        int group = 0;
+        if (placed.records[i].group) {
+            auto it = groups.find(placed.records[i].group);
+            if (it == groups.end()) it = groups.emplace(placed.records[i].group, NewGroupId()).first;
+            group = it->second;
+        }
+        placed.records[i].group = group;
+        // C4-PARTITION-END
+        const proj_codec::EngineRow& row = narrowed[i];
+        const int uid = SubmitPlaceRow(rep.request, (int)i, { row.x, row.y, row.z }, Rot{ row.yaw, row.pitch, row.roll }, row.scale, group);
+        admitted[i] = uid;
+        if (uid) { uids.push_back(uid); SetObjectNote(uid, placed.records[i].note); }
+        else rep.excludedPrefabs.push_back(prefab);   // the admission itself refused: a named exclusion, not a success
+    }
+    placed.groupNames.clear();
+    for (const auto& name : doc.groupNames) {
+        const auto mapped = groups.find(name.first);
+        if (mapped != groups.end()) { placed.groupNames.emplace(mapped->second, name.second); SetGroupName(mapped->second, name.second); }
+    }
+    rep.admitted = (int)uids.size();
+    rep.excluded = (int)rep.excludedPrefabs.size();
+    if (uids.empty()) return fail("record 0: no placeable members");
+    // Bind the per-copy envelope provenance: the saved bounds stay authoritative and the pivot is never
+    // recomputed from the receiver's measurements (not even for a single surviving member).
+    if (!RetainGroupValues(placed, admitted, error)) {
+        for (int uid : uids) { HideUid(uid); ForgetUid(uid); }
+        uids.clear(); rep.admitted = 0;
+        return fail(error);
+    }
+    pivot = target;
+    rep.valid = true;
+    Log("group admission: %d requested, %d admitted, %d excluded at (%.2f %.2f %.2f) yaw %.1f scale %.3f",
+        rep.requested, rep.admitted, rep.excluded, target.x, target.y, target.z, deltaYaw, factor);
+    return rep;
+}
+#ifdef WB_UNIFIED_HOST_TEST
+// One-shot file fault + pre-replace hook for the ProjectLifecycle suite (never compiled into the shipped ASI).
+static void InstallSaveFaultHooks(proj_codec::WriteHooks& hooks) {
+    hooks.fault = [](proj_codec::WriteStage stage, const std::string&, size_t& length, std::string& faultError) -> bool {
+        const int fault = g_saveFaultStage;
+        if (fault == 0) return true;
+        if (fault == 1 && stage == proj_codec::WriteStage::Write) { g_saveFaultStage = 0; faultError = "record 0: injected write failure"; return false; }
+        if (fault == 2 && stage == proj_codec::WriteStage::Write) { g_saveFaultStage = 0; length /= 2; return true; }   // short write: the readback catches it
+        if (fault == 3 && stage == proj_codec::WriteStage::Flush) { g_saveFaultStage = 0; faultError = "record 0: injected flush failure"; return false; }
+        if (fault == 4 && stage == proj_codec::WriteStage::Replace) { g_saveFaultStage = 0; faultError = "record 0: injected replace failure"; return false; }
+        if (fault == 5 && stage == proj_codec::WriteStage::Close) { g_saveFaultStage = 0; faultError = "record 0: injected close failure"; return false; }
+        return true;
+    };
+    hooks.beforeReplace = [](std::string&) -> bool {
+        if (g_beforeReplaceCallback) { std::function<void()> callback = std::move(g_beforeReplaceCallback); g_beforeReplaceCallback = {}; callback(); }
+        return true;
+    };
+}
+#endif
+
+static bool SameTerrainStrokes(const std::vector<TerrainStroke>& a, const std::vector<TerrainStroke>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const auto& x = a[i]; const auto& y = b[i];
+        if (x.mode != y.mode || x.proj != y.proj || x.x != y.x || x.z != y.z || x.r != y.r ||
+            x.amount != y.amount || x.strength != y.strength || x.ax != y.ax || x.az != y.az || x.y != y.y) return false;
+    }
+    return true;
+}
+
+static bool InSaveScope(int scope, int pid, int proj) {
+    return scope == SaveWholeScene || (scope == SaveProjectAndNew && (proj == pid || proj == 0)) ||
+        (scope == SaveNewOnly && proj == 0) || (scope == SaveProjectOnly && proj == pid);
+}
+static proj_codec::NpcRecord NpcValue(const ManagedNpc& n) {
+    return { n.key, { n.pos.x, n.pos.y, n.pos.z }, n.type, n.extra, n.aiEnabled, n.behavior, n.group, n.label, n.note };
+}
+static bool SameObjectSnapshot(const SpawnedObj& a, const SpawnedObj& b) {
+    return a.uid == b.uid && a.gen == b.gen && a.proj == b.proj && a.hidden == b.hidden && a.group == b.group &&
+        a.note == b.note && SamePose(ValueRecord(a), ValueRecord(b));
+}
+static bool SameNpcSnapshot(const ManagedNpc& a, const ManagedNpc& b) {
+    return a.uid == b.uid && a.gen == b.gen && a.proj == b.proj && a.hidden == b.hidden && a.key == b.key &&
+        a.pos.x == b.pos.x && a.pos.y == b.pos.y && a.pos.z == b.pos.z && a.type == b.type && a.extra == b.extra &&
+        a.aiEnabled == b.aiEnabled && a.behavior == b.behavior && a.group == b.group && a.label == b.label && a.note == b.note;
+}
+bool ProjectMutationPending(int id) {
+    std::lock_guard<std::recursive_mutex> files(g_fileMutex);
+    const std::string name = ProjectNameOf(id);
+    for (const auto* work : g_fileActivities)
+        if (work->kind == proj_codec::Kind::Project && FileNameEqual(work->name, name)) return true;
+    std::vector<PlaceRequestHandle> requests;
+    { std::lock_guard<std::mutex> operation(g_groundOpMutex);
+      if (g_groundWorldWriting) return true;
+      REG_LOCK;
+      for (const auto& o : g_reg) if (o.proj == id) {
+          if (g_groundLeases.count(o.uid) || g_groundMutationPending.count(o.uid) || (!o.hidden && (!o.obj || o.standin))) return true;
+          if (auto request = o.placeReq.lock()) requests.push_back(std::move(request));
+      }
+      for (const auto& n : g_npcReg) if (n.proj == id && !n.hidden &&
+          (n.spawnPending || (!n.actor && n.spawnRequestTick) || n.editMoving || n.liveMovePending)) return true;
+    }
+    for (const auto& request : requests) if (!PlaceRequestState(request).settled) return true;
+    return false;
 }
 
 bool SaveProject(const std::string& rawName, int scope) {
@@ -1070,223 +2193,954 @@ bool SaveProject(const std::string& rawName, int scope) {
     size_t b = rawName.find_first_not_of(" \t"), e = rawName.find_last_not_of(" \t");
     if (b == std::string::npos) return false;
     const std::string name = rawName.substr(b, e - b + 1);
+    if (IsGroupFileName(name) || !ValidFileName(name + ".cdproj", proj_codec::Kind::Project) || scope < SaveWholeScene || scope > SaveProjectOnly) {
+        g_projectError = "record 0: invalid project name or save scope"; Log("save: %s", g_projectError.c_str()); return false;
+    }
+    FileActivity fileWork(proj_codec::Kind::Project, name, FileReason::PendingOperation);
     const int pid = ProjectId(name);
-    CreateDirectoryA(ProjDir().c_str(), nullptr);
-    FILE* f = fopen(ProjPath(name).c_str(), "w");
-    if (!f) { Log("save: cannot write %s", ProjPath(name).c_str()); return false; }
-    fprintf(f, "# cdmodkit project v4: object rows remain v3-compatible; optional note hex, named groups, managed NPCs and terrain strokes are comment records\n");
-    auto l = Spawned(); auto npcs = ManagedNpcs(); int n = 0, nn = 0; std::vector<int> written, writtenNpcs; std::set<int> usedGroups;
-    auto inScope = [&](int proj) {
-        if (scope == SaveProjectAndNew) return proj == pid || proj == 0;
-        if (scope == SaveNewOnly) return proj == 0;
-        if (scope == SaveProjectOnly) return proj == pid;
-        return true;
-    };
-    for (const auto& o : l) if (!o.hidden && inScope(o.proj) && o.group > 0) usedGroups.insert(o.group);
-    for (const auto& npc : npcs) if (!npc.hidden && inScope(npc.proj) && npc.group > 0) usedGroups.insert(npc.group);
-    for (int gid : usedGroups) { const std::string gn = GroupName(gid); if (!gn.empty()) fprintf(f, "#group|%d|%s\n", gid, HexText(gn).c_str()); }
-    for (auto& o : l) {
-        if (o.hidden) continue;
-        if (!inScope(o.proj)) continue;
-        fprintf(f, "%s|%.6f|%.6f|%.6f|%.5f|%.6f|%d|%.5f|%.5f|%s\n", o.prefab.c_str(), o.pos.x, o.pos.y, o.pos.z, o.rot.yaw, o.scale, o.group, o.rot.pitch, o.rot.roll, HexText(o.note).c_str());
-        written.push_back(o.uid); n++;
+    // 1. authoritative value builder: build the whole document from the live records under the registry lock and
+    //    remember each record's project at capture time, so adoption can never overwrite a newer adoption.
+    proj_codec::Document doc; std::string text, error;
+    std::vector<SpawnedObj> objects; std::vector<ManagedNpc> npcs;
+    ReconcileManagedNpcActors();
+    {
+        std::lock_guard<std::mutex> operation(g_groundOpMutex);
+        std::lock_guard<std::mutex> l(g_regMutex);
+        if (g_groundWorldWriting) { g_projectError = "record 0: world transition in progress"; return false; }
+        for (const auto& o : g_reg) if (!o.hidden && InSaveScope(scope, pid, o.proj)) {
+            if (g_groundLeases.count(o.uid) || g_groundMutationPending.count(o.uid)) { g_projectError = "record 0: grounding still applying"; return false; }
+            objects.push_back(o);
+        }
+        if (!ValueDocumentLocked(objects, doc, error)) { g_projectError = error; Log("save: %s", error.c_str()); return false; }
+        for (const auto& n : g_npcReg) if (!n.hidden && InSaveScope(scope, pid, n.proj)) {
+            if (n.editMoving || n.liveMovePending) { g_projectError = "record 0: NPC edit still applying"; return false; }
+            npcs.push_back(n); doc.npcs.push_back(NpcValue(n));
+            const auto group = g_groupNames.find(n.group);
+            if (group != g_groupNames.end()) doc.groupNames.emplace(group->first, group->second);
+        }
     }
-    for (const auto& npc : npcs) {
-        if (npc.hidden || !inScope(npc.proj)) continue;
-        fprintf(f, "#npc|%u|%.6f|%.6f|%.6f|%d|%u|%d|%d|%d|%s|%s\n", npc.key, npc.pos.x, npc.pos.y, npc.pos.z, npc.type, npc.extra,
-            npc.aiEnabled ? 1 : 0, npc.behavior, npc.group, HexText(npc.label).c_str(), HexText(npc.note).c_str());
-        writtenNpcs.push_back(npc.uid); nn++;
-    }
-    int ns = 0;   // terrain strokes, same scope rules as the objects; '#' lines, so older versions simply skip them
-    for (const auto& t : TerrainStrokes()) {
+    const auto terrain = TerrainStrokes();
+    for (const auto& t : terrain) {
         if (scope == SaveProjectAndNew && !(t.proj == pid || t.proj == 0)) continue;
         if (scope == SaveNewOnly && t.proj != 0) continue;
         if (scope == SaveProjectOnly && t.proj != pid) continue;
-        fprintf(f, "#terrain|%d|%.3f|%.3f|%.3f|%.4f|%.3f|%.3f|%.3f|%.3f\n", t.mode, t.x, t.z, t.r, t.amount, t.strength, t.ax, t.az, t.y); ns++;
-
+        doc.terrain.push_back({ t.mode, t.x, t.z, t.r, t.amount, t.strength, t.ax, t.az, t.y });
     }
-    fclose(f);
-    if (scope == SaveWholeScene) { for (const auto& t : TerrainStrokes()) if (t.proj != pid) TerrainSetProject(t.proj, pid); }
-    else if (scope != SaveProjectOnly) TerrainSetProject(0, pid);   // written strokes join the project, like the objects
-    for (int uid : written) AssignProject(uid, pid);   // what was written is now part of that project
-    for (int uid : writtenNpcs) AssignNpcProject(uid, pid);
-    { std::lock_guard<std::mutex> l(g_regMutex); if (scope == SaveWholeScene) g_projDirty.clear(); else g_projDirty.erase(pid); }
-    Log("save: %d objects, %d NPCs, %d terrain strokes (scope %d) -> %s", n, nn, ns, scope, ProjPath(name).c_str());
+    std::vector<proj_codec::EngineRow> narrowed;
+    if (!proj_codec::NarrowForEngine(doc, narrowed, error) || !proj_codec::Serialize(doc, text, error)) { g_projectError = error; Log("save: invalid document: %s", error.c_str()); return false; }
+    const std::string path = ProjPath(name);
+    if (!CreateDirectoryA(ProjDir().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) { g_projectError = "record 0: cannot create the projects directory"; Log("save: %s", g_projectError.c_str()); return false; }
+    // 2. transactional write: same-directory temp, flush, readback against the intended bytes, then replace.
+    //    Every failure leaves the previous file bytes untouched and removes only the owned temp file.
+    proj_codec::WriteHooks hooks; proj_codec::WriteHooks* writeHooks = nullptr;
+#ifdef WB_UNIFIED_HOST_TEST
+    InstallSaveFaultHooks(hooks);
+    writeHooks = &hooks;
+#endif
+    if (!proj_codec::WriteTransactional(path, proj_codec::Kind::Project, text, writeHooks, error)) {
+        g_projectError = error; Log("save: write or replace failed: %s (%s)", path.c_str(), error.c_str()); return false;
+    }
+    // 3. adoption: a record becomes a member only while its project still is what was captured; if a newer
+    //    adoption happened during the write it is kept and the project stays dirty (its file may not match).
+    bool stale = !SameTerrainStrokes(terrain, TerrainStrokes());
+    if (!stale) {
+        if (scope == SaveWholeScene) { for (const auto& t : terrain) if (t.proj != pid) TerrainSetProject(t.proj, pid); }
+        else if (scope != SaveProjectOnly) TerrainSetProject(0, pid);
+    } // never adopt a newer terrain snapshot that was not written
+    {
+        std::lock_guard<std::mutex> l(g_regMutex);
+        size_t currentObjects = 0, currentNpcs = 0;
+        for (const auto& o : g_reg) if (!o.hidden && InSaveScope(scope, pid, o.proj)) ++currentObjects;
+        for (const auto& n : g_npcReg) if (!n.hidden && InSaveScope(scope, pid, n.proj)) ++currentNpcs;
+        stale |= currentObjects != objects.size() || currentNpcs != npcs.size();
+        std::set<int> usedGroups;
+        for (const auto& o : objects) if (o.group) usedGroups.insert(o.group);
+        for (const auto& n : npcs) if (n.group) usedGroups.insert(n.group);
+        for (int group : usedGroups) {
+            const auto saved = doc.groupNames.find(group), current = g_groupNames.find(group);
+            const std::string before = saved == doc.groupNames.end() ? std::string() : saved->second;
+            const std::string after = current == g_groupNames.end() ? std::string() : current->second;
+            stale |= before != after; // adding the first name is also a newer metadata edit
+        }
+        for (const auto& saved : objects) {
+            const int i = IndexOfUidLocked(saved.uid);
+            if (i < 0 || !SameObjectSnapshot(saved, g_reg[(size_t)i])) { stale = true; continue; }
+            g_reg[(size_t)i].proj = pid;
+        }
+        for (const auto& saved : npcs) {
+            const int i = NpcIndexOfUidLocked(saved.uid);
+            if (i < 0 || !SameNpcSnapshot(saved, g_npcReg[(size_t)i])) { stale = true; continue; }
+            g_npcReg[(size_t)i].proj = pid;
+        }
+        if (stale) g_projDirty.insert(pid);
+        else if (scope == SaveWholeScene) g_projDirty.clear(); else g_projDirty.erase(pid);
+    }
+    g_projectError.clear();
+    Log("save: %zu objects, %zu NPCs, %zu terrain strokes (scope %d) -> %s%s", objects.size(), npcs.size(), doc.terrain.size(), scope, path.c_str(), stale ? " (newer scene data was kept; the project stays dirty)" : "");
+    return true;
+}
 
+// ---- C6: protected group export ------------------------------------------------------------------------
+// The two authorities of an export are the editor's published selection/project/placement context and the
+// core's registry. Neither is reduced to a revision counter: each final boundary re-derives the semantic
+// document with the SAME authoritative builder (ValueDocumentLocked) and compares values, and the protected
+// replacement holds both authorities across the atomic rename.
+static std::mutex g_exportCtxMutex;   // guards g_exportContext only; the export guard takes it BEFORE g_regMutex
+static ExportContext g_exportContext;
+#ifdef WB_UNIFIED_HOST_TEST
+// Observation seam of the Export suite (never compiled into the shipped ASI): runs inside the protected region,
+// after the last authoritative comparison and before the rename. Not a substitute writer.
+static std::function<void()> g_exportReplaceProbe;
+#endif
+void PublishExportContext(const ExportContext& context) {
+    std::lock_guard<std::mutex> l(g_exportCtxMutex);
+    g_exportContext = context;
+}
+ExportContext PublishedExportContext() {
+    std::lock_guard<std::mutex> l(g_exportCtxMutex);
+    return g_exportContext;
+}
+static std::string GroupDir() { return g_modDir + "\\Groups"; }
+static std::string GroupPath(const std::string& name) { return GroupDir() + "\\" + name + ".cdgroup"; }
+static bool FileAt(const std::string& path) { return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+// One path component inside Groups\: no separators, no reserved characters, no extension (the export adds
+// .cdgroup), never a directory name. An invalid name must never become a path outside the group folder.
+static bool ValidateExportName(const std::string& name, std::string& error) {
+    if (name.empty()) { error = "record 0: empty group name"; return false; }
+    if (name.size() > 100) { error = "record 0: group name too long"; return false; }
+    if (name.find_first_of("\\/:*?\"<>|") != std::string::npos) { error = "record 0: invalid group name"; return false; }
+    if (name == "." || name == ".." || name.back() == '.' || name.back() == ' ') { error = "record 0: invalid group name"; return false; }
+    const size_t n = name.size();
+    const bool groupExt = n >= 8 && _stricmp(name.c_str() + n - 8, ".cdgroup") == 0;
+    const bool projExt = n >= 7 && _stricmp(name.c_str() + n - 7, ".cdproj") == 0;
+    if (groupExt || projExt) { error = "record 0: the name must not carry a file extension"; return false; }
+    return true;
+}
+static bool SameUidSet(std::vector<int> a, std::vector<int> b) {
+    std::sort(a.begin(), a.end()); a.erase(std::unique(a.begin(), a.end()), a.end());
+    std::sort(b.begin(), b.end()); b.erase(std::unique(b.begin(), b.end()), b.end());
+    return a == b;
+}
+static bool SameContext(const ExportContext& a, const ExportContext& b) {
+    return a.name == b.name && a.placing == b.placing && SameUidSet(a.selection, b.selection) && SameUidSet(a.carried, b.carried);
+}
+// Compare semantic values before canonical id remapping: swapping partitions must invalidate an approval.
+static bool SameDocument(const proj_codec::Document& a, const proj_codec::Document& b) { return proj_codec::SameValues(a, b); }
+// What one selection becomes: the included records (registry order, with their project ids) and one named
+// exclusion per selected object that cannot be exported. Runs under g_regMutex.
+struct ExportPlan {
+    std::vector<int> included;
+    std::vector<int> projects;
+    std::vector<ExportExclusion> excluded;
+    std::vector<SpawnedObj> objects;
+};
+static void ExportPlanLocked(const std::vector<int>& selection, ExportPlan& plan) {
+    plan = ExportPlan();
+    std::set<int> selected(selection.begin(), selection.end());
+    selected.erase(0);
+    for (const auto& o : g_reg) {
+        if (!selected.erase(o.uid)) continue;
+        std::string reason;
+        if (o.hidden) reason = "hidden";
+        else if (o.standin) reason = "stand-in during a retry";
+        else if (!PrefabKnown(o.prefab)) reason = "missing prefab";
+        if (!reason.empty()) { plan.excluded.push_back(ExportExclusion{ o.uid, o.prefab, reason }); continue; }
+        plan.included.push_back(o.uid);
+        plan.projects.push_back(o.proj);
+        plan.objects.push_back(o);
+    }
+    for (int uid : selected) plan.excluded.push_back(ExportExclusion{ uid, std::string(), "forgotten selection" });
+}
+// The guard both write boundaries run: the published context must still be the one the approval was bound to,
+// the inclusion/exclusion plan must re-derive exactly, the values and envelopes must rebuild identically, and a
+// destination that exists right now needs the explicit overwrite approval. The caller holds g_exportCtxMutex
+// and g_regMutex (that order); no engine call, no queue push happens here.
+static bool ExportAuthoritativeLocked(const GroupExportApproval& approval, std::string& error) {
+    // C6-GUARD-BEGIN
+    if (!SameContext(approval.context, g_exportContext)) { error = "record 0: the selection or placement context changed; review the export again"; return false; }
+    ExportPlan plan;
+    ExportPlanLocked(approval.context.selection, plan);
+    if (plan.included != approval.included || plan.projects != approval.projects) { error = "record 0: the included objects changed; review the export again"; return false; }
+    if (plan.excluded.size() != approval.excluded.size()) { error = "record 0: the excluded objects changed; review the export again"; return false; }
+    for (size_t i = 0; i < plan.excluded.size(); ++i)
+        if (plan.excluded[i].uid != approval.excluded[i].uid || plan.excluded[i].prefab != approval.excluded[i].prefab || plan.excluded[i].reason != approval.excluded[i].reason)
+        { error = "record 0: the exclusion reasons changed; review the export again"; return false; }
+    proj_codec::Document now;
+    if (!ValueDocumentLocked(plan.objects, now, error)) return false;   // names the failing data record
+    now.kind = proj_codec::Kind::Group;
+    if (!proj_codec::Validate(now, error)) return false;
+    std::vector<proj_codec::EngineRow> narrowed;
+    if (!proj_codec::NarrowForEngine(now, narrowed, error)) return false;
+    if (!SameDocument(now, approval.document)) { error = "record 0: the approved values or envelopes changed; review the export again"; return false; }
+    if (FileAt(approval.path) && !approval.overwriteApproved) { error = "record 0: the destination file exists; explicit overwrite approval required"; return false; }
+    // C6-GUARD-END
+    return true;
+}
+// The protected replacement: both authorities are held from the last comparison through the atomic rename, so
+// nothing can change in between (only the comparison and the file rename run under these locks).
+static bool ExportReplaceGuarded(const GroupExportApproval& approval, const std::string& temp, const std::string& destination, std::string& error) {
+    // C6-PROTECT-BEGIN
+    std::lock_guard<std::mutex> ctx(g_exportCtxMutex);
+    std::lock_guard<std::mutex> reg(g_regMutex);
+    if (!ExportAuthoritativeLocked(approval, error)) return false;
+#ifdef WB_UNIFIED_HOST_TEST
+    if (g_exportReplaceProbe) { std::function<void()> probe = std::move(g_exportReplaceProbe); g_exportReplaceProbe = {}; probe(); }
+#endif
+    if (MoveFileExA(temp.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+        error = "record 0: replace failed"; return false;
+    }
+    // C6-PROTECT-END
+    return true;
+}
+
+bool PrepareGroupExport(const std::vector<int>& selection, const std::string& name, bool overwriteApproved,
+                        GroupExportApproval& approval) {
+    approval = GroupExportApproval();
+    auto fail = [&](const std::string& why) { approval.error = why; Log("export preflight: %s", why.c_str()); return false; };
+    if (!ValidateExportName(name, approval.error)) return fail(approval.error);
+    approval.name = name;
+    approval.path = GroupPath(name);
+    approval.overwriteApproved = overwriteApproved;
+    if (selection.empty()) return fail("record 0: no selected objects");
+    // The approval binds the PUBLISHED context: a selection or destination name the editor did not publish
+    // could not have been reviewed, so preflight refuses it instead of guessing.
+    // C6-CONTEXT-BEGIN
+    const ExportContext live = PublishedExportContext();
+    if (!SameUidSet(live.selection, selection)) return fail("record 0: the selection was not published");
+    if (live.name != name) return fail("record 0: the export context was not published for this name");
+    approval.context = live;
+    // C6-CONTEXT-END
+    // 1. authoritative value builder, one document for the captured records (same builder SaveProject uses)
+    proj_codec::Document doc;
+    std::string error;
+    bool built = false;
+    {
+        std::lock_guard<std::mutex> l(g_regMutex);
+        ExportPlan plan;
+        ExportPlanLocked(selection, plan);
+        // The named inclusions/exclusions are part of the approval even when nothing placeable is left, so the
+        // editor can show WHY the selection cannot be exported.
+        approval.included = plan.included; approval.projects = plan.projects; approval.excluded = plan.excluded;
+        // C6-NONEMPTY-BEGIN
+        if (plan.included.empty()) error = "record 0: no placeable selected objects";
+        else if (ValueDocumentLocked(plan.objects, doc, error)) {
+            doc.kind = proj_codec::Kind::Group;
+            built = true;
+        }
+        // C6-NONEMPTY-END
+    }
+    if (!built) return fail(error);
+    std::string text;   // Serialize validates the approved document and re-parses its own canonical output
+    if (!proj_codec::Serialize(doc, text, error)) return fail(error);
+    approval.document = std::move(doc);
+    // C6-OVERWRITE-BEGIN
+    if (FileAt(approval.path) && !overwriteApproved) return fail("record 0: the destination file exists; explicit overwrite approval required");
+    // C6-OVERWRITE-END
+    approval.error.clear();
+    approval.valid = true;
+    Log("export preflight: %zu selected, %d included, %d excluded -> %s%s", selection.size(), (int)approval.included.size(),
+        (int)approval.excluded.size(), approval.path.c_str(), overwriteApproved ? " (overwrite approved)" : "");
+    return true;
+}
+
+bool WriteGroupExport(const GroupExportApproval& approval, std::string& error) {
+    FileActivity fileWork(proj_codec::Kind::Group, approval.name, FileReason::InFlightExport);
+    error.clear();
+    if (!approval.valid) { error = "record 0: the approval is not valid"; Log("export: %s", error.c_str()); return false; }
+    if (approval.document.kind != proj_codec::Kind::Group || approval.document.records.empty()) {
+        error = "record 0: not a group document"; Log("export: %s", error.c_str()); return false;
+    }
+    if (!ValidateExportName(approval.name, error)) { Log("export: %s", error.c_str()); return false; }
+    if (approval.path != GroupPath(approval.name)) { error = "record 0: the approval path does not match its name"; Log("export: %s", error.c_str()); return false; }
+    // 1. BEFORE-WRITE: both authorities, before any file is touched.
+    {
+        std::lock_guard<std::mutex> ctx(g_exportCtxMutex);
+        std::lock_guard<std::mutex> reg(g_regMutex);
+        if (!ExportAuthoritativeLocked(approval, error)) { Log("export refused before writing: %s", error.c_str()); return false; }
+    }
+    std::string text;
+    if (!proj_codec::Serialize(approval.document, text, error)) { Log("export: %s", error.c_str()); return false; }
+    if (!CreateDirectoryA(GroupDir().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        error = "record 0: cannot create the Groups directory"; Log("export: %s", error.c_str()); return false;
+    }
+    // 2. same-directory temporary through the ONE transactional writer; the final replacement revalidates both
+    //    authorities and renames while they are held (hooks.replace), so the pre-replace callback runs first and
+    //    the guard sees its mutation.
+    proj_codec::WriteHooks hooks;
+    hooks.replace = [&approval](const std::string& temp, const std::string& destination, std::string& err) {
+        return ExportReplaceGuarded(approval, temp, destination, err);
+    };
+#ifdef WB_UNIFIED_HOST_TEST
+    InstallSaveFaultHooks(hooks);   // the one-shot file faults and the deterministic pre-replace callback
+#endif
+    if (!proj_codec::WriteTransactional(approval.path, proj_codec::Kind::Group, text, &hooks, error)) {
+        Log("export failed: %s (%s)", approval.path.c_str(), error.c_str());
+        return false;
+    }
+    error.clear();
+    Log("export: wrote %s: %zu records, %d included, %d excluded", approval.path.c_str(), approval.document.records.size(),
+        (int)approval.included.size(), (int)approval.excluded.size());
+    return true;
+}
+static void ClearSceneContents(std::unique_lock<std::mutex>& operation) {
+    // Caller holds the ground-operation lock after synchronous admission or owns the validated-load reservation.
+    // v0.97 TerrainClear marks projects dirty after releasing its own lock. Never call it under the registry lock.
+    TerrainClear();
+    std::vector<SpawnedObj> removed; std::vector<ManagedNpc> npcs;
+    { REG_LOCK; removed.swap(g_reg); npcs.swap(g_npcReg); g_copyMembers.clear(); g_groupNames.clear(); g_projDirty.clear(); }
+    operation.unlock();
+    for (const auto& o : removed) {
+        SettleRowOnce(o.placeReq, o.placeRow, PlaceCanceled, PlaceLaneNone, o.uid, "the scene was cleared before attachment");
+        auto work = TrackProjectNativeWork(o.proj);
+        if (!o.hidden && o.gimmick && !o.standin) { if (o.actor) RunOnServerTick([actor = o.actor, work]() { RemoveSpawnedActor(actor); }); }
+        else if (!o.hidden && o.obj) RunOnGameThread([obj = o.obj, work]() { DoRemove(obj); });
+    }
+    for (const auto& n : npcs) if (!n.hidden && n.actor) {
+        auto work = TrackProjectNativeWork(n.proj);
+        RunOnServerTick([actor = n.actor, work]() { RemoveSpawnedActor(actor); });
+    }
+    Log("delete all: %zu objects, %zu NPCs", removed.size(), npcs.size());
+}
+bool ClearScene() {
+    std::unique_lock<std::mutex> operation(g_groundOpMutex);
+    if (g_groundWorldWriting || !g_groundLeases.empty() || !g_groundMutationPending.empty()) {
+        g_projectError = "record 0: project mutation busy; retry after grounding or travel settles"; return false;
+    }
+    GroundEpochLocked();
+    ClearSceneContents(operation);
+    g_projectError.clear();
     return true;
 }
 void DeleteAllSpawned() {
-    TerrainClear();   // the terrain strokes belong to the scene as well (loaded tiles keep the old shape until an apply)
-    std::vector<uintptr_t> objs, actors;
-    { std::lock_guard<std::mutex> l(g_regMutex);
-      g_projDirty.clear();   // TerrainClear marks affected projects dirty; the whole scene is gone, so clear that bookkeeping again
-      for (auto& o : g_reg) if (!o.hidden) { if (o.gimmick && !o.standin) { if (o.actor) actors.push_back(o.actor); } else if (o.obj) objs.push_back(o.obj); }
-      for (auto& npc : g_npcReg) if (!npc.hidden && npc.actor) actors.push_back(npc.actor);
-      g_reg.clear(); g_npcReg.clear(); g_groupNames.clear(); }
-    for (auto actor : actors) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
-    if (!GameThreadReady()) return;
-    for (auto obj : objs) RunOnGameThread([obj]() { DoRemove(obj); });
-    Log("delete all: %zu objects", objs.size());
+    if (!ClearScene()) Log("delete all refused: %s", g_projectError.c_str());
 }
-bool UnloadProject(int id) {
-    if (id <= 0) return false;
-    std::vector<uintptr_t> objs, actors;
-    int objectCount = 0, npcCount = 0, terrainCount = 0;
-    for (const auto& t : TerrainStrokes()) if (t.proj == id) terrainCount++;
-    {
-        std::lock_guard<std::mutex> l(g_regMutex);
-        for (auto it = g_reg.begin(); it != g_reg.end();) {
-            if (it->proj != id) { ++it; continue; }
-            if (!it->hidden) {
-                if (it->gimmick && !it->standin) { if (it->actor) actors.push_back(it->actor); }
-                else if (it->obj) objs.push_back(it->obj);
-            }
-            it = g_reg.erase(it); objectCount++;
-        }
-        for (auto it = g_npcReg.begin(); it != g_npcReg.end();) {
-            if (it->proj != id) { ++it; continue; }
-            if (!it->hidden && it->actor) actors.push_back(it->actor);
-            it = g_npcReg.erase(it); npcCount++;
-        }
-        g_projDirty.erase(id);
+static bool UnloadProjectImpl(int id, bool ownsWorld) {
+    if (id <= 0) { g_projectError = "record 0: invalid project id"; return false; }
+    auto work = std::make_shared<FileActivity>(proj_codec::Kind::Project, ProjectNameOf(id), FileReason::PendingOperation);
+    std::unique_lock<std::mutex> operation(g_groundOpMutex);
+    std::vector<int> ids;
+    { REG_LOCK; for (const auto& o : g_reg) if (o.proj == id) ids.push_back(o.uid); }
+    if ((!ownsWorld && g_groundWorldWriting) || std::any_of(ids.begin(), ids.end(), [](int uid) {
+            return g_groundLeases.count(uid) || g_groundMutationPending.count(uid);
+        })) { g_projectError = "record 0: project mutation busy; retry after grounding or travel settles"; return false; }
+    if (!ids.empty()) for (auto& weak : g_groundOps) if (auto op = weak.lock())
+        if (GroundTouches(op, ids)) GroundEndLocked(op, GroundInvalidated, "epoch-invalidated");
+    std::vector<SpawnedObj> removed; std::vector<ManagedNpc> npcs;
+    int terrainCount = 0; for (const auto& t : TerrainStrokes()) if (t.proj == id) ++terrainCount;
+    { REG_LOCK;
+      for (auto it = g_reg.begin(); it != g_reg.end();) {
+          if (it->proj != id) { ++it; continue; }
+          ForgetCopyValueLocked(it->uid); removed.push_back(*it); it = g_reg.erase(it);
+      }
+      for (auto it = g_npcReg.begin(); it != g_npcReg.end();) {
+          if (it->proj != id) { ++it; continue; }
+          npcs.push_back(*it); it = g_npcReg.erase(it);
+      }
+      if (!removed.empty() || !npcs.empty() || terrainCount) g_projDirty.erase(id);
     }
     if (terrainCount) TerrainReplaceProject(id, {});
-    for (uintptr_t actor : actors) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
-    for (uintptr_t obj : objs) RunOnGameThread([obj]() { DoRemove(obj); });
-    Log("unload project %d: %d objects, %d NPCs, %d terrain strokes", id, objectCount, npcCount, terrainCount);
-    return objectCount || npcCount || terrainCount;
-}
-static bool g_autoDone = false; static DWORD g_worldSince = 0, g_worldLast = 0;
-// "#terrain|mode|x|z|r|amount|strength|ax|az|y": one terrain brush stroke of the project (see TerrainStroke)
-static bool ParseTerrainLine(const char* line, TerrainStroke* t) {
-    if (strncmp(line, "#terrain|", 9) != 0) return false;
-    *t = TerrainStroke{};
-    return sscanf(line + 9, "%d|%f|%f|%f|%f|%f|%f|%f|%f", &t->mode, &t->x, &t->z, &t->r, &t->amount, &t->strength, &t->ax, &t->az, &t->y) >= 6;
-}
-bool LoadProject(const std::string& name, bool clearFirst) {
-    FILE* f = fopen(ProjPath(name).c_str(), "r");
-    if (!f) { Log("load: cannot open %s", ProjPath(name).c_str()); return false; }
-    g_autoDone = true;   // a manual load (or replace) counts: the autoload must not add a second copy of the scene later
-    if (clearFirst) DeleteAllSpawned();
-    const int pid = ProjectId(name);   // the objects remember where they came from, so this project can be overwritten on its own
-    g_loading = true;
-    char line[2048]; int n = 0, nn = 0; std::map<int, int> groups;   // file group ids -> fresh ids
-    std::vector<TerrainStroke> strokes;
-    auto mapGroup = [&](int fileGroup) {
-        if (fileGroup <= 0) return 0;
-        auto it = groups.find(fileGroup); if (it == groups.end()) it = groups.emplace(fileGroup, NewGroupId()).first; return it->second;
-    };
-    while (fgets(line, sizeof line, f)) {
-        TerrainStroke t{}; if (ParseTerrainLine(line, &t)) { strokes.push_back(t); continue; }
-        if (line[0] == '\n') continue;
-        const std::vector<std::string> p = SplitPipe(line); if (p.empty()) continue;
-        if (p[0] == "#group") {
-            if (p.size() >= 3) { const int g = mapGroup(atoi(p[1].c_str())); const std::string gn = UnhexText(p[2]); if (g > 0 && !gn.empty()) SetGroupName(g, gn); }
-            continue;
-        }
-        if (p[0] == "#npc") {
-            if (p.size() < 10) continue;
-            const uint32_t key = (uint32_t)strtoul(p[1].c_str(), nullptr, 10); Vec3 pos{ (float)atof(p[2].c_str()), (float)atof(p[3].c_str()), (float)atof(p[4].c_str()) };
-            const int type = atoi(p[5].c_str()); const uint32_t extra = (uint32_t)strtoul(p[6].c_str(), nullptr, 10); const bool ai = atoi(p[7].c_str()) != 0;
-            const int behavior = atoi(p[8].c_str()), g = mapGroup(atoi(p[9].c_str())); const std::string label = p.size() > 10 ? UnhexText(p[10]) : std::string(), note = p.size() > 11 ? UnhexText(p[11]) : std::string();
-            if (SpawnManagedNpc(key, pos, type, extra, ai, behavior, g, pid, label, note)) nn++; continue;
-        }
-        if (!p[0].empty() && p[0][0] == '#') continue;
-        if (p.size() < 4) continue;
-        const float x = (float)atof(p[1].c_str()), y = (float)atof(p[2].c_str()), z = (float)atof(p[3].c_str());
-        const float yaw = p.size() > 4 ? (float)atof(p[4].c_str()) : 0.0f, sc = p.size() > 5 ? (float)atof(p[5].c_str()) : 1.0f;
-        const int grp = p.size() > 6 ? atoi(p[6].c_str()) : 0; const float pitch = p.size() > 7 ? (float)atof(p[7].c_str()) : 0.0f, roll = p.size() > 8 ? (float)atof(p[8].c_str()) : 0.0f;
-        const int g = mapGroup(grp); const int uid = SpawnAt(p[0], { x, y, z }, Rot{ yaw, pitch, roll }, sc, g, pid);
-        if (uid && p.size() > 9) SetObjectNote(uid, UnhexText(p[9])); if (uid) n++;
-
+    operation.unlock();
+    for (const auto& o : removed) {
+        SettleRowOnce(o.placeReq, o.placeRow, PlaceCanceled, PlaceLaneNone, o.uid, "the project was unloaded before attachment");
+        if (!o.hidden && o.gimmick && !o.standin) { if (o.actor) RunOnServerTick([actor = o.actor, work]() { RemoveSpawnedActor(actor); }); }
+        else if (!o.hidden && o.obj) RunOnGameThread([obj = o.obj, work]() { DoRemove(obj); });
     }
-    fclose(f);
-    TerrainReplaceProject(pid, strokes);   // a tile that is already loaded shows them after an apply
-    g_loading = false;
-    { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.erase(pid); }   // freshly loaded = in sync with the file
-    Log("load: %d objects, %d NPCs queued from %s", n, nn, ProjPath(name).c_str());
+    for (const auto& n : npcs) if (!n.hidden && n.actor) RunOnServerTick([actor = n.actor, work]() { RemoveSpawnedActor(actor); });
+    const bool changed = !removed.empty() || !npcs.empty() || terrainCount != 0;
+    g_projectError = changed ? std::string() : "record 0: project has no loaded entities";
+    Log("unload project %d: %zu objects, %zu NPCs, %d terrain strokes", id, removed.size(), npcs.size(), terrainCount);
+    return changed;
+}
+bool UnloadProject(int id) { return UnloadProjectImpl(id, false); }
+static bool g_autoDone = false; static DWORD g_worldSince = 0, g_worldLast = 0;
+// Reads and fully validates a project document: the codec parse (kind/grammar/metadata/records) plus the SAME
+// double->float and tiled-int16 narrowing the engine consumes. Nothing here mutates the scene, the registry,
+// the project table, the queues, the selection or the History.
+static bool ReadProjectDocument(const std::string& path, proj_codec::Document& doc, std::vector<proj_codec::EngineRow>& rows, std::string& error) {
+    error.clear();
+    std::ifstream file(path.c_str(), std::ios::binary);
+    if (!file) { error = "record 0: cannot open the project file"; return false; }
+    std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (file.bad()) { error = "record 0: cannot read the project file"; return false; }
+    if (!proj_codec::Parse(bytes, path, proj_codec::Kind::Project, doc, error)) return false;
+    return proj_codec::NarrowForEngine(doc, rows, error);
+}
+static std::vector<TerrainStroke> ProjectTerrain(const proj_codec::Document& doc, int pid) {
+    std::vector<TerrainStroke> strokes;
+    for (const auto& t : doc.terrain)
+        strokes.push_back({ t.mode, (float)t.x, (float)t.z, (float)t.r, (float)t.amount, (float)t.strength,
+                            (float)t.ax, (float)t.az, (float)t.y, pid });
+    return strokes; // ReadProjectDocument validated every float before any scene mutation
+}
+static std::map<std::string, ProjectLoadReport> g_projectLoads;   // guarded by g_regMutex
+bool PreflightProject(const std::string& name) {
+    if (IsGroupFileName(name) || !ValidFileName(name + ".cdproj", proj_codec::Kind::Project)) { g_projectError = "record 0: invalid project name"; return false; }
+    proj_codec::Document doc; std::vector<proj_codec::EngineRow> rows;
+    return ReadProjectDocument(ProjPath(name), doc, rows, g_projectError);
+}
+static bool AdmitProjectDocument(const std::string& name, const proj_codec::Document& doc,
+                                 const std::vector<proj_codec::EngineRow>& rows, bool clearFirst, bool replace) {
+    std::string error;
+    // Bool is a synchronous mutation outcome, never deferred admission. Busy leaves the scene and allocators untouched.
+    { std::lock_guard<std::mutex> operation(g_groundOpMutex);
+      if (g_groundWorldWriting || !g_groundLeases.empty() || !g_groundMutationPending.empty()) {
+          g_projectError = "record 0: project mutation busy; retry after grounding or travel settles"; return false;
+      }
+      ++g_groundWorldWriting; GroundEpochLocked();
+    }
+    struct WorldWrite { ~WorldWrite() { std::lock_guard<std::mutex> lock(g_groundOpMutex); --g_groundWorldWriting; } } worldWrite;
+    g_autoDone = true;   // a validated manual load (or replace) counts: the autoload must not add a second copy later
+    if (clearFirst) { std::unique_lock<std::mutex> operation(g_groundOpMutex); ClearSceneContents(operation); }
+    const int pid = ProjectId(name);
+    if (replace) UnloadProjectImpl(pid, true); // this call owns the world reservation; an empty old project is valid
+    struct Loading { bool previous = g_loading; Loading() { g_loading = true; } ~Loading() { g_loading = previous; } } loading;
+    std::map<int, int> groups;   // ONE map shared by objects, NPCs and named groups
+    auto mapGroup = [&](int source) {
+        if (!source) return 0;
+        const auto found = groups.find(source);
+        return found == groups.end() ? groups.emplace(source, NewGroupId()).first->second : found->second;
+    };
+    std::vector<int> loaded; std::vector<std::string> excludedPrefabs;
+    for (size_t i = 0; i < doc.records.size(); ++i) {
+        const proj_codec::Record& record = doc.records[i];
+        int uid = 0;
+        if (rows[i].placeable) {
+            uid = SpawnAt(record.prefab, { rows[i].x, rows[i].y, rows[i].z }, Rot{ rows[i].yaw, rows[i].pitch, rows[i].roll }, rows[i].scale, mapGroup(record.group), pid);
+            if (uid) SetObjectNote(uid, record.note);
+        }
+        // A valid row the legacy state wrapper marked hidden/missing, or a refused admission: a named exclusion,
+        // never a parser success over malformed data.
+        if (!uid) excludedPrefabs.push_back(record.prefab);
+        loaded.push_back(uid);
+    }
+    std::vector<uint32_t> excludedNpcs;
+    for (const auto& n : doc.npcs) {
+        const int uid = SpawnManagedNpc(n.key, { (float)n.pos.x, (float)n.pos.y, (float)n.pos.z }, n.type, n.extra,
+                                       n.aiEnabled, n.behavior, mapGroup(n.group), pid, n.label, n.note);
+        if (uid) SetManagedNpcControl(uid, n.aiEnabled, n.behavior); // exact persisted desired state, not the spawn preset's default
+        else excludedNpcs.push_back(n.key);
+    }
+    for (const auto& group : doc.groupNames) SetGroupName(mapGroup(group.first), group.second);
+    TerrainReplaceProject(pid, ProjectTerrain(doc, pid));
+    if (doc.hasBounds && !RetainGroupValues(doc, loaded, error)) Log("load: copy metadata: %s", error.c_str());
+    {
+        std::lock_guard<std::mutex> l(g_regMutex);
+        ProjectLoadReport report;
+        report.valid = true;
+        report.requested = (int)doc.records.size();
+        report.queued = report.requested - (int)excludedPrefabs.size();
+        report.excluded = (int)excludedPrefabs.size();
+        report.excludedPrefabs = excludedPrefabs;
+        report.requestedNpcs = (int)doc.npcs.size(); report.excludedNpcs = (int)excludedNpcs.size();
+        report.queuedNpcs = report.requestedNpcs - report.excludedNpcs; report.excludedNpcKeys = excludedNpcs;
+        report.terrainStrokes = (int)doc.terrain.size();
+        g_projectLoads[name] = report;
+        g_projDirty.erase(pid);   // freshly loaded = in sync with the file
+    }
+    g_projectError.clear();
+    Log("load: %zu requested, %d queued, %zu excluded from %s", doc.records.size(), (int)(doc.records.size() - excludedPrefabs.size()), excludedPrefabs.size(), ProjPath(name).c_str());
+    for (const auto& prefab : excludedPrefabs) Log("load excluded: %s", prefab.c_str());
     return true;
 }
+static bool LoadProjectSnapshot(const std::string& name, bool clearFirst, bool replace) {
+    if (IsGroupFileName(name) || !ValidFileName(name + ".cdproj", proj_codec::Kind::Project)) { g_projectError = "record 0: invalid project name"; return false; }
+    auto fileWork = std::make_shared<FileActivity>(proj_codec::Kind::Project, name, FileReason::PendingOperation);
+    proj_codec::Document doc; std::vector<proj_codec::EngineRow> rows;
+    if (!ReadProjectDocument(ProjPath(name), doc, rows, g_projectError)) { Log("load: %s", g_projectError.c_str()); return false; }
+    return AdmitProjectDocument(name, doc, rows, clearFirst, replace);
+}
+bool LoadProject(const std::string& name, bool clearFirst) { return LoadProjectSnapshot(name, clearFirst, false); }
+bool ReloadProject(const std::string& name) { return LoadProjectSnapshot(name, false, true); }
 std::vector<std::string> ListProjects() {
-    std::vector<std::string> out;
-    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA((ProjDir() + "\\*.cdproj").c_str(), &fd);
+    std::vector<std::string> out; WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA((ProjDir() + "\\*.cdproj").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return out;
     do { std::string n = fd.cFileName; out.push_back(n.substr(0, n.size() - 7)); } while (FindNextFileA(h, &fd));
     FindClose(h);
     return out;
 }
+std::string ProjectError() { return g_projectError; }
+// The last successful load receipt for that name; a failed/malformed load publishes none (valid stays false),
+// so "malformed data" can never be mistaken for a successful load with exclusions.
+ProjectLoadReport ProjectLoadReportFor(const std::string& name) {
+    std::lock_guard<std::mutex> l(g_regMutex);
+    const auto it = g_projectLoads.find(name);
+    return it == g_projectLoads.end() ? ProjectLoadReport() : it->second;
+}
+// validate-first import: a shared .cdproj is copied into the projects folder only when its bytes parse and
+// narrow; the write is transactional, so a failure leaves an existing file of that name untouched.
+bool ImportProjectFile(const std::string& path) {
+    const std::string base = path.substr(path.find_last_of("\\/") + 1);
+    if (base.empty()) { g_projectError = "record 0: empty import file name"; return false; }
+    if (IsGroupFileName(base)) { g_projectError = "record 0: group files cannot be imported as projects"; return false; }
+    if (base.size() < 7 || _stricmp(base.c_str() + base.size() - 7, ".cdproj") != 0) { g_projectError = "record 0: the import needs a .cdproj file"; return false; }
+    FileActivity fileWork(proj_codec::Kind::Project, base.substr(0, base.size() - 7), FileReason::PendingOperation);
+    std::ifstream file(path.c_str(), std::ios::binary);
+    if (!file) { g_projectError = "record 0: cannot open the import file"; return false; }
+    const std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (file.bad()) { g_projectError = "record 0: cannot read the import file"; return false; }
+    file.close(); // bytes are the owned snapshot; retaining this handle prevents replacing an already-local source on Windows
+    if (file.fail()) { g_projectError = "record 0: cannot close the import file"; return false; }
+    proj_codec::Document doc; std::vector<proj_codec::EngineRow> rows; std::string error;
+    if (!proj_codec::Parse(bytes, path, proj_codec::Kind::Project, doc, error) || !proj_codec::NarrowForEngine(doc, rows, error)) {
+        g_projectError = error; Log("import: %s", error.c_str()); return false;
+    }
+    if (!CreateDirectoryA(ProjDir().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) { g_projectError = "record 0: cannot create the projects directory"; return false; }
+    proj_codec::WriteHooks hooks; proj_codec::WriteHooks* writeHooks = nullptr;
+#ifdef WB_UNIFIED_HOST_TEST
+    InstallSaveFaultHooks(hooks);
+    writeHooks = &hooks;
+#endif
+    if (!proj_codec::WriteTransactional(ProjDir() + "\\" + base, proj_codec::Kind::Project, bytes, writeHooks, error)) {
+        g_projectError = error; Log("import: write or replace failed: %s", error.c_str()); return false;
+    }
+    g_projectError.clear();
+    return true;
+}
 // autoload.txt: one project name per line (without .cdproj); lines starting with '#' and blank lines are skipped.
 // '#' is only a comment at the start of a line, so a project whose name contains one still works.
 // Any number of projects can be listed; they are all loaded into the same scene, in file order.
 static std::string AutoloadPath() { return g_modDir + "\\autoload.txt"; }
-std::vector<std::string> Autoload() {
-    std::vector<std::string> out;
-    FILE* f = fopen(AutoloadPath().c_str(), "r"); if (!f) return out;
-    char line[512]; bool firstLine = true;
-    while (fgets(line, sizeof line, f)) {
-        std::string s = line;
-        if (firstLine) {   // Notepad can save the file as "UTF-8 with BOM"; those three bytes are not part of the name
-            firstLine = false;
-            if (s.size() >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF) s.erase(0, 3);
-        }
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
-        size_t b = s.find_first_not_of(" \t");
-        if (b == std::string::npos) continue;
-        s = s.substr(b);
-        if (s[0] == '#') continue;
-        if (s.size() > 7 && _stricmp(s.c_str() + s.size() - 7, ".cdproj") == 0) s.resize(s.size() - 7);   // a pasted file name works too
-        if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);   // never load the same project twice
-    }
-    fclose(f);
-    return out;
+static std::string AutoloadName(std::string s, bool first) {
+    if (first && s.size() >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF) s.erase(0, 3);
+    const size_t b = s.find_first_not_of(" \t\r\n"); if (b == std::string::npos) return {};
+    s = s.substr(b, s.find_last_not_of(" \t\r\n") - b + 1);
+    if (s[0] == '#') return {};
+    if (s.size() > 7 && FileNameEqual(s.substr(s.size() - 7), ".cdproj")) s.resize(s.size() - 7);
+    return s;
 }
-// At startup, before the world streams: the terrain strokes of the autoload projects, so the first load of the world already
-// carries them. The autoload later loads the same strokes again, which TerrainReplaceProject recognises as unchanged.
-static bool ParseTerrainLine(const char* line, TerrainStroke* t);
+static std::vector<std::string> ParseAutoload(const std::string& bytes) {
+    std::vector<std::string> names;
+    for (size_t pos = 0; pos < bytes.size();) {
+        size_t end = bytes.find('\n', pos); if (end == std::string::npos) end = bytes.size(); else ++end;
+        const std::string name = AutoloadName(bytes.substr(pos, end - pos), pos == 0);
+        if (!name.empty() && std::none_of(names.begin(), names.end(), [&](const std::string& n) { return FileNameEqual(n, name); })) names.push_back(name);
+        pos = end;
+    }
+    return names;
+}
+// A missing list means OFF; an unreadable/directory/reparse/malformed list NEVER means OFF for a file gate.
+static FileResult ReadAutoload(std::string& bytes, std::vector<std::string>& names) {
+    FileHandle h;
+    h.h = CreateFileA(AutoloadPath().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h.h == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND) { bytes.clear(); names.clear(); return {}; }
+        return { FileReason::AutoloadReadFailed, e };
+    }
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(h.h, &info)) return { FileReason::AutoloadReadFailed, GetLastError() };
+    if (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) return { FileReason::AutoloadReadFailed };
+    if (!ReadHandleBytes(h.h, bytes)) return { FileReason::AutoloadReadFailed, GetLastError() };
+    if (bytes.find('\0') != std::string::npos) return { FileReason::AutoloadReadFailed };
+    names = ParseAutoload(bytes);
+    return {};
+}
+std::vector<std::string> Autoload() {
+    std::lock_guard<std::recursive_mutex> l(g_fileMutex);
+    std::string bytes; std::vector<std::string> names;
+    const FileResult r = ReadAutoload(bytes, names);
+    if (!r.ok()) Log("autoload: %s (%lu)", FileReasonCode(r.reason), r.systemError);
+    return names;
+}
+struct AutoloadTemp {
+    std::string path;
+    ~AutoloadTemp() { if (!path.empty() && !DeleteFileA(path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) Log("autoload: temporary cleanup failed: %s (%lu)", path.c_str(), GetLastError()); }
+};
+static bool AutoloadFault(int stage) {
+#ifdef WB_UNIFIED_HOST_TEST
+    if (g_saveFaultStage == stage) { g_saveFaultStage = 0; return true; }
+#else
+    (void)stage;
+#endif
+    return false;
+}
+static FileResult WriteAutoload(const std::string& original, const std::string& bytes, const std::vector<std::string>& expected) {
+    FileHandle dir; FileResult r = OpenFileDirectory(g_modDir, dir); if (!r.ok()) return r;
+    char path[MAX_PATH]{};
+    if (!GetTempFileNameA(g_modDir.c_str(), "wba", 0, path)) return { FileReason::WriteFailed, GetLastError() };
+    AutoloadTemp temp{ path }; FileHandle h;
+    h.h = CreateFileA(path, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h.h == INVALID_HANDLE_VALUE) return { FileReason::WriteFailed, GetLastError() };
+    if (AutoloadFault(1)) return { FileReason::WriteFailed };
+    const size_t length = AutoloadFault(2) ? bytes.size() / 2 : bytes.size();
+    for (size_t at = 0; at < length;) {
+        const DWORD chunk = (DWORD)(std::min)(length - at, (size_t)65536); DWORD written = 0;
+        if (!WriteFile(h.h, bytes.data() + at, chunk, &written, nullptr) || written != chunk) return { FileReason::WriteFailed, GetLastError() };
+        at += written;
+    }
+    if (AutoloadFault(3) || !FlushFileBuffers(h.h)) return { FileReason::WriteFailed, GetLastError() };
+    if (!h.close() || AutoloadFault(5)) return { FileReason::WriteFailed, GetLastError() };
+    FileHandle verify;
+    verify.h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    std::string actual;
+    if (verify.h == INVALID_HANDLE_VALUE || !ReadHandleBytes(verify.h, actual) || actual != bytes) return { FileReason::VerifyFailed, GetLastError() };
+#ifdef WB_UNIFIED_HOST_TEST
+    if (g_beforeReplaceCallback) { auto callback = std::move(g_beforeReplaceCallback); g_beforeReplaceCallback = {}; callback(); }
+#endif
+    std::vector<std::string> current;
+    r = ReadAutoload(actual, current); if (!r.ok()) return r;
+    if (actual != original) return { FileReason::StaleTarget };
+    if (AutoloadFault(4)) return { FileReason::WriteFailed };
+    if (expected.empty()) {
+        // Deleting the last enabled list is one atomic namespace operation, preserving v0.95's no-list state.
+        if (!DeleteFileA(AutoloadPath().c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) return { FileReason::WriteFailed, GetLastError() };
+    } else if (!MoveFileExA(path, AutoloadPath().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return { FileReason::WriteFailed, GetLastError() };
+    r = ReadAutoload(actual, current); if (!r.ok()) return r;
+    if (current != expected || (!expected.empty() && actual != bytes)) return { FileReason::VerifyFailed };
+    return {};
+}
+FileResult SetAutoload(const std::string& rawName, bool on) {
+    std::lock_guard<std::recursive_mutex> l(g_fileMutex);
+    const std::string name = AutoloadName(rawName, false);
+    if (!ValidFileName(name + ".cdproj", proj_codec::Kind::Project) || IsGroupFileName(name) || name.find_first_of("\r\n") != std::string::npos) return { FileReason::InvalidName };
+    if (on) {
+        const DWORD attrs = GetFileAttributesA(ProjPath(name).c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) return { FileReason::NotFound, GetLastError() };
+        if (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) return { FileReason::UnsafePath };
+        FileDirectories dirs; SavedFile file; file.kind = proj_codec::Kind::Project;
+        const FileResult r = OpenFileDirectories(file, false, dirs); if (!r.ok()) return r;
+    }
+    std::string original; std::vector<std::string> list;
+    FileResult r = ReadAutoload(original, list); if (!r.ok()) return r;
+    const bool present = std::any_of(list.begin(), list.end(), [&](const std::string& n) { return FileNameEqual(n, name); });
+    if (present == on) return {}; // already verified from a fresh disk read, not a cached checkbox
+    std::string bytes;
+    if (on) { bytes = original; if (!bytes.empty() && bytes.back() != '\n') bytes += '\n'; bytes += name + "\n"; }
+    else {
+        // Remove every Windows-case alias of ONLY this name; retain all other bytes, comments and file order.
+        for (size_t pos = 0; pos < original.size();) {
+            size_t end = original.find('\n', pos); if (end == std::string::npos) end = original.size(); else ++end;
+            const std::string line = original.substr(pos, end - pos);
+            if (!FileNameEqual(AutoloadName(line, pos == 0), name)) bytes += line;
+            pos = end;
+        }
+    }
+    r = WriteAutoload(original, bytes, ParseAutoload(bytes));
+    Log("autoload: %s %s: %s (%lu)", name.c_str(), on ? "on" : "off", FileReasonCode(r.reason), r.systemError);
+    return r;
+}
+
+// Install-time preload uses the same validated project document as manual load and import.
+// Invalid object OR terrain data must not partially modify the initial streamed world.
 static void PreloadAutoloadTerrain() {
     if (!TerrainAvailable()) return;
     int total = 0;
     for (const auto& name : Autoload()) {
-        FILE* f = fopen(ProjPath(name).c_str(), "r"); if (!f) continue;
-        std::vector<TerrainStroke> strokes; char line[1024];
-        while (fgets(line, sizeof line, f)) { TerrainStroke t{}; if (ParseTerrainLine(line, &t)) strokes.push_back(t); }
-        fclose(f);
-        if (!strokes.empty()) { TerrainReplaceProject(ProjectId(name), strokes); total += (int)strokes.size(); }
+        proj_codec::Document doc; std::vector<proj_codec::EngineRow> rows; std::string error;
+        if (!ReadProjectDocument(ProjPath(name), doc, rows, error)) { Log("terrain preload: %s: %s", name.c_str(), error.c_str()); continue; }
+        if (!doc.terrain.empty()) {
+            const int pid = ProjectId(name);
+            TerrainReplaceProject(pid, ProjectTerrain(doc, pid)); total += (int)doc.terrain.size();
+        }
     }
     TerrainMarkApplied();
     if (total) Log("terrain: %d strokes of the autoload projects preloaded", total);
 }
-static void WriteAutoload(const std::vector<std::string>& list) {
-    if (list.empty()) { DeleteFileA(AutoloadPath().c_str()); return; }
-    FILE* f = fopen(AutoloadPath().c_str(), "w"); if (!f) { Log("autoload: cannot write %s", AutoloadPath().c_str()); return; }
-    fprintf(f, "# World Builder autoload: one project name per line (without .cdproj). Lines starting with '#' are ignored.\n");
-    for (auto& n : list) fprintf(f, "%s\n", n.c_str());
-    fclose(f);
+
+const char* FileReasonCode(FileReason reason) {
+    switch (reason) {
+#define FILE_REASON(x) case FileReason::x: return #x
+        FILE_REASON(None); FILE_REASON(InvalidName); FILE_REASON(InvalidAction); FILE_REASON(NotFound);
+        FILE_REASON(StaleTarget); FILE_REASON(ConfirmationMismatch); FILE_REASON(GuardMissing); FILE_REASON(SelectionChanged);
+        FILE_REASON(VisibleReference); FILE_REASON(HiddenReference); FILE_REASON(UndoReference); FILE_REASON(RedoReference);
+        FILE_REASON(DirtyProject); FILE_REASON(PendingOperation); FILE_REASON(InFlightExport); FILE_REASON(InFlightPlace);
+        FILE_REASON(AutoloadEnabled); FILE_REASON(AutoloadReadFailed); FILE_REASON(Collision); FILE_REASON(UnsafePath);
+        FILE_REASON(ReadFailed); FILE_REASON(WriteFailed); FILE_REASON(MoveFailed); FILE_REASON(DeleteFailed); FILE_REASON(VerifyFailed);
+#undef FILE_REASON
+    }
+    return "InvalidReason";
 }
-void SetAutoload(const std::string& name, bool on) {
-    if (name.empty()) return;
-    std::vector<std::string> list = Autoload();
-    auto it = std::find(list.begin(), list.end(), name);
-    if (on) { if (it == list.end()) list.push_back(name); }
-    else    { if (it != list.end()) list.erase(it); }
-    WriteAutoload(list);
-    Log("autoload: %s %s (%zu active)", name.c_str(), on ? "on" : "off", list.size());
+static FileResult FileCollision(const std::string& directory, const std::string& filename) {
+    WIN32_FIND_DATAA fd{}; HANDLE find = FindFirstFileA((directory + "\\*").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) { const DWORD e = GetLastError(); return e == ERROR_FILE_NOT_FOUND ? FileResult{} : FileResult{ FileReason::ReadFailed, e }; }
+    bool collision = false;
+    do { if (FileNameEqual(fd.cFileName, filename) || (fd.cAlternateFileName[0] && FileNameEqual(fd.cAlternateFileName, filename))) { collision = true; break; } } while (FindNextFileA(find, &fd));
+    const DWORD e = GetLastError(); FindClose(find);
+    if (collision) return { FileReason::Collision };
+    if (e != ERROR_NO_MORE_FILES) return { FileReason::ReadFailed, e };
+    return {};
+}
+FileResult ExecuteFileAction(const FileSelectionHandle& selection, FileAction action,
+                             const std::string& typedFilename, const FileExecutionGuard& guard) {
+    if (!selection) return { FileReason::StaleTarget };
+    const SavedFile& file = selection->file;
+    FileResult r = ValidateSavedFile(file); if (!r.ok()) return r;
+    const bool moving = action == FileAction::Archive || action == FileAction::Restore;
+    if ((action != FileAction::Archive && action != FileAction::Restore && action != FileAction::Purge && action != FileAction::Delete) ||
+        (file.archived != (action == FileAction::Restore || action == FileAction::Purge))) return { FileReason::InvalidAction };
+    if (!moving && typedFilename != file.filename) return { FileReason::ConfirmationMismatch };
+    if (!guard) return { FileReason::GuardMissing };
+    // The UI owns History/selection and executes synchronously on its thread. No callback under registry locks.
+    const FileReason editor = guard(file); if (editor != FileReason::None) return { editor };
+    std::lock_guard<std::recursive_mutex> lifecycle(g_fileMutex);
+    const std::string name = file.filename.substr(0, file.filename.size() - strlen(FileExtension(file.kind)));
+    for (const auto* work : g_fileActivities) if (work->kind == file.kind && FileNameEqual(work->name, name)) return { work->reason };
+    if (file.kind == proj_codec::Kind::Group) {
+        for (auto it = g_filePlaces.begin(); it != g_filePlaces.end();) {
+            const auto req = it->request.lock();
+            if (!req || PlaceRequestState(req).settled) { it = g_filePlaces.erase(it); continue; }
+            if (FileNameEqual(it->name, name)) return { FileReason::InFlightPlace };
+            ++it;
+        }
+    }
+    FileDirectories dirs; r = OpenFileDirectories(file, false, dirs); if (!r.ok()) return r;
+    FileHandle source; FileSelection now;
+    // Exclusive open + handle-based rename/delete binds execution to THIS object, not a swapped pathname.
+    r = ReadSelectedFile(file, GENERIC_READ | DELETE, 0, source, now); if (!r.ok()) return r;
+    if (!SameFileSelection(*selection, now)) return { FileReason::StaleTarget };
+    std::string autoBytes; std::vector<std::string> autoNames;
+    if (file.kind == proj_codec::Kind::Project) {
+        r = ReadAutoload(autoBytes, autoNames); if (!r.ok()) return r;
+        for (const auto& n : autoNames) if (FileNameEqual(n, name)) return { FileReason::AutoloadEnabled };
+    }
+    // Project ids are looked up, never allocated as a side effect of a row/action. Keep both authorities held
+    // until the actual namespace change, so an assignment/spawn/dirty mark cannot pass the final check.
+    std::lock_guard<std::mutex> projects(g_projMutex);
+    std::lock_guard<std::mutex> registry(g_regMutex);
+    if (file.kind == proj_codec::Kind::Project) {
+        // ProjectId preserves v0.95's CRT name matching. Windows Unicode case aliases can therefore have
+        // multiple session ids; ALL aliases must be checked, not just the first (possibly empty) identity.
+        std::set<int> ids;
+        for (size_t i = 1; i < g_projNames.size(); ++i) if (FileNameEqual(g_projNames[i], name)) ids.insert((int)i);
+        for (const auto& o : g_reg) if (ids.count(o.proj)) {
+            if (!o.hidden && (!o.obj || o.standin)) return { FileReason::PendingOperation };
+            return { o.hidden ? FileReason::HiddenReference : FileReason::VisibleReference };
+        }
+        for (const auto& n : g_npcReg) if (ids.count(n.proj)) {
+            if (!n.hidden && (n.spawnPending || !n.actor || n.editMoving || n.liveMovePending)) return { FileReason::PendingOperation };
+            return { n.hidden ? FileReason::HiddenReference : FileReason::VisibleReference };
+        }
+        for (const auto& stroke : TerrainStrokes()) if (ids.count(stroke.proj)) return { FileReason::VisibleReference };
+        for (int pid : ids) if (g_projDirty.count(pid)) return { FileReason::DirtyProject };
+    }
+    if (moving) {
+        FileDirectories destinationDirs;
+        SavedFile destination = file; destination.archived = !file.archived;
+        r = OpenFileDirectories(destination, action == FileAction::Archive, destinationDirs); if (!r.ok()) return r;
+        const std::string directory = FileDirectory(file.kind, destination.archived);
+        r = FileCollision(directory, file.filename); if (!r.ok()) return r;
+        const std::wstring path = FileWide(directory + "\\" + file.filename);
+        const DWORD n = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+        if (!n) return { FileReason::MoveFailed, GetLastError() };
+        std::vector<wchar_t> full(n);
+        if (!GetFullPathNameW(path.c_str(), n, full.data(), nullptr)) return { FileReason::MoveFailed, GetLastError() };
+        const DWORD bytes = (DWORD)(wcslen(full.data()) * sizeof(wchar_t));
+        // Win32's wrapper requires a terminated FileName even though FileNameLength excludes the terminator.
+        std::vector<unsigned char> buffer(offsetof(FILE_RENAME_INFO, FileName) + bytes + sizeof(wchar_t));
+        auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+        rename->ReplaceIfExists = FALSE; rename->RootDirectory = nullptr; rename->FileNameLength = bytes;
+        memcpy(rename->FileName, full.data(), bytes);
+        // No REPLACE and no COPY_ALLOWED: a rename on this open file, on the proven same volume, or refusal.
+#ifdef WB_UNIFIED_HOST_TEST
+        if (g_fileMutationFault == FileMutationFault::Move) { g_fileMutationFault = FileMutationFault::None; return { FileReason::MoveFailed, ERROR_ACCESS_DENIED }; }
+#endif
+        if (!SetFileInformationByHandle(source.h, FileRenameInfo, rename, (DWORD)buffer.size())) {
+            const DWORD e = GetLastError(); return { e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS ? FileReason::Collision : FileReason::MoveFailed, e };
+        }
+    } else {
+        FILE_DISPOSITION_INFO disposition{ TRUE };
+#ifdef WB_UNIFIED_HOST_TEST
+        if (g_fileMutationFault == FileMutationFault::Delete) { g_fileMutationFault = FileMutationFault::None; return { FileReason::DeleteFailed, ERROR_ACCESS_DENIED }; }
+#endif
+        if (!SetFileInformationByHandle(source.h, FileDispositionInfo, &disposition, sizeof disposition)) return { FileReason::DeleteFailed, GetLastError() };
+    }
+    if (!source.close()) return { FileReason::VerifyFailed, GetLastError() };
+    return {};
+}
+GroupAdmissionReport AdmitGroupFileCopy(const FileSelectionHandle& selection, Vec3 target, double deltaYaw,
+                                       double factor, std::vector<int>& uids, Vec3& pivot) {
+    std::lock_guard<std::recursive_mutex> l(g_fileMutex);
+    GroupAdmissionReport report;
+    uids.clear();
+    auto fail = [&](FileResult r) { report.error = FileReasonCode(r.reason); return report; };
+    if (!selection || selection->file.kind != proj_codec::Kind::Group || selection->file.archived) return fail({ FileReason::InvalidAction });
+    const SavedFile& file = selection->file;
+    FileResult r = ValidateSavedFile(file); if (!r.ok()) return fail(r);
+    FileDirectories dirs; r = OpenFileDirectories(file, false, dirs); if (!r.ok()) return fail(r);
+    FileHandle h; FileSelection now;
+    r = ReadSelectedFile(file, GENERIC_READ, FILE_SHARE_READ, h, now); if (!r.ok()) return fail(r);
+    if (!SameFileSelection(*selection, now)) return fail({ FileReason::StaleTarget });
+    proj_codec::Document doc;
+    if (!proj_codec::Parse(now.bytes, file.path, proj_codec::Kind::Group, doc, report.error)) return report;
+    FileActivity admission(proj_codec::Kind::Group, file.filename.substr(0, file.filename.size() - 8), FileReason::InFlightPlace);
+    report = AdmitGroupCopy(doc, target, deltaYaw, factor, uids, pivot);
+    if (report.request) g_filePlaces.push_back({ admission.row.name, report.request });
+    return report;
 }
 int PendingSpawns() { return (int)InterlockedCompareExchange(&g_queueCount, 0, 0); }
+
+// ---- C5: per-request caller-owned terminal placement results (public API) --------------------------------
+// The request handle is caller-owned: the UI keeps it and reads its own receipt. Rows are bound to records by
+// (request, rowId) carried by SpawnedObj, so two requests sharing a basename never share a result and a late
+// completion resolves its own row. Nothing here consults PendingSpawns() - that is a queue diagnostic only.
+PlaceRequestHandle BeginPlaceRequest(const std::vector<std::string>& prefabs) {
+    auto req = std::make_shared<PlaceRequest>();
+    for (size_t i = 0; i < prefabs.size(); ++i) { PlaceRow r; r.rowId = (int)i; r.prefab = prefabs[i]; req->rows.push_back(std::move(r)); }
+    return req;
+}
+// Caller-side preflight exclusion (missing/hidden/nonplaceable prefab): the row never spawns.
+bool PlaceRowExclude(const PlaceRequestHandle& req, int rowId, const std::string& reason) {
+    if (!req) return false;
+    return SettleRowOnce(req, rowId, PlaceExcluded, PlaceLaneNone, 0, reason.empty() ? std::string("preflight exclusion") : reason);
+}
+#ifdef WB_UNIFIED_HOST_TEST
+std::function<void()> g_admissionInterrupt;   // B2-R1 admission-interrupt seam (see core.h); null unless a host test arms it
+std::function<void()> g_replayRevalidateProbe;   // D1 replay-revalidation interleave seam (host tests only); null unless a host test arms it
+#endif
+int SubmitPlaceRow(const PlaceRequestHandle& req, int rowId, Vec3 world, Rot rot, float scale, int group) {
+    if (!req) return 0;
+    std::string prefab; bool found = false;
+    { std::lock_guard<std::mutex> l(req->m); for (const auto& r : req->rows) if (r.rowId == rowId && r.state == PlacePending) { prefab = r.prefab; found = true; break; } }
+    if (!found) return 0;                                          // unknown row, or already terminal
+    if (prefab.empty()) { SettleRowOnce(req, rowId, PlaceExcluded, PlaceLaneNone, 0, "missing prefab"); return 0; }
+    const int uid = SpawnAtLinked(prefab, world, rot, scale, group, 0, req, rowId);
+    if (!uid) { SettleRowOnce(req, rowId, PlaceExcluded, PlaceLaneNone, 0, "the spawn was not admitted"); return 0; }
+#ifdef WB_UNIFIED_HOST_TEST
+    if (g_admissionInterrupt) g_admissionInterrupt();   // B2-R1 seam (null unless a test arms it): the record and its work are published, the row UID is not yet written
+#endif
+    { std::lock_guard<std::mutex> l(req->m); for (auto& r : req->rows) if (r.rowId == rowId) { r.uid = uid; break; } }
+    return uid;
+}
+// Counted per-row cleanup obligations (B2): req->cleanupOutstanding is always the sum of the rows'
+// cleanupObligations. Every queued engine removal that must precede finality holds exactly one obligation,
+// released by that removal's own lane completion AFTER it dispatched - never at enqueue time. A hide with no
+// queued removal releases its obligation synchronously; a hide that never ran releases it on the spot, so no
+// obligation is ever left dangling and no second cancel can clear another obligation's share.
+static void C5AddObligation(const std::shared_ptr<PlaceRequest>& req, int rowId) {
+    if (!req || rowId < 0) return;
+    std::lock_guard<std::mutex> l(req->m);
+    for (auto& r : req->rows) if (r.rowId == rowId) { ++r.cleanupObligations; r.cleanupPending = true; ++req->cleanupOutstanding; return; }
+}
+static void C5ReleaseObligation(const std::shared_ptr<PlaceRequest>& req, int rowId) {
+    if (!req || rowId < 0) return;
+    std::lock_guard<std::mutex> l(req->m);
+    for (auto& r : req->rows) if (r.rowId == rowId && r.cleanupObligations > 0) {
+        --r.cleanupObligations; r.cleanupPending = r.cleanupObligations > 0;
+        if (req->cleanupOutstanding > 0) --req->cleanupOutstanding; return; }
+}
+// One charged game-lane removal: the obligation is registered BEFORE the queue push and released by the lane
+// completion after the removal dispatched. No engine or queue call happens while the request mutex is held.
+static void C5QueueChargedGameRemove(const std::shared_ptr<PlaceRequest>& req, int rowId, uintptr_t handle) {
+    if (!handle || !GameThreadReady()) return;
+    C5AddObligation(req, rowId);
+    RunOnGameThread([handle, req, rowId]() { DoRemove(handle); C5ReleaseObligation(req, rowId); });
+}
+static void C5QueueChargedActorRemove(const std::shared_ptr<PlaceRequest>& req, int rowId, uintptr_t actor) {
+    if (!actor) return;
+    C5AddObligation(req, rowId);
+    RunOnServerTick([actor, req, rowId]() { RemoveSpawnedActor(actor); C5ReleaseObligation(req, rowId); });
+}
+// B2-R1: whether the owning row is already terminally dead (Canceled/Excluded/Failed). A row still
+// Pending, an already Attached row (e.g. a drag-finalize re-attachment), a requestless completion and
+// an unknown row all report NOT dead, so their completions keep the previous behavior. No locks held
+// on entry; only the request mutex is taken, never while the registry lock is held.
+static bool C5RowDead(const std::weak_ptr<PlaceRequest>& w, int rowId) {
+    if (rowId < 0) return false;
+    const std::shared_ptr<PlaceRequest> req = w.lock();
+    if (!req) return false;
+    std::lock_guard<std::mutex> l(req->m);
+    for (const auto& r : req->rows) if (r.rowId == rowId) return r.state != PlacePending && r.state != PlaceAttached;
+    return false;
+}
+// Remove one member through the existing cancel semantics (HideUid invalidates unapplied work and queues the
+// visible member's removal) and attach the cleanup completion to that removal's own lane. A deferred hide
+// carries the completion with it, so the obligation cannot clear before the deferred removal executed; when no
+// hide happened the obligation is dropped, so no cleanup is ever left dangling.
+static void C5CleanupMember(const std::shared_ptr<PlaceRequest>& req, int rowId, int uid) {
+    // The hide obligation is reserved by the cancel caller atomically with publishing Canceled (below), never
+    // here: the completion travels with the hide, so the obligation cannot clear before the dispatched removal.
+    const bool hid = HideUidInternal(uid, [req, rowId]() { C5ReleaseObligation(req, rowId); });
+    if (!hid) C5ReleaseObligation(req, rowId);
+}
+static void C5CleanupAttached(const std::shared_ptr<PlaceRequest>& req, int rowId, int uid) {
+    C5CleanupMember(req, rowId, uid);
+}
+// C5-CANCEL-BEGIN
+// The hide obligation is reserved atomically with publishing Canceled under the request mutex (before it is
+// released), so a racing in-flight native completion can never observe a transient settled=true: the row's sum
+// stays nonzero from the moment it leaves Pending until every queued removal dispatched. A hide that queued no
+// removal releases it synchronously; a repeated cancel is a true no-op that neither reserves nor releases.
+bool PlaceRowCancel(const PlaceRequestHandle& req, int rowId) {
+    if (!req) return false;
+    int uid = 0, state = PlacePending; bool found = false, alreadyRemoved = false;
+    { std::lock_guard<std::mutex> l(req->m);
+      for (auto& r : req->rows) if (r.rowId == rowId) {
+          found = true; uid = r.uid; state = r.state;
+          if (r.state == PlacePending) { r.state = PlaceCanceled; r.reason = "the row was canceled"; ++r.cleanupObligations; r.cleanupPending = true; ++req->cleanupOutstanding; }
+          else if (r.state == PlaceAttached) { if (r.removedAfterAttach) alreadyRemoved = true; else { r.removedAfterAttach = true; ++r.cleanupObligations; r.cleanupPending = true; ++req->cleanupOutstanding; } }
+          break; } }
+    if (!found || alreadyRemoved) return false;   // B2-R2: an already removed Attached receipt keeps its history; the repeat changes nothing
+    if (state == PlaceAttached) { C5CleanupAttached(req, rowId, uid); return true; }
+    if (state == PlacePending) {
+        C5CleanupMember(req, rowId, uid);
+        return true;
+    }
+    return false;
+}
+int PlaceRequestCancel(const PlaceRequestHandle& req) {
+    if (!req) return 0;
+    std::vector<std::pair<int, int>> pending, attached;   // (rowId, uid)
+    { std::lock_guard<std::mutex> l(req->m);
+      if (req->canceled) return 0;
+      req->canceled = true;
+      for (auto& r : req->rows) {
+          if (r.state == PlacePending) { r.state = PlaceCanceled; r.reason = "the request was canceled"; if (r.uid) { ++r.cleanupObligations; r.cleanupPending = true; ++req->cleanupOutstanding; pending.push_back({ r.rowId, r.uid }); } }
+          else if (r.state == PlaceAttached) { r.removedAfterAttach = true; ++r.cleanupObligations; r.cleanupPending = true; ++req->cleanupOutstanding; attached.push_back({ r.rowId, r.uid }); } } }
+    int moved = 0;
+    for (const auto& p : pending) {
+        C5CleanupMember(req, p.first, p.second);
+        ++moved;
+    }
+    for (const auto& a : attached) { C5CleanupAttached(req, a.first, a.second); ++moved; }
+    return moved;
+}
+// C5-CANCEL-END
+PlaceRequestView PlaceRequestState(const PlaceRequestHandle& req) {
+    PlaceRequestView v;
+    if (!req) return v;
+    std::lock_guard<std::mutex> l(req->m);
+    v.requested = (int)req->rows.size();
+    v.requestCanceled = req->canceled;
+    // C5-VIEW-BEGIN
+    for (const auto& r : req->rows) {
+        switch (r.state) {
+        case PlaceAttached: ++v.attached; break;
+        case PlaceExcluded: ++v.excluded; break;
+        case PlaceFailed:   ++v.failed;   break;
+        case PlaceCanceled: ++v.canceled; break;
+        default:            ++v.pending;  break;
+        }
+        if (r.cleanupPending) v.cleanupPending = true;
+    }
+    // C5-VIEW-END
+    v.rows = req->rows;
+    v.settled = (v.pending == 0 && req->cleanupOutstanding == 0);
+    return v;
+}
 // called from the pump: once the player has been in the world for ~3 s, load the autoload projects once per session.
 // A single failed position read (loading screen, camera cut, mount transition) only sets the counter back a little, so the
 // load happens seconds after the world is up, not minutes later when the user may already have loaded the scene by hand.
+// The settled autoload action: every listed project is loaded in file order. LoadProject validates before it
+// changes anything (and rejects a group file), so a bad entry never spawns, clears or allocates. The per-session
+// marker is checked and set here, so a manual LoadProject (which sets it too) keeps autoload from adding a second
+// copy of the scene. Returns true when this call was the one that settled the listing.
+static bool AutoloadProjects() {
+    std::lock_guard<std::recursive_mutex> lifecycle(g_fileMutex); // bind the persisted list to its load admissions
+    if (g_autoDone) return false;   // a manual load/replace already settled this session
+    g_autoDone = true;
+    // several projects are loaded into the same scene: every LoadProject only queues spawns and hands out fresh group ids,
+    // so the lists simply add up
+    std::vector<std::string> names = Autoload();
+    for (auto& name : names) { Log("autoload: loading project %s", name.c_str()); LoadProject(name, false); }
+    return true;
+}
 static void AutoloadTick() {
     if (g_autoDone) return;
     const DWORD now = GetTickCount();
     Vec3 p; if (!PlayerWorldPos(&p)) { if (now - g_worldLast > 2000) g_worldSince = 0; return; }   // a dropout of up to 2 s keeps the clock
     g_worldLast = now; if (!g_worldSince) g_worldSince = now;
     if (now - g_worldSince < 3000) return;
-    g_autoDone = true;
-    // several projects are loaded into the same scene: every LoadProject only queues spawns and hands out fresh group ids,
-    // so the lists simply add up (LoadProject sets g_autoDone itself, which is already true here)
-    std::vector<std::string> names = Autoload();
-    for (auto& name : names) { Log("autoload: loading project %s", name.c_str()); LoadProject(name, false); }
+    AutoloadProjects();
 }
 
 
@@ -1372,12 +3226,32 @@ static void* __fastcall HookCastShape(void* ctx, void* world, void* query, void*
 struct CastTemplate { bool have = false; void* world = nullptr; uint8_t query[0x200], xform[0x100], collector[0x200], hits[0x100], shape[0x200]; uintptr_t collAddr = 0, hitsAddr = 0, shapeAddr = 0; };
 static CastTemplate g_tpl;
 static std::mutex g_tplMutex;
-struct GroundReq { int id; Vec3 start; float len; bool verbose; Vec3 dir; bool robust; };   // robust = editor ground query, samples neighbours to reject terrain-hole fall-throughs
-static std::mutex g_groundMutex; static std::vector<GroundReq> g_groundQueue; static std::map<int, GroundHit> g_groundResults; static int g_groundNext = 0;
+float g_probeRadius = 0.0f; static bool g_probeCalibrated = false; // protected by g_tplMutex
+struct GroundReq { int id; Vec3 start; float len; bool verbose; uint64_t epoch; std::weak_ptr<GroundOp> op; bool owned = false; Vec3 dir{ 0, -1, 0 }; bool robust = false; };
+struct GroundStored { GroundHit hit; uint64_t epoch; std::weak_ptr<GroundOp> op; bool owned; GroundProbeStatus status = GroundProbeStatus::Pending; };
+static std::mutex g_groundMutex; static std::vector<GroundReq> g_groundQueue; static std::map<int, GroundStored> g_groundResults; static int g_groundNext = 0;
 static volatile LONG g_groundQueued = 0;
+static void PruneGroundTickets() {
+    std::set<int> canceled; uint64_t epoch;
+    { std::lock_guard<std::mutex> lock(g_groundOpMutex); epoch = g_groundEpoch;
+      for (auto& w : g_groundOps) if (auto op = w.lock()) if (op->view.terminal() && op->view.probe) {
+          canceled.insert(op->view.probe); op->ticket = 0;
+      }
+    }
+    std::lock_guard<std::mutex> queue(g_groundMutex);
+    for (auto it = g_groundResults.begin(); it != g_groundResults.end();) {
+        const auto& r = it->second;
+        // Owned operations expose invalidation through their receipt. Raw consumers need a terminal ticket
+        // even when the queued cast was pruned, so retain its epoch until consumption (or bounded eviction).
+        if (r.owned && (canceled.count(it->first) || r.epoch != epoch || r.op.expired())) it = g_groundResults.erase(it); else ++it;
+    }
+    g_groundQueue.erase(std::remove_if(g_groundQueue.begin(), g_groundQueue.end(), [&](const GroundReq& r) {
+        return canceled.count(r.id) || r.epoch != epoch || (r.owned && r.op.expired());
+    }), g_groundQueue.end());
+}
 static void ServiceGroundQueue(void* world);
 static void CaptureTemplate(void* world, void* q, void* xf, void* col) {
-    if (g_tpl.have && g_tpl.world == world) return;
+    { std::lock_guard<std::mutex> lock(g_tplMutex); if (g_tpl.have && g_tpl.world == world) return; }
     uintptr_t hits = 0, shape = 0; ReadBytes((uintptr_t)col + 0x20, &hits, 8); ReadBytes((uintptr_t)q + 0x28, &shape, 8);
     if (!hits || !shape) return;
     { const char* sn = RttiName(shape); if (!sn || !strstr(sn, "hknpSphereShape")) return; }   // the character's ground probe uses a small sphere
@@ -1398,10 +3272,14 @@ static void CaptureTemplate(void* world, void* q, void* xf, void* col) {
         }
         static int s_logged = 0; if (s_logged++ < 3) Log("[probe] template candidate: query start local (%.2f %.2f %.2f) player (%.2f %.2f %.2f) collector vtable rva 0x%llx", qs[0], qs[1], qs[2], pi.tiled.x, pi.tiled.y, pi.tiled.z, (unsigned long long)(vt - g_base));
     }
-    g_tpl.have = false;
-    if (!ReadBytes((uintptr_t)q, g_tpl.query, sizeof g_tpl.query) || !ReadBytes((uintptr_t)xf, g_tpl.xform, sizeof g_tpl.xform) || !ReadBytes((uintptr_t)col, g_tpl.collector, sizeof g_tpl.collector)
-        || !ReadBytes(hits, g_tpl.hits, sizeof g_tpl.hits) || !ReadBytes(shape, g_tpl.shape, sizeof g_tpl.shape)) return;
-    g_tpl.world = world; g_tpl.collAddr = (uintptr_t)col; g_tpl.hitsAddr = hits; g_tpl.shapeAddr = shape; g_tpl.have = true;
+    CastTemplate next;
+    if (!ReadBytes((uintptr_t)q, next.query, sizeof next.query) || !ReadBytes((uintptr_t)xf, next.xform, sizeof next.xform) || !ReadBytes((uintptr_t)col, next.collector, sizeof next.collector)
+        || !ReadBytes(hits, next.hits, sizeof next.hits) || !ReadBytes(shape, next.shape, sizeof next.shape)) return;
+    next.world = world; next.collAddr = (uintptr_t)col; next.hitsAddr = hits; next.shapeAddr = shape; next.have = true;
+    { std::lock_guard<std::mutex> operation(g_groundOpMutex); std::lock_guard<std::mutex> lock(g_tplMutex);
+      if (g_tpl.world != world || g_tpl.have) return; // superseded capture; publish only to its observed world
+      g_tpl = next; g_probeCalibrated = false;
+    }
     Log("[probe] template captured: collector %p hits %p (delta 0x%llx) shape %p (%s)", col, (void*)hits, (unsigned long long)(hits - (uintptr_t)col), (void*)shape, RttiName(shape) ? RttiName(shape) : "?");
 }
 static uintptr_t FindPatternCount(const char* pat, int* count);
@@ -1569,35 +3447,55 @@ static void LogSpawnTransforms(const char* what, uintptr_t save, uintptr_t s8, u
 // SpawnAt queues them here; the ServerField tick (slot 9, server thread) spawns one per tick from the newest usable capture
 // (a level streaming spawn, else a housing placement) with the prefab, position, rotation and scale swapped in. A refused replay
 // keeps a plain client stand-in visible while newer/different captures are retried. Moves remove + respawn (final only), deletes remove the actor.
-struct GimmickReq { int uid; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; bool directTried = false; };
+struct GimmickReq { int uid; uint64_t gen; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; bool noDirect = false; MoveCompletion done; };
 static const size_t kGimmickMaxTries = 3;   // refusals with different templates before an interactive prefab becomes a plain object
 static std::deque<GimmickReq> g_gimmickQueue; static std::mutex g_gimmickQueueMutex;
 static std::deque<std::function<void()>> g_serverJobs; static std::mutex g_serverJobsMutex;
-static void RunOnServerTick(std::function<void()> f) { std::lock_guard<std::mutex> l(g_serverJobsMutex); g_serverJobs.push_back(std::move(f)); }
-static void EnqueueGimmick(int uid, const std::string& prefab, Vec3 pos, Rot rot, float scale) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back({ uid, prefab, pos, rot, scale, {} }); }
+static void RunOnServerTick(std::function<void()> f) { NoteWorkQueued(); std::lock_guard<std::mutex> l(g_serverJobsMutex); g_serverJobs.push_back(std::move(f)); }
+static void EnqueueGimmick(int uid, uint64_t gen, const std::string& prefab, Vec3 pos, Rot rot, float scale, MoveCompletion done) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back({ uid, gen, prefab, pos, rot, scale, {}, false, std::move(done) }); }
 int GimmickPending() { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); return (int)g_gimmickQueue.size(); }
-static bool MoveGimmick(size_t idx, Vec3 pos, Rot rot, float scale, bool final) {
+// game thread: the interactive lane of an admitted move. The job carries (uid, generation); the pose was stored by
+// the admission. Only the lane transitions (server object -> client stand-in on the first live move, stand-in ->
+// server object on the final move) replace the physical object, and the admission renewed the generation for those.
+static void MoveGimmickJob(int uid, uint64_t gen, bool final, MoveCompletion done, const MoveReq* target) {
     // While an interactive object is dragged it cannot follow the mouse (a server object only moves by remove + respawn), so
     // the first live move takes it away and puts a plain client object of the same prefab in its place; that one follows the
     // drag like any other object, and the release removes it and spawns the interactive object at the final transform.
-    int uid = 0; uintptr_t actor = 0, obj = 0; std::string prefab; bool standin = false;
-    { std::lock_guard<std::mutex> l(g_regMutex); if (idx >= g_reg.size() || !g_reg[idx].gimmick) return false;
-      SpawnedObj& e = g_reg[idx]; e.pos = pos; e.rot = rot; e.scale = scale; uid = e.uid; actor = e.actor; obj = e.obj; prefab = e.prefab; standin = e.standin;
+    uintptr_t actor = 0, obj = 0; std::string prefab; bool standin = false; Vec3 pos; Rot rot; float scale = 1;
+    { REG_LOCK; const int i = IndexOfUidLocked(uid);
+      if (i < 0 || g_reg[(size_t)i].gen != gen || g_reg[(size_t)i].hidden || !g_reg[(size_t)i].gimmick) return;
+      SpawnedObj& e = g_reg[(size_t)i];
+      actor = e.actor; obj = e.obj; prefab = e.prefab; standin = e.standin;
+      pos = e.pos; rot = e.rot; scale = e.scale;   // the admitted pose, stored by AdmitMoveLocked
       if (!final) { if (!standin) { e.standin = true; e.actor = 0; e.obj = 0; } }
-      else { MarkDirtyLocked(e.proj); e.standin = false; e.actor = 0; e.obj = 0; } }
+      else { e.standin = false; e.actor = 0; e.obj = 0; } }
+    if (target) { pos = target->pos; rot = target->rot; scale = target->scale; }
     if (!final) {
         if (!standin) {
             { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); for (auto it = g_gimmickQueue.begin(); it != g_gimmickQueue.end(); ) it = it->uid == uid ? g_gimmickQueue.erase(it) : it + 1; }   // not yet spawned: it must not appear under the stand-in
             if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
-            if (GameThreadReady()) RunOnGameThread([prefab, pos, rot, scale, uid]() { DoSpawn(prefab, pos, rot, scale, uid); });
-        } else if (obj && GameThreadReady() && InterlockedCompareExchange(&g_queueCount, 0, 0) <= 2) { const DWORD now = GetTickCount(); RunOnGameThread([obj, pos, rot, scale, now]() { DoLiveMove(obj, pos, rot, scale, now); }); }
-        return true;
+            if (GameThreadReady()) RunOnGameThread([uid, gen]() { DoSpawn(uid, gen, PlaceLaneStandin); });   // the client stand-in, same generation
+        } else if (obj && GameThreadReady() && InterlockedCompareExchange(&g_queueCount, 0, 0) <= 2) RunOnGameThread([uid, gen]() { ApplyMove(uid, gen, false); });
+        return;
+    }
+    if (done) {
+        auto refused = [uid, gen, obj, actor, standin, done]() {
+            { REG_LOCK; if (GenCurrentLocked(uid, gen)) { auto& e = g_reg[(size_t)IndexOfUidLocked(uid)]; e.obj = obj; e.actor = actor; e.standin = standin; } }
+            done(false);
+        };
+        if (standin && obj && !DoRemove(obj)) { refused(); return; }
+        if (actor) RunOnServerTick([uid, gen, prefab, pos, rot, scale, actor, done, refused]() {
+            if (!RemoveSpawnedActor(actor)) { refused(); return; }
+            EnqueueGimmick(uid, gen, prefab, pos, rot, scale, done);
+        });
+        else EnqueueGimmick(uid, gen, prefab, pos, rot, scale, done);
+        return;
     }
     if (standin && obj && GameThreadReady()) RunOnGameThread([obj]() { DoRemove(obj); });
     if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); for (auto it = g_gimmickQueue.begin(); it != g_gimmickQueue.end(); ) it = it->uid == uid ? g_gimmickQueue.erase(it) : it + 1; }   // an older pending spawn of it is void
-    EnqueueGimmick(uid, prefab, pos, rot, scale);
-    return true;
+    EnqueueGimmick(uid, gen, prefab, pos, rot, scale, std::move(done));
+    return;
 }
 static float g_replayQuat[4] = { 0, 0, 0, 1 }; static float g_replayScale = 1.0f; static bool g_replayUseRot = false;   // MakeCopy: also swap rotation and scale
 static uintptr_t g_replayResultSo = 0, g_replayResultActor = 0;   // what the last replay created
@@ -1820,6 +3718,7 @@ static void CheckReplayWatchdog() {
     LogStuckStack(g_spawnWindowThread);
 }
 static const DWORD kTemplateSettleMs = 2000;
+#ifndef WB_UNIFIED_HOST_TEST
 static bool FindTemplateCapture(GimmickCapture& out, const std::vector<int>* avoid = nullptr) {
     std::lock_guard<std::mutex> l(g_gringMutex);
     auto usable = [&](const GimmickCapture& c) {
@@ -1843,25 +3742,46 @@ static bool FindTemplateCapture(GimmickCapture& out, const std::vector<int>* avo
     }
     return false;
 }
+#else
+// Host: a template capture is the seam's business; the retry/stand-in/attachment bookkeeping below stays production.
+static bool FindTemplateCapture(GimmickCapture& out, const std::vector<int>* avoid = nullptr) {
+    (void)avoid;
+    if (!host::Seam().templateReady || !host::Seam().templateReady()) return false;
+    out = GimmickCapture{};
+    out.id = host::Seam().nextTemplateId++; out.valid = true; out.when = GetTickCount();
+    return true;
+}
+#endif
 bool GimmickTemplateReady() { GimmickCapture c; return FindTemplateCapture(c); }
 static void ProcessServerJobs() {   // a bounded number per tick: a batch of hundreds of NPC spawns must not stall the server thread in one tick
     for (int n = 0; n < 8; n++) { std::function<void()> job; { std::lock_guard<std::mutex> l(g_serverJobsMutex); if (g_serverJobs.empty()) return; job = std::move(g_serverJobs.front()); g_serverJobs.pop_front(); } job(); }
 }
 static uintptr_t kRva_GimmickFromSave = 0, g_scopeAttacherVt = 0;
 static volatile DWORD g_gameSpawnTick = 0;   // last spawn the game made itself (HookGimmickSpawn)
+static bool GimmickWorldQuiet(DWORD now, DWORD since, DWORD lastSpawn) {
+    return since && now - since >= 10000 && now - lastSpawn >= 3000;
+}
 static volatile uintptr_t g_serverFieldObj = 0;   // the ServerField whose slot 9 tick runs our server jobs
 static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uintptr_t* soOut, uintptr_t* actOut);   // below
 static void ProcessGimmickQueue() {   // server thread, one object per tick
     GimmickReq r; size_t pending = 0;
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty()) return; r = g_gimmickQueue.front(); pending = g_gimmickQueue.size(); }
+    int proj = 0; bool current;
+    { REG_LOCK; current = GenCurrentLocked(r.uid, r.gen); if (current) proj = g_reg[(size_t)IndexOfUidLocked(r.uid)].proj; }
+    if (!current) {
+        std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
+        if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid && g_gimmickQueue.front().gen == r.gen) g_gimmickQueue.pop_front();
+        return;
+    }
+    auto nativeWork = TrackProjectNativeWork(proj);
     // A refused replay queued a plain stand-in on the game thread. Until it exists, a retry would spawn a second stand-in whose
     // registration overwrites the first one (left in the world, no longer selectable or deletable): wait for it.
     bool standinPending = false;
-    { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid);
-      standinPending = i >= 0 && !g_reg[(size_t)i].hidden && g_reg[(size_t)i].standin && !g_reg[(size_t)i].obj && !r.triedTemplates.empty(); }
+    { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
+      standinPending = i >= 0 && !g_reg[(size_t)i].hidden && g_reg[(size_t)i].gen == r.gen && g_reg[(size_t)i].standin && !g_reg[(size_t)i].obj && !r.triedTemplates.empty(); }
     if (standinPending) {
         std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
-        if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); }
+        if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid && g_gimmickQueue.front().gen == r.gen) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); }
         return;
     }
     // Template-free first: the game's own "gimmick from save data" builder with the prefab's gimmickinfo key and the level spawn
@@ -1872,44 +3792,130 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     // logs: tower and airship parts, stuck stack ...278d6d3 -> 2af9d17 -> 27a4a7c -> 2792ae4 -> 27a208f -> 2a99a95 -> 1851084).
     // Wait until the player has been in the world for 10 s and the game spawned nothing of its own for 3 s.
     const DWORD nowQ = GetTickCount();
-    const bool worldQuiet = g_worldSince && nowQ - g_worldSince >= 10000 && nowQ - g_gameSpawnTick >= 3000;
-    const bool directWanted = !r.directTried && kRva_GimmickFromSave && g_serverFieldObj;
+    const bool worldQuiet = GimmickWorldQuiet(nowQ, g_worldSince, g_gameSpawnTick);
+    const bool directWanted = !r.noDirect && kRva_GimmickFromSave && g_serverFieldObj;
     if (directWanted && !worldQuiet) {
         static DWORD s_lastWaitLog = 0; if (nowQ - s_lastWaitLog > 10000) { s_lastWaitLog = nowQ; Log("[gimmick] %zu interactive object%s waiting until the world has finished loading", pending, pending == 1 ? "" : "s"); }
         return;
     }
     if (const uint32_t gkey = directWanted ? thumbgen::GimmickKey(r.prefab) : 0) {
-        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid) return; g_gimmickQueue.pop_front(); }
-        uintptr_t standin = 0;
-        { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return;
-          if (g_reg[(size_t)i].standin) { standin = g_reg[(size_t)i].obj; g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].standin = false; } }
-        if (standin && GameThreadReady()) RunOnGameThread([standin]() { DoRemove(standin); });
+        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid || g_gimmickQueue.front().gen != r.gen) return; g_gimmickQueue.pop_front(); }
+        // B2: capture the owning row under the registry lock, then reserve one strong in-flight attempt
+        // obligation under the request mutex (no engine or queue calls while holding it), then revalidate the
+        // incarnation. The reservation is held across the native call so a cancel racing inside it can never
+        // observe a transient settled=true.
+        std::weak_ptr<PlaceRequest> flightReqw; int flightRow = -1;
+        { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
+          if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].gen != r.gen) return;   // hidden, forgotten or restored meanwhile
+          flightReqw = g_reg[(size_t)i].placeReq; flightRow = g_reg[(size_t)i].placeRow; }
+        const std::shared_ptr<PlaceRequest> flightReq = flightReqw.lock();
+        C5AddObligation(flightReq, flightRow);
+        uintptr_t standin = 0; bool staleDirect = false;
+        { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
+          if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].gen != r.gen) staleDirect = true;
+          else if (g_reg[(size_t)i].standin) { standin = g_reg[(size_t)i].obj; g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].standin = false; } }
+        if (staleDirect) { C5ReleaseObligation(flightReq, flightRow); return; }   // outside REG_LOCK: no registry -> request nesting
+        if (standin) {   // the retired placeholder's removal is tracked like any other outstanding cleanup
+            if (flightReq) C5QueueChargedGameRemove(flightReq, flightRow, standin);
+            else if (GameThreadReady()) RunOnGameThread([standin]() { DoRemove(standin); });
+        }
         strncpy_s(g_replayWatchPrefab, r.prefab.c_str(), _TRUNCATE);
         uintptr_t so = 0, actor = 0;
-        if (DirectGimmickSpawn(gkey, r.pos, r.rot, r.scale, &so, &actor)) {
-            std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid);
-            if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].standin) { if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); return; }   // deleted or picked up while spawning
-            g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale;
+#ifdef WB_UNIFIED_HOST_TEST
+        const bool directOk = host::Seam().directGimmick ? host::Seam().directGimmick(r.prefab, r.pos, r.rot, r.scale, &so, &actor) : false;
+#else
+        const bool directOk = DirectGimmickSpawn(gkey, r.pos, r.rot, r.scale, &so, &actor);
+#endif
+        if (directOk) {
+            bool attached = false; std::weak_ptr<PlaceRequest> reqw; int rowId = -1;
+            { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
+              if (i >= 0 && !g_reg[(size_t)i].hidden && g_reg[(size_t)i].gen == r.gen && !g_reg[(size_t)i].standin) {
+                  g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale; attached = true;
+                  reqw = g_reg[(size_t)i].placeReq; rowId = g_reg[(size_t)i].placeRow; } }
+            if (!attached) {   // deleted, picked up, restored or superseded while spawning: dispose BOTH rejected handles, outside the lock
+                // B2: one obligation per rejected handle BEFORE queueing its removal; each lane completion
+                // releases its own after dispatch, and the in-flight reservation is released only after the
+                // handoff, so the sum never touches zero while cleanup is still queued.
+                if (flightReq) {
+                    if (actor) C5AddObligation(flightReq, flightRow);
+                    if (so && GameThreadReady()) C5AddObligation(flightReq, flightRow);
+                }
+                if (actor) RunOnServerTick([actor, flightReq, flightRow]() { RemoveSpawnedActor(actor); C5ReleaseObligation(flightReq, flightRow); });
+                if (so && GameThreadReady()) RunOnGameThread([so, flightReq, flightRow]() { DoRemove(so); C5ReleaseObligation(flightReq, flightRow); });
+                C5ReleaseObligation(flightReq, flightRow);
+                return;
+            }
+            if (r.done) r.done(true);
+            const bool notedDirect = rowId >= 0 ? NoteAttachOnce(reqw, rowId, PlaceLaneDirect, r.uid) : true;
+            if (!notedDirect && C5RowDead(reqw, rowId)) {
+                // B2-R1: the row died while the native call ran (e.g. canceled with row.uid == 0, so no hide
+                // could invalidate the record) and the handles were just written into it. Take them back only
+                // if this attempt still owns them, tombstone the record, and dispose both through the charged
+                // rejected-handle path. An already Attached row (e.g. a drag-finalize re-attachment) keeps them.
+                bool rolledBack = false;
+                { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
+                  if (i >= 0 && g_reg[(size_t)i].gen == r.gen && g_reg[(size_t)i].obj == so && g_reg[(size_t)i].actor == actor) {
+                      g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].actor = 0; g_reg[(size_t)i].hidden = true; g_reg[(size_t)i].gen = NewGenLocked();
+                      rolledBack = true; } }
+                if (rolledBack) {
+                    if (flightReq) {
+                        if (actor) C5AddObligation(flightReq, flightRow);
+                        if (so && GameThreadReady()) C5AddObligation(flightReq, flightRow);
+                    }
+                    if (actor) RunOnServerTick([actor, flightReq, flightRow]() { RemoveSpawnedActor(actor); C5ReleaseObligation(flightReq, flightRow); });
+                    if (so && GameThreadReady()) RunOnGameThread([so, flightReq, flightRow]() { DoRemove(so); C5ReleaseObligation(flightReq, flightRow); });
+                }
+                // else: a racing hide already took the handles and owns their cleanup; only the attempt ends.
+                C5ReleaseObligation(flightReq, flightRow);
+                return;
+            }
+            C5ReleaseObligation(flightReq, flightRow);
             Log("[gimmick] object %d spawned directly (no template): %s key %u (scene object %p, actor %p)", r.uid, r.prefab.c_str(), gkey, (void*)so, (void*)actor);
             return;
         }
+        // B2-R1: a row that died while the native call ran must not fall through to the template replay;
+        // tombstone the record instead.
+        const bool deadDirect = C5RowDead(flightReqw, flightRow);
+        C5ReleaseObligation(flightReq, flightRow);   // the builder refused: no handles, the template replay takes over
+        if (deadDirect) { HideUid(r.uid); return; }
         Log("[gimmick] object %d: direct spawn of %s failed, the template replay takes over", r.uid, r.prefab.c_str());
-        r.directTried = true; std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); return;
+        r.noDirect = true; std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); return;
     }
     GimmickCapture t;
     if (!FindTemplateCapture(t, r.triedTemplates.empty() ? nullptr : &r.triedTemplates)) {
         static DWORD lastLog = 0; if (GetTickCount() - lastLog > 15000) { lastLog = GetTickCount();
             Log(r.triedTemplates.empty() ? "[gimmick] %zu interactive object%s waiting for a spawn template (the game spawns one when you walk)" : "[gimmick] %zu interactive object%s waiting for a fresh spawn template after a replay was refused", pending, pending == 1 ? "" : "s"); }
-        if (!r.triedTemplates.empty()) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); } }
+        if (!r.triedTemplates.empty()) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid && g_gimmickQueue.front().gen == r.gen) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); } }
         return;
     }
     { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.pop_front(); }
-    uintptr_t waitingStandin = 0;
-    { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return;
+    // B2: the same in-flight attempt reservation as the direct path above.
+    std::weak_ptr<PlaceRequest> flightReqw; int flightRow = -1;
+    { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
+      if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].gen != r.gen) return;
+      flightReqw = g_reg[(size_t)i].placeReq; flightRow = g_reg[(size_t)i].placeRow; }
+    const std::shared_ptr<PlaceRequest> flightReq = flightReqw.lock();
+    C5AddObligation(flightReq, flightRow);
+#ifdef WB_UNIFIED_HOST_TEST
+    if (g_replayRevalidateProbe) g_replayRevalidateProbe();   // D1 seam (null unless a host test arms it): runs with no locks held, between flight capture and replay revalidation
+#endif
+    uintptr_t waitingStandin = 0; bool staleReplay = false;
+    { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
+      if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].gen != r.gen) staleReplay = true;
       // A stand-in plus a queue entry means a previous server replay failed and left a visible client placeholder. Active dragging
       // removes the queue entry, so it never reaches this path. Retire the placeholder before retrying the interactive spawn.
-      if (g_reg[(size_t)i].standin) { waitingStandin = g_reg[(size_t)i].obj; g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].standin = false; } }
-    if (waitingStandin && GameThreadReady()) RunOnGameThread([waitingStandin]() { DoRemove(waitingStandin); });
+      // D1: guarded — a stale record must never retire a current-generation stand-in.
+      else if (g_reg[(size_t)i].standin) { waitingStandin = g_reg[(size_t)i].obj; g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].standin = false; } }
+    if (staleReplay) { C5ReleaseObligation(flightReq, flightRow); return; }   // outside REG_LOCK: no registry -> request nesting
+    if (waitingStandin) {   // the retired placeholder's removal is tracked like any other outstanding cleanup
+        if (flightReq) C5QueueChargedGameRemove(flightReq, flightRow, waitingStandin);
+        else if (GameThreadReady()) RunOnGameThread([waitingStandin]() { DoRemove(waitingStandin); });
+    }
+    uintptr_t so = 0, actor = 0;
+#ifdef WB_UNIFIED_HOST_TEST
+    g_gimmickReplayId = t.id; g_gimmickReplayAt = r.pos;
+    if (host::Seam().replay) host::Seam().replay(t.id, r.prefab, r.pos, r.rot, r.scale, &so, &actor);
+#else
     char saved[256]; memcpy(saved, g_replayPrefab, sizeof saved); strncpy_s(g_replayPrefab, r.prefab.c_str(), _TRUNCATE);
     float xf[12]; MakeTransform(xf, r.pos, r.rot, r.scale, false); memcpy(g_replayQuat, xf + 3, 16); g_replayScale = r.scale; g_replayUseRot = true;
     g_gimmickReplayId = t.id; g_gimmickReplayAt = r.pos;
@@ -1918,14 +3924,57 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
     ReplayGimmick();
     g_replayWatchTick = 0;
     g_replayUseRot = false; memcpy(g_replayPrefab, saved, sizeof saved);
-    const uintptr_t so = g_replayResultSo, actor = g_replayResultActor;
+    so = g_replayResultSo; actor = g_replayResultActor;
+#endif
     if (so) {
-        std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid);
-        if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].standin) { if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); }); return; }   // deleted or picked up while spawning
-        g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale;
+        bool attached = false; std::weak_ptr<PlaceRequest> reqw; int rowId = -1;
+        { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
+          if (i >= 0 && !g_reg[(size_t)i].hidden && g_reg[(size_t)i].gen == r.gen && !g_reg[(size_t)i].standin) {
+              g_reg[(size_t)i].obj = so; g_reg[(size_t)i].actor = actor; g_reg[(size_t)i].colRot = r.rot; g_reg[(size_t)i].colScale = r.scale; attached = true;
+              reqw = g_reg[(size_t)i].placeReq; rowId = g_reg[(size_t)i].placeRow; } }
+        if (!attached) {   // superseded while replaying: dispose BOTH rejected handles, outside the lock
+            // B2: one obligation per rejected handle BEFORE queueing its removal; each lane completion
+            // releases its own after dispatch, and the in-flight reservation is released only after the
+            // handoff, so the sum never touches zero while cleanup is still queued.
+            if (flightReq) {
+                if (actor) C5AddObligation(flightReq, flightRow);
+                if (so && GameThreadReady()) C5AddObligation(flightReq, flightRow);
+            }
+            if (actor) RunOnServerTick([actor, flightReq, flightRow]() { RemoveSpawnedActor(actor); C5ReleaseObligation(flightReq, flightRow); });
+            if (so && GameThreadReady()) RunOnGameThread([so, flightReq, flightRow]() { DoRemove(so); C5ReleaseObligation(flightReq, flightRow); });
+            C5ReleaseObligation(flightReq, flightRow);
+            return;
+        }
+        if (r.done) r.done(true);
+        const bool notedReplay = rowId >= 0 ? NoteAttachOnce(reqw, rowId, PlaceLaneReplay, r.uid) : true;
+        if (!notedReplay && C5RowDead(reqw, rowId)) {
+            // B2-R1: same late-rejection as the direct path above: the row died while the native call ran
+            // and the handles were just written into it. An already Attached row keeps them.
+            bool rolledBack = false;
+            { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
+              if (i >= 0 && g_reg[(size_t)i].gen == r.gen && g_reg[(size_t)i].obj == so && g_reg[(size_t)i].actor == actor) {
+                  g_reg[(size_t)i].obj = 0; g_reg[(size_t)i].actor = 0; g_reg[(size_t)i].hidden = true; g_reg[(size_t)i].gen = NewGenLocked();
+                  rolledBack = true; } }
+            if (rolledBack) {
+                if (flightReq) {
+                    if (actor) C5AddObligation(flightReq, flightRow);
+                    if (so && GameThreadReady()) C5AddObligation(flightReq, flightRow);
+                }
+                if (actor) RunOnServerTick([actor, flightReq, flightRow]() { RemoveSpawnedActor(actor); C5ReleaseObligation(flightReq, flightRow); });
+                if (so && GameThreadReady()) RunOnGameThread([so, flightReq, flightRow]() { DoRemove(so); C5ReleaseObligation(flightReq, flightRow); });
+            }
+            C5ReleaseObligation(flightReq, flightRow);
+            return;
+        }
+        C5ReleaseObligation(flightReq, flightRow);
         if (g_goodTemplateId != t.id) { g_goodTemplateId = t.id; Log("[gimmick] capture %d is the proven template now", t.id); }
         Log("[gimmick] object %d spawned through the game: %s (scene object %p, actor %p)", r.uid, r.prefab.c_str(), (void*)so, (void*)actor);
     } else {
+        // B2-R1: a row that died while the native call ran must not be retried behind a fresh stand-in;
+        // tombstone the record instead.
+        const bool deadReplay = C5RowDead(flightReqw, flightRow);
+        C5ReleaseObligation(flightReq, flightRow);   // refused: no handles, the stand-in retry takes over
+        if (deadReplay) { HideUid(r.uid); return; }
         r.triedTemplates.push_back(t.id);
         if (g_goodTemplateId == t.id) g_goodTemplateId = 0;   // the proven template failed: the next object searches a new one
         // A refusal can depend on the template (captures change as the player moves), so a few different ones are tried; a
@@ -1933,9 +3982,10 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
         const bool giveUp = r.triedTemplates.size() >= kGimmickMaxTries;
         if (giveUp) Log("[gimmick] object %d: %s refused with %zu different templates, placing it as a plain object", r.uid, r.prefab.c_str(), r.triedTemplates.size());
         else Log("[gimmick] object %d: replay with template %d was refused; a plain stand-in waits for another template (try %zu of %d)", r.uid, t.id, r.triedTemplates.size(), kGimmickMaxTries);
-        { std::lock_guard<std::mutex> l(g_regMutex); const int i = IndexOfUidLocked(r.uid); if (i < 0 || g_reg[(size_t)i].hidden) return;
+        { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
+          if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].gen != r.gen) return;
           SpawnedObj& e = g_reg[(size_t)i]; e.standin = !giveUp; e.obj = 0; e.actor = 0; if (giveUp) e.gimmick = false; }
-        if (GameThreadReady()) RunOnGameThread([r]() { DoSpawn(r.prefab, r.pos, r.rot, r.scale, r.uid); });
+        if (GameThreadReady()) RunOnGameThread([uid = r.uid, gen = r.gen, lane = giveUp ? PlaceLanePlain : PlaceLaneStandin, retry = !giveUp, done = r.done, target = MoveReq{ r.uid, r.pos, r.rot, r.scale }]() { DoSpawn(uid, gen, lane, done, done ? &target : nullptr, retry); });   // the plain stand-in (retry) or the accepted plain-object fallback (budget spent)
         if (!giveUp) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); }
     }
 }
@@ -1962,7 +4012,6 @@ static bool CallGimmickFromSave(void* field, uint8_t* save, void* holder, bool* 
     CDK_GUARD_BEGIN *ok = ((Fn)(g_base + kRva_GimmickFromSave))(field, save, 0, 0, 8, holder); return true;
     CDK_GUARD_FAIL { EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); } return false;
     CDK_GUARD_END
-    return false;
 }
 // The spawn reason byte (desc+0xA) decides what the gimmick becomes: with 0 a campfire cannot be cooked on and a bed not slept
 // in (boxes and torches work either way); the level spawn passes its own (0x1F in 2976). Read from the level caller's code:
@@ -2185,15 +4234,20 @@ static void ResolveRemovalLoop() {
 }
 static volatile uintptr_t g_removeActorRequest = 0;
 void RequestRemoveSpawned(uintptr_t actor) { g_removeActorRequest = actor; Log("[remove] removal of actor %p requested (runs on the next server tick)", (void*)actor); }
-static void RemoveSpawnedActor(uintptr_t actor) {
-    if (!actor || !RttiName(actor)) { Log("[remove] actor %p: no RTTI, not touched", (void*)actor); return; }
+static bool RemoveSpawnedActor(uintptr_t actor) {
+#ifdef WB_UNIFIED_HOST_TEST
+    const bool removed = actor && host::Seam().removeActor && host::Seam().removeActor(actor);
+    if (removed) { REG_LOCK; g_managedNpcActors.erase(actor); }
+    return removed;
+#else
+    if (!actor || !RttiName(actor)) { Log("[remove] actor %p: no RTTI, not touched", (void*)actor); return false; }
     {   // does this actor refer to the scene object our replay made? (a wrong actor must not be touched)
         uintptr_t so = 0; { std::lock_guard<std::mutex> l(g_spawnedMutex); for (const auto& g : g_spawned) if (g.actor == actor) so = g.so; }
         int found = -1; { int w = 0; if (ActorRefersTo(actor, so, &w)) found = w; }
         const bool managedNpc = IsManagedNpcActor(actor);
         Log("[remove] actor %p refers to scene object %p: %s", (void*)actor, (void*)so, found < 0 ? (managedNpc ? "managed World Builder NPC" : IsOurActor(actor) ? "not by pointer, but it was constructed during our replay" : "NOT FOUND (wrong actor?)") : "yes");
         if (found >= 0) Log("[remove]   at actor+0x%x%s%s", found & 0xFFF, (found >> 12) & 0xFF ? " -> +0x.." : "", (found >> 20) ? " -> +0x.. (two pointers deep)" : "");
-        if (found < 0 && !IsOurActor(actor) && !managedNpc) return;
+        if (found < 0 && !IsOurActor(actor) && !managedNpc) return false;
     }
     const bool tr = g_trace; g_trace = true; g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount(); WatchObject(actor);   // the removal traces itself
     struct Restore { bool tr; ~Restore() { g_trace = tr; } } restore{ tr };
@@ -2202,7 +4256,7 @@ static void RemoveSpawnedActor(uintptr_t actor) {
     typedef void* (__fastcall* F1)(void*); typedef void* (__fastcall* F2)(void*, void*);
     uintptr_t lockObj = actor + 0x18; uintptr_t lvt = 0; ReadBytes(lockObj, &lvt, 8); uintptr_t vt = 0; ReadBytes(actor, &vt, 8);
     uintptr_t lockF = 0, unlockF = 0, f16 = 0, f34 = 0; ReadBytes(lvt + 8, &lockF, 8); ReadBytes(lvt + 0x10, &unlockF, 8); ReadBytes(vt + 0x80, &f16, 8); ReadBytes(vt + 0x110, &f34, 8);
-    if (!InImage(lockF) || !InImage(unlockF) || !InImage(f16) || !InImage(f34)) { Log("[remove] unexpected vtables, not touched"); return; }
+    if (!InImage(lockF) || !InImage(unlockF) || !InImage(f16) || !InImage(f34)) { Log("[remove] unexpected vtables, not touched"); return false; }
     ((F1)lockF)((void*)lockObj);
     memcpy((void*)(actor + 0x98), &reason, 4); uint8_t zero = 0; memcpy((void*)(actor + 0x9C), &zero, 1); memcpy((void*)(actor + 0x5C), &st, 2);
     ((F1)f16)((void*)actor);
@@ -2211,6 +4265,8 @@ static void RemoveSpawnedActor(uintptr_t actor) {
     Log("[remove] vtable[34] result %d (%s)", result, DecodeErr((uint32_t)result).c_str());
     { std::lock_guard<std::mutex> l(g_regMutex); g_managedNpcActors.erase(actor); }
     std::lock_guard<std::mutex> l(g_spawnedMutex); for (auto it = g_spawned.begin(); it != g_spawned.end(); ++it) if (it->actor == actor) { g_spawned.erase(it); break; }
+    return result == 0;
+#endif
 }
 int SpawnedList(SpawnedInfo* out, int max) {
     std::lock_guard<std::mutex> l(g_spawnedMutex); int n = 0;
@@ -2790,7 +4846,6 @@ static bool CallNpcExecute(void* pkt, int* res) {   // guarded: a wrong packet m
     CDK_GUARD_BEGIN ((Exec)g_npcExecute)((void*)g_npcHandler, res, pkt); return true;
     CDK_GUARD_FAIL { EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); NpcUnwind(ep.ContextRecord); } return false;
     CDK_GUARD_END
-    return false;
 }
 static bool CallNpcAiExecute(void* pkt, int* res) {
     if (!g_npcAiExecute || !g_npcAiHandler) return false;
@@ -2798,7 +4853,6 @@ static bool CallNpcAiExecute(void* pkt, int* res) {
     CDK_GUARD_BEGIN ((Exec)g_npcAiExecute)((void*)g_npcAiHandler, res, pkt); return true;
     CDK_GUARD_FAIL { EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); NpcUnwind(ep.ContextRecord); } return false;
     CDK_GUARD_END
-    return false;
 }
 static uint32_t ManagedNpcActorId(uintptr_t actor) {
     if (!actor || !g_actorRegistryGlobal) return 0;
@@ -2827,7 +4881,12 @@ static uint32_t ManagedNpcActorId(uintptr_t actor) {
     }
     return 0;
 }
-bool NpcAiControlAvailable() { return g_npcAiExecute && g_npcAiHandler && g_actorRegistryGlobal; }
+bool NpcAiControlAvailable() {
+#ifdef WB_UNIFIED_HOST_TEST
+    if (g_managedNpcNativeTest.toggleAi) return true;
+#endif
+    return g_npcAiExecute && g_npcAiHandler && g_actorRegistryGlobal;
+}
 static bool SetNpcAiTerminatedNow(uintptr_t actor, bool terminated) {
     if (!actor || !g_npcAiTerminate) return false;
     typedef void (__fastcall* Fn)(void*, bool);
@@ -2844,6 +4903,9 @@ static bool SetNpcAiTerminatedNow(uintptr_t actor, bool terminated) {
 }
 static bool ToggleNpcAiControlNow(uint32_t actorId) {
     if (!actorId || !NpcAiControlAvailable()) return false;
+#ifdef WB_UNIFIED_HOST_TEST
+    if (g_managedNpcNativeTest.toggleAi) return g_managedNpcNativeTest.toggleAi(actorId);
+#endif
     alignas(16) uint8_t pkt[0x40]; uintptr_t s = 0, vt = 0, cur = 0;
     AcquireSRWLockShared(&g_npcLock);
     memcpy(pkt, g_pktTemplate, sizeof pkt); s = g_serverSession; vt = g_sessionVt;
@@ -2859,15 +4921,15 @@ static bool ToggleNpcAiControlNow(uint32_t actorId) {
     Log("[npc] AI control toggle id 0x%08x: %s, result %d (%s)", actorId, ok ? "executed" : "FAULTED", res, DecodeErr((uint32_t)res).c_str());
     return ok && res == 0;
 }
-static bool SetManagedNpcRuntimeAiNow(int uid, bool enabled) {
-    uintptr_t actor = 0; uint32_t actorId = 0; bool desired = true;
+static bool SetManagedNpcRuntimeAiNow(int uid, bool enabled, uint64_t expectedGen = 0) {
+    uintptr_t actor = 0; uint32_t actorId = 0; bool desired = true; uint64_t gen = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (i < 0) return false;
         const ManagedNpc& n = g_npcReg[i];
-        if (n.hidden || !n.actor) return false;
+        if (n.hidden || !n.actor || (expectedGen && n.gen != expectedGen)) return false;
         if (n.aiApplied == enabled) return true;
-        actor = n.actor; actorId = n.actorId; desired = enabled;
+        actor = n.actor; actorId = n.actorId; desired = enabled; gen = n.gen;
     }
     if (!actorId) {
         actorId = ManagedNpcActorId(actor);
@@ -2880,7 +4942,7 @@ static bool SetManagedNpcRuntimeAiNow(int uid, bool enabled) {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (i < 0) return false;
         ManagedNpc& n = g_npcReg[i];
-        if (n.hidden || n.actor != actor) return false;
+        if (n.hidden || n.actor != actor || n.gen != gen) return false;
         n.actorId = actorId;
         n.aiApplied = desired;
     }
@@ -2953,6 +5015,9 @@ static void QueueManagedNpcAiReconcile() {
     for (int uid : ids) RunOnServerTick([uid]() { SyncManagedNpcAiNow(uid); });
 }
 int NpcState() {
+#ifdef WB_UNIFIED_HOST_TEST
+    if (g_managedNpcNativeTest.state) return g_managedNpcNativeTest.state();
+#endif
     if (!g_npcExecute) return 0;
     AcquireSRWLockShared(&g_npcLock); const bool have = g_serverSession != 0; ReleaseSRWLockShared(&g_npcLock);
     return have ? 2 : 1;
@@ -2992,6 +5057,9 @@ static uintptr_t PickNpcSpawnActor(Vec3 expected, uintptr_t innerActor) {
 }
 static bool SpawnNpcNow(uint32_t key, Vec3 pos, int type, uint32_t extra, uintptr_t* actorOut = nullptr, uint32_t* actorIdOut = nullptr) {
     if (actorOut) *actorOut = 0; if (actorIdOut) *actorIdOut = 0;
+#ifdef WB_UNIFIED_HOST_TEST
+    if (g_managedNpcNativeTest.spawn) return g_managedNpcNativeTest.spawn(key, pos, type, extra, actorOut, actorIdOut);
+#endif
     if (type < 1 || type > 255) type = 1;   // 0 is no valid reason and faults inside the game
     alignas(16) uint8_t pkt[0x40]; uintptr_t s = 0, vt = 0, cur = 0;
     AcquireSRWLockShared(&g_npcLock); memcpy(pkt, g_pktTemplate, sizeof pkt); s = g_serverSession; vt = g_sessionVt; ReleaseSRWLockShared(&g_npcLock);
@@ -3064,25 +5132,26 @@ bool SpawnNpc(uint32_t key, Vec3 pos, int type, uint32_t extra) {
     return true;
 }
 
-static void SpawnManagedNpcNow(int uid) {
+static void SpawnManagedNpcNow(int uid, uint64_t gen) {
     ManagedNpc n;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
-        if (i < 0) return;
-        if (g_npcReg[i].hidden) { g_npcReg[i].spawnPending = false; return; }
+        if (!NpcGenCurrentLocked(uid, gen)) return;
         g_npcReg[i].spawnRequestTick = GetTickCount();
         n = g_npcReg[i];
     }
+    auto nativeWork = TrackProjectNativeWork(n.proj);
+    { REG_LOCK; if (!NpcGenCurrentLocked(uid, gen)) return; }
     uintptr_t actor = 0; uint32_t actorId = 0;
     if (!SpawnNpcNow(n.key, n.pos, n.type, n.extra, &actor, &actorId)) {
-        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i >= 0) { g_npcReg[i].spawnPending = false; g_npcReg[i].spawnRequestTick = 0; }
+        std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (NpcGenCurrentLocked(uid, gen)) { g_npcReg[i].spawnPending = false; g_npcReg[i].spawnRequestTick = 0; }
         return;
     }
     bool discard = false, needAiSync = false;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (actor) g_managedNpcActors.insert(actor);
-        if (i < 0 || g_npcReg[i].hidden) discard = true;
+        if (!NpcGenCurrentLocked(uid, gen)) discard = true;
         else {
             ManagedNpc& live = g_npcReg[i];
             live.actor = actor; live.actorId = actorId; live.transform = actor ? FindActorTransform(actor) : 0;
@@ -3107,47 +5176,47 @@ static void SpawnManagedNpcNow(int uid) {
 }
 static bool QueueManagedNpcIfReady(int uid) {
     if (NpcState() < 2) return false;
-    bool queue = false;
+    bool queue = false; uint64_t gen = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (i >= 0) {
             ManagedNpc& n = g_npcReg[i];
-            if (!n.hidden && !n.actor && !n.spawnPending) { n.spawnPending = true; queue = true; }
+            if (!n.hidden && !n.actor && !n.spawnPending) { n.spawnPending = true; gen = n.gen; queue = true; }
         }
     }
-    if (queue) RunOnServerTick([uid]() { SpawnManagedNpcNow(uid); });
+    if (queue) RunOnServerTick([uid, gen]() { SpawnManagedNpcNow(uid, gen); });
     return queue;
 }
 int SpawnManagedNpc(uint32_t key, Vec3 pos, int type, uint32_t extra, bool aiEnabled, int behavior, int group, int proj, const std::string& label, const std::string& note) {
-    if (!g_npcExecute || !key) return 0;
+    if (NpcState() == 0 || !key) return 0;
     if (type < 1 || type > 255) type = 1; behavior = behavior == 1 ? 1 : 0; if (behavior == 1) aiEnabled = false;
     int uid = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextNpcUid++;
-        ManagedNpc n; n.uid = uid; n.key = key; n.pos = pos; n.type = type; n.extra = extra; n.aiEnabled = aiEnabled; n.behavior = behavior; n.tick = GetTickCount(); n.group = group; n.proj = proj; n.label = label; n.note = note;
+        ManagedNpc n; n.uid = uid; n.gen = NewGenLocked(); n.key = key; n.pos = pos; n.type = type; n.extra = extra; n.aiEnabled = aiEnabled; n.behavior = behavior; n.tick = GetTickCount(); n.group = group; n.proj = proj; n.label = label; n.note = note;
         g_npcReg.push_back(std::move(n)); if (!g_loading) MarkDirtyLocked(proj);
     }
     QueueManagedNpcIfReady(uid);
     return uid;
 }
 static void QueuePendingManagedNpcs() {
-    std::vector<int> pending;
+    std::vector<std::pair<int, uint64_t>> pending;
     {
         std::lock_guard<std::mutex> l(g_regMutex);
-        for (auto& n : g_npcReg) if (!n.hidden && !n.actor && !n.spawnPending) { n.spawnPending = true; pending.push_back(n.uid); }
+        for (auto& n : g_npcReg) if (!n.hidden && !n.actor && !n.spawnPending) { n.spawnPending = true; pending.push_back({ n.uid, n.gen }); }
     }
-    for (int uid : pending) RunOnServerTick([uid]() { SpawnManagedNpcNow(uid); });
+    for (const auto& p : pending) RunOnServerTick([p]() { SpawnManagedNpcNow(p.first, p.second); });
 }
 bool HideManagedNpc(int uid) {
     uintptr_t actor = 0;
     { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || g_npcReg[i].hidden) return false;
-      ManagedNpc& n = g_npcReg[i]; n.hidden = true; actor = n.actor; n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.editMoving = false; n.liveMovePending = false; n.aiApplied = true; MarkDirtyLocked(n.proj); }
+      ManagedNpc& n = g_npcReg[i]; n.hidden = true; n.gen = NewGenLocked(); n.spawnPending = false; actor = n.actor; n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.editMoving = false; n.liveMovePending = false; n.aiApplied = true; MarkDirtyLocked(n.proj); }
     if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });
     return true;
 }
 bool RestoreManagedNpc(int uid) {
     { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || !g_npcReg[i].hidden) return false;
-      g_npcReg[i].hidden = false; MarkDirtyLocked(g_npcReg[i].proj); }
+      g_npcReg[i].hidden = false; g_npcReg[i].gen = NewGenLocked(); g_npcReg[i].spawnPending = false; MarkDirtyLocked(g_npcReg[i].proj); }
     QueueManagedNpcIfReady(uid); return true;
 }
 static bool WriteManagedNpcTransformNow(uintptr_t tf, Vec3 world) {
@@ -3167,7 +5236,7 @@ static bool WriteManagedNpcTransformNow(uintptr_t tf, Vec3 world) {
     return WriteBytes(tf + kOff_Tf_Pos, &packed, sizeof packed);
 }
 bool BeginManagedNpcMove(int uid) {
-    bool queuePause = false;
+    bool queuePause = false; uint64_t gen = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (i < 0) return false; ManagedNpc& n = g_npcReg[i];
@@ -3183,53 +5252,54 @@ bool BeginManagedNpcMove(int uid) {
             if (!n.actorId) n.actorId = ManagedNpcActorId(n.actor);
             if (!n.actorId) { Log("[npc] managed #%d live move: actor id not resolved", uid); return false; }
         }
-        n.editMoving = true; n.liveMoveTarget = n.pos; n.liveMovePending = false;
+        n.editMoving = true; n.liveMoveTarget = n.pos; n.liveMovePending = false; gen = n.gen;
     }
-    if (queuePause) RunOnServerTick([uid]() { SetManagedNpcRuntimeAiNow(uid, false); });
+    if (queuePause) RunOnServerTick([uid, gen]() { SetManagedNpcRuntimeAiNow(uid, false, gen); });
     return true;
 }
-static void QueueManagedNpcLiveWrite(int uid, uintptr_t tf) {
-    RunOnServerTick([uid, tf]() {
-        Vec3 world{};
+static void QueueManagedNpcLiveWrite(int uid, uintptr_t tf, uint64_t gen) {
+    RunOnServerTick([uid, tf, gen]() {
+        Vec3 world{}; int proj = 0;
         {
             std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
-            if (i < 0) return; ManagedNpc& n = g_npcReg[i];
+            if (!NpcGenCurrentLocked(uid, gen)) return; ManagedNpc& n = g_npcReg[i];
             if (n.transform == tf) n.liveMovePending = false;
-            if (n.hidden || !n.editMoving || n.transform != tf) return;
-            world = n.liveMoveTarget;
+            if (!n.editMoving || n.transform != tf) return;
+            world = n.liveMoveTarget; proj = n.proj;
         }
+        auto work = TrackProjectNativeWork(proj);
         if (!WriteManagedNpcTransformNow(tf, world))
             Log("[npc] managed #%d live move could not write TransformSync", uid);
     });
 }
 bool MoveManagedNpcLive(int uid, Vec3 world) {
-    uintptr_t tf = 0; bool queue = false;
+    uintptr_t tf = 0; bool queue = false; uint64_t gen = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (i < 0 || !g_npcReg[i].editMoving || g_npcReg[i].hidden) return false;
-        ManagedNpc& n = g_npcReg[i]; tf = n.transform; n.liveMoveTarget = world;
+        ManagedNpc& n = g_npcReg[i]; tf = n.transform; n.liveMoveTarget = world; gen = n.gen;
         if (!n.liveMovePending) { n.liveMovePending = true; queue = true; }
     }
-    if (queue) QueueManagedNpcLiveWrite(uid, tf);
+    if (queue) QueueManagedNpcLiveWrite(uid, tf, gen);
     return true;
 }
 bool CommitManagedNpcMove(int uid, Vec3 world) {
-    uintptr_t tf = 0; bool queue = false;
+    uintptr_t tf = 0; bool queue = false; uint64_t gen = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (i < 0 || !g_npcReg[i].editMoving || g_npcReg[i].hidden) return false;
-        ManagedNpc& n = g_npcReg[i]; n.pos = world; n.liveMoveTarget = world; tf = n.transform; MarkDirtyLocked(n.proj);
+        ManagedNpc& n = g_npcReg[i]; n.pos = world; n.liveMoveTarget = world; tf = n.transform; gen = n.gen; MarkDirtyLocked(n.proj);
         if (!n.liveMovePending) { n.liveMovePending = true; queue = true; }
     }
-    if (queue) QueueManagedNpcLiveWrite(uid, tf);
+    if (queue) QueueManagedNpcLiveWrite(uid, tf, gen);
     return true;
 }
 bool EndManagedNpcMove(int uid, Vec3 world) {
-    uintptr_t tf = 0; bool moving = false;
+    uintptr_t tf = 0; bool moving = false; uint64_t gen = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
         if (i < 0 || g_npcReg[i].hidden) return false; ManagedNpc& n = g_npcReg[i];
-        moving = n.editMoving; tf = n.transform;
+        moving = n.editMoving; tf = n.transform; gen = n.gen;
     }
     if (!moving || !tf) return MoveManagedNpc(uid, world);
     {
@@ -3237,31 +5307,34 @@ bool EndManagedNpcMove(int uid, Vec3 world) {
         if (i < 0 || g_npcReg[i].hidden) return false;
         g_npcReg[i].pos = world; g_npcReg[i].liveMoveTarget = world; MarkDirtyLocked(g_npcReg[i].proj);
     }
-    RunOnServerTick([uid, tf, world]() {
+    RunOnServerTick([uid, tf, world, gen]() {
+        int proj = 0;
         {
             std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
-            if (i < 0 || g_npcReg[i].hidden || !g_npcReg[i].editMoving || g_npcReg[i].transform != tf) return;
+            if (!NpcGenCurrentLocked(uid, gen) || !g_npcReg[i].editMoving || g_npcReg[i].transform != tf) return;
+            proj = g_npcReg[i].proj;
         }
+        auto work = TrackProjectNativeWork(proj);
         const bool moved = WriteManagedNpcTransformNow(tf, world);
-        bool desired = true; uintptr_t actor = 0;
+        bool desired = true; uintptr_t actor = 0; uint64_t nextGen = gen;
         {
             std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
             if (i < 0) return; ManagedNpc& n = g_npcReg[i];
-            if (n.hidden || !n.editMoving || n.transform != tf) return;
+            if (n.hidden || n.gen != gen || !n.editMoving || n.transform != tf) return;
             desired = n.aiEnabled; n.editMoving = false; n.liveMovePending = false;
             if (!moved) {
                 actor = n.actor;
                 n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.aiApplied = true;
-                n.spawnPending = true;
+                n.spawnPending = true; n.gen = nextGen = NewGenLocked();
             }
         }
         if (!moved) {
             Log("[npc] managed #%d final live move write failed; respawning at the committed position", uid);
             if (actor) RemoveSpawnedActor(actor);
-            SpawnManagedNpcNow(uid);
+            SpawnManagedNpcNow(uid, nextGen);
             return;
         }
-        SetManagedNpcRuntimeAiNow(uid, desired);
+        SetManagedNpcRuntimeAiNow(uid, desired, gen);
     });
     return true;
 }
@@ -3272,13 +5345,16 @@ bool MoveManagedNpc(int uid, Vec3 world) {
         MoveManagedNpcLive(uid, world);
         return EndManagedNpcMove(uid, world);
     }
-    uintptr_t actor = 0; bool pending = false;
+    uintptr_t actor = 0; bool pending = false; uint64_t gen = 0; int proj = 0;
     { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || g_npcReg[i].hidden) return false;
       ManagedNpc& n = g_npcReg[i]; if (n.pos.x == world.x && n.pos.y == world.y && n.pos.z == world.z) return true;
-      n.pos = world; actor = n.actor; pending = n.spawnPending; n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.editMoving = false; n.liveMovePending = false; n.aiApplied = true; MarkDirtyLocked(n.proj);
-      if (actor && !pending) n.spawnPending = true; }
-    if (pending) return true;   // the already queued spawn reads the latest registry position when it actually runs
-    if (actor) RunOnServerTick([uid, actor]() { RemoveSpawnedActor(actor); SpawnManagedNpcNow(uid); });
+      pending = n.spawnPending && !n.spawnRequestTick; // a queued, not yet executing spawn can still read this latest pose
+      if (!pending) n.gen = NewGenLocked();
+      gen = n.gen; proj = n.proj; n.pos = world; actor = n.actor;
+      n.actor = 0; n.actorId = 0; n.transform = 0; n.spawnRequestTick = 0; n.editMoving = false; n.liveMovePending = false; n.aiApplied = true;
+      n.spawnPending = pending || actor != 0; MarkDirtyLocked(n.proj); }
+    if (pending) return true;
+    if (actor) { auto work = TrackProjectNativeWork(proj); RunOnServerTick([uid, actor, gen, work]() { RemoveSpawnedActor(actor); SpawnManagedNpcNow(uid, gen); }); }
     else QueueManagedNpcIfReady(uid);
     return true;
 }
@@ -3417,7 +5493,13 @@ static void LogGroundProbe(void* q, void* col, uintptr_t ret) {
 }
 static void* __fastcall HookWorldCastShape(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {
     const bool trace = g_shapeTraceLeft > 0 && InterlockedDecrement(&g_shapeTraceLeft) >= 0;
-    if (!g_tpl.have || g_tpl.world != a) { std::lock_guard<std::mutex> l(g_tplMutex); CaptureTemplate(a, b, c, d); }   // automatic, once per world
+    { std::lock_guard<std::mutex> operation(g_groundOpMutex); std::lock_guard<std::mutex> lock(g_tplMutex);
+      if (g_tpl.world != a) {
+          if (g_tpl.world) GroundEpochLocked(); // initial readiness is not replacement of an older template
+          g_tpl.world = a; g_tpl.have = false; g_probeCalibrated = false;
+      }
+    }
+    CaptureTemplate(a, b, c, d); // native reads happen without operation/registry/probe-queue locks   // automatic, once per world
     if (g_groundTraceUntil && GetTickCount64() < g_groundTraceUntil) {
         void* r = g_origWorldCastShape(a, b, c, d, e, f, g, h);
         LogGroundProbe(b, d, (uintptr_t)_ReturnAddress());
@@ -3443,13 +5525,17 @@ static bool CallCastGuarded(void* world, void* q, void* xf, void* col, void** r)
     CDK_GUARD_BEGIN *r = g_origWorldCastShape(world, q, xf, col, col, nullptr, nullptr, nullptr); return true;
     CDK_GUARD_FAIL return false;
     CDK_GUARD_END
-    return false;
 }
 static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int tileZ, GroundHit* out, bool verbose, Vec3 dir = Vec3{ 0, -1, 0 }) {
-    if (!g_tpl.have || !g_origWorldCastShape) { if (verbose) Log("[probe] no template yet (the character has to be in the world for a moment)"); return false; }
+#ifdef WB_UNIFIED_HOST_TEST
+    return host::Seam().groundCast && host::Seam().groundCast(start, len, out);
+#else
     alignas(16) uint8_t q[0x200], xf[0x100], col[0x300], shp[0x200];
     memset(col, 0, sizeof col);
-    { std::lock_guard<std::mutex> l(g_tplMutex); memcpy(q, g_tpl.query, sizeof q); memcpy(xf, g_tpl.xform, sizeof xf); memcpy(col, g_tpl.collector, sizeof g_tpl.collector); memcpy(shp, g_tpl.shape, sizeof shp); }
+    { std::lock_guard<std::mutex> l(g_tplMutex);
+      if (!g_tpl.have || !g_origWorldCastShape) return false;
+      world = g_tpl.world;
+      memcpy(q, g_tpl.query, sizeof q); memcpy(xf, g_tpl.xform, sizeof xf); memcpy(col, g_tpl.collector, sizeof g_tpl.collector); memcpy(shp, g_tpl.shape, sizeof shp); }
     uintptr_t pShape = (uintptr_t)shp, pHits = (uintptr_t)col + 0x30; memcpy(q + 0x28, &pShape, 8); memcpy(col + 0x20, &pHits, 8);   // inline hit buffer at +0x30, as in the original object
     float* fq = (float*)q;
     fq[0x30 / 4] = start.x - tileX * 1000.0f; fq[0x34 / 4] = start.y; fq[0x38 / 4] = start.z - tileZ * 1000.0f; fq[0x3C / 4] = 0;
@@ -3466,27 +5552,47 @@ static bool RunGroundCast(void* world, Vec3 start, float len, int tileX, int til
     out->center = { start.x + dir.x * (float)frac * len, out->centerY, start.z + dir.z * (float)frac * len };
     if (verbose) Log("[probe] RESULT hits %u fraction %.4f -> sphere center y %.3f (%.2f m below start), normal (%.3f %.3f %.3f), returned %p", nh, frac, out->centerY, (float)frac * len, out->normal.x, out->normal.y, out->normal.z, r);
     return true;
+#endif
 }
-static int QueueGround(Vec3 start, float len, bool verbose, Vec3 dir = Vec3{ 0, -1, 0 }, bool robust = false) {
+static int QueueGround(Vec3 start, float len, bool verbose, uint64_t epoch, const GroundHandle& op = {}, Vec3 dir = Vec3{ 0, -1, 0 }, bool robust = false) {
     std::lock_guard<std::mutex> l(g_groundMutex); const int id = ++g_groundNext;
-    g_groundQueue.push_back({ id, start, len, verbose, dir, robust }); InterlockedExchange(&g_groundQueued, 1); return id;
+    g_groundQueue.push_back({ id, start, len, verbose, epoch, op, bool(op), dir, robust });
+    g_groundResults[id] = { {}, epoch, op, bool(op) }; // admission identity survives queue dispatch and world invalidation
+    if (g_groundResults.size() > 40000) g_groundResults.erase(g_groundResults.begin()); // evicted -> explicit Unknown, never Pending
+    InterlockedExchange(&g_groundQueued, 1); return id;
 }
 // ---- ground queries for the editor
-float g_probeRadius = 0.0f; static bool g_probeCalibrated = false;
-bool GroundProbeReady() { return g_tpl.have && g_origWorldCastShape != nullptr; }
+bool GroundProbeReady() {
+#ifdef WB_UNIFIED_HOST_TEST
+    return host::Seam().probeReady;
+#else
+    std::lock_guard<std::mutex> lock(g_tplMutex); return g_tpl.have && g_origWorldCastShape != nullptr;
+#endif
+}
 static void CalibrateProbe(void* world) {   // cast at the player's feet; the sphere center stops one radius above the ground
+    uint64_t epoch; { std::lock_guard<std::mutex> operation(g_groundOpMutex); epoch = g_groundEpoch; }
     PosInfo pi{}; if (!PlayerPosInfo(&pi)) return;
     GroundHit h; Vec3 s = { pi.world.x, pi.world.y + 3.0f, pi.world.z };
     if (!RunGroundCast(world, s, 10.0f, pi.tileX, pi.tileZ, &h, false) || !h.hit) return;
     const float r = h.centerY - pi.world.y;
-    if (r > -0.5f && r < 1.0f) { g_probeRadius = r > 0.0f ? r : 0.0f; g_probeCalibrated = true; Log("[ground] probe calibrated at the player: sphere center %.3f above the feet -> radius %.3f", r, g_probeRadius); }
+    if (r > -0.5f && r < 1.0f) { std::lock_guard<std::mutex> operation(g_groundOpMutex); if (epoch != g_groundEpoch) return; std::lock_guard<std::mutex> lock(g_tplMutex); g_probeRadius = r > 0.0f ? r : 0.0f; g_probeCalibrated = true; Log("[ground] probe calibrated at the player: sphere center %.3f above the feet -> radius %.3f", r, g_probeRadius); }
 }
 static void ServiceGroundQueue(void* world) {   // physics thread, inside the game's own worldCastShape call
     static thread_local bool s_inside = false; if (s_inside) return; s_inside = true;
     std::vector<GroundReq> batch;
     { std::lock_guard<std::mutex> l(g_groundMutex); batch.swap(g_groundQueue); InterlockedExchange(&g_groundQueued, 0); }
-    if (!g_probeCalibrated && !batch.empty()) CalibrateProbe(world);
+    bool calibrated; { std::lock_guard<std::mutex> lock(g_tplMutex); calibrated = g_probeCalibrated; }
+    if (!calibrated && !batch.empty()) CalibrateProbe(world);
     for (const auto& rq : batch) {
+        auto op = rq.op.lock();
+        { std::lock_guard<std::mutex> lock(g_groundOpMutex);
+          const bool invalid = rq.epoch != g_groundEpoch || g_groundWorldWriting || (rq.owned && (!op || !GroundValidLocked(op)));
+          std::lock_guard<std::mutex> queue(g_groundMutex);
+          const auto stored = g_groundResults.find(rq.id);
+          if (stored == g_groundResults.end()) continue; // consumed invalidation or eviction: never resurrect it
+          if (invalid) { stored->second.status = GroundProbeStatus::Invalidated; continue; }
+        }
+        float radius; { std::lock_guard<std::mutex> lock(g_tplMutex); radius = g_probeRadius; }
         const int tx = (int)(rq.start.x * 0.001), tz = (int)(rq.start.z * 0.001);
         t_geoTracing = InterlockedExchange(&g_geoTraceArm, 0) != 0;   // research: log the geometry calls of this one cast
         if (t_geoTracing) Log("[geo] ---- traced cast from (%.2f %.2f %.2f) %.2f m down", rq.start.x, rq.start.y, rq.start.z, rq.len);
@@ -3506,7 +5612,7 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
                 const int stx = (int)(s.x * 0.001f), stz = (int)(s.z * 0.001f);
                 GroundHit qh;
                 if (RunGroundCast(world, s, rq.len, stx, stz, &qh, false, rq.dir) && qh.hit && std::isfinite(qh.centerY)) {
-                    ns[nn].h = qh; ns[nn].y = qh.centerY - g_probeRadius; nn++;
+                    ns[nn].h = qh; ns[nn].y = qh.centerY - radius; nn++;
                 }
             }
             if (nn >= 2) {
@@ -3518,7 +5624,7 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
                     if (d <= 0.45f) agree++;
                     if (d < best) { best = d; pick = k; }
                 }
-                const float cy = h.centerY - g_probeRadius;
+                const float cy = h.centerY - radius;
                 const bool centreBad = !h.hit || !std::isfinite(cy);
                 const bool fellThrough = !centreBad && agree >= 2 && median > cy + 0.55f;
                 if ((centreBad && agree >= 2) || fellThrough) {
@@ -3536,45 +5642,91 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
             }
         }
         if (t_geoTracing) { Log("[geo] ---- result: %s y %.2f", h.hit ? "hit" : "MISS", h.centerY); t_geoTracing = false; }
-        std::lock_guard<std::mutex> l(g_groundMutex); g_groundResults[rq.id] = h; if (g_groundResults.size() > 40000) g_groundResults.erase(g_groundResults.begin());
+        h.radius = radius;
+        { std::lock_guard<std::mutex> lock(g_groundOpMutex);
+          const bool invalid = rq.epoch != g_groundEpoch || g_groundWorldWriting || (rq.owned && (!op || !GroundValidLocked(op)));
+          std::lock_guard<std::mutex> queue(g_groundMutex);
+          const auto stored = g_groundResults.find(rq.id);
+          if (stored == g_groundResults.end()) continue; // a consumed invalidation cannot publish a late physical hit
+          stored->second.hit = h;
+          stored->second.status = invalid ? GroundProbeStatus::Invalidated : h.hit ? GroundProbeStatus::Hit : GroundProbeStatus::Miss;
+        }
     }
     s_inside = false;
 }
 // Research: the collision height on a grid (the character's own sphere cast, replayed straight down from 'top' over 'len' m),
 // queued in one batch and served on the game thread like GroundProbe. Returns the sphere centre heights (NAN = nothing found).
 bool GroundGrid(float x0, float z0, int nx, int nz, float step, float top, float len, std::vector<float>* out) {
-    if (!GroundProbeReady() || !GameThreadReady() || nx < 1 || nz < 1 || nx * nz > 20000) return false;
+    if (!GroundProbeReady() || !GameThreadReady() || nx < 1 || nz < 1 || nx > 20000 / nz) return false;
+    uint64_t epoch; { std::lock_guard<std::mutex> lock(g_groundOpMutex); if (g_groundWorldWriting) return false; epoch = g_groundEpoch; }
     std::vector<int> ids; ids.reserve((size_t)nx * nz);
-    for (int j = 0; j < nz; j++) for (int i = 0; i < nx; i++) ids.push_back(QueueGround({ x0 + i * step, top, z0 + j * step }, len, false));
-    RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });
+    for (int j = 0; j < nz; j++) for (int i = 0; i < nx; i++) ids.push_back(QueueGround({ x0 + i * step, top, z0 + j * step }, len, false, epoch));
+    RunOnGameThread([]() { ServiceGroundQueue(nullptr); });
     out->assign(ids.size(), NAN);
     const ULONGLONG until = GetTickCount64() + 20000; size_t done = 0;
     while (done < ids.size() && GetTickCount64() < until) {
         Sleep(20); done = 0;
         for (size_t k = 0; k < ids.size(); k++) {
             if (ids[k] == 0) { done++; continue; }
-            GroundHit h; if (GroundResult(ids[k], &h)) { (*out)[k] = h.hit ? h.centerY : NAN; ids[k] = 0; done++; }
+            GroundHit h; const auto status = GroundResultState(ids[k], &h);
+            if (status == GroundProbeStatus::Invalidated || status == GroundProbeStatus::Unknown) return false;
+            if (status != GroundProbeStatus::Pending) { (*out)[k] = status == GroundProbeStatus::Hit ? h.centerY : NAN; ids[k] = 0; done++; }
         }
     }
     return done == ids.size();
 }
 int GroundProbe(Vec3 start, float len) {
     if (!GroundProbeReady() || !GameThreadReady()) return 0;
-    const int id = QueueGround(start, len, false, Vec3{ 0, -1, 0 }, true);
-    RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });   // game thread, between the game's own casts (the only context that worked so far)
+    uint64_t epoch; { std::lock_guard<std::mutex> lock(g_groundOpMutex); if (g_groundWorldWriting) return 0; epoch = g_groundEpoch; }
+    const int id = QueueGround(start, len, false, epoch, {}, Vec3{ 0, -1, 0 }, true);
+    RunOnGameThread([]() { ServiceGroundQueue(nullptr); });   // game thread, between the game's own casts (the only context that worked so far)
     return id;
 }
 int RayProbe(Vec3 start, Vec3 dir, float len) {   // the same cast along any direction (the terrain brush: from the camera along the mouse ray)
     if (!GroundProbeReady() || !GameThreadReady()) return 0;
     const float l = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z); if (l < 1e-6f) return 0;
-    const int id = QueueGround(start, len, false, Vec3{ dir.x / l, dir.y / l, dir.z / l });
-    RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });
+    uint64_t epoch; { std::lock_guard<std::mutex> lock(g_groundOpMutex); if (g_groundWorldWriting) return 0; epoch = g_groundEpoch; }
+    const int id = QueueGround(start, len, false, epoch, {}, Vec3{ dir.x / l, dir.y / l, dir.z / l });
+    RunOnGameThread([]() { ServiceGroundQueue(nullptr); });
     return id;
 }
+GroundProbeStatus GroundResultState(int ticket, GroundHit* out) {
+    std::lock_guard<std::mutex> operation(g_groundOpMutex);
+    std::lock_guard<std::mutex> queue(g_groundMutex);
+    const auto it = g_groundResults.find(ticket);
+    if (it == g_groundResults.end()) return GroundProbeStatus::Unknown;
+    const auto status = it->second.epoch != g_groundEpoch ? GroundProbeStatus::Invalidated : it->second.status;
+    if (status == GroundProbeStatus::Pending) return status;
+    if (status == GroundProbeStatus::Hit || status == GroundProbeStatus::Miss) *out = it->second.hit;
+    g_groundResults.erase(it); // invalidation is consumed as its own outcome, never synthesized as a miss
+    return status;
+}
 bool GroundResult(int ticket, GroundHit* out) {
-    std::lock_guard<std::mutex> l(g_groundMutex);
-    auto it = g_groundResults.find(ticket); if (it == g_groundResults.end() || !it->second.done) return false;
-    *out = it->second; g_groundResults.erase(it); return true;
+    const auto status = GroundResultState(ticket, out);
+    return status == GroundProbeStatus::Hit || status == GroundProbeStatus::Miss;
+}
+int GroundTicket(const GroundHandle& op, Vec3 start, float length) {
+    if (!GroundProbeReady() || !GameThreadReady()) return 0;
+    int id;
+    { std::lock_guard<std::mutex> lock(g_groundOpMutex);
+      if (op->ticket || op->view.state != GroundProbing || !GroundValidLocked(op)) return 0;
+      id = QueueGround(start, length, false, op->view.epoch, op, Vec3{ 0, -1, 0 }, true);
+      op->ready = true; op->ticketAt = g_groundFrame; op->ticket = op->view.probe = id;
+    }
+    RunOnGameThread([]() { ServiceGroundQueue(nullptr); });
+    return id;
+}
+bool GroundPoll(const GroundHandle& op, GroundHit* hit) {
+    int ticket;
+    { std::lock_guard<std::mutex> lock(g_groundOpMutex); ticket = op->ticket; }
+    if (!ticket) return false;
+    const auto status = GroundResultState(ticket, hit);
+    if (status == GroundProbeStatus::Pending) return false;
+    std::lock_guard<std::mutex> lock(g_groundOpMutex); op->ticket = 0;
+    if (status == GroundProbeStatus::Invalidated || status == GroundProbeStatus::Unknown) {
+        GroundEndLocked(op, GroundInvalidated, "epoch-invalidated"); return false;
+    }
+    return GroundValidLocked(op);
 }
 void ProbeGround(float above, float len) {
     PosInfo pi{}; if (!PlayerPosInfo(&pi)) { Log("[probe] no player position"); return; }
@@ -3582,8 +5734,9 @@ void ProbeGround(float above, float len) {
     (void)tx; (void)tz;
     if (!GroundProbeReady()) { Log("[probe] no template yet (the character has to be in the world for a moment)"); return; }
     Log("[probe] player at (%.2f %.2f %.2f); replays: %.0f m above / %.0f m down, %.0f m above / %.0f m down, %.0f m above / 30 m down (served inside the game's next cast)", pi.world.x, pi.world.y, pi.world.z, above, len, above + 3, len, above + 3);
-    QueueGround(start, len, true); Vec3 s2 = { start.x, start.y + 3.0f, start.z }; QueueGround(s2, len, true); QueueGround(s2, 30.0f, true);
-    if (GameThreadReady()) RunOnGameThread([]() { ServiceGroundQueue(g_tpl.world); });
+    uint64_t epoch; { std::lock_guard<std::mutex> lock(g_groundOpMutex); epoch = g_groundEpoch; }
+    QueueGround(start, len, true, epoch); Vec3 s2 = { start.x, start.y + 3.0f, start.z }; QueueGround(s2, len, true, epoch); QueueGround(s2, 30.0f, true, epoch);
+    if (GameThreadReady()) RunOnGameThread([]() { ServiceGroundQueue(nullptr); });
 }
 // Research: up to 6 arbitrary functions hooked by rva; a call is logged (integer args, return value, caller) only on a thread
 // that is inside one of our traced ground casts. Nothing is logged before the original returns, so float / vector arguments
@@ -3621,7 +5774,10 @@ void RayTrace(int calls) { InterlockedExchange(&g_rayTraceLeft, calls); Interloc
     Log("[ray] tracing the next %d ray casts and %d shape casts (walk a few steps for the ground probe, then aim / interact for ray casts)", calls, calls); }
 
 // ---- experimental: teleport by writing the player's transform component; camera field discovery ----
-bool SetPlayerPos(Vec3 world) {
+static bool SetPlayerPosWrites(Vec3 world) {
+#ifdef WB_UNIFIED_HOST_TEST
+    return host::Seam().teleport && host::Seam().teleport(world);
+#else
     uintptr_t actor = PlayerActor(); if (!actor) return false;
     uintptr_t comps = Deref(actor, kOff_Ent_Comps);
     uintptr_t tf = comps ? Deref(comps, kOff_Comps_Transform) : 0;
@@ -3630,6 +5786,16 @@ bool SetPlayerPos(Vec3 world) {
     float v[3] = { world.x - tx * kTileSize, world.y, world.z - tz * kTileSize }; int16_t tile[2] = { (int16_t)tx, (int16_t)tz };
     bool ok = WriteBytes(tf + kOff_Tf_Pos, v, 12) && WriteBytes(tf + kOff_Tf_Tile, tile, 4);
     Log("teleport -> (%.1f %.1f %.1f) tile %d,%d: %s", world.x, world.y, world.z, tx, tz, ok ? "written" : "FAILED");
+    return ok;
+#endif
+}
+bool SetPlayerPos(Vec3 world) {
+    { std::lock_guard<std::mutex> lock(g_groundOpMutex);
+      if (!g_groundLeases.empty() || g_groundWorldWriting) return false; // synchronous busy; NEVER delayed teleport
+      ++g_groundWorldWriting; GroundEpochLocked();
+    }
+    const bool ok = SetPlayerPosWrites(world); // even a partial write invalidates every older probe
+    { std::lock_guard<std::mutex> lock(g_groundOpMutex); --g_groundWorldWriting; }
     return ok;
 }
 static uintptr_t FindComponent(const char* cls) {   // walks the player's component table
@@ -3846,6 +6012,67 @@ static void CmdList() {
     for (size_t i = 0; i < l.size(); i++) Log("  #%zu %p %s (%.1f %.1f %.1f)%s", i, (void*)l[i].obj, l[i].prefab.c_str(), l[i].pos.x, l[i].pos.y, l[i].pos.z, l[i].hidden ? " hidden" : "");
     if (l.empty()) Log("  (nothing spawned yet)");
 }
+// One console line -> one production command. ConsoleThread feeds every line it reads to this function
+// (AllocConsole/stdin stay its OS boundary), and the host suites drive the SAME function through
+// host::ConsoleDispatch - there is no second, copied test dispatcher. Returns true when the console loop
+// must end (quit). Every mutating branch keeps the core entry point it always used (SpawnAt / MoveSpawned /
+// HideSpawned / SetPlayerPos / LoadProject carry the C7 pre-mutation reconciliation); malformed input only logs.
+static bool ConsoleDispatch(const std::string& cmd) {
+    if (cmd == "pos") CmdPos();
+    else if (cmd == "status") CmdStatus();
+    else if (cmd == "list") CmdList();
+    else if (cmd.rfind("flags ", 0) == 0) { int a = 1, b = 1, c = 0; sscanf(cmd.c_str() + 6, "%d %d %d", &a, &b, &c); g_flags[0] = a; g_flags[1] = b; g_flags[2] = c; Log("spawn flags now %d,%d,%d", a, b, c); }
+    else if (cmd.rfind("spawn ", 0) == 0) {
+        char path[400] = {0}; float dx = 2, dy = 0, dz = 0;
+        if (sscanf(cmd.c_str() + 6, "%399s %f %f %f", path, &dx, &dy, &dz) < 1) { Log("usage: spawn <prefab> [dx dy dz]"); return false; }
+        Vec3 p{}; if (!PlayerWorldPos(&p)) { Log("spawn: no player position"); return false; }
+        SpawnAt(path, { p.x + dx, p.y + dy, p.z + dz });
+    }
+    else if (cmd.rfind("move ", 0) == 0) { int i = 0; float x, y, z, yaw = 0, sc = 1; if (sscanf(cmd.c_str() + 5, "%d %f %f %f %f %f", &i, &x, &y, &z, &yaw, &sc) >= 4) Log("move #%d -> %s", i, MoveSpawned(i, { x, y, z }, Rot{ yaw }, sc) ? "queued" : "failed"); else Log("usage: move <idx> x y z [yaw] [scale]"); }
+    else if (cmd.rfind("hide ", 0) == 0) { int i = atoi(cmd.c_str() + 5); Log("hide #%d -> %s", i, HideSpawned(i) ? "ok" : "failed"); }
+    else if (cmd.rfind("livemode ", 0) == 0) { g_liveMode = atoi(cmd.c_str() + 9); Log("livemode = %d", g_liveMode); }
+    else if (cmd == "livedrag on" || cmd == "livedrag off") { g_liveDrag = cmd == "livedrag on"; Log("livedrag = %d", g_liveDrag ? 1 : 0); }
+    else if (cmd == "recreate on" || cmd == "recreate off") { g_recreateOnMove = cmd == "recreate on"; Log("recreate = %d", g_recreateOnMove ? 1 : 0); }
+    else if (cmd == "gimmicks on" || cmd == "gimmicks off") { g_gimmickSpawn = cmd == "gimmicks on"; Log("gimmicks = %d", g_gimmickSpawn ? 1 : 0); }
+    else if (cmd == "captures") {
+        GimmickCapInfo caps[16]; const int count = GimmickCaptureList(caps, 16);
+        Log("captures=%d replay_armed=%d prefab=%s", count, GimmickReplayArmed() ? 1 : 0, GimmickReplayPrefab());
+        for (int i = 0; i < count; ++i) { const auto& c = caps[i]; const char* caller = GimmickCallerName(c.caller);
+            Log("id=%d age_ms=%lu name=%s path=%s caller=%s address=%p words=%u/%u", c.id, c.ageMs, c.name, c.path, caller ? caller : "?", (void*)c.caller, c.k1, c.k2); }
+    }
+    else if (cmd == "replays") {
+        SpawnedInfo objects[16]; const int count = SpawnedList(objects, 16);
+        for (int i = 0; i < count; ++i) { const auto& o = objects[i]; Log("actor=%p age_ms=%lu prefab=%s", (void*)o.actor, o.ageMs, o.prefab); }
+        Log("replays=%d", count);
+    }
+    else if (cmd == "replayprefab" || cmd.rfind("replayprefab ", 0) == 0) { SetGimmickReplayPrefab(cmd.size() > 12 ? cmd.c_str() + 13 : ""); Log("replay prefab=%s", GimmickReplayPrefab()); }
+    else if (cmd.rfind("replay ", 0) == 0) { int id = 0; Vec3 at{};
+        if (sscanf(cmd.c_str() + 7, "%d %f %f %f", &id, &at.x, &at.y, &at.z) == 4 && id > 0) ArmGimmickReplay(at, id);
+        else Log("usage: replay <capture id> x y z (captures lists ids; replayprefab sets the override)"); }
+    else if (cmd.rfind("removereplay ", 0) == 0) { unsigned long long actor = 0;
+        if (sscanf(cmd.c_str() + 13, "%llx", &actor) == 1 && actor) RequestRemoveSpawned((uintptr_t)actor);
+        else Log("usage: removereplay <hex actor from replays>"); }
+    else if (cmd == "trace on" || cmd == "trace off") SetTrace(cmd == "trace on");
+    else if (cmd.rfind("tp ", 0) == 0) { Vec3 w{}; if (sscanf(cmd.c_str() + 3, "%f %f %f", &w.x, &w.y, &w.z) == 3) SetPlayerPos(w); else Log("usage: tp x y z"); }
+    else if (cmd == "camtrace") CamTrace(16);
+    else if (cmd == "fovtrace") FovTrace(12);
+    else if (cmd == "raytrace") RayTrace(12);
+    else if (cmd == "probe") ProbeGround(3.0f, 10.0f);
+    else if (cmd.rfind("camwatch", 0) == 0) { int s = 8, m = 0; sscanf(cmd.c_str() + 8, "%d %d", &s, &m); CamWatch(s, m); }
+    else if (cmd == "traceio on" || cmd == "traceio off") SetIoTrace(cmd == "traceio on");
+    else if (cmd.rfind("npc ", 0) == 0) {   // npc <characterKey> [type]: spawn 4 m east of the player
+        unsigned key = 0; int type = 1; Vec3 p{};
+        if (sscanf(cmd.c_str() + 4, "%u %d", &key, &type) >= 1 && PlayerWorldPos(&p)) { p.x += 4.0f; SpawnNpc(key, p, type); } else Log("usage: npc <characterKey> [type]");
+    }
+    else if (cmd == "thumbs on" || cmd == "thumbs off") { thumbgen::SetBackground(cmd == "thumbs on"); Log("background preview generation %s", thumbgen::Background() ? "on" : "off"); }
+    else if (cmd.rfind("save ", 0) == 0) SaveProject(cmd.substr(5));
+    else if (cmd.rfind("load ", 0) == 0) LoadProject(cmd.substr(5), false);
+    else if (cmd == "projects") { for (auto& p : ListProjects()) Log("  %s", p.c_str()); }
+    else if (cmd == "help") Log("commands: pos | status | list | spawn <prefab> [dx dy dz] | move <idx> x y z [yaw] [scale] | hide <idx> | save <name> | load <name> | projects | flags a b c | livemode <0..3> | livedrag on/off | recreate on/off | gimmicks on/off | captures | replays | replayprefab [path] | replay <id> x y z | removereplay <hex actor> | trace on/off | tp x y z | camtrace | fovtrace | raytrace | probe | camwatch [s] [mode] | traceio on/off | thumbs on/off | npc <key> [type] | quit");
+    else if (cmd == "quit") return true;
+    else if (!cmd.empty()) Log("unknown command '%s'", cmd.c_str());
+    return false;
+}
 static DWORD WINAPI ConsoleThread(LPVOID) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout); freopen_s(&f, "CONIN$", "r", stdin);
@@ -3855,38 +6082,7 @@ static DWORD WINAPI ConsoleThread(LPVOID) {
     char line[512];
     while (fgets(line, sizeof line, stdin)) {
         std::string cmd(line); while (!cmd.empty() && (cmd.back() == '\n' || cmd.back() == '\r' || cmd.back() == ' ')) cmd.pop_back();
-        if (cmd == "pos") CmdPos();
-        else if (cmd == "status") CmdStatus();
-        else if (cmd == "list") CmdList();
-        else if (cmd.rfind("flags ", 0) == 0) { int a = 1, b = 1, c = 0; sscanf(cmd.c_str() + 6, "%d %d %d", &a, &b, &c); g_flags[0] = a; g_flags[1] = b; g_flags[2] = c; Log("spawn flags now %d,%d,%d", a, b, c); }
-        else if (cmd.rfind("spawn ", 0) == 0) {
-            char path[400] = {0}; float dx = 2, dy = 0, dz = 0;
-            if (sscanf(cmd.c_str() + 6, "%399s %f %f %f", path, &dx, &dy, &dz) < 1) { Log("usage: spawn <prefab> [dx dy dz]"); continue; }
-            Vec3 p{}; if (!PlayerWorldPos(&p)) { Log("spawn: no player position"); continue; }
-            SpawnAt(path, { p.x + dx, p.y + dy, p.z + dz });
-        }
-        else if (cmd.rfind("move ", 0) == 0) { int i = 0; float x, y, z, yaw = 0, sc = 1; if (sscanf(cmd.c_str() + 5, "%d %f %f %f %f %f", &i, &x, &y, &z, &yaw, &sc) >= 4) Log("move #%d -> %s", i, MoveSpawned(i, { x, y, z }, Rot{ yaw }, sc) ? "queued" : "failed"); else Log("usage: move <idx> x y z [yaw] [scale]"); }
-        else if (cmd.rfind("hide ", 0) == 0) { int i = atoi(cmd.c_str() + 5); Log("hide #%d -> %s", i, HideSpawned(i) ? "ok" : "failed"); }
-        else if (cmd.rfind("livemode ", 0) == 0) { g_liveMode = atoi(cmd.c_str() + 9); Log("livemode = %d", g_liveMode); }
-        else if (cmd == "trace on" || cmd == "trace off") SetTrace(cmd == "trace on");
-        else if (cmd.rfind("tp ", 0) == 0) { Vec3 w{}; if (sscanf(cmd.c_str() + 3, "%f %f %f", &w.x, &w.y, &w.z) == 3) SetPlayerPos(w); else Log("usage: tp x y z"); }
-        else if (cmd == "camtrace") CamTrace(16);
-        else if (cmd == "fovtrace") FovTrace(12);
-        else if (cmd == "raytrace") RayTrace(12);
-        else if (cmd == "probe") ProbeGround(3.0f, 10.0f);
-        else if (cmd.rfind("camwatch", 0) == 0) { int s = 8, m = 0; sscanf(cmd.c_str() + 8, "%d %d", &s, &m); CamWatch(s, m); }
-        else if (cmd == "traceio on" || cmd == "traceio off") SetIoTrace(cmd == "traceio on");
-        else if (cmd.rfind("npc ", 0) == 0) {   // npc <characterKey> [type]: spawn 4 m east of the player
-            unsigned key = 0; int type = 1; Vec3 p{};
-            if (sscanf(cmd.c_str() + 4, "%u %d", &key, &type) >= 1 && PlayerWorldPos(&p)) { p.x += 4.0f; SpawnNpc(key, p, type); } else Log("usage: npc <characterKey> [type]");
-        }
-        else if (cmd == "thumbs on" || cmd == "thumbs off") { thumbgen::SetBackground(cmd == "thumbs on"); Log("background preview generation %s", thumbgen::Background() ? "on" : "off"); }
-        else if (cmd.rfind("save ", 0) == 0) SaveProject(cmd.substr(5));
-        else if (cmd.rfind("load ", 0) == 0) LoadProject(cmd.substr(5), false);
-        else if (cmd == "projects") { for (auto& p : ListProjects()) Log("  %s", p.c_str()); }
-        else if (cmd == "help") Log("commands: pos | status | list | spawn <prefab> [dx dy dz] | move <idx> x y z [yaw] [scale] | hide <idx> | save <name> | load <name> | projects | flags a b c | quit");
-        else if (cmd == "quit") break;
-        else if (!cmd.empty()) Log("unknown command '%s'", cmd.c_str());
+        if (ConsoleDispatch(cmd)) break;
     }
     return 0;
 }
@@ -3994,18 +6190,11 @@ static DWORD WINAPI InitThread(LPVOID) {
 // ---- runtime signature resolution (survives game updates as long as the prologues stay) ----
 // counts pattern hits in executable sections; returns the first hit
 static uintptr_t FindPatternCount(const char* pat, int* count) {
-    auto p = ParsePattern(pat); uintptr_t first = 0; int n = 0;
-    auto dos = (IMAGE_DOS_HEADER*)g_base; auto nt = (IMAGE_NT_HEADERS64*)(g_base + dos->e_lfanew); auto sec = IMAGE_FIRST_SECTION(nt);
-    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-        uint8_t* s = (uint8_t*)(g_base + sec[i].VirtualAddress); size_t sz = sec[i].Misc.VirtualSize;
-        for (size_t k = 0; k + p.size() <= sz; k++) {
-            if (p[0] >= 0 && s[k] != p[0]) continue;
-            bool ok = true; for (size_t j = 1; j < p.size(); j++) if (p[j] >= 0 && s[k + j] != p[j]) { ok = false; break; }
-            if (ok) { if (!first) first = (uintptr_t)(s + k); n++; if (n > 64) break; }
-        }
-    }
-    *count = n; return first;
+    // *count is clamped to 65, and the clamp only bounds the number that gets LOGGED: the pre-extraction scanner
+    // kept counting raw per-section hits (which could exceed 65 across sections), while the uniqueness consumer
+    // compares the count against 1, so its decision is unchanged by the clamp. The 22 call-site literals
+    // (15 direct + 7 ResolveSig) are at most 63 tokens, inside the reader's 64-byte limit.
+    return ScanPattern(ParsePattern(pat), count);
 }
 static bool ResolveSig(const char* name, const char* sig, uintptr_t* outRva, bool mustBeUnique = true) {
     int n = 0; uintptr_t hit = FindPatternCount(sig, &n);

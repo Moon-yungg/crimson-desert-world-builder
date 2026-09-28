@@ -7,6 +7,7 @@
 #include <array>
 #include <cstring>
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <atomic>
@@ -153,14 +154,78 @@ namespace i18n {
             g_pack.emplace(std::move(fields[0]), std::move(row));
         }
     }
+    static bool HeaderMatches(const std::vector<std::string>& header) {
+        if (header.size() != 12 || header[0] != "key") return false;
+        for (int i = 0; i < 11; ++i) if (header[(size_t)i + 1] != kLocaleIds[i]) return false;
+        return true;
+    }
+    // Optional personal translations (bin64\cdmodkit\locales.tsv). The embedded resource-103 table stays
+    // the base: a personal row only replaces the cells that are nonempty, empty cells keep the embedded
+    // value, and keys the embedded table lacks are retained as installed-only rows. The file is opened
+    // read-only and never written back; a missing, wrong-header, malformed or unreadable file leaves the
+    // embedded translations in place and is reported through the log with the file path.
+    static void MergePersonalPack() {
+        const std::string path = core::ModDir() + "\\locales.tsv";
+        std::ifstream disk(path, std::ios::binary);
+        if (!disk) {
+            core::Log("[i18n] personal locale file not found, keeping embedded translations (%s)", path.c_str());
+            return;
+        }
+        std::string content((std::istreambuf_iterator<char>(disk)), std::istreambuf_iterator<char>());
+        if (disk.bad() || content.empty()) {
+            core::Log("[i18n] personal locale file is unreadable, keeping embedded translations (%s)", path.c_str());
+            return;
+        }
+        std::istringstream file(content);
+        std::string line;
+        if (!std::getline(file, line)) {
+            core::Log("[i18n] personal locale file is unreadable, keeping embedded translations (%s)", path.c_str());
+            return;
+        }
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!HeaderMatches(SplitRow(line))) {
+            core::Log("[i18n] personal locale file has an unexpected header, keeping embedded translations (%s)", path.c_str());
+            return;
+        }
+        int merged = 0, added = 0, skipped = 0;
+        while (std::getline(file, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
+            auto fields = SplitRow(line);
+            if (fields.size() != 12 || fields[0].empty()) { ++skipped; continue; }
+            auto it = g_pack.find(fields[0]);
+            if (it == g_pack.end()) {
+                PackRow row;
+                for (size_t i = 0; i < row.size(); ++i) row[i] = std::move(fields[i + 1]);
+                g_pack.emplace(std::move(fields[0]), std::move(row));
+                ++added;
+            } else {
+                for (size_t i = 0; i < it->second.size(); ++i)
+                    if (!fields[i + 1].empty()) it->second[i] = std::move(fields[i + 1]);
+            }
+            ++merged;
+        }
+        core::Log("[i18n] personal locale file merged: %d rows (%d new keys), %d malformed rows skipped (%s)",
+                  merged, added, skipped, path.c_str());
+    }
     void Initialize() {
         if (g_initialized) return;
         g_initialized = true; g_systemLanguage = ResolveSystemLocale();
         const uint8_t* data = nullptr; size_t size = 0;
         if (core::EmbeddedResource(core::kResourceLocales, &data, &size)) LoadPack(data, size);
         else core::Log("[i18n] embedded locale table resource is missing");
+        MergePersonalPack();   // read-only per-cell override; the file is never written back
         BuildGlyphRanges();   // also without the resource: the language selector shows the native names
     }
+#ifdef WB_I18N_HOST_TEST
+    void TestReset() {
+        g_pack.clear();
+        g_glyphRanges.clear();
+        { std::lock_guard<std::mutex> lock(g_extraMutex); g_extra.clear(); g_inAtlas.clear(); }
+        g_glyphsDirty = false;
+        g_initialized = false;
+    }
+#endif
     const char* Translate(const char* source) {
         if (!source) return "";
         std::string prefix, suffix;

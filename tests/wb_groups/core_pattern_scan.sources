@@ -1,0 +1,46 @@
+# Deterministic host variant of the CorePatternScan suite (plan wb079-unified-77f68967, Task 3).
+# The fixture textually includes asi/cdmodkit/cdmodkit.cpp - the production core TU - and calls its actual static
+# ScanImage/ScanPattern/FindPattern/FindPatternCount; overlay_discovery.cpp is linked here as its own translation
+# unit, so the bounded reader is real and not a copy. i18n.cpp is the production settings dependency of that TU and
+# pulls imgui for the font-atlas helpers it declares. The engine/service boundaries the suite never exercises
+# (overlay install, thumbgen, input, httpapi, diag, MinHook installation) are stubbed inside the fixture.
+# The production TU is compiled at its own production warning level: the runner row for this variant carries
+# cflags '/W3 /WX' (asi/cdmodkit/build.bat builds cdmodkit.cpp with /W3) and the production define below.
+# cdmodkit.cpp's project save/load (plan Task 9) uses the shipped disk-value codec and group math exactly like
+# build.bat links them, so the two production TUs are compiled here as well.
+@define _CRT_SECURE_NO_WARNINGS
+@include tools/imgui
+@include tools/imgui/backends
+@include tools/minhook/include
+asi/cdmodkit/overlay_discovery.cpp
+asi/cdmodkit/proj_codec.cpp
+asi/cdmodkit/wb_group_math.cpp
+asi/cdmodkit/i18n.cpp
+# v0.95 adaptation (WB080 Task 2 repair B1): the shipped environment.cpp provides
+# core_internal::EnvironmentInstall/Tick called by cdmodkit.cpp; linked as production, never substituted.
+asi/cdmodkit/environment.cpp
+# Current-main native services; scanner policy still runs in the actual core TU.
+tests/wb_groups/production_research_host.cpp
+tests/wb_groups/production_travel_host.cpp
+tests/wb_groups/production_terrain_host.cpp
+asi/cdmodkit/terrain_live.cpp
+asi/cdmodkit/terrain_physics.cpp
+asi/cdmodkit/terrain_research.cpp
+asi/cdmodkit/gpu_research.cpp
+@evidence asi/cdmodkit/terrain.cpp
+@evidence asi/cdmodkit/travel.cpp
+@evidence asi/cdmodkit/core_internal.h
+@evidence tests/wb_groups/production_host.h
+tools/imgui/imgui.cpp
+tools/imgui/imgui_draw.cpp
+tools/imgui/imgui_tables.cpp
+tools/imgui/imgui_widgets.cpp
+# @evidence entries are hashed into the run receipt and are never passed to the compiler as sources: the included
+# production TU, the header it resolves the discovery API against, the core header and this manifest.
+@evidence asi/cdmodkit/cdmodkit.cpp
+@evidence asi/cdmodkit/proj_codec.h
+@evidence asi/cdmodkit/wb_group_math.h
+@evidence asi/cdmodkit/overlay_discovery.h
+@evidence asi/cdmodkit/core.h
+@evidence asi/cdmodkit/environment.cpp
+@evidence tests/wb_groups/core_pattern_scan.sources
