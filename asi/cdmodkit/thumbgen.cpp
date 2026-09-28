@@ -1285,6 +1285,30 @@ static bool Generate(const std::string& logical, float dims[6], std::string& why
     for (const auto& r : roots) Collect(r, I, Z, inst, cx);
     if (g_readError) { why = "read error"; return false; }   // a sub-prefab could not be read
     if (inst.empty()) { why = "no meshes"; return false; }
+    if (g_measureOnly) {
+        // Bounds need transformed vertices only. Material and texture reads can fail independently
+        // of the mesh and previously prevented an otherwise valid center from being recorded.
+        float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+        bool haveVertex = false;
+        for (const Inst& in : inst) {
+            const auto m = LoadMesh(in.path); if (!m) continue;
+            for (size_t i = 0; i + 2 < m->v.size(); i += 3) {
+                const float x = m->v[i], y = m->v[i + 1], z = m->v[i + 2];
+                const float v[3] = {
+                    in.m[0] * x + in.m[1] * y + in.m[2] * z + in.t[0],
+                    in.m[3] * x + in.m[4] * y + in.m[5] * z + in.t[1],
+                    in.m[6] * x + in.m[7] * y + in.m[8] * z + in.t[2]
+                };
+                if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) continue;
+                for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], v[k]); mx[k] = std::max(mx[k], v[k]); }
+                haveVertex = true;
+            }
+        }
+        if (g_readError) { why = "read error"; return false; }
+        if (!haveVertex) { why = "no geometry"; return false; }
+        for (int k = 0; k < 3; ++k) { dims[k] = mx[k] - mn[k]; dims[3 + k] = (mn[k] + mx[k]) * 0.5f; }
+        return true;
+    }
     Mesh all; bool anyCompressed = false; std::vector<uint16_t> fs; std::vector<Surface> surf; g_statInst = (int)inst.size(); g_statSurf = g_statMat = g_statTex = 0;
     for (size_t k = 0; k < inst.size() && k < 400; k++) {
         auto m = LoadMesh(inst[k].path); if (!m) continue; if (m->compressed) anyCompressed = true;
@@ -1327,7 +1351,6 @@ static bool Generate(const std::string& logical, float dims[6], std::string& why
     float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
     for (size_t i = 0; i < all.v.size(); i += 3) for (int k = 0; k < 3; k++) { mn[k] = std::min(mn[k], all.v[i + k]); mx[k] = std::max(mx[k], all.v[i + k]); }
     for (int k = 0; k < 3; k++) { dims[k] = mx[k] - mn[k]; dims[3 + k] = (mn[k] + mx[k]) * 0.5f; }   // size + center relative to the pivot
-    if (g_measureOnly && GetFileAttributesA(core::ThumbFile(logical).c_str()) != INVALID_FILE_ATTRIBUTES) return true;
     if (g_recheckOnly && !g_recheckForce && !anyCompressed && GetFileAttributesA(core::ThumbFile(logical).c_str()) != INVALID_FILE_ATTRIBUTES) { g_lastSkipped = true; return true; }
     // characters face the other way than static objects: a preview made only of skinned meshes is seen from the front
     const bool skinnedOnly = std::all_of(inst.begin(), inst.end(), [](const Inst& in) { return EndsWith(in.path, ".pac"); });
@@ -1508,9 +1531,13 @@ static DWORD WINAPI Worker(LPVOID) {
             if (!prio) Sleep(20);
             continue;
         }
-        if (measure) { if (ok) { if (g_sizes) { fprintf(g_sizes, "%s\t%.2f\t%.2f\t%.2f\t%.3f\t%.3f\t%.3f\n", path.c_str(), dims[0], dims[1], dims[2], dims[3], dims[4], dims[5]); fflush(g_sizes); } core::SetPrefabSize(path, dims); }
-                       else { int pi = -1; const auto& ix = core::PrefabIndex(); for (size_t i = 0; i < ix.size(); i++) if (ix[i].path == path) { pi = (int)i; break; }
-                              if (pi >= 0 && g_sizes) { float d6[6] = { ix[pi].sx, ix[pi].sy, ix[pi].sz, 0, ix[pi].sy * 0.5f, 0 }; fprintf(g_sizes, "%s\t%.2f\t%.2f\t%.2f\t0\t%.3f\t0\n", path.c_str(), d6[0], d6[1], d6[2], d6[4]); fflush(g_sizes); core::SetPrefabSize(path, d6); } } Sleep(2); continue; }   // center unknown: pivot at the bottom center is the usual convention
+        if (measure) {
+            if (ok) {
+                if (g_sizes) { fprintf(g_sizes, "%s\t%.2f\t%.2f\t%.2f\t%.3f\t%.3f\t%.3f\n", path.c_str(), dims[0], dims[1], dims[2], dims[3], dims[4], dims[5]); fflush(g_sizes); }
+                core::SetPrefabSize(path, dims);
+            } else Log("[thumbs] bounds unavailable for %s: %s", path.c_str(), why.c_str());
+            Sleep(2); continue;
+        }
         if (!ok) { for (float& d : dims) d = 0; reasons[why]++; }
         const bool record = ok || why != "prefab missing";
         if (record && g_sizes) { fprintf(g_sizes, "%s\t%.2f\t%.2f\t%.2f\t%.3f\t%.3f\t%.3f\n", path.c_str(), dims[0], dims[1], dims[2], dims[3], dims[4], dims[5]); fflush(g_sizes); }

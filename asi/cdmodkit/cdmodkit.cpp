@@ -1494,8 +1494,11 @@ static void LoadPrefabs() {
       while (std::getline(sf, line)) { size_t t = line.find('\t'); if (t == std::string::npos) continue; auto it = byPath.find(line.substr(0, t)); if (it == byPath.end()) continue;
         PrefabInfo& pi = g_index[it->second];
         int got = sscanf(line.c_str() + t + 1, "%f\t%f\t%f\t%f\t%f\t%f", &pi.sx, &pi.sy, &pi.sz, &pi.cx, &pi.cy, &pi.cz);
-        pi.hasCenter = got == 6; if (got < 6) pi.cx = pi.cy = pi.cz = 0; n++;
-        if (pi.hasCenter && pi.cx == 0 && pi.cy == 0 && pi.cz == 0 && pi.sy > 0) pi.cy = pi.sy * 0.5f;   // lines written for a failed re-measure: assume the pivot at the bottom center
+        // Old failed re-measures wrote literal "0" for X/Z and an assumed Y center. Keep the size,
+        // but do not present that guess as measured geometry; the thumbnail worker retries it.
+        const bool guessed = got == 6 && line.find("\t0\t", t + 1) != std::string::npos &&
+            line.size() >= 2 && line.compare(line.size() - 2, 2, "\t0") == 0;
+        pi.hasCenter = got == 6 && !guessed; if (!pi.hasCenter) pi.cx = pi.cy = pi.cz = 0; n++;
     }
       if (n) Log("prefab sizes: %d", n); }
     for (auto& kv : tagc) g_tagCounts.push_back(kv);
