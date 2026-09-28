@@ -208,11 +208,11 @@ namespace editor {
     static bool  g_showSpawnOpts = false, g_showMass = false; static int g_hoverUid = 0, g_hoverNpcUid = 0;
     static bool  g_cardView = false; static float g_cardSize = 96.0f;   // browser: tile view instead of the list (same matches / filters)
     static int   g_browserDragPrefab = -1;   // browser row/card being dragged out into the game view
-    struct BrowserDropJob { int prefab = -1, ticket = 0; DWORD queuedAt = 0; Vec3 center{}; float yaw = 0, scale = 1, probeTop = 0; int retry = 0; };
+    struct BrowserDropJob { int prefab = -1, ticket = 0; DWORD queuedAt = 0; Vec3 center{}; float yaw = 0, scale = 1; };
     static std::vector<BrowserDropJob> g_browserDropJobs;   // ground is probed before spawning, so a new object's own collision cannot be mistaken for the surface
     static int   g_npcDragIndex = -1;        // character row/card being dragged out into the game view
     struct NpcDropJob { uint32_t key = 0; int ticket = 0; DWORD queuedAt = 0; Vec3 at{}; int count = 1, formation = 1; float spacing = 1.5f, radius = 8.0f, fx = 0, fz = 1; bool ai = true; int behavior = 0;
-        float probeTop = 0; int retry = 0; bool centerResolved = false; std::vector<Vec3> positions; std::vector<int> memberTickets; std::vector<uint8_t> memberRetries; };
+        bool centerResolved = false; std::vector<Vec3> positions; std::vector<int> memberTickets; };
     static std::vector<NpcDropJob> g_npcDropJobs;
     static std::set<std::string> g_tagFilter;
     static std::vector<int> g_matches; static std::string g_lastKey;
@@ -251,6 +251,7 @@ namespace editor {
     static void SelectAllSceneEntities(const std::vector<SpawnedObj>& objects, const std::vector<ManagedNpc>& npcs, int projectFilter = -1);
     static void DeleteSceneSelection();
     static void TravelGo(Vec3 pos, const char* what);
+    static void SavedThumbnailTick();
     static void GroupSceneSelection(bool makeGroup);
     static void MoveSceneSelection(Vec3 delta);
     // snapping
@@ -909,7 +910,7 @@ namespace editor {
             + (P.m.size() > 1 ? T("  (group)") : "") + "  |  " + pose;
         if (!embedded) {
             const char* actions[] = { "drop", "Cancel", "To ground", "level" };
-            const int actionCount = P.hasNpc ? 3 : 4;
+            const int actionCount = P.hasNpc ? 2 : 4;
             float actionsWidth = style.WindowPadding.x * 2.0f + style.ItemSpacing.x * (actionCount - 1);
             for (int i = 0; i < actionCount; ++i) actionsWidth += ImGui::CalcTextSize(T(actions[i])).x + style.FramePadding.x * 2.0f;
             const float desiredWidth = std::max(actionsWidth, ImGui::CalcTextSize(status.c_str()).x + style.WindowPadding.x * 2.0f);
@@ -929,8 +930,10 @@ namespace editor {
                 ImGui::SetTooltip("%s", status.c_str());
             if (ImGui::Button(T("drop"))) DropCarried();
             SameLineForControl("Cancel"); if (ImGui::Button(T("Cancel"))) CancelCarried();
-            SameLineForControl("To ground"); if (ImGui::Button(T("To ground"))) StartGroundSnap(P);
-            if (!P.hasNpc) { SameLineForControl("level"); if (ImGui::Button(T("level"))) { if (P.m.size() == 1) { P.pitch = -P.m[0].rot0.pitch; P.roll = -P.m[0].rot0.roll; } else { P.pitch = P.roll = 0; } P.dirty = P.touched = true; CommitPlaceHistory(P); } }
+            if (!P.hasNpc) {
+                SameLineForControl("To ground"); if (ImGui::Button(T("To ground"))) StartGroundSnap(P);
+                SameLineForControl("level"); if (ImGui::Button(T("level"))) { if (P.m.size() == 1) { P.pitch = -P.m[0].rot0.pitch; P.roll = -P.m[0].rot0.roll; } else { P.pitch = P.roll = 0; } P.dirty = P.touched = true; CommitPlaceHistory(P); }
+            }
             DrawPlacementSnapControls();
             // Explicit translation controls are useful when a world-space gizmo handle is hard to hit (especially for NPCs).
             // They operate on the same placement transaction, so one click is one undoable move and NPC AI stays paused until Drop.
@@ -2269,14 +2272,13 @@ namespace editor {
             g_npcDropJobs.push_back({ key, 0, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
             return;
         }
-        const float startY = center.y + 5.0f;
+        const float startY = center.y + 0.5f;
         const int ticket = core::GroundProbe({ center.x, startY, center.z }, 30.0f);
         if (!ticket) {
             g_npcDropJobs.push_back({ key, 0, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
             return;
         }
         g_npcDropJobs.push_back({ key, ticket, GetTickCount(), center, count, formation, spacing, radius, fx, fz, ai, behavior });
-        g_npcDropJobs.back().probeTop = startY;
     }
     static int NpcCategory(const std::string& n) {   // from the internal name's first token: NHM_ = human male, NGW_ = goblin female, ...
         const std::string t = n.substr(0, n.find('_'));
@@ -3464,6 +3466,11 @@ namespace editor {
         const float pad = 4.0f * ui, tile = g_cardSize * ui, textH = ImGui::GetTextLineHeight() * 2 + 3;
         const float cw = tile + 2 * pad, ch = tile + 2 * pad + textH;
         ImGui::BeginChild("scenecards", ImVec2(0, listH), ImGuiChildFlags_Borders);
+        if (entities.empty() && tiles.empty()) {
+            ImGui::TextDisabled("%s", T("No scene entries in this view."));
+            ImGui::EndChild();
+            return;
+        }
         const float sp = ImGui::GetStyle().ItemSpacing.x; const int cols = CardGridColumns(ImGui::GetContentRegionAvail().x, cw, sp);
         ImDrawList* dl = ImGui::GetWindowDrawList();
         auto card = [&](int ei) {
@@ -3588,12 +3595,16 @@ namespace editor {
         SameLineForControl("Remove duplicates"); if(FittedButton(T("Remove duplicates")))RemoveDuplicates();
         ImGui::TextWrapped(T("%d entities, %d selected"),(int)(entities.size() + terrainTiles.size()),(int)SceneSelectionCount() + (g_terrainTileSelected ? 1 : 0));
 
-        const float availY=ImGui::GetContentRegionAvail().y; const float footer=56.0f*ui;
-        const float listH=std::max(64.0f*ui,availY-footer);
-        if (entities.empty() && terrainTiles.empty()) ImGui::TextDisabled("%s", T("No scene entries in this view."));
-        else if(useCards) DrawSceneCards(objects,npcs,entities,terrainTiles,chars?chars.get():nullptr,p,havePos,listH,ui);
-        else if(ImGui::BeginTable("scene_entities",7,ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY|ImGuiTableFlags_BordersInnerH,ImVec2(-1,listH))){
+        static float footerHeight = 56.0f;
+        const float availY = ImGui::GetContentRegionAvail().y;
+        const float listH = std::max(1.0f, availY - footerHeight - ImGui::GetStyle().ItemSpacing.y);
+        if(useCards) DrawSceneCards(objects,npcs,entities,terrainTiles,chars?chars.get():nullptr,p,havePos,listH,ui);
+        else if(ImGui::BeginTable("scene_entities",7,ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY|ImGuiTableFlags_BordersInnerH|ImGuiTableFlags_BordersOuter,ImVec2(-1,listH))){
             ImGui::TableSetupColumn("#",ImGuiTableColumnFlags_WidthFixed,48); ImGui::TableSetupColumn(T("entity")); ImGui::TableSetupColumn(T("type"),ImGuiTableColumnFlags_WidthFixed,70); ImGui::TableSetupColumn(T("grp"),ImGuiTableColumnFlags_WidthFixed,46); ImGui::TableSetupColumn(T("position"),ImGuiTableColumnFlags_WidthFixed,220); ImGui::TableSetupColumn(T("state"),ImGuiTableColumnFlags_WidthFixed,190); ImGui::TableSetupColumn(T("dist"),ImGuiTableColumnFlags_WidthFixed,64); ImGui::TableHeadersRow();
+            if (entities.empty() && terrainTiles.empty()) {
+                ImGui::TableNextRow(); ImGui::TableSetColumnIndex(1);
+                ImGui::TextDisabled("%s", T("No scene entries in this view."));
+            }
             std::map<int,std::vector<int>> groups; std::vector<int> order; for(int i=0;i<(int)entities.size();++i){const auto&e=entities[i];if(e.group>0){if(!groups.count(e.group))order.push_back(-e.group);groups[e.group].push_back(i);}else order.push_back(i+1);}
             std::vector<std::pair<int,bool>> rows; for(int x:order){if(x>0)rows.push_back({x-1,false});else{rows.push_back({x,false});if(!g_closedGroups.count(-x))for(int ei:groups[-x])rows.push_back({ei,true});}}
             for(const auto&rw:rows){
@@ -3633,6 +3644,7 @@ namespace editor {
             ImGui::EndTable();
         }
 
+        const float footerStart = ImGui::GetCursorPosY();
         selectedTerrain = std::find_if(terrainTiles.begin(), terrainTiles.end(), [](const SceneTerrainTile& tile) { return TerrainTileSelected(tile); });
         for(auto it=g_sel.begin();it!=g_sel.end();){const auto* o=Find(objects,*it);if(!o||o->hidden)it=g_sel.erase(it);else ++it;} for(auto it=g_managedNpcSel.begin();it!=g_managedNpcSel.end();){const auto* n=FindManagedNpc(npcs,*it);if(!n||n->hidden)it=g_managedNpcSel.erase(it);else ++it;}
         if (SceneHasSelection()) {
@@ -3647,6 +3659,7 @@ namespace editor {
             if (ImGui::Button(T("Delete"))) DeleteTerrainTileAction(selectedTerrain->tx, selectedTerrain->tz, selectedTerrain->project);
         } else if (!entities.empty()) ImGui::TextDisabled("%s", T("Select an object or NPC to inspect it. Ctrl-click adds, Shift-click selects a range."));
         if (ImGui::CollapsingHeader(TStable("Grounding operations"))) DrawProjectGrounding();
+        footerHeight = ImGui::GetCursorPosY() - footerStart;
     }
     static void DrawSelectionPropertiesContent(const PosInfo& p, bool havePos, bool compact) {
         auto objects = core::Spawned(); auto npcs = core::ManagedNpcs(); const auto chars = thumbgen::Characters();
@@ -3742,6 +3755,8 @@ namespace editor {
     static std::vector<size_t> g_libraryRows;
     static std::map<std::string, ULONGLONG> g_badSavedThumbnailStamps;
     static std::map<std::string, DWORD> g_pendingSavedThumbnailTicks;
+    static std::map<std::string, ULONGLONG> g_requestedSavedThumbnailSourceStamps;
+    static std::map<std::string, ProjectFile> g_deferredProjectThumbnails;
     static std::set<std::string> g_currentSavedThumbnails;
     static char g_librarySearch[256] = {};
     static int g_libraryLocation = 0;
@@ -3879,32 +3894,49 @@ namespace editor {
     static bool GenerateSavedThumbnail(const ProjectFile& file, const proj_codec::Document& doc) {
         if (doc.records.empty() && doc.npcs.empty() && doc.terrain.empty()) return false;
         const std::string png = SavedThumbnailPath(file);
+        WIN32_FILE_ATTRIBUTE_DATA sourceInfo{};
+        if (GetFileAttributesExA(ProjectFilePath(file).c_str(), GetFileExInfoStandard, &sourceInfo))
+            g_requestedSavedThumbnailSourceStamps[png] = ((ULONGLONG)sourceInfo.ftLastWriteTime.dwHighDateTime << 32) | sourceInfo.ftLastWriteTime.dwLowDateTime;
         thumbgen::RequestDocumentThumbnail(doc, png);
         g_pendingSavedThumbnailTicks[png] = GetTickCount();
         return true;
     }
-    static void EnsureSavedThumbnail(const ProjectFile& file) {
+    static bool EnsureSavedThumbnail(const ProjectFile& file) {
         const std::string path = SavedThumbnailPath(file), source = ProjectFilePath(file);
         WIN32_FILE_ATTRIBUTE_DATA thumbInfo{}, sourceInfo{};
         if (!GetFileAttributesExA(source.c_str(), GetFileExInfoStandard, &sourceInfo) ||
-            (sourceInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return;
+            (sourceInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return true;
         const bool haveThumb = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &thumbInfo) &&
             !(thumbInfo.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
-        if (thumbgen::DocumentThumbnailPending(path)) return;
+        if (thumbgen::DocumentThumbnailPending(path)) return false;
         if (haveThumb && !g_currentSavedThumbnails.count(path)) {
             int w = 0, h = 0, comp = 0; unsigned char* old = stbi_load(path.c_str(), &w, &h, &comp, 4);
             if (old && w == 320 && h == 240 && old[3] == 0) g_currentSavedThumbnails.insert(path);
             if (old) stbi_image_free(old);
         }
-        const auto pending = g_pendingSavedThumbnailTicks.find(path);
-        if (pending != g_pendingSavedThumbnailTicks.end() && GetTickCount() - pending->second < 2000) return;
-        if (haveThumb && g_currentSavedThumbnails.count(path) &&
-            CompareFileTime(&thumbInfo.ftLastWriteTime, &sourceInfo.ftLastWriteTime) >= 0) return;
         const ULONGLONG stamp = ((ULONGLONG)sourceInfo.ftLastWriteTime.dwHighDateTime << 32) | sourceInfo.ftLastWriteTime.dwLowDateTime;
-        if (const auto it = g_badSavedThumbnailStamps.find(source); it != g_badSavedThumbnailStamps.end() && it->second == stamp) return;
+        const auto requested = g_requestedSavedThumbnailSourceStamps.find(path);
+        if (haveThumb && g_currentSavedThumbnails.count(path) &&
+            CompareFileTime(&thumbInfo.ftLastWriteTime, &sourceInfo.ftLastWriteTime) >= 0 &&
+            (requested == g_requestedSavedThumbnailSourceStamps.end() || requested->second == stamp)) return true;
+        const auto pending = g_pendingSavedThumbnailTicks.find(path);
+        const DWORD interval = file.kind == proj_codec::Kind::Project ? 30000 : 2000;
+        if (pending != g_pendingSavedThumbnailTicks.end() && GetTickCount() - pending->second < interval) return false;
+        if (const auto it = g_badSavedThumbnailStamps.find(source); it != g_badSavedThumbnailStamps.end() && it->second == stamp) return true;
         proj_codec::Document doc;
         if (!ReadProjectFile(file, doc, false) || !GenerateSavedThumbnail(file, doc)) g_badSavedThumbnailStamps[source] = stamp;
         else g_badSavedThumbnailStamps.erase(source);
+        return g_badSavedThumbnailStamps.count(source) != 0;
+    }
+    static void SavedThumbnailTick() {
+        static DWORD lastCheck = 0;
+        const DWORD now = GetTickCount();
+        if (now - lastCheck < 1000) return;
+        lastCheck = now;
+        for (auto it = g_deferredProjectThumbnails.begin(); it != g_deferredProjectThumbnails.end();) {
+            if (EnsureSavedThumbnail(it->second)) it = g_deferredProjectThumbnails.erase(it);
+            else ++it;
+        }
     }
     static bool SaveProjectAction(const std::string& rawName, int scope, bool approved) {
         const bool inPlace = scope == core::SaveProjectOnly || scope == core::SaveProjectAndNew;
@@ -3922,8 +3954,7 @@ namespace editor {
             g_projectRefresh = true;
             if (!inPlace) strncpy_s(g_projName, name.c_str(), _TRUNCATE);
             const ProjectFile file{ name, proj_codec::Kind::Project };
-            proj_codec::Document doc;
-            if (ReadProjectFile(file, doc, false)) GenerateSavedThumbnail(file, doc);
+            if (!EnsureSavedThumbnail(file)) g_deferredProjectThumbnails[ProjectFilePath(file)] = file;
         }
         return ok;
     }
@@ -4081,6 +4112,8 @@ namespace editor {
             overlay::InvalidateThumb(thumbnail);
             g_badSavedThumbnailStamps.erase(file.path);
             g_pendingSavedThumbnailTicks.erase(thumbnail);
+            g_requestedSavedThumbnailSourceStamps.erase(thumbnail);
+            g_deferredProjectThumbnails.erase(file.path);
             g_currentSavedThumbnails.erase(thumbnail);
             if (g_projectReadPath == file.path) g_projectReadValid = false;
         }
@@ -4895,12 +4928,6 @@ namespace editor {
                 g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
             }
             if (status != core::GroundProbeStatus::Hit || !gh.hit || !std::isfinite(gh.centerY)) {
-                if (j.retry++ == 0) {
-                    PosInfo player{};
-                    const float retryTop = core::PlayerPosInfo(&player) ? player.world.y + 25.0f : j.center.y + 25.0f;
-                    j.ticket = core::GroundProbe({ j.center.x, retryTop, j.center.z }, 50.0f);
-                    if (j.ticket) { ++i; continue; }
-                }
                 SpawnBrowserDrop(j.prefab, j.center, j.yaw, j.scale);
                 g_browserDropJobs.erase(g_browserDropJobs.begin() + i); continue;
             }
@@ -4940,14 +4967,13 @@ namespace editor {
             return;
         }
         const float halfHeight = pi.hasCenter ? std::max(0.0f, pi.sy) * g_spawnScale * 0.5f : 0.0f;
-        const float startY = center.y - halfHeight + 5.0f;
+        const float startY = center.y - halfHeight + 0.5f;
         const int ticket = core::GroundProbe({ center.x, startY, center.z }, 30.0f);
         if (!ticket) {
             g_browserDropJobs.push_back({ prefab, 0, GetTickCount(), center, g_spawnYaw, g_spawnScale });
             return;
         }
         g_browserDropJobs.push_back({ prefab, ticket, GetTickCount(), center, g_spawnYaw, g_spawnScale });
-        g_browserDropJobs.back().probeTop = startY;
     }
     static bool NpcDropPoint(ImVec2 mouse, Vec3* at, bool* onGroundPlane) {
         CamFrame cf = CurrentCam(); if (!cf.ok) return false;
@@ -5006,12 +5032,6 @@ namespace editor {
                     g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
                 }
                 if (status != core::GroundProbeStatus::Hit || !gh.hit || !std::isfinite(gh.centerY)) {
-                    if (j.retry++ == 0) {
-                        PosInfo player{};
-                        const float retryTop = core::PlayerPosInfo(&player) ? player.world.y + 25.0f : j.at.y + 25.0f;
-                        j.ticket = core::GroundProbe({ j.at.x, retryTop, j.at.z }, 50.0f);
-                        if (j.ticket) { ++i; continue; }
-                    }
                     SpawnNpcFormation(j.key, j.at, j.count, j.formation, j.spacing, j.radius, j.fx, j.fz, j.ai, j.behavior);
                     g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
                 }
@@ -5022,14 +5042,13 @@ namespace editor {
                     g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue;
                 }
                 j.memberTickets.assign(j.positions.size(), 0);
-                j.memberRetries.assign(j.positions.size(), 0);
                 j.centerResolved = true;
             }
             int issued = 0; bool pending = false, invalidated = false;
             for (size_t k = 0; k < j.positions.size(); ++k) {
                 int& ticket = j.memberTickets[k];
                 if (ticket == 0 && issued < 16) {
-                    ticket = core::GroundProbe({ j.positions[k].x, j.at.y + 5.0f, j.positions[k].z }, 30.0f);
+                    ticket = core::GroundProbe({ j.positions[k].x, j.at.y + 0.5f, j.positions[k].z }, 30.0f);
                     ++issued;
                     if (!ticket) { invalidated = true; break; }
                 }
@@ -5042,10 +5061,6 @@ namespace editor {
                 if (status == core::GroundProbeStatus::Hit && memberHit.hit && std::isfinite(memberHit.centerY)) {
                     j.positions[k].y = memberHit.centerY - memberHit.radius;
                     ticket = -1;
-                } else if (j.memberRetries[k]++ == 0) {
-                    ticket = core::GroundProbe({ j.positions[k].x, j.at.y + 25.0f, j.positions[k].z }, 50.0f);
-                    if (!ticket) { invalidated = true; break; }
-                    pending = true;
                 } else ticket = -2;
             }
             if (invalidated) { SpawnNpcPositions(j.key, j.positions, j.ai, j.behavior); g_npcDropJobs.erase(g_npcDropJobs.begin() + i); continue; }
@@ -5205,8 +5220,8 @@ namespace editor {
     // narrow dock: the browser keeps the full placement settings and drag/drop behavior of the full editor.
     static void DrawCompact(const PosInfo& p, bool havePos) {
         ImGuiIO& io = ImGui::GetIO(); const float ui = ImGui::GetFontSize() / 17.0f;
-        ImGui::SetNextWindowSize(ImVec2(300.0f * ui, io.DisplaySize.y - 80.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 320.0f * ui, 40.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(450.0f * ui, io.DisplaySize.y - 80.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 470.0f * ui, 40.0f), ImGuiCond_FirstUseEver);
         const bool playAlpha = g_playMode;
         if (playAlpha) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.20f);
         char title[160]; snprintf(title, sizeof title, T("World Builder [%s]###cdmodkit_dock"), T(g_cameraMode ? "CAMERA" : (g_playMode ? "PLAY" : "EDIT")));
@@ -5399,7 +5414,7 @@ namespace editor {
         struct FrameCommit { ~FrameCommit() {
             if (!TerrainTabShown()) CommitBrushHistory(); PumpGroundHistory();
             if (g_place.active && !g_placeHudDrawn) DrawPlaceHud();
-            FinalizeNumericEdits(); PublishProjectContext(); AutoSaveTick();
+            FinalizeNumericEdits(); PublishProjectContext(); AutoSaveTick(); SavedThumbnailTick();
         } } frameCommit;
         {   // in-game names follow the UI language
             static std::string lastLang; std::string lang = i18n::ActiveLanguage();
