@@ -1969,49 +1969,34 @@ namespace editor {
     }
     static void HandleHotkeys(bool havePos) {
         ImGuiIO& io = ImGui::GetIO();
-        const bool sceneContext = g_compact ? g_compactPage == TabScene : g_mainTab == TabScene;
-        auto selectAllForContext = [&]() {
-            if (sceneContext) SelectAllSceneEntities(core::Spawned(), core::ManagedNpcs(), g_projTab);
+        // The game routes ordinary keys to itself when no text field is active, so ImGui alone
+        // cannot detect editor shortcuts. Poll the same key state used by the free camera.
+        auto pressed = [&](int vk, ImGuiKey key) {
+            const bool now = (GetAsyncKeyState(vk) & 0x8000) != 0 || input::VkDown(vk);
+            const bool fire = (now && !g_cameraShortcutDown[vk & 0xFF]) || ImGui::IsKeyPressed(key, false);
+            g_cameraShortcutDown[vk & 0xFF] = now;
+            return fire;
         };
-        auto deleteForContext = [&]() {
-            if (sceneContext && SceneHasSelection()) DeleteSceneSelection();
-        };
-        auto groupForContext = [&]() {
-            if (sceneContext && SceneHasSelection()) GroupSceneSelection(true);
-        };
-        if (g_cameraMode) {
-            // Camera movement uses async key state because the game may not forward legacy keyboard messages.
-            // Editing shortcuts must use the same reliable source while camera mode owns the workflow.
-            auto pressed = [&](int vk) {
-                const bool now = (GetAsyncKeyState(vk) & 0x8000) != 0;
-                const bool fire = now && !g_cameraShortcutDown[vk & 0xFF];
-                g_cameraShortcutDown[vk & 0xFF] = now;
-                return fire;
-            };
-            const bool pZ = pressed('Z'), pY = pressed('Y'), pC = pressed('C'), pV = pressed('V');
-            const bool pD = pressed('D'), pG = pressed('G'), pA = pressed('A'), pDelete = pressed(VK_DELETE);
-            const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            if (io.WantTextInput || g_playMode) return;
-            if (ctrl && pZ) Undo();
-            if (ctrl && pY) Redo();
-            if (sceneContext && ctrl && pC && (!g_sel.empty() || g_managedNpcSel.empty())) CopySel();
-            if (sceneContext && ctrl && pV) Paste(havePos);
-            if (sceneContext && ctrl && pD && !g_sel.empty()) { CopySel(); Paste(havePos); }
-            if (ctrl && pG) groupForContext();
-            if (ctrl && pA) selectAllForContext();
-            if (!ctrl && pDelete) deleteForContext();
-            return;
-        }
+        const bool pZ = pressed('Z', ImGuiKey_Z), pY = pressed('Y', ImGuiKey_Y);
+        const bool pC = pressed('C', ImGuiKey_C), pV = pressed('V', ImGuiKey_V);
+        const bool pD = pressed('D', ImGuiKey_D), pG = pressed('G', ImGuiKey_G);
+        const bool pA = pressed('A', ImGuiKey_A), pDelete = pressed(VK_DELETE, ImGuiKey_Delete);
+        const bool ctrl = CtrlHeld(io) || input::VkDown(VK_CONTROL);
+        DWORD foregroundProcess = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &foregroundProcess);
+        if (foregroundProcess != GetCurrentProcessId()) return;
         if (io.WantTextInput || g_playMode) return;
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) Undo();
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) Redo();
-        // Empty Scene copy clears the old object payload; NPC-only copy remains unchanged.
-        if (sceneContext && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false) && (!g_sel.empty() || g_managedNpcSel.empty())) CopySel();
-        if (sceneContext && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false)) Paste(havePos);
-        if (sceneContext && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false) && !g_sel.empty()) { CopySel(); Paste(havePos); }
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false)) groupForContext();
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) selectAllForContext();
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) deleteForContext();
+        if (ctrl && pZ) Undo();
+        if (ctrl && pY) Redo();
+        if (ctrl && pA) {
+            SelectAllSceneEntities(core::Spawned(), core::ManagedNpcs());
+            core::Log("[editor/hotkey] Ctrl+A selected %zu objects and %zu NPCs", g_sel.size(), g_managedNpcSel.size());
+        }
+        if (ctrl && pC && (!g_sel.empty() || g_managedNpcSel.empty())) CopySel();
+        if (ctrl && pV) Paste(havePos);
+        if (ctrl && pD && !g_sel.empty()) { CopySel(); Paste(havePos); }
+        if (ctrl && pG && SceneHasSelection()) GroupSceneSelection(true);
+        if (!ctrl && pDelete && SceneHasSelection()) DeleteSceneSelection();
     }
 
     // ---- line / circle tools ----

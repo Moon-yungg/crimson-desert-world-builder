@@ -955,7 +955,7 @@ bool Trace() { return g_trace; }
 // so an object that is updated every frame never comes back. The final drop always re-creates (g_recreateOnMove) for a clean state.
 // 2 = setWorldTransform(0,1): remove + re-insert per update, visible but may flicker; 1 = (0,0) leaves the object invisible until
 // re-inserted; 0 = disable/enable hides it (async re-add). Release/drop always re-creates.
-int g_liveMode = 2;
+int g_liveMode = 3; // keep the object enabled while its live transform changes
 static void DoLiveMove(uintptr_t obj, Vec3 pos, Rot rot, float scale, DWORD queuedAt) {
 #ifdef WB_UNIFIED_HOST_TEST
     const DWORD wait = GetTickCount() - queuedAt;
@@ -974,6 +974,8 @@ static void DoLiveMove(uintptr_t obj, Vec3 pos, Rot rot, float scale, DWORD queu
     case 3: setXf((void*)obj, xf, 0, 0); setEnable((void*)obj, 1); break;
     default: setEnable((void*)obj, 0); setXf((void*)obj, xf, 0, 1); setEnable((void*)obj, 1); break;
     }
+    static int traceSamples = 0;
+    if (traceSamples++ < 12) Log("[live] mode=%d obj=%p pos=(%.2f %.2f %.2f)", g_liveMode, (void*)obj, pos.x, pos.y, pos.z);
 #endif
 }
 // A final move that must re-create: remove the record's current handle and materialize its next incarnation.
