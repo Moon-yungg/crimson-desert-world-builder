@@ -4290,9 +4290,10 @@ static bool RemoveSpawnedActor(uintptr_t actor) {
     ((F1)unlockF)((void*)lockObj);
     int result = 0; ((F2)f34)((void*)actor, &result);
     Log("[remove] vtable[34] result %d (%s)", result, DecodeErr((uint32_t)result).c_str());
+    if (result != 0) return false;
     { std::lock_guard<std::mutex> l(g_regMutex); g_managedNpcActors.erase(actor); }
     std::lock_guard<std::mutex> l(g_spawnedMutex); for (auto it = g_spawned.begin(); it != g_spawned.end(); ++it) if (it->actor == actor) { g_spawned.erase(it); break; }
-    return result == 0;
+    return true;
 #endif
 }
 int SpawnedList(SpawnedInfo* out, int max) {
