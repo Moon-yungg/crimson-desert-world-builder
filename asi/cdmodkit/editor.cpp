@@ -4067,6 +4067,7 @@ namespace editor {
             if (ImGui::Button(T("Read"))) DispatchProjectAction(file, ProjectAction::Read);
             if (!saved.archived) {
                 const bool editing = core::FileNameEqual(core::EditingProject(), file.name);
+                ProjectButtonWrap("Edit project");
                 if (ImGui::RadioButton(T("Edit project"), editing)) {
                     if (core::SetEditingProject(file.name)) { ClearSceneSelection(); g_projectRefresh = true; }
                     else g_projectStatus = core::ProjectError();
@@ -4158,7 +4159,6 @@ namespace editor {
             if (ImGui::Button(T("Approve project overwrite"))) { const auto name = g_projectOverwriteName; const int scope = g_projectOverwriteScope; g_projectOverwriteName.clear(); SaveProjectAction(name, scope, true); }
             ProjectButtonWrap("Cancel overwrite"); if (ImGui::Button(T("Cancel overwrite"))) g_projectOverwriteName.clear();
         }
-        if (ImGui::Button(T("Refresh"))) g_projectRefresh = true;
         if (!g_projectStatus.empty()) ImGui::TextWrapped("%s", ProjectUiStatus(g_projectStatus.c_str()));
         if (!g_projectFileFailures.empty() && ProjectDisclosure(std::string(T("File attempt details")) + " (! " + std::to_string(g_projectFileFailures.size()) + ")", "file-attempts"))
             for (const auto& f : g_projectFileFailures) { ImGui::TextWrapped("%s: %s", T(f.action.c_str()), f.path.c_str()); ImGui::TextWrapped("%s", ProjectUiStatus(f.reason.c_str())); }
@@ -4177,6 +4177,8 @@ namespace editor {
         const std::string editing = core::EditingProject();
         ImGui::Text("%s: %s", T("Editing project"), editing.empty() ? T("None") : editing.c_str());
         bool autosave = core::g_projectAutoSave;
+        const std::string autosaveLabel = std::string(T("Auto-save")) + ": " + T(autosave ? "ON" : "OFF");
+        SameLineOrWrap(true, ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x + ImGui::CalcTextSize(autosaveLabel.c_str()).x);
         if (ImGui::Checkbox("##project-autosave", &autosave)) { core::g_projectAutoSave = autosave; core::SaveSettings(); }
         SameLineForControl("Auto-save");
         ImGui::PushStyleColor(ImGuiCol_Text, autosave ? ImVec4(0.45f, 0.9f, 0.55f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
@@ -4201,6 +4203,7 @@ namespace editor {
             if (GetOpenFileNameA(&ofn)) { if (core::ImportProjectFile(file)) { Note(T("imported %s"), file); g_projectRefresh = true; } else { g_projectStatus = core::ProjectError(); Note(T("import failed")); } }
         }
         ProjectButtonWrap("Open project folder"); if (ImGui::Button(T("Open project folder"))) ShellExecuteA(nullptr, "open", (core::ModDir() + "\\projects").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ProjectButtonWrap("Refresh"); if (ImGui::Button(T("Refresh"))) g_projectRefresh = true;
         DrawProjectExtras();
         DrawSavedLibrary(false);
         DrawProjectReports();
@@ -4953,7 +4956,7 @@ namespace editor {
         };
         for (int i = 0; i < (int)(sizeof(dockPages) / sizeof(dockPages[0])); ++i) {
             if (dockPages[i].id == TabTerrain && !core::TerrainAvailable()) continue;
-            if (i) SameLineForControl(dockPages[i].label);
+            SameLineForControl(dockPages[i].label);
             const bool act = g_compactPage == dockPages[i].id;   // decided once: the click below may change the page
             if (act) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
             if (FittedButton(TStable(dockPages[i].label))) { g_compactPage = dockPages[i].id; g_mainTab = dockPages[i].id; ImGui::SetScrollY(0); }
@@ -5172,12 +5175,12 @@ namespace editor {
             g_mainTab == TabEnvironment ? "narrow side window: time and weather controls" :
             g_mainTab == TabTerrain ? "narrow side window: terrain brush and apply controls" :
             "narrow side window: search, cards in one column, PLACE"));
-        ImGui::SameLine();
         {   // free-fly camera
             const bool fc = g_cameraMode;
             ImGui::BeginDisabled(!core::FreeCamAvailable());
             if (fc) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.36f, 0.22f, 1.0f));
             char fl[96]; snprintf(fl, sizeof fl, "%s (%s)###freecam", T(fc ? ICON_EYE " flying" : ICON_EYE " free camera"), core::KeyName(core::g_keyMode));
+            SameLineOrWrap(true, ImGui::CalcTextSize(fl, nullptr, true).x + ImGui::GetStyle().FramePadding.x * 2.0f);
             if (ImGui::Button(fl)) ToggleCameraMode();
             if (fc) ImGui::PopStyleColor();
             ImGui::EndDisabled();
@@ -5185,16 +5188,6 @@ namespace editor {
                 ? "Free camera: W/A/S/D move, E or Space up, Q down, Shift faster, mouse wheel forward. Ctrl remains available for multi-select and editor shortcuts. Drag with the right mouse button over the world to look around; a right click without moving opens the context menu. Your character stays where it is; new objects appear in front of the camera."
                 : "The free camera is not available in this game build (see the log)."));
             SameLineOrWrap(false, ImGui::GetFrameHeight()); DrawCameraViewTool();
-        }
-        if (havePos) ImGui::TextWrapped(T(ICON_LOCATION_DOT "  %.1f  %.1f  %.1f   tile %d,%d"), p.world.x, p.world.y, p.world.z, p.tileX, p.tileZ);
-        else ImGui::TextWrapped("%s", T("player position not available (load a save)"));
-        SameLineOrWrap(false, 330);
-        {   // game thread state: the mod runs its work on the game's simulation tick; the counter tells whether that tick is alive
-            static long s_lastTicks = 0; static DWORD s_lastChange = 0; const long ticks = core::PumpTicks(); const DWORD now = GetTickCount();
-            if (ticks != s_lastTicks) { s_lastTicks = ticks; s_lastChange = now; }
-            const char* state = !core::HooksReady() ? "hooks MISSING" : ticks == 0 ? "game thread: waiting" : now - s_lastChange < 500 ? "game thread: running" : "game thread: paused";
-            ImGui::TextDisabled(T("objects %d  |  %s"), (int)core::Spawned().size(), T(state));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Spawning and moving happen on the game's simulation tick (%ld ticks so far).\nPaused = loading screen, menu or pause; queued actions run once it continues."), ticks);
         }
         {
             // ImGui's TabBar can shrink or scroll but cannot flow onto another row. The editor has enough pages that translated
@@ -5215,16 +5208,11 @@ namespace editor {
                 { TabSettings, ICON_LIST " Settings", true },
                 { TabLog, ICON_LIST " Log", true },
             };
-            bool firstNav = true;
             for (const auto& page : pages) {
                 if (!page.show) continue;
                 const char* label = TStable(page.label);
                 const float width = ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
-                if (!firstNav) {
-                    const float gap = ImGui::GetStyle().ItemSpacing.x;
-                    const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
-                    if (ImGui::GetItemRectMax().x + gap + width <= right) ImGui::SameLine();
-                }
+                SameLineOrWrap(true, width);
                 ImGui::PushID(page.id);
                 const bool active = g_mainTab == page.id;
                 if (active) {
@@ -5234,9 +5222,18 @@ namespace editor {
                 if (FittedButton(label)) g_mainTab = page.id;
                 if (active) ImGui::PopStyleColor(2);
                 ImGui::PopID();
-                firstNav = false;
             }
             g_selectMainTab = false;
+            if (havePos) ImGui::TextWrapped(T(ICON_LOCATION_DOT "  %.1f  %.1f  %.1f   tile %d,%d"), p.world.x, p.world.y, p.world.z, p.tileX, p.tileZ);
+            else ImGui::TextWrapped("%s", T("player position not available (load a save)"));
+            SameLineOrWrap(false, 330);
+            {   // game thread state: the mod runs its work on the game's simulation tick; the counter tells whether that tick is alive
+                static long s_lastTicks = 0; static DWORD s_lastChange = 0; const long ticks = core::PumpTicks(); const DWORD now = GetTickCount();
+                if (ticks != s_lastTicks) { s_lastTicks = ticks; s_lastChange = now; }
+                const char* state = !core::HooksReady() ? "hooks MISSING" : ticks == 0 ? "game thread: waiting" : now - s_lastChange < 500 ? "game thread: running" : "game thread: paused";
+                ImGui::TextDisabled(T("objects %d  |  %s"), (int)core::Spawned().size(), T(state));
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Spawning and moving happen on the game's simulation tick (%ld ticks so far).\nPaused = loading screen, menu or pause; queued actions run once it continues."), ticks);
+            }
             ImGui::Separator();
 
             const bool inBrowser = g_mainTab == TabBrowser;
