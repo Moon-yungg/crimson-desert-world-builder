@@ -1,0 +1,8 @@
+# Codec suite: the production proj_codec TU is the unit under test (the fixture is the only other TU).
+# Everything here is disk values: no engine/registry/DXGI surface is linked or substituted.
+asi/cdmodkit/proj_codec.cpp
+# @evidence entries are hashed into the run receipt and are never passed to the compiler as sources.
+@evidence asi/cdmodkit/proj_codec.h
+@evidence asi/cdmodkit/proj_codec.cpp
+@evidence tests/wb_groups/codec.sources
+@evidence tests/wb_groups/codec_v097_cases.h

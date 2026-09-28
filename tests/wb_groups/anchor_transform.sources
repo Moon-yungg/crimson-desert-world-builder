@@ -1,0 +1,8 @@
+# AnchorTransform suite: the production wb_group_math TU is the unit under test. The math layer consumes the
+# proj_codec value types (header-only dependency); no codec TU, scene or engine surface is linked here.
+asi/cdmodkit/wb_group_math.cpp
+# @evidence entries are hashed into the run receipt and are never passed to the compiler as sources.
+@evidence asi/cdmodkit/wb_group_math.h
+@evidence asi/cdmodkit/wb_group_math.cpp
+@evidence asi/cdmodkit/proj_codec.h
+@evidence tests/wb_groups/anchor_transform.sources
