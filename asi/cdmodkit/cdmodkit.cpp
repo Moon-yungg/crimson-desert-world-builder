@@ -2129,7 +2129,8 @@ static bool SameTerrainStrokes(const std::vector<TerrainStroke>& a, const std::v
     for (size_t i = 0; i < a.size(); ++i) {
         const auto& x = a[i]; const auto& y = b[i];
         if (x.mode != y.mode || x.proj != y.proj || x.x != y.x || x.z != y.z || x.r != y.r ||
-            x.amount != y.amount || x.strength != y.strength || x.ax != y.ax || x.az != y.az || x.y != y.y) return false;
+            x.amount != y.amount || x.strength != y.strength || x.ax != y.ax || x.az != y.az || x.y != y.y ||
+            x.tileScoped != y.tileScoped || x.tileX != y.tileX || x.tileZ != y.tileZ) return false;
     }
     return true;
 }
@@ -2207,7 +2208,8 @@ bool SaveProject(const std::string& rawName, int scope) {
         if (scope == SaveProjectAndNew && !(t.proj == pid || t.proj == 0)) continue;
         if (scope == SaveNewOnly && t.proj != 0) continue;
         if (scope == SaveProjectOnly && t.proj != pid) continue;
-        doc.terrain.push_back({ t.mode, t.x, t.z, t.r, t.amount, t.strength, t.ax, t.az, t.y });
+        doc.terrain.push_back({ t.mode, t.x, t.z, t.r, t.amount, t.strength, t.ax, t.az, t.y,
+                                t.tileScoped, t.tileX, t.tileZ });
     }
     std::vector<proj_codec::EngineRow> narrowed;
     if (!proj_codec::NarrowForEngine(doc, narrowed, error) || !proj_codec::Serialize(doc, text, error)) { g_projectError = error; Log("save: invalid document: %s", error.c_str()); return false; }
@@ -2552,7 +2554,7 @@ static std::vector<TerrainStroke> ProjectTerrain(const proj_codec::Document& doc
     std::vector<TerrainStroke> strokes;
     for (const auto& t : doc.terrain)
         strokes.push_back({ t.mode, (float)t.x, (float)t.z, (float)t.r, (float)t.amount, (float)t.strength,
-                            (float)t.ax, (float)t.az, (float)t.y, pid });
+                            (float)t.ax, (float)t.az, (float)t.y, pid, t.tileScoped, t.tileX, t.tileZ });
     return strokes; // ReadProjectDocument validated every float before any scene mutation
 }
 static std::map<std::string, ProjectLoadReport> g_projectLoads;   // guarded by g_regMutex
@@ -2675,6 +2677,46 @@ bool ImportProjectFile(const std::string& path) {
 #endif
     if (!proj_codec::WriteTransactional(ProjDir() + "\\" + base, proj_codec::Kind::Project, bytes, writeHooks, error)) {
         g_projectError = error; Log("import: write or replace failed: %s", error.c_str()); return false;
+    }
+    g_projectError.clear();
+    return true;
+}
+// validate-first import: shared .cdgroup bytes enter Groups only after parsing and narrowing succeed.
+bool ImportGroupFile(const std::string& path) {
+    const std::string base = path.substr(path.find_last_of("\\/") + 1);
+    if (base.empty()) { g_projectError = "record 0: empty import file name"; return false; }
+    if (base.size() < 9 || _stricmp(base.c_str() + base.size() - 8, ".cdgroup") != 0) { g_projectError = "record 0: the import needs a .cdgroup file"; return false; }
+    const std::string name = base.substr(0, base.size() - 8);
+    std::string nameError;
+    if (!ValidateExportName(name, nameError) || !ValidFileName(base, proj_codec::Kind::Group)) {
+        g_projectError = nameError.empty() ? "record 0: invalid blueprint file name" : nameError; return false;
+    }
+    FileActivity fileWork(proj_codec::Kind::Group, name, FileReason::PendingOperation);
+    std::ifstream file(path.c_str(), std::ios::binary);
+    if (!file) { g_projectError = "record 0: cannot open the import file"; return false; }
+    const std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (file.bad()) { g_projectError = "record 0: cannot read the import file"; return false; }
+    file.close();
+    if (file.fail()) { g_projectError = "record 0: cannot close the import file"; return false; }
+    proj_codec::Document doc; std::vector<proj_codec::EngineRow> rows; std::string error;
+    if (!proj_codec::Parse(bytes, path, proj_codec::Kind::Group, doc, error) || !proj_codec::NarrowForEngine(doc, rows, error)) {
+        g_projectError = error; Log("blueprint import: %s", error.c_str()); return false;
+    }
+    const std::string destination = GroupDir() + "\\" + base;
+    if (GetFileAttributesA(destination.c_str()) != INVALID_FILE_ATTRIBUTES && _stricmp(path.c_str(), destination.c_str()) != 0) {
+        g_projectError = "record 0: a blueprint with that filename already exists; rename the imported file first"; return false;
+    }
+    if (_stricmp(path.c_str(), destination.c_str()) == 0) { g_projectError.clear(); return true; }
+    if (!CreateDirectoryA(GroupDir().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        g_projectError = "record 0: cannot create the Groups directory"; return false;
+    }
+    proj_codec::WriteHooks hooks; proj_codec::WriteHooks* writeHooks = nullptr;
+#ifdef WB_UNIFIED_HOST_TEST
+    InstallSaveFaultHooks(hooks);
+    writeHooks = &hooks;
+#endif
+    if (!proj_codec::WriteTransactional(destination, proj_codec::Kind::Group, bytes, writeHooks, error)) {
+        g_projectError = error; Log("blueprint import: write failed: %s", error.c_str()); return false;
     }
     g_projectError.clear();
     return true;
