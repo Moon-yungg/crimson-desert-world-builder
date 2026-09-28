@@ -955,7 +955,7 @@ bool Trace() { return g_trace; }
 // so an object that is updated every frame never comes back. The final drop always re-creates (g_recreateOnMove) for a clean state.
 // 2 = setWorldTransform(0,1): remove + re-insert per update, visible but may flicker; 1 = (0,0) leaves the object invisible until
 // re-inserted; 0 = disable/enable hides it (async re-add). Release/drop always re-creates.
-int g_liveMode = 2;
+int g_liveMode = 2; // restore the pre-regression re-insert path so the object stays visible while dragging
 static void DoLiveMove(uintptr_t obj, Vec3 pos, Rot rot, float scale, DWORD queuedAt) {
 #ifdef WB_UNIFIED_HOST_TEST
     const DWORD wait = GetTickCount() - queuedAt;
@@ -974,6 +974,8 @@ static void DoLiveMove(uintptr_t obj, Vec3 pos, Rot rot, float scale, DWORD queu
     case 3: setXf((void*)obj, xf, 0, 0); setEnable((void*)obj, 1); break;
     default: setEnable((void*)obj, 0); setXf((void*)obj, xf, 0, 1); setEnable((void*)obj, 1); break;
     }
+    static int traceSamples = 0;
+    if (traceSamples++ < 12) Log("[live] mode=%d obj=%p pos=(%.2f %.2f %.2f)", g_liveMode, (void*)obj, pos.x, pos.y, pos.z);
 #endif
 }
 // A final move that must re-create: remove the record's current handle and materialize its next incarnation.
@@ -983,7 +985,7 @@ static void DoLiveMove(uintptr_t obj, Vec3 pos, Rot rot, float scale, DWORD queu
 static void DoReplace(int uid, uint64_t gen, MoveCompletion done = {}, const MoveReq* target = nullptr) {
     uintptr_t old = 0;
     { REG_LOCK; if (!GenCurrentLocked(uid, gen)) return; old = g_reg[(size_t)IndexOfUidLocked(uid)].obj; }
-    if (old && !DoRemove(old) && done) { done(false); return; } // actual refusal; no fictitious replacement
+    if (old && !DoRemove(old)) { if (done) done(false); return; } // never spawn a duplicate while the old object survives
     uint64_t next = 0;
     { REG_LOCK; if (!GenCurrentLocked(uid, gen)) return;   // a forget/hide/restore replaced the incarnation while removing
       SpawnedObj& e = g_reg[(size_t)IndexOfUidLocked(uid)];
@@ -1027,7 +1029,9 @@ static std::function<void()> AdmitMoveLocked(size_t i, Vec3 pos, Rot rot, float 
     const uint64_t pose = e.poseGen;
     return [uid, gen, pose, final, recreate, done, target]() {
         { REG_LOCK; const int ix = IndexOfUidLocked(uid);
-          if (ix < 0 || g_reg[(size_t)ix].poseGen != pose || !GenCurrentLocked(uid, gen)) return; }
+          // Live jobs read the newest admitted pose in ApplyMove. Rejecting every older queued
+          // sample can starve visible motion while the UI keeps admitting a new pose each frame.
+          if (ix < 0 || (final && g_reg[(size_t)ix].poseGen != pose) || !GenCurrentLocked(uid, gen)) return; }
         if (recreate) DoReplace(uid, gen, done, done ? &target : nullptr); else ApplyMove(uid, gen, final, done, done ? &target : nullptr);
     };
 }
@@ -1153,6 +1157,7 @@ static void HideUidDeferred(int uid, std::function<void()> removed) {
 static bool HideUidInternal(int uid, std::function<void()> removed) {
     std::unique_lock<std::mutex> operation(g_groundOpMutex);
     if (!GroundBeforeMutationLocked({ uid }, [uid, removed]() { HideUidDeferred(uid, removed); })) return true;
+    if (!GameThreadReady()) return false;
     uintptr_t obj = 0, actor = 0, standinObj = 0; bool gimmick = false; std::weak_ptr<PlaceRequest> reqw; int rowId = -1;
     {   // an interactive object: its actor is removed on the server tick, the way the game removes a picked-up item
         REG_LOCK; const int idx = IndexOfUidLocked(uid); if (idx < 0 || g_reg[(size_t)idx].hidden) return false;
@@ -1175,7 +1180,6 @@ static bool HideUidInternal(int uid, std::function<void()> removed) {
         } else if (!serverLane && removed) removed();   // nothing visible to remove: the cleanup is already complete
         return true;
     }
-    if (!GameThreadReady()) return false;
     if (obj) RunOnGameThread([obj, removed]() { DoRemove(obj); if (removed) removed(); });
     else if (removed) removed();                        // hidden record with no materialized object: nothing to remove
     return true;
@@ -1357,7 +1361,7 @@ static void PumpJobs() {
 #ifndef WB_UNIFIED_HOST_TEST   // host runs are deterministic: the tick duties need the game's own state
     if ((g_pumpTicks & 31) == 0) CheckReplayWatchdog();
     if (g_trace) TraceTick();
-    if ((g_pumpTicks & 15) == 0) AutoloadTick();
+    AutoloadFrame();
 #endif
     std::function<void()> job;
     if (InterlockedCompareExchange(&g_queueCount, 0, 0) != 0) {
@@ -1380,10 +1384,11 @@ static uint64_t HookPump(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uin
 // still resolves the row identity.
 static int SpawnAtLinked(const std::string& prefab, Vec3 world, Rot rot, float scale, int group, int proj,
                          const std::shared_ptr<PlaceRequest>& req, int rowId) {
-    if (!GameThreadReady()) { Log("spawn: game thread pump not active yet"); return 0; }
     // a character appearance is assembled by the game's actor system; as a scene object it would spawn nothing visible
     if (prefab.size() > 8 && prefab.compare(prefab.size() - 8, 8, ".app_xml") == 0) { Log("spawn: %s is a character appearance, characters cannot be spawned yet", prefab.c_str()); return 0; }
     const bool gim =g_gimmickSpawn && kRva_GimmickSpawn_ && IsGimmickPrefab(prefab);
+    if (!gim && !GameThreadReady()) { Log("spawn: game thread pump not active yet"); return 0; }
+    if (!proj && !g_loading) { proj = EnsureEditingProject(); if (!proj) { Log("spawn: no editable project is available"); return 0; } }
     int uid; uint64_t gen = 0;
     { std::lock_guard<std::mutex> l(g_regMutex); uid = g_nextUid++; gen = NewGenLocked();
       SpawnedObj o{ 0, prefab, world, rot, scale, false, GetTickCount(), rot, scale, uid, group, proj, gim, 0, false, gen };
@@ -1494,8 +1499,11 @@ static void LoadPrefabs() {
       while (std::getline(sf, line)) { size_t t = line.find('\t'); if (t == std::string::npos) continue; auto it = byPath.find(line.substr(0, t)); if (it == byPath.end()) continue;
         PrefabInfo& pi = g_index[it->second];
         int got = sscanf(line.c_str() + t + 1, "%f\t%f\t%f\t%f\t%f\t%f", &pi.sx, &pi.sy, &pi.sz, &pi.cx, &pi.cy, &pi.cz);
-        pi.hasCenter = got == 6; if (got < 6) pi.cx = pi.cy = pi.cz = 0; n++;
-        if (pi.hasCenter && pi.cx == 0 && pi.cy == 0 && pi.cz == 0 && pi.sy > 0) pi.cy = pi.sy * 0.5f;   // lines written for a failed re-measure: assume the pivot at the bottom center
+        // Old failed re-measures wrote literal "0" for X/Z and an assumed Y center. Keep the size,
+        // but do not present that guess as measured geometry; the thumbnail worker retries it.
+        const bool guessed = got == 6 && line.find("\t0\t", t + 1) != std::string::npos &&
+            line.size() >= 2 && line.compare(line.size() - 2, 2, "\t0") == 0;
+        pi.hasCenter = got == 6 && !guessed; if (!pi.hasCenter) pi.cx = pi.cy = pi.cz = 0; n++;
     }
       if (n) Log("prefab sizes: %d", n); }
     for (auto& kv : tagc) g_tagCounts.push_back(kv);
@@ -1534,10 +1542,13 @@ void PreviewSet(const std::string& prefab, Vec3 pos, float yawDeg, float scale, 
     });
 }
 int PreviewCommit() {
+    { std::lock_guard<std::mutex> l(g_prevMutex); if (!g_prev.obj) return 0; }
+    const int project = EnsureEditingProject();
+    if (!project) return 0;
     std::lock_guard<std::mutex> l(g_prevMutex);
     if (!g_prev.obj) return 0;
     int uid = 0;
-    { std::lock_guard<std::mutex> r(g_regMutex); uid = g_nextUid++; g_reg.push_back({ g_prev.obj, g_prev.prefab, g_prev.pos, Rot{ g_prev.yaw }, g_prev.scale, false, GetTickCount(), Rot{ g_prev.yaw }, g_prev.scale, uid, 0, 0, false, 0, false, NewGenLocked() }); }
+    { std::lock_guard<std::mutex> r(g_regMutex); uid = g_nextUid++; g_reg.push_back({ g_prev.obj, g_prev.prefab, g_prev.pos, Rot{ g_prev.yaw }, g_prev.scale, false, GetTickCount(), Rot{ g_prev.yaw }, g_prev.scale, uid, 0, project, false, 0, false, NewGenLocked() }); MarkDirtyLocked(project); }
     Log("preview committed: %s at (%.2f %.2f %.2f)", g_prev.prefab.c_str(), g_prev.pos.x, g_prev.pos.y, g_prev.pos.z);
     g_prev.obj = 0; g_prev.prefab.clear();
     return uid;
@@ -1597,7 +1608,7 @@ struct FileHandle {
 struct FileSelection { SavedFile file; BY_HANDLE_FILE_INFORMATION info{}; std::string bytes; };
 static const char* FileExtension(proj_codec::Kind kind) { return kind == proj_codec::Kind::Project ? ".cdproj" : ".cdgroup"; }
 static std::string FileDirectory(proj_codec::Kind kind, bool archived) {
-    return g_modDir + (kind == proj_codec::Kind::Project ? "\\projects" : "\\Groups") + (archived ? "\\.archive" : "");
+    return g_modDir + (kind == proj_codec::Kind::Project ? "\\projects" : "\\groups") + (archived ? "\\.archive" : "");
 }
 static bool ValidFileName(const std::string& filename, proj_codec::Kind kind) {
     if (kind != proj_codec::Kind::Project && kind != proj_codec::Kind::Group) return false;
@@ -1706,6 +1717,9 @@ SavedFile SelectedFile(const FileSelectionHandle& selection) { return selection 
 // per session and only name the .cdproj files; the file format itself does not change.
 static std::mutex g_projMutex;                 // guards g_projNames only - never taken while g_regMutex is held
 static std::vector<std::string> g_projNames{ "" };   // index 0 = "no project"
+static std::string g_editProjectName;
+static std::recursive_mutex g_editEnsureMutex;
+static std::set<int> g_loadedProjectIds;       // guarded by g_regMutex; empty projects are loaded too
 int ProjectId(const std::string& name) {
     if (name.empty()) return 0;
     std::lock_guard<std::mutex> l(g_projMutex);
@@ -1716,6 +1730,41 @@ int ProjectId(const std::string& name) {
 std::string ProjectNameOf(int id) {
     std::lock_guard<std::mutex> l(g_projMutex);
     return (id > 0 && id < (int)g_projNames.size()) ? g_projNames[id] : std::string();
+}
+std::string EditingProject() { std::lock_guard<std::mutex> l(g_projMutex); return g_editProjectName; }
+bool IsProjectLoaded(const std::string& name) {
+    if (name.empty()) return false;
+    const int id = ProjectId(name);
+    REG_LOCK; return g_loadedProjectIds.count(id) != 0;
+}
+bool SetEditingProject(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> ensure(g_editEnsureMutex);
+    if (FileNameEqual(EditingProject(), name) && (name.empty() || IsProjectLoaded(name))) return true;
+    if (!name.empty()) {
+        if (!ValidFileName(name + ".cdproj", proj_codec::Kind::Project)) { g_projectError = "record 0: invalid project name"; return false; }
+        const DWORD attrs = GetFileAttributesA(ProjPath(name).c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) { g_projectError = "record 0: project file not found"; return false; }
+        if (!IsProjectLoaded(name) && !LoadProject(name, false)) {
+            if (g_projectError != "record 0: game thread pump not active yet") return false;
+            Log("editing project %s: waiting for the game thread before loading", name.c_str());
+        }
+    }
+    { std::lock_guard<std::mutex> l(g_projMutex); g_editProjectName = name; }
+    SaveSettings();
+    return true;
+}
+int EnsureEditingProject() {
+    std::lock_guard<std::recursive_mutex> ensure(g_editEnsureMutex);
+    std::string name = EditingProject();
+    if (!name.empty() && ValidFileName(name + ".cdproj", proj_codec::Kind::Project) && GetFileAttributesA(ProjPath(name).c_str()) != INVALID_FILE_ATTRIBUTES)
+        return SetEditingProject(name) ? ProjectId(name) : 0;
+    for (int n = 1; n < 100000; ++n) {
+        name = "Untitled " + std::to_string(n);
+        if (GetFileAttributesA(ProjPath(name).c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+        if (!SaveProject(name, SaveProjectOnly) || !SetEditingProject(name)) return 0;
+        return ProjectId(name);
+    }
+    return 0;
 }
 int ProjectObjectCount(int id) {
     int n = 0;
@@ -2064,7 +2113,7 @@ GroupAdmissionReport AdmitGroupCopy(const proj_codec::Document& doc, Vec3 target
     for (const auto& record : placed.records) prefabs.push_back(record.prefab);
     rep.request = BeginPlaceRequest(prefabs);
     rep.requested = (int)placed.records.size();
-    std::map<int, int> groups;   // source partition -> fresh independent session id (zero stays zero)
+    const int group = NewGroupId(); // every placed blueprint copy is one selectable group
     std::vector<int> admitted(placed.records.size(), 0);
     for (size_t i = 0; i < placed.records.size(); ++i) {
         const std::string& prefab = placed.records[i].prefab;
@@ -2073,15 +2122,7 @@ GroupAdmissionReport AdmitGroupCopy(const proj_codec::Document& doc, Vec3 target
             rep.excludedPrefabs.push_back(prefab);
             continue;
         }
-        // C4-PARTITION-BEGIN
-        int group = 0;
-        if (placed.records[i].group) {
-            auto it = groups.find(placed.records[i].group);
-            if (it == groups.end()) it = groups.emplace(placed.records[i].group, NewGroupId()).first;
-            group = it->second;
-        }
         placed.records[i].group = group;
-        // C4-PARTITION-END
         const proj_codec::EngineRow& row = narrowed[i];
         const int uid = SubmitPlaceRow(rep.request, (int)i, { row.x, row.y, row.z }, Rot{ row.yaw, row.pitch, row.roll }, row.scale, group);
         admitted[i] = uid;
@@ -2089,10 +2130,7 @@ GroupAdmissionReport AdmitGroupCopy(const proj_codec::Document& doc, Vec3 target
         else rep.excludedPrefabs.push_back(prefab);   // the admission itself refused: a named exclusion, not a success
     }
     placed.groupNames.clear();
-    for (const auto& name : doc.groupNames) {
-        const auto mapped = groups.find(name.first);
-        if (mapped != groups.end()) { placed.groupNames.emplace(mapped->second, name.second); SetGroupName(mapped->second, name.second); }
-    }
+    if (doc.groupNames.size() == 1) { placed.groupNames.emplace(group, doc.groupNames.begin()->second); SetGroupName(group, doc.groupNames.begin()->second); }
     rep.admitted = (int)uids.size();
     rep.excluded = (int)rep.excludedPrefabs.size();
     if (uids.empty()) return fail("record 0: no placeable members");
@@ -2290,10 +2328,10 @@ ExportContext PublishedExportContext() {
     std::lock_guard<std::mutex> l(g_exportCtxMutex);
     return g_exportContext;
 }
-static std::string GroupDir() { return g_modDir + "\\Groups"; }
+static std::string GroupDir() { return g_modDir + "\\groups"; }
 static std::string GroupPath(const std::string& name) { return GroupDir() + "\\" + name + ".cdgroup"; }
 static bool FileAt(const std::string& path) { return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
-// One path component inside Groups\: no separators, no reserved characters, no extension (the export adds
+// One path component inside groups\: no separators, no reserved characters, no extension (the export adds
 // .cdgroup), never a directory name. An invalid name must never become a path outside the group folder.
 static bool ValidateExportName(const std::string& name, std::string& error) {
     if (name.empty()) { error = "record 0: empty group name"; return false; }
@@ -2451,7 +2489,7 @@ bool WriteGroupExport(const GroupExportApproval& approval, std::string& error) {
     std::string text;
     if (!proj_codec::Serialize(approval.document, text, error)) { Log("export: %s", error.c_str()); return false; }
     if (!CreateDirectoryA(GroupDir().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        error = "record 0: cannot create the Groups directory"; Log("export: %s", error.c_str()); return false;
+        error = "record 0: cannot create the groups directory"; Log("export: %s", error.c_str()); return false;
     }
     // 2. same-directory temporary through the ONE transactional writer; the final replacement revalidates both
     //    authorities and renames while they are held (hooks.replace), so the pre-replace callback runs first and
@@ -2477,7 +2515,7 @@ static void ClearSceneContents(std::unique_lock<std::mutex>& operation) {
     // v0.97 TerrainClear marks projects dirty after releasing its own lock. Never call it under the registry lock.
     TerrainClear();
     std::vector<SpawnedObj> removed; std::vector<ManagedNpc> npcs;
-    { REG_LOCK; removed.swap(g_reg); npcs.swap(g_npcReg); for (const auto& n : npcs) if (!n.hidden) RememberUnboundNpcCleanupLocked(n); g_copyMembers.clear(); g_groupNames.clear(); g_projDirty.clear(); }
+    { REG_LOCK; removed.swap(g_reg); npcs.swap(g_npcReg); for (const auto& n : npcs) if (!n.hidden) RememberUnboundNpcCleanupLocked(n); g_copyMembers.clear(); g_groupNames.clear(); g_projDirty.clear(); g_loadedProjectIds.clear(); }
     operation.unlock();
     for (const auto& o : removed) {
         SettleRowOnce(o.placeReq, o.placeRow, PlaceCanceled, PlaceLaneNone, o.uid, "the scene was cleared before attachment");
@@ -2516,6 +2554,7 @@ static bool UnloadProjectImpl(int id, bool ownsWorld) {
     if (!ids.empty()) for (auto& weak : g_groundOps) if (auto op = weak.lock())
         if (GroundTouches(op, ids)) GroundEndLocked(op, GroundInvalidated, "epoch-invalidated");
     std::vector<SpawnedObj> removed; std::vector<ManagedNpc> npcs;
+    bool wasLoaded = false;
     int terrainCount = 0; for (const auto& t : TerrainStrokes()) if (t.proj == id) ++terrainCount;
     { REG_LOCK;
       for (auto it = g_reg.begin(); it != g_reg.end();) {
@@ -2527,6 +2566,7 @@ static bool UnloadProjectImpl(int id, bool ownsWorld) {
           if (!it->hidden) RememberUnboundNpcCleanupLocked(*it);
           npcs.push_back(*it); it = g_npcReg.erase(it);
       }
+      wasLoaded = g_loadedProjectIds.erase(id) != 0;
       if (!removed.empty() || !npcs.empty() || terrainCount) g_projDirty.erase(id);
     }
     if (terrainCount) TerrainReplaceProject(id, {});
@@ -2537,7 +2577,7 @@ static bool UnloadProjectImpl(int id, bool ownsWorld) {
         else if (!o.hidden && o.obj) RunOnGameThread([obj = o.obj, work]() { DoRemove(obj); });
     }
     for (const auto& n : npcs) if (!n.hidden && n.actor) RunOnServerTick([actor = n.actor, work]() { RemoveSpawnedActor(actor); });
-    const bool changed = !removed.empty() || !npcs.empty() || terrainCount != 0;
+    const bool changed = wasLoaded || !removed.empty() || !npcs.empty() || terrainCount != 0;
     g_projectError = changed ? std::string() : "record 0: project has no loaded entities";
     Log("unload project %d: %zu objects, %zu NPCs, %d terrain strokes", id, removed.size(), npcs.size(), terrainCount);
     return changed;
@@ -2572,6 +2612,14 @@ bool PreflightProject(const std::string& name) {
 static bool AdmitProjectDocument(const std::string& name, const proj_codec::Document& doc,
                                  const std::vector<proj_codec::EngineRow>& rows, bool clearFirst, bool replace) {
     std::string error;
+    const bool needsGameThread = std::any_of(doc.records.begin(), doc.records.end(), [](const auto& record) {
+        return !(g_gimmickSpawn && kRva_GimmickSpawn_ && IsGimmickPrefab(record.prefab));
+    });
+    if (needsGameThread && !GameThreadReady()) {
+        g_projectError = "record 0: game thread pump not active yet";
+        Log("load: %s (%s)", g_projectError.c_str(), name.c_str());
+        return false;
+    }
     // Bool is a synchronous mutation outcome, never deferred admission. Busy leaves the scene and allocators untouched.
     { std::lock_guard<std::mutex> operation(g_groundOpMutex);
       if (g_groundWorldWriting || !g_groundLeases.empty() || !g_groundMutationPending.empty()) {
@@ -2580,7 +2628,6 @@ static bool AdmitProjectDocument(const std::string& name, const proj_codec::Docu
       ++g_groundWorldWriting; GroundEpochLocked();
     }
     struct WorldWrite { ~WorldWrite() { std::lock_guard<std::mutex> lock(g_groundOpMutex); --g_groundWorldWriting; } } worldWrite;
-    g_autoDone = true;   // a validated manual load (or replace) counts: the autoload must not add a second copy later
     if (clearFirst) { std::unique_lock<std::mutex> operation(g_groundOpMutex); ClearSceneContents(operation); }
     const int pid = ProjectId(name);
     if (replace) UnloadProjectImpl(pid, true); // this call owns the world reservation; an empty old project is valid
@@ -2626,6 +2673,7 @@ static bool AdmitProjectDocument(const std::string& name, const proj_codec::Docu
         report.queuedNpcs = report.requestedNpcs - report.excludedNpcs; report.excludedNpcKeys = excludedNpcs;
         report.terrainStrokes = (int)doc.terrain.size();
         g_projectLoads[name] = report;
+        g_loadedProjectIds.insert(pid);
         g_projDirty.erase(pid);   // freshly loaded = in sync with the file
     }
     g_projectError.clear();
@@ -2687,7 +2735,7 @@ bool ImportProjectFile(const std::string& path) {
     g_projectError.clear();
     return true;
 }
-// validate-first import: shared .cdgroup bytes enter Groups only after parsing and narrowing succeed.
+// validate-first import: shared .cdgroup bytes enter groups only after parsing and narrowing succeed.
 bool ImportGroupFile(const std::string& path) {
     const std::string base = path.substr(path.find_last_of("\\/") + 1);
     if (base.empty()) { g_projectError = "record 0: empty import file name"; return false; }
@@ -2714,7 +2762,7 @@ bool ImportGroupFile(const std::string& path) {
     }
     if (_stricmp(path.c_str(), destination.c_str()) == 0) { g_projectError.clear(); return true; }
     if (!CreateDirectoryA(GroupDir().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        g_projectError = "record 0: cannot create the Groups directory"; return false;
+        g_projectError = "record 0: cannot create the groups directory"; return false;
     }
     proj_codec::WriteHooks hooks; proj_codec::WriteHooks* writeHooks = nullptr;
 #ifdef WB_UNIFIED_HOST_TEST
@@ -2856,7 +2904,10 @@ FileResult SetAutoload(const std::string& rawName, bool on) {
 static void PreloadAutoloadTerrain() {
     if (!TerrainAvailable()) return;
     int total = 0;
-    for (const auto& name : Autoload()) {
+    auto names = Autoload();
+    const std::string editing = EditingProject();
+    if (!editing.empty() && std::none_of(names.begin(), names.end(), [&](const auto& name) { return FileNameEqual(name, editing); })) names.push_back(editing);
+    for (const auto& name : names) {
         proj_codec::Document doc; std::vector<proj_codec::EngineRow> rows; std::string error;
         if (!ReadProjectDocument(ProjPath(name), doc, rows, error)) { Log("terrain preload: %s: %s", name.c_str(), error.c_str()); continue; }
         if (!doc.terrain.empty()) {
@@ -2933,6 +2984,7 @@ FileResult ExecuteFileAction(const FileSelectionHandle& selection, FileAction ac
         // multiple session ids; ALL aliases must be checked, not just the first (possibly empty) identity.
         std::set<int> ids;
         for (size_t i = 1; i < g_projNames.size(); ++i) if (FileNameEqual(g_projNames[i], name)) ids.insert((int)i);
+        for (int pid : ids) if (g_loadedProjectIds.count(pid)) return { FileReason::VisibleReference };
         for (const auto& o : g_reg) if (ids.count(o.proj)) {
             if (!o.hidden && (!o.obj || o.standin)) return { FileReason::PendingOperation };
             return { o.hidden ? FileReason::HiddenReference : FileReason::VisibleReference };
@@ -3148,30 +3200,49 @@ PlaceRequestView PlaceRequestState(const PlaceRequestHandle& req) {
     v.settled = (v.pending == 0 && req->cleanupOutstanding == 0);
     return v;
 }
-// called from the pump: once the player has been in the world for ~3 s, load the autoload projects once per session.
+// Called from the game-thread pump, independently of the editor window and render overlay.
 // A single failed position read (loading screen, camera cut, mount transition) only sets the counter back a little, so the
 // load happens seconds after the world is up, not minutes later when the user may already have loaded the scene by hand.
 // The settled autoload action: every listed project is loaded in file order. LoadProject validates before it
 // changes anything (and rejects a group file), so a bad entry never spawns, clears or allocates. The per-session
-// marker is checked and set here, so a manual LoadProject (which sets it too) keeps autoload from adding a second
-// copy of the scene. Returns true when this call was the one that settled the listing.
+// marker is set after admissions; a transiently unavailable game thread leaves the remaining names pending.
 static bool AutoloadProjects() {
     std::lock_guard<std::recursive_mutex> lifecycle(g_fileMutex); // bind the persisted list to its load admissions
-    if (g_autoDone) return false;   // a manual load/replace already settled this session
-    g_autoDone = true;
+    if (g_autoDone) return false;
     // several projects are loaded into the same scene: every LoadProject only queues spawns and hands out fresh group ids,
     // so the lists simply add up
     std::vector<std::string> names = Autoload();
-    for (auto& name : names) { Log("autoload: loading project %s", name.c_str()); LoadProject(name, false); }
-    return true;
+    const std::string editing = EditingProject();
+    if (!editing.empty() && std::none_of(names.begin(), names.end(), [&](const auto& name) { return FileNameEqual(name, editing); })) names.push_back(editing);
+    bool pending = false;
+    for (auto& name : names) {
+        if (IsProjectLoaded(name)) continue;
+        Log("autoload: loading project %s", name.c_str()); LoadProject(name, false);
+        if (!IsProjectLoaded(name) && g_projectError == "record 0: game thread pump not active yet") pending = true;
+    }
+    g_autoDone = !pending;
+    return g_autoDone;
 }
 static void AutoloadTick() {
     if (g_autoDone) return;
     const DWORD now = GetTickCount();
+    static DWORD lastAttempt = 0;
+    if (lastAttempt && now - lastAttempt < 2000) return;
+    static DWORD lastProbe = 0;
+    if (lastProbe && now - lastProbe < 250) return;
+    lastProbe = now;
     Vec3 p; if (!PlayerWorldPos(&p)) { if (now - g_worldLast > 2000) g_worldSince = 0; return; }   // a dropout of up to 2 s keeps the clock
     g_worldLast = now; if (!g_worldSince) g_worldSince = now;
     if (now - g_worldSince < 3000) return;
+    lastAttempt = now;
     AutoloadProjects();
+}
+static void QueuePendingManagedNpcs();
+void AutoloadFrame() {
+    AutoloadTick();
+    static DWORD lastNpcRetry = 0;
+    const DWORD now = GetTickCount();
+    if (now - lastNpcRetry >= 1000) { lastNpcRetry = now; QueuePendingManagedNpcs(); }
 }
 
 
@@ -3478,7 +3549,7 @@ static void LogSpawnTransforms(const char* what, uintptr_t save, uintptr_t s8, u
 // SpawnAt queues them here; the ServerField tick (slot 9, server thread) spawns one per tick from the newest usable capture
 // (a level streaming spawn, else a housing placement) with the prefab, position, rotation and scale swapped in. A refused replay
 // keeps a plain client stand-in visible while newer/different captures are retried. Moves remove + respawn (final only), deletes remove the actor.
-struct GimmickReq { int uid; uint64_t gen; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; bool noDirect = false; MoveCompletion done; };
+struct GimmickReq { int uid; uint64_t gen; std::string prefab; Vec3 pos; Rot rot; float scale; std::vector<int> triedTemplates; bool noDirect = false; MoveCompletion done; bool standinQueued = false; bool finalPlain = false; };
 static const size_t kGimmickMaxTries = 3;   // refusals with different templates before an interactive prefab becomes a plain object
 static std::deque<GimmickReq> g_gimmickQueue; static std::mutex g_gimmickQueueMutex;
 static std::deque<std::function<void()>> g_serverJobs; static std::mutex g_serverJobsMutex;
@@ -3805,14 +3876,36 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
         return;
     }
     auto nativeWork = TrackProjectNativeWork(proj);
+    if (r.finalPlain) {
+        if (!GameThreadReady()) return;
+        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
+          if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid || g_gimmickQueue.front().gen != r.gen) return;
+          g_gimmickQueue.pop_front(); }
+        RunOnGameThread([uid = r.uid, gen = r.gen, done = r.done, target = MoveReq{ r.uid, r.pos, r.rot, r.scale }]() {
+            DoSpawn(uid, gen, PlaceLanePlain, done, done ? &target : nullptr, false);
+        });
+        return;
+    }
     // A refused replay queued a plain stand-in on the game thread. Until it exists, a retry would spawn a second stand-in whose
     // registration overwrites the first one (left in the world, no longer selectable or deletable): wait for it.
     bool standinPending = false;
     { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
       standinPending = i >= 0 && !g_reg[(size_t)i].hidden && g_reg[(size_t)i].gen == r.gen && g_reg[(size_t)i].standin && !g_reg[(size_t)i].obj && !r.triedTemplates.empty(); }
     if (standinPending) {
-        std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
-        if (!g_gimmickQueue.empty() && g_gimmickQueue.front().uid == r.uid && g_gimmickQueue.front().gen == r.gen) { g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); }
+        const bool queueStandin = !r.standinQueued && GameThreadReady();
+        const int standinUid = r.uid; const uint64_t standinGen = r.gen;
+        const MoveCompletion standinDone = r.done;
+        const MoveReq standinTarget{ r.uid, r.pos, r.rot, r.scale };
+        { std::lock_guard<std::mutex> l(g_gimmickQueueMutex);
+          if (g_gimmickQueue.empty() || g_gimmickQueue.front().uid != r.uid || g_gimmickQueue.front().gen != r.gen) return;
+          if (queueStandin) r.standinQueued = true;
+          g_gimmickQueue.pop_front(); g_gimmickQueue.push_back(std::move(r)); }
+        if (queueStandin) {
+            RunOnGameThread([uid = standinUid, gen = standinGen, done = standinDone, target = standinTarget]() {
+                DoSpawn(uid, gen, PlaceLaneStandin, done, done ? &target : nullptr, true);
+            });
+            Log("[gimmick] object %d: deferred stand-in queued after the game thread became ready", standinUid);
+        }
         return;
     }
     // Template-free first: the game's own "gimmick from save data" builder with the prefab's gimmickinfo key and the level spawn
@@ -4016,8 +4109,10 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
         { REG_LOCK; const int i = IndexOfUidLocked(r.uid);
           if (i < 0 || g_reg[(size_t)i].hidden || g_reg[(size_t)i].gen != r.gen) return;
           SpawnedObj& e = g_reg[(size_t)i]; e.standin = !giveUp; e.obj = 0; e.actor = 0; if (giveUp) e.gimmick = false; }
-        if (GameThreadReady()) RunOnGameThread([uid = r.uid, gen = r.gen, lane = giveUp ? PlaceLanePlain : PlaceLaneStandin, retry = !giveUp, done = r.done, target = MoveReq{ r.uid, r.pos, r.rot, r.scale }]() { DoSpawn(uid, gen, lane, done, done ? &target : nullptr, retry); });   // the plain stand-in (retry) or the accepted plain-object fallback (budget spent)
-        if (!giveUp) { std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); }
+        const bool queuePlain = GameThreadReady();
+        if (queuePlain) RunOnGameThread([uid = r.uid, gen = r.gen, lane = giveUp ? PlaceLanePlain : PlaceLaneStandin, retry = !giveUp, done = r.done, target = MoveReq{ r.uid, r.pos, r.rot, r.scale }]() { DoSpawn(uid, gen, lane, done, done ? &target : nullptr, retry); });   // the plain stand-in (retry) or the accepted plain-object fallback (budget spent)
+        r.standinQueued = queuePlain;
+        if (!giveUp || !queuePlain) { r.finalPlain = giveUp; std::lock_guard<std::mutex> l(g_gimmickQueueMutex); g_gimmickQueue.push_back(std::move(r)); }
     }
 }
 // ---- template-free gimmick spawn (research) ----
@@ -4294,9 +4389,10 @@ static bool RemoveSpawnedActor(uintptr_t actor) {
     ((F1)unlockF)((void*)lockObj);
     int result = 0; ((F2)f34)((void*)actor, &result);
     Log("[remove] vtable[34] result %d (%s)", result, DecodeErr((uint32_t)result).c_str());
+    if (result != 0) return false;
     { std::lock_guard<std::mutex> l(g_regMutex); g_managedNpcActors.erase(actor); }
     std::lock_guard<std::mutex> l(g_spawnedMutex); for (auto it = g_spawned.begin(); it != g_spawned.end(); ++it) if (it->actor == actor) { g_spawned.erase(it); break; }
-    return result == 0;
+    return true;
 #endif
 }
 int SpawnedList(SpawnedInfo* out, int max) {
@@ -5145,8 +5241,9 @@ static uintptr_t PickNpcSpawnActor(Vec3 expected, uintptr_t innerActor) {
         if (tf && ReadTransformPos(tf, &p, false)) {
             const float dx = p.world.x - expected.x, dy = p.world.y - expected.y, dz = p.world.z - expected.z;
             const float d = sqrtf(dx * dx + dy * dy + dz * dz);
-            if (d < 50.0f) score += 500.0f - d * 5.0f; else score -= std::min(d, 500.0f);
-        }
+            if (d > 30.0f) continue;
+            score += 500.0f - d * 5.0f;
+        } else continue; // an actor without a readable transform has not entered the world
         if (score > bestScore) { bestScore = score; best = a; }
     }
     if (best) {
@@ -5291,7 +5388,7 @@ static void SpawnManagedNpcNow(int uid, uint64_t gen) {
     }
 }
 static bool QueueManagedNpcIfReady(int uid) {
-    if (NpcState() < 2) return false;
+    if (NpcState() < 2 || !GameThreadReady() || !g_worldSince || GetTickCount() - g_worldSince < 10000) return false;
     bool queue = false; uint64_t gen = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
@@ -5305,6 +5402,7 @@ static bool QueueManagedNpcIfReady(int uid) {
 }
 int SpawnManagedNpc(uint32_t key, Vec3 pos, int type, uint32_t extra, bool aiEnabled, int behavior, int group, int proj, const std::string& label, const std::string& note) {
     if (NpcState() == 0 || !key) return 0;
+    if (!proj && !g_loading) { proj = EnsureEditingProject(); if (!proj) { Log("[npc] spawn: no editable project is available"); return 0; } }
     if (type < 1 || type > 255) type = 1; behavior = behavior == 1 ? 1 : 0; if (behavior == 1) aiEnabled = false;
     int uid = 0;
     {
@@ -5316,6 +5414,7 @@ int SpawnManagedNpc(uint32_t key, Vec3 pos, int type, uint32_t extra, bool aiEna
     return uid;
 }
 static void QueuePendingManagedNpcs() {
+    if (NpcState() < 2 || !GameThreadReady() || !g_worldSince || GetTickCount() - g_worldSince < 10000) return;
     std::vector<std::pair<int, uint64_t>> pending;
     {
         std::lock_guard<std::mutex> l(g_regMutex);
@@ -5362,11 +5461,11 @@ bool BeginManagedNpcMove(int uid) {
         if (psec[0] || psec[1] || fabsf(parent[0]) > 0.001f || fabsf(parent[1]) > 0.001f || fabsf(parent[2]) > 0.001f) { Log("[npc] managed #%d live move refused: actor is parented/attached", uid); return false; }
         // An NPC whose runtime AI is already off needs no native control request just to move. If AI is still active,
         // however, the edit transaction must be able to take control before queued transform writes begin.
-        queuePause = true;
+        queuePause = n.aiApplied;
         if (queuePause) {
             if (!NpcAiControlAvailable()) { Log("[npc] managed #%d live move: AI control is not available to pause the actor", uid); return false; }
         }
-        n.editMoving = true; n.liveMoveTarget = n.pos; n.liveMovePending = false; gen = n.gen;
+        n.editMoving = true; n.editMoveStart = n.pos; n.liveMoveTarget = n.pos; n.liveMovePending = false; gen = n.gen;
     }
     if (queuePause) RunOnServerTick([uid, gen]() { SetManagedNpcRuntimeAiNow(uid, false, gen); });
     return true;
@@ -5429,7 +5528,14 @@ bool EndManagedNpcMove(int uid, Vec3 world) {
             proj = g_npcReg[i].proj;
         }
         auto work = TrackProjectNativeWork(proj);
-        const bool moved = WriteManagedNpcTransformNow(tf, world);
+        // A TransformSync write may succeed while the actor's simulation keeps the old position.
+        // Recreate a changed NPC at the committed pose on release; the live write is only a preview.
+        bool changed = false;
+        { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
+          if (!NpcGenCurrentLocked(uid, gen) || !g_npcReg[i].editMoving || g_npcReg[i].transform != tf) return;
+          const Vec3 start = g_npcReg[i].editMoveStart;
+          changed = fabsf(start.x - world.x) > 0.001f || fabsf(start.y - world.y) > 0.001f || fabsf(start.z - world.z) > 0.001f; }
+        const bool moved = !changed && WriteManagedNpcTransformNow(tf, world);
         bool desired = true; uintptr_t actor = 0; uint64_t nextGen = gen;
         {
             std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
@@ -5443,7 +5549,7 @@ bool EndManagedNpcMove(int uid, Vec3 world) {
             }
         }
         if (!moved) {
-            Log("[npc] managed #%d final live move write failed; respawning at the committed position", uid);
+            Log(changed ? "[npc] managed #%d move committed; respawning at the new position" : "[npc] managed #%d final live move write failed; respawning at the committed position", uid);
             if (actor) RemoveSpawnedActor(actor);
             SpawnManagedNpcNow(uid, nextGen);
             return;
@@ -5708,7 +5814,7 @@ static void ServiceGroundQueue(void* world) {   // physics thread, inside the ga
           if (invalid) { stored->second.status = GroundProbeStatus::Invalidated; continue; }
         }
         float radius; { std::lock_guard<std::mutex> lock(g_tplMutex); radius = g_probeRadius; }
-        const int tx = (int)(rq.start.x * 0.001), tz = (int)(rq.start.z * 0.001);
+        const int tx = (int)(rq.start.x * 0.001f), tz = (int)(rq.start.z * 0.001f);
         t_geoTracing = InterlockedExchange(&g_geoTraceArm, 0) != 0;   // research: log the geometry calls of this one cast
         if (t_geoTracing) Log("[geo] ---- traced cast from (%.2f %.2f %.2f) %.2f m down", rq.start.x, rq.start.y, rq.start.z, rq.len);
         GroundHit h;
@@ -6075,6 +6181,7 @@ static void LoadSettings() {
         if (k == "freecam_sens") { const float s = (float)atof(v.c_str()); if (s >= 0.01f && s <= 2.0f) g_fcSens = s; continue; }
         if (k == "keyboard_placement") { g_keyboardPlacement = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "project_autosave") { g_projectAutoSave = v == "1" || v == "on" || v == "true"; continue; }
+        if (k == "editing_project") { if (v.empty() || ValidFileName(v + ".cdproj", proj_codec::Kind::Project)) { std::lock_guard<std::mutex> l(g_projMutex); g_editProjectName = v; } continue; }
         if (k == "project_autosave_seconds") continue;   // legacy timed-auto-save setting; real-time auto-save no longer uses an interval
         if (k == "auto_freecam_on_open") { g_autoFreeCamOnOpen = v == "1" || v == "on" || v == "true"; continue; }
         if (k == "show_selection_details") { g_showSelectionDetails = v != "0" && v != "off" && v != "false"; continue; }
@@ -6099,7 +6206,9 @@ void SaveSettings() {
     fprintf(f, "# gimmick_spawn=0: place gimmick prefabs (/object/cd_gimmick/...) as plain objects instead of through the game spawn path\ngimmick_spawn=%d\n", g_gimmickSpawn ? 1 : 0);
     fprintf(f, "# free camera (camera mode, key_mode in the editor): speed in m/s, mouse sensitivity in degrees per count\nfreecam_speed=%.1f\nfreecam_sens=%.3f\n", g_fcSpeed, g_fcSens);
     fprintf(f, "# Optional keyboard object placement. Off by default; enable in Settings or set keyboard_placement=1.\nkeyboard_placement=%d\n", g_keyboardPlacement ? 1 : 0);
-    fprintf(f, "# Save dirty loaded projects immediately after each committed edit. New/unassigned objects are not attached to a project automatically.\nproject_autosave=%d\n", g_projectAutoSave ? 1 : 0);
+    fprintf(f, "# Save dirty projects after committed edits. New objects, NPCs and terrain belong to the editing project.\nproject_autosave=%d\n", g_projectAutoSave ? 1 : 0);
+    const std::string editingProject = EditingProject();
+    fprintf(f, "# Last project selected for editing; loaded independently of autoload.txt.\nediting_project=%s\n", editingProject.c_str());
     fprintf(f, "# Editor UI behavior.\nauto_freecam_on_open=%d\nshow_selection_details=%d\n", g_autoFreeCamOnOpen ? 1 : 0, g_showSelectionDetails ? 1 : 0);
     for (int i = 0; i < PK_COUNT; i++) fprintf(f, "key_%s=%s\n", kPlaceKeyIds[i], KeyName(g_placeKeys[i]));
     fprintf(f, "# Interface language: auto, en, zh-CN, zh-TW, de, fr, ko, ja, es, pt-BR, ru, tr\nlanguage=%s\n", i18n::Preference());

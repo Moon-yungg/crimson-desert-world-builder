@@ -320,7 +320,9 @@ static void QueueLive(const std::vector<std::pair<int, int>>& tiles) {
     }).detach();
 }
 void TerrainAddStroke(const TerrainStroke& s) {
-    const auto parts = SplitStroke(s);
+    TerrainStroke owned = s;
+    if (!owned.proj) { owned.proj = EnsureEditingProject(); if (!owned.proj) { Log("[terrain] stroke refused: no editable project is available"); return; } }
+    const auto parts = SplitStroke(owned);
     std::vector<std::pair<int, int>> t;
     { std::lock_guard<std::mutex> l(g_mx); for (const auto& part : parts) {
           g_strokes.push_back(part); TilesOf(part, &t);
@@ -328,7 +330,7 @@ void TerrainAddStroke(const TerrainStroke& s) {
           auto it = g_cpu.find(tile); if (it != g_cpu.end() && it->second.ok) ApplyStrokeCpu(it->second.edit, tile.first, tile.second, part);
       }
       g_needsApply = true; g_gen++; }
-    if (s.proj) MarkProjectDirty(s.proj);
+    MarkProjectDirty(owned.proj);
     FetchTables();
     QueueLive(UniqueTiles(t));
 }
@@ -355,6 +357,26 @@ void TerrainClear() {
     Log("[terrain] strokes cleared");
 }
 std::vector<TerrainStroke> TerrainStrokes() { std::lock_guard<std::mutex> l(g_mx); return g_strokes; }
+bool TerrainRemoveProject(int project, std::vector<TerrainStroke>& removed, std::vector<size_t>& positions) {
+    removed.clear(); positions.clear();
+    if (project <= 0) return false;
+    std::vector<std::pair<int, int>> changedTiles;
+    {
+        std::lock_guard<std::mutex> l(g_mx);
+        std::vector<std::pair<int, int>> touched;
+        for (size_t i = 0; i < g_strokes.size(); ++i) if (g_strokes[i].proj == project) {
+            removed.push_back(g_strokes[i]); positions.push_back(i); TilesOf(g_strokes[i], &touched);
+        }
+        if (removed.empty()) return false;
+        g_strokes.erase(std::remove_if(g_strokes.begin(), g_strokes.end(), [project](const TerrainStroke& s) { return s.proj == project; }), g_strokes.end());
+        changedTiles = UniqueTiles(touched);
+        RebuildEditedLocked(); RecomputeCpuLocked(); g_needsApply = true;
+    }
+    MarkProjectDirty(project);
+    QueueLive(changedTiles);
+    Log("[terrain] project %d: removed %zu terrain strokes", project, removed.size());
+    return true;
+}
 bool TerrainRemoveTile(int tx, int tz, int project, std::vector<TerrainStroke>& removed, std::vector<size_t>& positions) {
     removed.clear(); positions.clear();
     std::set<int> dirty; std::vector<std::pair<int, int>> changedTiles;
