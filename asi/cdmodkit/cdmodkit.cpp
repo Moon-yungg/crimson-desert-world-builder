@@ -3233,7 +3233,13 @@ static void AutoloadTick() {
     lastAttempt = now;
     AutoloadProjects();
 }
-void AutoloadFrame() { AutoloadTick(); }
+static void QueuePendingManagedNpcs();
+void AutoloadFrame() {
+    AutoloadTick();
+    static DWORD lastNpcRetry = 0;
+    const DWORD now = GetTickCount();
+    if (now - lastNpcRetry >= 1000) { lastNpcRetry = now; QueuePendingManagedNpcs(); }
+}
 
 
 
@@ -5231,8 +5237,9 @@ static uintptr_t PickNpcSpawnActor(Vec3 expected, uintptr_t innerActor) {
         if (tf && ReadTransformPos(tf, &p, false)) {
             const float dx = p.world.x - expected.x, dy = p.world.y - expected.y, dz = p.world.z - expected.z;
             const float d = sqrtf(dx * dx + dy * dy + dz * dz);
-            if (d < 50.0f) score += 500.0f - d * 5.0f; else score -= std::min(d, 500.0f);
-        }
+            if (d > 30.0f) continue;
+            score += 500.0f - d * 5.0f;
+        } else continue; // an actor without a readable transform has not entered the world
         if (score > bestScore) { bestScore = score; best = a; }
     }
     if (best) {
@@ -5377,7 +5384,7 @@ static void SpawnManagedNpcNow(int uid, uint64_t gen) {
     }
 }
 static bool QueueManagedNpcIfReady(int uid) {
-    if (NpcState() < 2) return false;
+    if (NpcState() < 2 || !GameThreadReady() || !g_worldSince || GetTickCount() - g_worldSince < 10000) return false;
     bool queue = false; uint64_t gen = 0;
     {
         std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid);
@@ -5403,6 +5410,7 @@ int SpawnManagedNpc(uint32_t key, Vec3 pos, int type, uint32_t extra, bool aiEna
     return uid;
 }
 static void QueuePendingManagedNpcs() {
+    if (NpcState() < 2 || !GameThreadReady() || !g_worldSince || GetTickCount() - g_worldSince < 10000) return;
     std::vector<std::pair<int, uint64_t>> pending;
     {
         std::lock_guard<std::mutex> l(g_regMutex);
