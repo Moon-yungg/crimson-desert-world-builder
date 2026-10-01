@@ -95,6 +95,27 @@ namespace overlay {
     static std::mutex g_swapChainHookMutex;
     static std::mutex g_functionHookMutex;
 
+    // Both ASIs patch the same DXGI entries with private MinHook tables. Serialize each create/enable/remove
+    // transaction so the second trampoline sees the first complete jump instead of backing up stale bytes.
+    class SharedDxgiHookLock {
+        HANDLE handle_ = nullptr;
+        bool owned_ = false;
+    public:
+        SharedDxgiHookLock() {
+            handle_ = CreateMutexW(nullptr, FALSE, L"Local\\CrimsonRouteWorldBuilderDxgiHooks");
+            if (!handle_) return;
+            const DWORD result = WaitForSingleObject(handle_, 250);
+            owned_ = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
+        }
+        ~SharedDxgiHookLock() {
+            if (owned_) ReleaseMutex(handle_);
+            if (handle_) CloseHandle(handle_);
+        }
+        explicit operator bool() const { return owned_; }
+        SharedDxgiHookLock(const SharedDxgiHookLock&) = delete;
+        SharedDxgiHookLock& operator=(const SharedDxgiHookLock&) = delete;
+    };
+
     constexpr size_t kCapturedSwapChains = 16;
     constexpr size_t kMaximumCapturedPresentQueues = 16;
     struct CapturedD3D12Queue {
@@ -676,6 +697,8 @@ namespace overlay {
     static bool InstallSingleHook(HookTarget& state, void* target, void* detour, void** original, const char* name) {
         if (!target) return false;
         std::lock_guard<std::mutex> hookLock(g_functionHookMutex);
+        SharedDxgiHookLock sharedLock;
+        if (!sharedLock) { core::Log("[overlay] %s shared DXGI hook lock unavailable", name); return false; }
         if (state.installed) {
             if (state.target == target) return true;
             core::Log("[overlay] factory_method_target_mismatch=1; method=%s; existing_module=%s; new_module=%s; alternate_factory_hooked=0",
@@ -702,6 +725,8 @@ namespace overlay {
 
     static bool InstallHookGroup(const std::vector<HookRequest>& requests) {
         std::lock_guard<std::mutex> hookLock(g_functionHookMutex);
+        SharedDxgiHookLock sharedLock;
+        if (!sharedLock) { core::Log("[overlay] swapchain shared DXGI hook lock unavailable"); return false; }
         for (const HookRequest& r : requests) {
             if (!r.target) return false;
             if (r.state->installed && r.state->target != r.target) {
@@ -1330,6 +1355,8 @@ namespace overlay {
         void* target = reinterpret_cast<void*>(GetProcAddress(module, symbol));
         if (!target) return false;
         std::lock_guard<std::mutex> hookLock(g_functionHookMutex);
+        SharedDxgiHookLock sharedLock;
+        if (!sharedLock) { core::Log("[overlay] %s shared DXGI hook lock unavailable", symbol); return false; }
         if (state.installed) return state.target == target;
         MH_STATUS create = MH_CreateHook(target, detour, original);
         if (create != MH_OK) return false;

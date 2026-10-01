@@ -27,7 +27,7 @@ struct SpawnedObj { uintptr_t obj; std::string prefab; Vec3 pos; Rot rot; float 
                                                        // replaced (restore, re-create) or invalidated (hide/forget) so that engine work queued for an older incarnation can
                                                        // never attach to a newer one; the record keeps its uid, project, group and pose across all of them.
 struct ManagedNpc { int uid = 0; uint32_t key = 0; Vec3 pos{}; int type = 1; uint32_t extra = 0; uintptr_t actor = 0; uint32_t actorId = 0;
-                    uintptr_t transform = 0; DWORD spawnRequestTick = 0; bool bindTimeoutLogged = false; bool editMoving = false; Vec3 liveMoveTarget{}; bool liveMovePending = false;   // runtime-only live binding/edit state; not serialized
+                    uintptr_t transform = 0; DWORD spawnRequestTick = 0; bool bindTimeoutLogged = false; bool editMoving = false; Vec3 liveMoveTarget{}; Vec3 editMoveStart{}; bool liveMovePending = false;   // runtime-only live binding/edit state; not serialized
                     bool aiEnabled = true; bool aiApplied = true; int behavior = 0; bool hidden = false; bool spawnPending = false; DWORD tick = 0;
                     int group = 0; int proj = 0; std::string label, note; uint64_t gen = 0; };
 
@@ -87,6 +87,7 @@ namespace core {
     void TerrainRestoreStrokes(const std::vector<TerrainStroke>& strokes, const std::vector<size_t>& positions);
     void TerrainSetProject(int from, int to);                                     // strokes saved into a project become its members
     void TerrainReplaceProject(int proj, const std::vector<TerrainStroke>& strokes); // a project's strokes as loaded from its file
+    bool TerrainRemoveProject(int proj, std::vector<TerrainStroke>& removed, std::vector<size_t>& positions);
     bool TerrainNeedsApply(); void TerrainMarkApplied();
     bool TerrainApply(Vec3 back);        // fast travel 5 km away and back to 'back': the edited tiles stream again (async)
     std::string TerrainApplyState();     // "" when idle
@@ -334,6 +335,10 @@ namespace core {
     enum SaveScope { SaveWholeScene = 0, SaveProjectAndNew = 1, SaveNewOnly = 2, SaveProjectOnly = 3 };
     int  ProjectId(const std::string& name);       // id for a project name, creating one on first use (0 for an empty name)
     std::string ProjectNameOf(int id);             // "" for 0 / unknown
+    std::string EditingProject();                 // persisted editing target; independent of the autoload list
+    bool IsProjectLoaded(const std::string& name);
+    bool SetEditingProject(const std::string& name); // loads the chosen project before making it editable; empty closes editing
+    int  EnsureEditingProject();                  // creates and loads a numbered Untitled project on first new edit
     int  ProjectObjectCount(int id);               // visible objects + visible managed NPCs + terrain strokes (upstream scene-count semantics); 0 = new/unassigned
     bool ProjectDirty(int id);                     // an entity/metadata item changed since the last load/save
     void AssignProject(int uid, int proj);
@@ -375,6 +380,7 @@ namespace core {
     // Autoload: bin64\cdmodkit\autoload.txt, one project name per line (without .cdproj), '#' at the line start = comment.
     // Several projects can be active at once; they are all loaded, in file order, once the player is in the world.
     // File lifecycle never unloads objects, clears History, or implicitly switches autoload OFF.
+    void AutoloadFrame(); // called from the game-thread pump, including while the editor window is closed
     enum class FileReason {
         None, InvalidName, InvalidAction, NotFound, StaleTarget, ConfirmationMismatch, GuardMissing,
         SelectionChanged, VisibleReference, HiddenReference, UndoReference, RedoReference, DirtyProject,
@@ -574,7 +580,7 @@ namespace core {
     struct GroupExportApproval {
         bool valid = false;                        // prepared from authoritative values and a fresh publication
         std::string name;                          // destination group name (no extension)
-        std::string path;                          // full destination path (<moddir>\Groups\<name>.cdgroup)
+        std::string path;                          // full destination path (<moddir>\groups\<name>.cdgroup)
         bool overwriteApproved = false;            // explicit approval to replace an existing file
         proj_codec::Document document;             // the approved semantic values/envelopes (kind=Group)
         std::vector<int> included;                 // included uids, registry order

@@ -8,6 +8,7 @@ Project	Project	项目	專案	Projekt	Projet	프로젝트	プロジェクト	Pro
 Settings	Settings	设置	設定	Einstellungen	Paramètres	설정	設定	Ajustes	Configurações	Настройки	Ayarlar
 Log	Log	日志	記錄	Protokoll	Journal	로그	ログ	Registro	Registro	Журнал	Kayıt
 Travel	Travel	传送	傳送	Reisen	Déplacement	이동	移動	Viaje	Viagem	Перемещение	Seyahat
+Travel here	Travel here	传送到这里	傳送到這裡	Hierher reisen	Voyager ici	여기로 이동	ここへ移動	Viajar aquí	Viajar até aqui	Переместиться сюда	Buraya seyahat et
 PLAY	PLAY	游玩	遊玩	SPIELEN	JOUER	플레이	プレイ	JUGAR	JOGAR	ИГРА	OYNA
 EDIT	EDIT	编辑	編輯	BEARBEITEN	ÉDITER	편집	編集	EDITAR	EDITAR	РЕДАКТИРОВАТЬ	DÜZENLE
 PLAY MODE	PLAY MODE	游玩模式	遊玩模式	SPIELMODUS	MODE JEU	플레이 모드	プレイモード	MODO JUEGO	MODO JOGO	РЕЖИМ ИГРЫ	OYUN MODU
@@ -37,7 +38,6 @@ folder	folder	文件夹	資料夾	Ordner	Dossier	폴더	フォルダー	Carpeta	
 tags	tags	标签	標籤	Tags	Tags	태그	タグ	Etiquetas	Tags	Теги	Etiketler
 nothing matches: fewer words, another category, or turn off 'favorites' / 'meshes only' / the tag filters ('clear' resets all).	nothing matches: fewer words, another category, or turn off 'favorites' / 'meshes only' / the tag filters ('clear' resets all).	没有匹配项：试试减少搜索词、更换分类，或关闭“收藏”“仅网格”和标签筛选（“清除”会重置所有筛选）。	找不到相符項目：試著減少搜尋詞、更換分類，或關閉「我的最愛」、「僅網格」與標籤篩選（「清除」會重設所有篩選）。	Keine Treffer: weniger Suchbegriffe, andere Kategorie oder Favoriten-, Mesh- und Tagfilter ausschalten („Leeren“ setzt alles zurück).	Aucun résultat : réduisez les mots, changez de catégorie ou désactivez les favoris, les maillages ou les filtres de tags (« Effacer » réinitialise tout).	일치 항목이 없습니다. 검색어를 줄이거나 다른 카테고리를 선택하고 즐겨찾기/메시/태그 필터를 끄세요(지우기로 모두 초기화).	一致する項目がありません。検索語を減らすかカテゴリを変え、お気に入り／メッシュ／タグのフィルターを解除してください（クリアでリセット）。	Sin coincidencias: usa menos palabras, cambia de categoría o desactiva favoritos, mallas o filtros de etiquetas (limpiar restablece todo).	Nada corresponde: use menos palavras, outra categoria ou filtros de favoritos, malhas ou tags (limpar redefine tudo).	Совпадений нет: сократите запрос, выберите другую категорию или отключите фильтры избранного, мешей и тегов («Очистить» сбрасывает всё).	Eşleşme yok: daha az kelime kullanın, başka kategori seçin veya favori, mesh ve etiket filtrelerini kapatın (Temizle tümünü sıfırlar).
 %d results	%d results	%d 个结果	%d 個結果	%d Ergebnisse	%d résultats	결과 %d개	%d 件の結果	%d resultados	%d resultados	Результатов: %d	%d sonuç
-%d results%s	%d results%s	%d 个结果%s	%d 個結果%s	%d Ergebnisse%s	%d résultats%s	결과 %d개%s	%d 件の結果%s	%d resultados%s	%d resultados%s	Результатов: %d%s	%d sonuç%s
 %d cards per row	%d cards per row	每行 %d 张卡片	每列 %d 張卡片	%d Karten pro Zeile	%d cartes par ligne	한 줄에 카드 %d개	1行に%d枚	%d tarjetas por fila	%d cartões por linha	Карточек в строке: %d	Satır başına %d kart
 remove from	remove from	从此收藏集移除：	從此收藏集移除：	Aus dieser Sammlung entfernen:	Retirer de cette collection :	이 컬렉션에서 제거:	このコレクションから削除：	Quitar de esta colección:	Remover desta coleção:	Удалить из этой коллекции:	Bu koleksiyondan kaldır:
 add to	add to	添加到收藏集：	加入收藏集：	Zu Sammlung hinzufügen:	Ajouter à la collection :	컬렉션에 추가:	コレクションに追加：	Añadir a colección:	Adicionar à coleção:	Добавить в коллекцию:	Koleksiyona ekle:
@@ -100,6 +100,8 @@ Duplicate	Duplicate	复制	複製	Duplizieren	Dupliquer	복제	複製	Duplicar	D
 Group	Group	编组	群組	Gruppieren	Grouper	그룹	グループ化	Agrupar	Agrupar	Сгруппировать	Grupla
 Ungroup	Ungroup	取消编组	取消群組	Gruppierung aufheben	Dissocier	그룹 해제	グループ解除	Desagrupar	Desagrupar	Разгруппировать	Grubu çöz
 Delete	Delete	删除	刪除	Löschen	Supprimer	삭제	削除	Eliminar	Excluir	Удалить	Sil
+Confirm deletion	Confirm deletion	确认删除	確認刪除	Löschung bestätigen	Confirmer la suppression	삭제 확인	削除を確認	Confirmar eliminación	Confirmar exclusão	Подтвердить удаление	Silmeyi onayla
+Delete this file permanently?	Delete this file permanently?	永久删除此文件？	永久刪除此檔案？	Diese Datei endgültig löschen?	Supprimer définitivement ce fichier ?	이 파일을 영구 삭제할까요?	このファイルを完全に削除しますか？	¿Eliminar este archivo permanentemente?	Excluir este arquivo permanentemente?	Удалить этот файл навсегда?	Bu dosya kalıcı olarak silinsin mi?
 Forget	Forget	从列表移除	從清單移除	Aus Liste entfernen	Retirer de la liste	목록에서 제거	リストから除外	Quitar de la lista	Remover da lista	Убрать из списка	Listeden kaldır
 Remove duplicates	Remove duplicates	删除重复物体	移除重複物件	Duplikate entfernen	Supprimer les doublons	중복 제거	重複を削除	Eliminar duplicados	Remover duplicatas	Удалить дубликаты	Yinelenenleri kaldır
 Cancel	Cancel	取消	取消	Abbrechen	Annuler	취소	キャンセル	Cancelar	Cancelar	Отмена	İptal
@@ -232,7 +234,6 @@ add to collection	add to collection	添加到收藏集	加入收藏集	Zur Samml
 favorite	favorite	收藏	我的最愛	Favorit	Favori	즐겨찾기	お気に入り	Favorito	Favorito	В избранное	Favori
 unfavorite	unfavorite	取消收藏	移除我的最愛	Aus Favoriten entfernen	Retirer des favoris	즐겨찾기 해제	お気に入り解除	Quitar de favoritos	Remover dos favoritos	Убрать из избранного	Favorilerden kaldır
 recent:	recent:	最近：	最近：	Zuletzt:	Récents :	최근 항목:	最近:	Recientes:	Recentes:	Недавние:	Son kullanılanlar:
-(first 5000)	(first 5000)	（前 5000 个）	（前 5000 個）	(erste 5000)	(5000 premiers)	(처음 5000개)	（先頭5000件）	(primeros 5000)	(primeiros 5000)	(первые 5000)	(ilk 5000)
 one grid step per press	one grid step per press	每按一次移动一个网格	每按一次移動一個格線	Ein Rasterfeld pro Tastendruck	Un pas de grille par pression	한 번 누를 때마다 한 칸	1回押すごとに1グリッド移動	Un paso de cuadrícula por pulsación	Um passo de grade por toque	Один шаг сетки за нажатие	Her basışta bir ızgara adımı
 fast	fast	快速	快速	Schnell	Rapide	빠르게	高速	Rápido	Rápido	Быстро	Hızlı
 (group)	(group)	（组）	（群組）	(Gruppe)	(groupe)	(그룹)	（グループ）	(grupo)	(grupo)	(группа)	(grup)
@@ -573,6 +574,31 @@ Clear selection	Clear selection	清除选择	清除選取	Auswahl aufheben	Effac
 Delete selected	Delete selected	删除所选	刪除所選	Auswahl löschen	Supprimer la sélection	선택 항목 삭제	選択を削除	Eliminar seleccionados	Excluir selecionados	Удалить выбранное	Seçileni sil
 Disable AI	Disable AI	禁用 AI	停用 AI	KI deaktivieren	Désactiver l’IA	AI 비활성화	AIを無効化	Desactivar IA	Desativar IA	Отключить ИИ	AI'ı devre dışı bırak
 Edit note	Edit note	编辑备注	編輯備註	Notiz bearbeiten	Modifier la note	메모 편집	メモを編集	Editar nota	Editar nota	Изменить заметку	Notu düzenle
+Edit NPC note	Edit NPC note	编辑 NPC 备注	編輯 NPC 備註	NPC-Notiz bearbeiten	Modifier la note du PNJ	NPC 메모 편집	NPCのメモを編集	Editar nota del PNJ	Editar nota do NPC	Изменить заметку NPC	NPC notunu düzenle
+Edit object note	Edit object note	编辑物品备注	編輯物品備註	Objektnotiz bearbeiten	Modifier la note de l’objet	물품 메모 편집	オブジェクトのメモを編集	Editar nota del objeto	Editar nota do objeto	Изменить заметку объекта	Nesne notunu düzenle
+Mesh	Mesh	网格	網格	Mesh	Maillage	메시	メッシュ	Malla	Malha	Сетка	Mesh
+SkinnedMesh	SkinnedMesh	蒙皮网格	蒙皮網格	Skinned Mesh	Maillage avec squelette	스킨 메시	スキンメッシュ	Malla esquelética	Malha com esqueleto	Скелетная сетка	İskeletli mesh
+Gimmick	Gimmick	互动机关	互動機關	Interaktives Objekt	Objet interactif	상호작용 장치	ギミック	Mecanismo interactivo	Mecanismo interativo	Интерактивный объект	Etkileşimli nesne
+Socket	Socket	挂接点	掛接點	Anschlusspunkt	Point d’ancrage	소켓	ソケット	Punto de anclaje	Ponto de encaixe	Точка крепления	Bağlantı noktası
+SubPrefab	SubPrefab	子预制体	子預製體	Unter-Prefab	Sous-préfabriqué	하위 프리팹	サブプレハブ	Subprefab	Subprefab	Дочерний префаб	Alt prefab
+Character	Character	人物	人物	Charakter	Personnage	캐릭터	キャラクター	Personaje	Personagem	Персонаж	Karakter
+Appearance	Appearance	外观	外觀	Erscheinungsbild	Apparence	외형	外見	Apariencia	Aparência	Внешний вид	Görünüm
+Spline	Spline	样条	樣條	Spline	Courbe spline	스플라인	スプライン	Curva spline	Curva spline	Сплайн	Eğri
+Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini	Houdini
+Head	Head	头部	頭部	Kopf	Tête	머리	頭	Cabeza	Cabeça	Голова	Baş
+Armor	Armor	护甲	護甲	Rüstung	Armure	방어구	防具	Armadura	Armadura	Броня	Zırh
+Hair	Hair	头发	頭髮	Haare	Cheveux	머리카락	髪	Cabello	Cabelo	Волосы	Saç
+GameData	GameData	游戏数据	遊戲資料	Spieldaten	Données du jeu	게임 데이터	ゲームデータ	Datos del juego	Dados do jogo	Игровые данные	Oyun verileri
+Effect	Effect	特效	特效	Effekt	Effet	효과	エフェクト	Efecto	Efeito	Эффект	Efekt
+Tree	Tree	树木	樹木	Baum	Arbre	나무	木	Árbol	Árvore	Дерево	Ağaç
+Decal	Decal	贴花	貼花	Decal	Décalcomanie	데칼	デカール	Calcomanía	Decalque	Декаль	Çıkartma
+Collision	Collision	碰撞	碰撞	Kollision	Collision	충돌	コリジョン	Colisión	Colisão	Коллизия	Çarpışma
+Trigger	Trigger	触发器	觸發器	Trigger	Déclencheur	트리거	トリガー	Activador	Gatilho	Триггер	Tetikleyici
+Light	Light	灯光	燈光	Licht	Lumière	조명	ライト	Luz	Luz	Освещение	Işık
+Physics	Physics	物理	物理	Physik	Physique	물리	物理	Física	Física	Физика	Fizik
+Navigation	Navigation	导航	導航	Navigation	Navigation	내비게이션	ナビゲーション	Navegación	Navegação	Навигация	Gezinme
+Other	Other	其他	其他	Sonstiges	Autres	기타	その他	Otros	Outros	Прочее	Diğer
+Camera	Camera	相机	相機	Kamera	Caméra	카메라	カメラ	Cámara	Câmera	Камера	Kamera
 Enable AI	Enable AI	启用 AI	啟用 AI	KI aktivieren	Activer l’IA	AI 활성화	AIを有効化	Activar IA	Ativar IA	Включить ИИ	AI'ı etkinleştir
 Group %d	Group %d	组 %d	群組 %d	Gruppe %d	Groupe %d	그룹 %d	グループ %d	Grupo %d	Grupo %d	Группа %d	Grup %d
 Hold	Hold	驻留	駐留	Halten	Maintien	고정	待機	Mantener	Manter	Удержание	Beklet
@@ -702,7 +728,7 @@ Overwrite project	Overwrite project	覆盖项目	覆寫專案	Projekt überschre
 Per-object	Per-object	逐个物体	個別物件	Pro Objekt	Par objet	오브젝트별	オブジェクトごと	Por objeto	Por objeto	По объектам	Nesne başına
 Placed counts attachments before cancellation, not surviving objects.	Placed counts attachments before cancellation, not surviving objects.	放置数统计取消前的附加次数，而不是剩余物体数。	放置數統計取消前的附加次數，而非剩餘物件數。	Die Platzierungszahl zählt Anhänge vor dem Abbruch, nicht verbleibende Objekte.	Le nombre placé compte les rattachements avant annulation, pas les objets restants.	배치 수는 취소 전에 연결된 횟수이며, 남아 있는 오브젝트 수가 아닙니다.	配置数はキャンセル前の接続数であり、残存するオブジェクト数ではありません。	La cantidad colocada cuenta las incorporaciones antes de cancelar, no los objetos restantes.	A contagem de colocados indica anexações antes do cancelamento, não os objetos restantes.	Число размещений учитывает присоединения до отмены, а не оставшиеся объекты.	Yerleştirilen sayısı kalan nesneleri değil, iptalden önceki eklemeleri sayar.
 Preflight	Preflight	预检	預先檢查	Vorprüfung	Vérification préalable	사전 검사	事前チェック	Comprobación previa	Verificação prévia	Предварительная проверка	Ön kontrol
-Projects: projects/*.cdproj | Groups: Groups/*.cdgroup	Projects: projects/*.cdproj | Groups: Groups/*.cdgroup	项目：projects/*.cdproj | 组：Groups/*.cdgroup	專案：projects/*.cdproj | 群組：Groups/*.cdgroup	Projekte: projects/*.cdproj | Gruppen: Groups/*.cdgroup	Projets : projects/*.cdproj | Groupes : Groups/*.cdgroup	프로젝트: projects/*.cdproj | 그룹: Groups/*.cdgroup	プロジェクト: projects/*.cdproj | グループ: Groups/*.cdgroup	Proyectos: projects/*.cdproj | Grupos: Groups/*.cdgroup	Projetos: projects/*.cdproj | Grupos: Groups/*.cdgroup	Проекты: projects/*.cdproj | Группы: Groups/*.cdgroup	Projeler: projects/*.cdproj | Gruplar: Groups/*.cdgroup
+Projects: projects/*.cdproj | Groups: groups/*.cdgroup	Projects: projects/*.cdproj | Groups: groups/*.cdgroup	项目：projects/*.cdproj | 组：groups/*.cdgroup	專案：projects/*.cdproj | 群組：groups/*.cdgroup	Projekte: projects/*.cdproj | Gruppen: groups/*.cdgroup	Projets : projects/*.cdproj | Groupes : groups/*.cdgroup	프로젝트: projects/*.cdproj | 그룹: groups/*.cdgroup	プロジェクト: projects/*.cdproj | グループ: groups/*.cdgroup	Proyectos: projects/*.cdproj | Grupos: groups/*.cdgroup	Projetos: projects/*.cdproj | Grupos: groups/*.cdgroup	Проекты: projects/*.cdproj | Группы: groups/*.cdgroup	Projeler: projects/*.cdproj | Gruplar: groups/*.cdgroup
 Read	Read	读取	讀取	Lesen	Lire	읽기	読み取り	Leer	Ler	Прочитать	Oku
 Refresh	Refresh	刷新	重新整理	Aktualisieren	Actualiser	새로 고침	更新	Actualizar	Atualizar	Обновить	Yenile
 Rigid	Rigid	整体贴地	整體貼地	Starr	Solidaire	형태 유지	一体として	Rígido	Rígido	Как единое целое	Rijit
@@ -883,3 +909,15 @@ cancel / put back	cancel / put back	取消或放回	取消或放回	Abbrechen / 
 fast (hold)	fast (hold)	加速（按住）	加速（按住）	Schnell (halten)	Rapide (maintenir)	빠르게(누르고 있기)	高速（長押し）	Rápido (mantener pulsado)	Rápido (manter pressionado)	Быстро (удерживать)	Hızlı (basılı tut)
 pasted	pasted	已粘贴	已貼上	eingefügt	collé	붙여넣음	貼り付け済み	pegado	colado	вставлено	yapıştırıldı
 extra	extra	额外参数	額外參數	Zusatzwert	valeur supplémentaire	추가 값	追加値	valor adicional	valor extra	дополнительное значение	ek değer
+None	None	无	無	Keine	Aucun	없음	なし	Ninguno	Nenhum	Нет	Yok
+Editing project	Editing project	编辑中的项目	編輯中的專案	Bearbeitetes Projekt	Projet en cours de modification	편집 중인 프로젝트	編集中のプロジェクト	Proyecto en edición	Projeto em edição	Редактируемый проект	Düzenlenen proje
+No project selected; placing creates a numbered Untitled project.	No project selected; placing creates a numbered Untitled project.	未选择项目；放置内容时会自动创建带序号的未命名项目。	未選擇專案；放置內容時會自動建立帶序號的未命名專案。	Kein Projekt ausgewählt; beim Platzieren wird ein nummeriertes unbenanntes Projekt erstellt.	Aucun projet sélectionné ; placer un élément crée un projet Sans titre numéroté.	선택한 프로젝트가 없습니다. 배치하면 번호가 붙은 제목 없는 프로젝트가 생성됩니다.	プロジェクトが選択されていません。配置すると番号付きの無題プロジェクトが作成されます。	No hay ningún proyecto seleccionado; al colocar algo se crea un proyecto Sin título numerado.	Nenhum projeto selecionado; ao posicionar algo, será criado um projeto Sem título numerado.	Проект не выбран; при размещении будет создан нумерованный проект «Без названия».	Proje seçilmedi; yerleştirme numaralı bir Adsız proje oluşturur.
+Edit project	Edit project	编辑项目	編輯專案	Projekt bearbeiten	Modifier le projet	프로젝트 편집	プロジェクトを編集	Editar proyecto	Editar projeto	Редактировать проект	Projeyi düzenle
+Load project	Load project	加载项目	載入專案	Projekt laden	Charger le projet	프로젝트 불러오기	プロジェクトを読み込む	Cargar proyecto	Carregar projeto	Загрузить проект	Projeyi yükle
+Create project	Create project	创建项目	建立專案	Projekt erstellen	Créer un projet	프로젝트 만들기	プロジェクトを作成	Crear proyecto	Criar projeto	Создать проект	Proje oluştur
+New objects, NPCs and terrain are saved to their editing project.	New objects, NPCs and terrain are saved to their editing project.	新物品、NPC 和地形修改会保存到当前编辑的项目。	新物品、NPC 和地形修改會儲存到目前編輯的專案。	Neue Objekte, NPCs und Geländeänderungen werden im bearbeiteten Projekt gespeichert.	Les nouveaux objets, PNJ et changements de terrain sont enregistrés dans le projet en cours de modification.	새 오브젝트, NPC와 지형 변경 사항은 편집 중인 프로젝트에 저장됩니다.	新しいオブジェクト、NPC、地形の変更は編集中のプロジェクトに保存されます。	Los objetos, PNJ y cambios de terreno nuevos se guardan en el proyecto en edición.	Novos objetos, NPCs e alterações no terreno são salvos no projeto em edição.	Новые объекты, NPC и изменения ландшафта сохраняются в редактируемом проекте.	Yeni nesneler, NPC'ler ve arazi değişiklikleri düzenlenen projeye kaydedilir.
+Create blueprint	Create blueprint	创建蓝图	建立藍圖	Bauplan erstellen	Créer un plan	설계도 만들기	設計図を作成	Crear plano	Criar esquema	Создать чертёж	Taslak oluştur
+Double-click or drag a blueprint into the world to place it in the editing project.	Double-click or drag a blueprint into the world to place it in the editing project.	双击蓝图或将其拖入游戏世界，即可放置到当前编辑的项目。	按兩下藍圖或將其拖入遊戲世界，即可放置到目前編輯的專案。	Doppelklicke auf einen Bauplan oder ziehe ihn in die Spielwelt, um ihn im bearbeiteten Projekt zu platzieren.	Double-cliquez sur un plan ou glissez-le dans le monde pour le placer dans le projet en cours de modification.	설계도를 두 번 클릭하거나 게임 세계로 끌어 편집 중인 프로젝트에 배치하세요.	設計図をダブルクリックするかゲーム世界へドラッグすると、編集中のプロジェクトに配置できます。	Haz doble clic en un plano o arrástralo al mundo para colocarlo en el proyecto en edición.	Clique duas vezes em um esquema ou arraste-o para o mundo para colocá-lo no projeto em edição.	Дважды щёлкните чертёж или перетащите его в игровой мир, чтобы разместить в редактируемом проекте.	Taslağı çift tıklayarak veya oyun dünyasına sürükleyerek düzenlenen projeye yerleştirin.
+Clear project terrain	Clear project terrain	清空当前项目的地形修改	清空目前專案的地形修改	Geländeänderungen dieses Projekts löschen	Effacer les modifications de terrain de ce projet	이 프로젝트의 지형 변경 사항 지우기	このプロジェクトの地形変更を消去	Borrar cambios de terreno de este proyecto	Limpar alterações de terreno deste projeto	Удалить изменения ландшафта этого проекта	Bu projenin arazi değişikliklerini temizle
+The editing project is not loaded yet. Enter the game world, move your character, then load it.	The editing project is not loaded yet. Enter the game world, move your character, then load it.	编辑中的项目尚未加载。进入游戏世界并移动角色后，再加载项目。	編輯中的專案尚未載入。進入遊戲世界並移動角色後，再載入專案。	Das bearbeitete Projekt ist noch nicht geladen. Betritt die Spielwelt, bewege deine Figur und lade es dann.	Le projet en cours de modification n'est pas encore chargé. Entrez dans le monde, déplacez votre personnage, puis chargez-le.	편집 중인 프로젝트가 아직 로드되지 않았습니다. 게임 세계에 들어가 캐릭터를 움직인 다음 프로젝트를 불러오세요.	編集中のプロジェクトはまだ読み込まれていません。ゲーム世界に入り、キャラクターを動かしてから読み込んでください。	El proyecto en edición aún no está cargado. Entra en el mundo, mueve al personaje y vuelve a cargarlo.	O projeto em edição ainda não foi carregado. Entre no mundo, mova o personagem e carregue o projeto novamente.	Редактируемый проект ещё не загружен. Войдите в игровой мир, переместите персонажа и загрузите проект.	Düzenlenen proje henüz yüklenmedi. Oyun dünyasına girin, karakterinizi hareket ettirin ve projeyi yükleyin.
+The game world is not ready for project objects yet. Move your character, then load the project again.	The game world is not ready for project objects yet. Move your character, then load the project again.	游戏世界尚未准备好生成项目物品。移动角色后重新加载项目。	遊戲世界尚未準備好產生專案物件。移動角色後重新載入專案。	Die Spielwelt ist noch nicht bereit für Projektobjekte. Bewege deine Figur und lade das Projekt erneut.	Le monde n'est pas encore prêt pour les objets du projet. Déplacez votre personnage, puis rechargez le projet.	게임 세계가 프로젝트 오브젝트를 생성할 준비가 되지 않았습니다. 캐릭터를 움직인 다음 프로젝트를 다시 불러오세요.	ゲーム世界はまだプロジェクトのオブジェクトを配置できません。キャラクターを動かしてから再度読み込んでください。	El mundo aún no está listo para los objetos del proyecto. Mueve al personaje y vuelve a cargar el proyecto.	O mundo ainda não está pronto para os objetos do projeto. Mova o personagem e carregue o projeto novamente.	Игровой мир ещё не готов к объектам проекта. Переместите персонажа и загрузите проект повторно.	Oyun dünyası henüz proje nesneleri için hazır değil. Karakterinizi hareket ettirin ve projeyi tekrar yükleyin.

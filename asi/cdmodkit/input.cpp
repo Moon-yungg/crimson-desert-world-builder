@@ -20,6 +20,7 @@ namespace input {
     static float g_pendingDx = 0, g_pendingDy = 0;
     static bool  g_rawButtons = false;
     static int   g_pendingButtons[5][2];
+    static bool  g_uiLeftHeld = false; // A press started in the UI must deliver its release outside it.
     static float g_pendingWheel = 0;
     static bool  g_weRegistered = false;
     typedef BOOL (WINAPI* FnGetCursorPos)(LPPOINT);
@@ -109,14 +110,15 @@ namespace input {
 
     void FeedMouse(ImGuiIO& io) {
         g_renderTid = GetCurrentThreadId();
+        static bool rawUiHeld[5]{};
         Lock();
         io.AddMousePosEvent(g_vx, g_vy);
         const bool toUi = core::g_uiWantsMouse;
         for (int b = 0; b < 5; ++b) {
-            if (toUi) {
-                for (int i = 0; i < g_pendingButtons[b][0]; ++i) io.AddMouseButtonEvent(b, true);
-                for (int i = 0; i < g_pendingButtons[b][1]; ++i) io.AddMouseButtonEvent(b, false);
-            }
+            for (int i = 0; i < g_pendingButtons[b][0]; ++i)
+                if (toUi) { io.AddMouseButtonEvent(b, true); rawUiHeld[b] = true; }
+            for (int i = 0; i < g_pendingButtons[b][1]; ++i)
+                if (toUi || rawUiHeld[b]) { io.AddMouseButtonEvent(b, false); rawUiHeld[b] = false; }
             g_pendingButtons[b][0] = g_pendingButtons[b][1] = 0;
         }
         if (g_pendingWheel != 0) { if (toUi) io.AddMouseWheelEvent(0, g_pendingWheel); g_pendingWheel = 0; }
@@ -158,6 +160,7 @@ namespace input {
     }
 
     void MenuOpened() {
+        g_uiLeftHeld = false;
         int w, h; ClientSize(&w, &h);
         POINT p{}; const bool haveWindowCursor = WindowedClient() && oGetCursorPos && oGetCursorPos(&p) && ScreenToClient(g_hwnd, &p);
         Lock(); g_vx = haveWindowCursor ? (float)p.x : w * 0.5f; g_vy = haveWindowCursor ? (float)p.y : h * 0.5f; g_pendingDx = g_pendingDy = 0; for (auto& b : g_pendingButtons) b[0] = b[1] = 0; g_pendingWheel = 0; Unlock();
@@ -167,6 +170,7 @@ namespace input {
         }
     }
     void MenuClosed() {
+        g_uiLeftHeld = false;
         if (ImGui::GetCurrentContext()) {
             ImGuiIO& io = ImGui::GetIO();
             for (int b = 0; b < 5; ++b) if (io.MouseDown[b]) io.AddMouseButtonEvent(b, false);
@@ -289,7 +293,18 @@ namespace input {
                 core::Log("[input/pick] left down: ui=%d rawButtons=%d freeCam=%d", (int)core::g_uiWantsMouse, (int)g_rawButtons, (int)g_freeCam);
         }
         if (IsKeyboard(msg)) TrackKey(msg, lParam);
-        if (msg == WM_KILLFOCUS || (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE)) { memset(g_scanDown, 0, sizeof g_scanDown); g_rmb = false; }
+        if (msg == WM_KILLFOCUS || (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE)) { memset(g_scanDown, 0, sizeof g_scanDown); g_rmb = false; g_uiLeftHeld = false; }
+        if (core::g_menuOpen && !g_rawButtons) {
+            if (msg == WM_LBUTTONDOWN && core::g_uiWantsMouse) g_uiLeftHeld = true;
+            if (msg == WM_LBUTTONUP) {
+                const bool held = g_uiLeftHeld;
+                g_uiLeftHeld = false;
+                if (held && !core::g_uiWantsMouse) {
+                    ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
+                    return CallWindowProc(g_original, hwnd, msg, wParam, lParam);
+                }
+            }
+        }
         // Keep the platform backend's keyboard code page in sync even when the game's WndProc would otherwise consume the change.
         if (core::g_menuOpen && msg == WM_INPUTLANGCHANGE) ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
         if (g_freeCam) {
