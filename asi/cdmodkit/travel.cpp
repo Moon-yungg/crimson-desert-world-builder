@@ -44,6 +44,10 @@ static void __fastcall HookStage(uintptr_t mgr, uint32_t key, uint32_t b, uint32
     if (MgrValid(mgr)) { g_mgr = mgr; g_key = key; g_argB = b; g_argC = c; }
     std::array<float, 10> transform{};
     if (!ReadBytes((uintptr_t)tf, transform.data(), sizeof transform)) { Log("[travel] native stage transform unreadable; reload refused"); return; }
+    if (PlayModeActive()) {   // play mode: every stage reload of the game's own is logged; one during the first load is redirected
+        Log("[travel] game stage reload: key %u b %u c %u to (%.1f %.1f %.1f)", key, b, c, transform[7], transform[8], transform[9]);
+        PlayModeStageOverride(transform.data());
+    }
     RunGroundWorldChange([mgr, key, b, c, transform]() {
         if (!MgrValid(mgr)) { Log("[travel] native stage manager lost while waiting for grounding; reload refused"); return; }
         g_origStage(mgr, key, b, c, transform.data());

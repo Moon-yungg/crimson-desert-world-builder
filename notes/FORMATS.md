@@ -393,3 +393,92 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Next steps (original list): find what the collision query reads (disassemble the geometry vtable 0x5D137A8 slots / hknpHeightFieldShape
   getHeight path), rebuild or patch the bounding-volume tree, find the patch's body transform; the render side (GPU height
   texture) is a separate problem.
+
+## Play mode: isolated start (2026-10-01, build 1.0.0.2976, plugin playmode.cpp)
+Request file `bin64\cdmodkit\playmode.json`, read at attach and renamed to `playmode.last.json` at once (a crash or a forced
+quit never traps the next start; without the file nothing below is installed). Format (every key optional):
+```
+{ "enabled": true,                                   // false = normal start (the file is still consumed)
+  "spawn": { "x": -11656.4, "y": 733, "z": -2178.2, "yaw": 0 },   // world metres, yaw degrees; omitted = stay where the save is
+  "isolate": true,                                   // master switch of the gates below
+  "isolateActors": true, "isolateObjects": true,
+  "isolateLevels": "all",                            // "all" (default: sector levels + named location levels), "sector" (256 m sector levels only), false
+  "radius": 0,                                       // > 0: sector levels farther than this from the spawn stay (0 = everywhere)
+  "blockReasons": ["Level", "NPCSchedule"],          // spawn reasons the actor gate drops (names or numbers); default below
+  "keep": ["/object/..."], "keepLevels": ["substring"],   // prefab prefixes / level path substrings that always pass
+  "objects": [ { "prefab": "/object/.../x.prefab", "pos": [x, y, z], "rot": [yaw, pitch, roll], "scale": 1 } ],   // or "yaw": n; scale may be [s, s, s] (first used)
+  "project": "World Builder project name",           // loaded like a manual load, after the objects
+  "autoContinue": true, "blockSave": true, "directLoad": false }
+```
+- Flow: title screen -> continue is pressed from inside the process (SendInput scan code 0x12 = E, only while the game window
+  is in front, every 6 s from 25 s after the window appeared, until the load starts = the game asks for rootlevel.palevel or the
+  server field ticks) -> first load at the save position (already isolated) -> if the spawn is more than 40 m away: the game's own
+  fast travel (travel.cpp, one more loading screen of ~15 s) -> 4 s after arrival the objects / project are spawned. Autoload is
+  skipped in play mode. State and counts: `GET /api/playmode`, census `GET /api/playmode/census`; exit
+  `POST /api/playmode/exit {"mode":"quit"|"travel"}` or Ctrl+Shift+End (quit = WM_CLOSE; the game's quit dialog then wants Space
+  held). "travel" turns isolation off and travels back to where the save had put the player; saving stays blocked until restart.
+  Seen: after "travel" the NPCs come back at once, but levels that were already loaded as the empty substitute stay empty until
+  they stream out (the town's guards stand on bare terrain) - "quit" is the clean exit.
+- The game thread pump (movement tick) does not run on the title screen or during loads: the title phase runs on its own thread.
+- What creates the world (census of a normal load at Calphade):
+  - createSceneObjectFrom is NOT the world's path: ~340 calls per load, all client mirrors of server actors (caller 0x8cfe71 =
+    gimmicks incl. the player's equipment, 0x52922e = armour parts of the character) plus a few presets. Static content comes with
+    the level files.
+  - Level files through ResourceLoader::load: `leveldata/bin__/rootlevel/rootlevel.palevel` -> ~45 global children (trigger_*,
+    regioninfolevel, gameplaytrigger*, content_level*, world_use_terrain, dev_*, gamedatalevel, gamephase, levelactionpoint,
+    levelsequencerspawn, roadlevel*, seamask, fx_sector_*) -> named location levels (calphade.palevel, shop_*_phase.., *_sub_..)
+    and the sector levels `sectorlevel/sector_X_Z.palevel` (256 m sectors: sector_-12_-3 spans x -3089..-2932, z -778..-493;
+    their children sector_X_Z_sub_A_B / _indoor_A_B are listed by the parent). Every level has a low-detail proxy
+    (`leveldata/rootlevel/[sectorlevel/]proxylod/<level>[_A_B].pam/.pami/.hkx/.pampg`, read by the texture/mesh streamer, not
+    ResourceLoader), shown while the level counts as far.
+  - Server actors: every desc list passes ServerField vtable slot 17 (0x2af9ae0, "field create": int* fn(field, int* result,
+    {desc** data; u32 count}* list, void*)). The function filters the list itself when a global switch is set (local vector of the
+    passing descs; none left -> error code in *result, return), so callers handle a shortened or an empty list.
+    Spawn reason = ICreateServerActorDesc +0xA (ctor 0x278ea70 stores r8b there). Enum (registration 0x15ba46c, count 41):
+    0 Level, 1 Sequencer, 2 AutoSpawn_Bird, 3 _SidWalk, 4 _Wagon, 5 _TerrainRegion, 6 _SpawningPool_Near, 7 _Socket, 8 _Point,
+    9 _MeshGroup, 10 _FactionPatrol, 11 _FactionPosition, 12 NPCSchedule, 13 Summon, 14 SummonMercenary, 15 SummonGimmick,
+    16 CombinationGimmick, 17 EquipDockingGimmick, 18 InstallationGimmick, 19 GuideEffectGimmick, 20 PortalGimmick, 21 DropItem,
+    22 DiscardItemFromInventory, 23 Housing, 24 Craft, 25 ThrowEquip, 26 DropFromDeadBody, 27 DropFromDeadBodyVehicle,
+    28 Transmutation, 29 Inspect, 30 GlobalGameActor, 31 SceneCollectSpawn, 32 Summon_LinkedVehicle, 33 Cheat, 34..37 Editor_*,
+    38 AutoSpawn_SpawningPool_ActionPoint, 39 DailyRoutine. Seen in a normal load at Calphade: Level 105, NPCSchedule 105
+    (CreateServerActorDesc_NPCSchedule), Bird 26, EquipDockingGimmick 46 (the player's equipment), SummonGimmick 9,
+    FactionPatrol 5, SpawningPool_Socket 4, SummonMercenary 3, Sequencer 2 (ambient animals), GlobalGameActor 2.
+- Gates (play mode only):
+  - actors: descs whose reason is in blockReasons (default 0, 1, 2..11, 12, 31, 38, 39) are taken out of the list before the call;
+    an emptied list returns hash("eErrNoActorSpawnFail") in *result. Our own server spawns (gimmick builder / replays, flagged per
+    thread) always pass; equipment, summons, items, GlobalGameActor pass. The game retries refused spawns (~10,000 refusals per
+    minute around a town, mostly birds and NPC schedules) without harm.
+  - levels: an isolated level is loaded from `leveldata/bin__/rootlevel/calphade_after_area_03_indoor_1_0.palevel` (788 bytes,
+    SceneLevelDataReflect {_forceMinLoadingRange true, _useProxyLOD false}, no objects, no child levels) by swapping the path
+    object of the ResourceLoader::load call. Ruled out: a path that does not exist (the loading screen never ends, seen twice);
+    an empty level with default settings such as rootlevel/0097.palevel (the level loads empty but its proxy mesh, collision
+    included, stays: a low-poly town shell); isolating the global children above (loading never ends). "all" keeps the global
+    children by name and isolates every other named level; rootlevel.palevel always loads.
+    The substitute is read through the game's loader on the title screen first; if a patch removed it, the level gate is off
+    (a missing substitute would keep the loading screen up).
+  - saving: the exe's import slots (by name, every descriptor) of CreateFileW/A/2, DeleteFileW, MoveFileExW, CopyFileW,
+    RemoveDirectoryW, CreateDirectoryW, SetFileAttributesW/A refuse mutating access below %LOCALAPPDATA%\Pearl Abyss\CD\save
+    (ERROR_ACCESS_DENIED), and the save requests / timers TrocTrSaveAutoReq, TrocTrSaveToFileCurrentPlayerReq,
+    TrocTrSaveGameDataAutoTimer, TrocTrGamePlaySaveDataRepeatTimer (fires every 10 s, also on the title screen) and
+    TrocTrFlushPendingSaveDataOnceTimer (execute = vtable slot 2; three are thunks into the protected .xtls code) do not run.
+    Save slots: `%LOCALAPPDATA%\Pearl Abyss\CD\save\<steamid>\slotN\save.save + lobby.save`; a normal autosave comes every 15 min.
+  - client scene objects (createSceneObjectFrom): census only, nothing of the world is created there.
+- What stays: terrain (height, material, collision), sky / weather / lighting, sea, the player, the camera, the player's
+  equipment and companion, World Builder objects (collision checked: the player leans against a spawned wall), the global trigger
+  levels (region names on screen), roads. Also stays (open): the mass-placed vegetation (forest trees, grass: tree/*.pat / .imp /
+  .meshinfo through the streamer, MassPlacementComponent; not in the level files) and far landmarks.
+- Direct first load (experiment, "directLoad": true): the first load of a save does not call the client's stage reload
+  (0xa9a860 is not called before the player is in the world). TrocTrGameLoadingStartReq::execute (slot 2, 0x29c59d0, empty
+  payload) calls 0x2bc9200([[sender+0x68]+0x1a0] = ServerTransformSyncActorComponent, &code), which applies a destination stored
+  at component +0x550 (u32 != 0 = pending; record copied by 0x2bbf510, transform at +0x28). A TrocTrReloadStageStartReq of our own
+  right before it (handler = its static instance, rva 0x6a7e240; payload 53 bytes: u32 a, u32 b, u32 c, pos3, quat4 (0x141fa90
+  reads 4 floats), scale3, u8 flag) puts the player at the spawn point during the first load (terrain streams there, the
+  character stands on the ground), but ~10 s later the player is reset to the loading placeholder (0, 1000, 0) and falls to
+  death: presumably the server tells the client to finish a stage reload the client never started. Off by default; the fast
+  travel after the first load is the working path.
+- Dev leftovers checked for a direct start: `paconfig.txt` (pack 0016, archive root) is the gv/global-variable file (key=value,
+  names hashed in the exe): gStartPositionX/Y/Z = new-character start only, gUseDirectGoToGamePlay=1. The startup option table
+  (0x1303f60) registers "LoadLevel", "PosX", "PosY", "Width", "Height", "SafeLaunchDummyTest(File)" (EditorData/DummyTest/
+  DummyTestCommand.xml) and ~200 options renamed "@@@NO_SVC_COMMAND_n" in the release; LoadLevel's only other reference is in the
+  protected .xtls code. The "Game Console" (registration 0xad6560) has only /help /h /? /setconfig /sc /showStringId
+  /toggleshowattackindicator /demoplay /togglejedi /togglesith - nothing that loads a level, teleports or stops spawning.

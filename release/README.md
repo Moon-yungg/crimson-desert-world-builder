@@ -147,6 +147,17 @@ stimmen) oder einen gespeicherten Punkt wählen, dann folgt ein Ladebildschirm u
 du unter einem Namen an der aktuellen Position; sie liegen in `bin64\cdmodkit\`. Die erste Reise einer Sitzung braucht bis zu
 einer halben Minute Vorbereitung, danach geht es sofort. In der Konsole: `tp x y z`.
 
+## Spielmodus (isolierte Welt)
+
+Liegt beim Start eine `bin64\cdmodkit\playmode.json` bereit (zum Beispiel vom "Play here"-Knopf eines Editors geschrieben),
+startet das Spiel direkt in eine leere Welt: World Builder drückt im Titelbildschirm selbst "Fortsetzen" (das Spielfenster
+muss dafür im Vordergrund sein), nach dem Laden bringt dich die Schnellreise zum angegebenen Punkt, und es bleiben nur Terrain,
+Himmel, Wetter, deine Figur und die gewünschten Objekte oder das Projekt. NPCs, Tiere, Gebäude und Requisiten der Welt werden
+nicht erzeugt. Wälder und Gras gehören zum Terrain und bleiben. Speichern ist in dieser Sitzung gesperrt, dein Spielstand
+bleibt unverändert. Die Datei wird beim Start sofort in `playmode.last.json` umbenannt; der nächste normale Start ist also
+wieder ganz normal. Beenden: Strg+Umschalt+Ende schließt das Spiel (im Dialog des Spiels die Leertaste gedrückt halten).
+Das Dateiformat beschreibt `HTTP_API.md` im Quellcode-Repository.
+
 ## Zeit und Wetter
 
 Der Tab **Time & Weather** steuert die visuelle Tageszeit und grundlegende Wetterwerte. Die Uhrzeit lässt sich frei einstellen

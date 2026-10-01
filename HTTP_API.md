@@ -16,6 +16,8 @@ Requests and responses use UTF-8 JSON. Write requests take a flat JSON object wi
 | `GET /api/objects/{uid}` | One scene object |
 | `GET /api/projects` | Saved project names |
 | `GET /api/autoload` | Names loaded automatically next game start |
+| `GET /api/playmode` | Play mode state: `active`, `isolating`, `phase` (`title`, `loading`, `in_world`, `travelling`, `arrived`, `ready`, `exited`, `off`), `status`, `spawn`, `loadedAt`, `counts` (refused saves / save requests, refused actors, isolated levels, ...) |
+| `GET /api/playmode/census` | The same plus what the game created this session: actor spawn reasons, field-create callers, createSceneObjectFrom callers, resource loads and streamer reads by type |
 
 Coordinates are absolute world coordinates. A prefab search returns catalog records, while scene object reads return instances created by World Builder. It does not enumerate all native game objects.
 
@@ -38,6 +40,7 @@ Both list endpoints return `total`, `offset`, `limit`, `nextOffset` and `items`.
 | `POST /api/projects/load` | `{"name":"Camp","clearFirst":false}` | Load a project; optionally clear the scene first |
 | `POST /api/autoload` | `{"name":"Camp","enabled":true}` | Add or remove a project from autoload |
 | `POST /api/npc` | `{"key":30191,"x":1,"y":2,"z":3,"type":1}` | Legacy one-shot NPC spawn through the game's own request. `key` is the characterinfo row key and `type` the spawn reason (default 1). Returns 202 when queued; 409 until the player has walked a few steps after loading; 503 if unsupported. This HTTP endpoint remains unmanaged (no editor UID/project persistence); NPCs created from the World Builder NPC/Scene UI use the separate managed-NPC registry with selection, AI/behavior control, movement, undo/redo and project saving. |
+| `POST /api/playmode/exit` | `{"mode":"quit"}` or `{"mode":"travel"}` | Leave play mode: `quit` closes the game (the game's quit dialog is confirmed by holding Space), `travel` turns isolation off and travels back to where the save had put the player (NPCs return at once, levels already loaded empty stay empty until they stream out; saving stays blocked until the game is restarted). 409 when play mode is not active. Also `POST /api/playmode {"exit":...}`. |
 | `POST /api/log` | `{"text":"hello"}` | Write a line to `cdmodkit.log` |
 
 Spawns, moves and removals run on the next game simulation tick. These requests return HTTP 202 when queued; `GET /api/status` reports the remaining job count. The ASI must be installed and running in Crimson Desert, and the game must be in a state where its simulation tick runs. `GET /api/status` remains available while the game is still loading.
@@ -54,3 +57,15 @@ Invoke-RestMethod "$base/api/prefabs?q=lamp&limit=5"
 $item = Invoke-RestMethod "$base/api/objects" -Method Post -ContentType 'application/json' -Body '{"prefab":"/object/cd_gimmick/breakable/gimmick_breakable_sack_01.prefab","x":0,"y":0,"z":0}'
 Invoke-RestMethod "$base/api/objects/$($item.uid)" -Method Patch -ContentType 'application/json' -Body '{"y":2}'
 ```
+
+## Play mode
+
+`bin64/cdmodkit/playmode.json` asks for an isolated start: the plugin presses continue on the title screen itself (while the game window is in front), the game loads, the player is taken to `spawn` with the game's own fast travel, and only terrain, sky, the player and the requested scene remain: the world's NPCs, animals, level gimmicks, buildings and props are not created, and saving is blocked for the whole session. The file is renamed to `playmode.last.json` as soon as it is read, so the following start is a normal one. Minimal request:
+
+```json
+{ "enabled": true,
+  "spawn": { "x": -11656.4, "y": 733.0, "z": -2178.2, "yaw": 0 },
+  "objects": [ { "prefab": "/object/00_common/castle/cd_castle_mercenary_wall_09b_shield.prefab", "pos": [-11656.0, 731.0, -2166.0], "rot": [0, 0, 0], "scale": 1 } ] }
+```
+
+`"project": "Name"` loads a saved World Builder project instead of (or in addition to) `objects`. All keys and the details are in `notes/FORMATS.md` ("Play mode"). A launcher writes the file and starts the game with `steam://rungameid/3321460`; `GET /api/playmode` reports when the scene is `ready`.

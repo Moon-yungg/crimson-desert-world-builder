@@ -3,6 +3,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "core.h"
+#include "core_internal.h"
 #include "http_api.h"
 #include <algorithm>
 #include <atomic>
@@ -339,6 +340,15 @@ static std::string Handle(const std::string& method, const std::string& path, co
         float hd = 0; if (Number(arg, "hdelta", hd)) core::IoHeightDelta((int)hd);
         float sd = 0; if (Number(arg, "sdelta", sd)) core::IoStreamDelta((int)sd);
         return "{\"ok\":true}";
+    }
+    if (method == "GET" && (path == "/api/playmode" || path == "/api/playmode/census")) {   // play mode state (and the census of what the world created)
+        return core::PlayModeStatusJson(path == "/api/playmode/census");
+    }
+    if (method == "POST" && (path == "/api/playmode" || path == "/api/playmode/exit")) {   // {"exit":"quit"|"travel"} or /exit {"mode":...}
+        auto it = arg.find(path == "/api/playmode" ? "exit" : "mode"); std::string mode = it == arg.end() ? "quit" : it->second;
+        if (mode != "quit" && mode != "travel") { status = 400; return Error("mode must be quit or travel"); }
+        if (!core::PlayModeExit(mode)) { status = 409; return Error("play mode is not active"); }
+        return "{\"ok\":true,\"mode\":\"" + mode + "\"}";
     }
     if (method == "POST" && path == "/api/travel") {   // {"x","y","z","yaw"}: the game's own fast travel to that point (loading screen)
         float x = 0, y = 0, z = 0, yaw = 0;

@@ -216,6 +216,7 @@ static uint32_t ApplyGuarded(uint8_t* buf, uint32_t off, uint32_t len, int tx, i
 
 static uint8_t __fastcall HookStreamReq(uintptr_t req) {
     const std::string s = PathObjText((void*)(req + 8)); int tx = 0, tz = 0;
+    if (PlayModeActive()) PlayModeOnStream(s);   // play mode: census of what the streamer reads (proxy meshes of the levels)
     if (!s.empty() && ParseTilePath(s, &tx, &tz)) {
         TerrainLiveInstall();   // needs the game's device, which exists by the time tiles stream
         bool edited; { std::lock_guard<std::mutex> l(g_mx); edited = g_edited.count({ tx, tz }) != 0; }

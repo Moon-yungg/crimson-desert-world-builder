@@ -36,4 +36,23 @@ namespace core {
     void TerrainLiveNoteRead(int tx, int tz, const uint8_t* data, uint32_t len);
     bool TerrainLiveUpload(int tx, int tz, const uint8_t* chain, size_t len);
     void TerrainPhysInstall(); int TerrainPhysSync(int tx, int tz, const float* prev, const float* next);   // terrain_physics.cpp
+    // play mode (playmode.cpp): an isolated start requested by bin64\cdmodkit\playmode.json; inert without the file
+    void PlayModeLoad();                 // at attach: read + consume the request
+    void PlayModeInstall();              // after ResolveGame: the hooks a consumed request needs
+    void PlayModeTick();                 // game thread pump
+    bool PlayModeActive(); bool PlayModeIsolating();
+    bool PlayModeOnCreate(uintptr_t retRva, const std::string& prefab, const float* xf, uint8_t f1, uint8_t f2, uint8_t f3, bool ours);   // true = do not create
+    bool PlayModeOnResLoad(const std::string& path);   // true = load the empty level PlayModeEmptyLevel() instead (isolated level)
+    const char* PlayModeEmptyLevel();
+    void PlayModeOnStream(const std::string& path);    // the texture / mesh streamer's requests (terrain.cpp hook)
+    bool PlayModeStageOverride(float* tf);   // a stage reload of the game's own during the first load: redirected
+    bool PlayModeLoadStarted();
+    bool PlayModeExit(const std::string& mode);   // "quit" or "travel"
+    std::string PlayModeStatusJson(bool census);
+    void PlayModeOurSpawn(bool on);      // marks this thread's server work as World Builder's own (never filtered)
+    // helpers for play mode (cdmodkit.cpp)
+    bool OurServerSpawnOnThisThread();   // a World Builder gimmick spawn runs on this thread right now
+    bool ServerFieldTicking();           // the in-process server field ticks (a game is loading or running)
+    uint32_t GameHashOf(const char* s);  // the game's string hash (error codes, reason names); 0 when unresolved
+    uintptr_t StaticObjectWithVtable(uintptr_t vt, int* count);   // first object in the image's writable data whose vtable is vt
 }

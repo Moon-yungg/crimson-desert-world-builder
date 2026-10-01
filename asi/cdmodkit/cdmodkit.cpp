@@ -385,6 +385,10 @@ static void* __fastcall HookCreate(void* mgr, void* tag, void* b, void* c, void*
     if (log) g_createLogged++;
     if (!g_inOurSpawn) g_lastMgr = mgr;
     uintptr_t retAddr = (uintptr_t)_ReturnAddress();
+    if (PlayModeActive()) {   // play mode: census of who creates what, and the isolation gate for the world's own objects
+        float t[10] = { 0 }; ReadBytes((uintptr_t)transform, t, 40);
+        if (PlayModeOnCreate(InImage(retAddr) ? retAddr - g_base : 0, PrefabPathText((uintptr_t)d), t, f1, f2, f3, g_inOurSpawn || OurServerSpawnOnThisThread())) return nullptr;
+    }
     void* r = g_origCreate(mgr, tag, b, c, d, transform, f1, f2, f3);
     if (!g_inOurSpawn && r) g_lastGameObj = (uintptr_t)r;
     if (!g_inOurSpawn && r && kRva_GimmickSpawn_) { float t[10] = {0}; if (ReadBytes((uintptr_t)transform, t, 40)) NameGimmickCapture(PrefabPathText((uintptr_t)d), t[7], t[8], t[9]); }
@@ -815,6 +819,13 @@ static void __fastcall IoHookWorker(uintptr_t worker) {
 }
 static void* __fastcall HookResLoad(void* self, void** out, void* path, uint32_t flags) {
     if (!g_resLoader && self) { g_resLoader = self; Log("resource loader captured %p (%s)", self, RttiName((uintptr_t)self) ? RttiName((uintptr_t)self) : "?"); }
+    alignas(16) uint8_t missing[64];   // play mode: a level file of the isolated world is loaded from an empty level file instead
+    if (PlayModeActive() && PlayModeOnResLoad(PathText(path)) && kRva_StringDataAlloc && kRva_PathNormalizeCtor) {
+        const char* none = PlayModeEmptyLevel(); const size_t len = strlen(none);   // an empty level the game ships (playmode.cpp)
+        auto sdAlloc = (uintptr_t(*)(int))(g_base + kRva_StringDataAlloc); auto normalize = (void*(*)(void*, const void*))(g_base + kRva_PathNormalizeCtor);
+        memset(missing, 0, sizeof missing); uintptr_t sd = sdAlloc((int)len);
+        if (sd) { strncpy_s((char*)*(uintptr_t*)sd, len + 1, none, _TRUNCATE); uintptr_t holder = sd; normalize(missing, &holder); path = missing; }
+    }
     void* r = g_origResLoad(self, out, path, flags);
     if (g_ioFilter[0] && g_ioLines < 2000) {
         const std::string s = PathText(path);
@@ -1357,7 +1368,8 @@ static void PumpJobs() {
 #ifndef WB_UNIFIED_HOST_TEST   // host runs are deterministic: the tick duties need the game's own state
     if ((g_pumpTicks & 31) == 0) CheckReplayWatchdog();
     if (g_trace) TraceTick();
-    if ((g_pumpTicks & 15) == 0) AutoloadTick();
+    if ((g_pumpTicks & 15) == 0 && !PlayModeActive()) AutoloadTick();   // play mode brings its own scene
+    PlayModeTick();
 #endif
     std::function<void()> job;
     if (InterlockedCompareExchange(&g_queueCount, 0, 0) != 0) {
@@ -3793,6 +3805,8 @@ static bool GimmickWorldQuiet(DWORD now, DWORD since, DWORD lastSpawn) {
     return since && now - since >= 10000 && now - lastSpawn >= 3000;
 }
 static volatile uintptr_t g_serverFieldObj = 0;   // the ServerField whose slot 9 tick runs our server jobs
+static volatile DWORD g_serverFieldTick = 0;      // when that tick last ran (play mode: a game is loading or running)
+bool ServerFieldTicking() { const DWORD t = g_serverFieldTick; return g_serverFieldObj && t && GetTickCount() - t < 3000; }
 static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uintptr_t* soOut, uintptr_t* actOut);   // below
 static void ProcessGimmickQueue() {   // server thread, one object per tick
     GimmickReq r; size_t pending = 0;
@@ -4089,6 +4103,8 @@ static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uin
     }
     *soOut = so; *actOut = act; return true;
 }
+bool OurServerSpawnOnThisThread() { return g_inGimmickReplay && GetCurrentThreadId() == g_spawnWindowThread; }
+uint32_t GameHashOf(const char* s) { return g_gameHash && s ? g_gameHash(s, strlen(s)) : 0; }
 static void* __fastcall HookGimmickSpawn(void* param, void* out, void* mgr, void* owner, void* s5, void* s6, void* s7, void* s8, void* s9, void* s10, void* s11, void* s12) {
     g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount();
     if (!g_directArmed && !g_inGimmickReplay) g_gameSpawnTick = GetTickCount();   // the game's own spawns: the world is still loading
@@ -4480,7 +4496,7 @@ template<int C, int N> static void* __fastcall VtThunk(void* a, void* b, void* c
     if (C == 3) { if (g_inGimmickReplay && GetCurrentThreadId() == g_spawnWindowThread) NoteReplayActor((uintptr_t)a, N); if (!g_trace || !g_inGimmickReplay) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); }
     if (C == 2 && N == 9 && g_gimmickReplayArmed) { if (InterlockedCompareExchange(&g_gimmickReplayArmed, 0, 1) == 1) ReplayGimmick(); }
     if (C == 2 && N == 9 && g_removeActorRequest) { const uintptr_t a = (uintptr_t)InterlockedExchangePointer((void* volatile*)&g_removeActorRequest, nullptr); if (a) RemoveSpawnedActor(a); }
-    if (C == 2 && N == 9) { g_serverFieldObj = (uintptr_t)a; ProcessServerJobs(); ProcessGimmickQueue(); }   // ServerField slot 9 runs ~18x per second on the server thread: armed replays run here, no game spawn needed
+    if (C == 2 && N == 9) { g_serverFieldObj = (uintptr_t)a; g_serverFieldTick = GetTickCount(); ProcessServerJobs(); ProcessGimmickQueue(); }   // ServerField slot 9 runs ~18x per second on the server thread: armed replays run here, no game spawn needed
     if (C == 2) { if (!g_trace) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); const LONG k = InterlockedIncrement(&g_vtCount[N]); g_vtCountThread[N] = GetCurrentThreadId(); if (k > 20) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); }
     const bool log = g_trace && (C == 0 || C == 2 || Watched((uintptr_t)a) || (GetCurrentThreadId() == g_spawnWindowThread && GetTickCount() - g_spawnWindowTick < 500));
     if (!log) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h);
@@ -4807,6 +4823,7 @@ static uintptr_t FindObjectWithVtable(uintptr_t vt, int* count) {   // static ha
     }
     return first;
 }
+uintptr_t StaticObjectWithVtable(uintptr_t vt, int* count) { return FindObjectWithVtable(vt, count); }
 static uintptr_t RelCallTarget(uintptr_t p) {
     uint8_t op = 0; int32_t rel = 0;
     if (!ReadBytes(p, &op, 1) || op != 0xE8 || !ReadBytes(p + 1, &rel, 4)) return 0;
@@ -6292,6 +6309,7 @@ static DWORD WINAPI InitThread(LPVOID) {
         if (kRva_GimmickSpawn) { void* t7 = (void*)(g_base + kRva_GimmickSpawn); HookFn(t7, (void*)HookGimmickSpawn, (void**)&g_origGimmickSpawn, "gimmick spawn (trace)"); }
         if (kRva_WorldCastRay) { void* t4 = (void*)(g_base + kRva_WorldCastRay); if (HookFn(t4, (void*)HookWorldCastRay, (void**)&g_origWorldCastRay, "worldCastRay (trace)")) Log("resolved worldCastRay        rva 0x%llx", (unsigned long long)kRva_WorldCastRay); }
     }
+    PlayModeInstall();           // only with a consumed play mode request
     uintptr_t pump = FindPattern("48 8B C4 4C 89 48 ?? 48 89 50 ?? 55 41 56");
     if (pump) {
         ReleaseHookPiece();
@@ -6563,6 +6581,7 @@ static void Attach(HMODULE h) {
     ReadGameVersion();
     Log("cdmodkit.asi v0.97 attached, base=%p, game build %s", (void*)g_base, g_gameVersion.empty() ? "unknown" : g_gameVersion.c_str());
     LoadSettings();
+    PlayModeLoad();              // bin64\cdmodkit\playmode.json: consumed here, before the game reads its save
     ReserveHookGap();            // before the game fills the address space around its image (see ReserveHookGap)
     CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     if (g_showConsole) CreateThread(nullptr, 0, ConsoleThread, nullptr, 0, nullptr); else Log("console window hidden (settings.txt console=0)");
