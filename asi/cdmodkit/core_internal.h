@@ -42,7 +42,10 @@ namespace core {
     void PlayModeTick();                 // game thread pump
     bool PlayModeActive(); bool PlayModeIsolating();
     bool PlayModeOnCreate(uintptr_t retRva, const std::string& prefab, const float* xf, uint8_t f1, uint8_t f2, uint8_t f3, bool ours);   // true = do not create
-    bool PlayModeOnResLoad(const std::string& path);   // true = load the empty level PlayModeEmptyLevel() instead (isolated level)
+    bool PlayModeOnResLoad(const std::string& path);   // true = an isolated level (loaded as PlayModeEmptyLevel())
+    std::string PlayModeSwapPath(const std::string& path);   // the game path to load instead ("" = as asked): isolated level / pack override
+    void PlayModeAfterResLoad(const std::string& path, uintptr_t handler);   // local-file overrides, scene level scan
+    bool PlayModeWorkerRead(uintptr_t handler, uint8_t* buf, uint32_t cap, uint32_t off, uint32_t len, bool after, bool* ok);   // load worker vslot 5
     const char* PlayModeEmptyLevel();
     void PlayModeOnStream(const std::string& path);    // the texture / mesh streamer's requests (terrain.cpp hook)
     bool PlayModeStageOverride(float* tf);   // a stage reload of the game's own during the first load: redirected

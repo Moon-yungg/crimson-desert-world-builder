@@ -482,3 +482,42 @@ quit never traps the next start; without the file nothing below is installed). F
   DummyTestCommand.xml) and ~200 options renamed "@@@NO_SVC_COMMAND_n" in the release; LoadLevel's only other reference is in the
   protected .xtls code. The "Game Console" (registration 0xad6560) has only /help /h /? /setconfig /sc /showStringId
   /toggleshowattackindicator /demoplay /togglejedi /togglesith - nothing that loads a level, teleports or stops spawning.
+
+### Play mode v2: the editor's scene as a whitelist (2026-10-01)
+```
+{ "version": 2, "enabled": true, "autoContinue": true, "blockSave": true,
+  "spawn": { "x": .., "y": .., "z": .., "yaw": 90 },           // yaw: 0 = facing +z, 90 = facing +x (editor camera yaw)
+  "isolate": true,
+  "scene": { "levels": ["leveldata/bin__/rootlevel/sectorlevel/sector_-46_-9.palevel", ...],   // load normally (+ their child levels)
+             "sectors": [[-46, -9]],                            // 256 m sectors: level actors / NPCs inside pass the actor gate
+             "keepTerrain": true },
+  "overrides": { "<game path>": "C:\...\local file" | "<another game path>" },
+  "objects": [...], "project": "..." }                          // v1 fields keep working
+```
+- Levels: a level loads normally when its normalized path (lower case, '/', no leading '/') is in scene.levels, when its file
+  stem is one of the names found in a scene level's own bytes (child levels are named in the parent's string table, e.g.
+  sector_-46_-9.palevel names 479 strings incl. its _sub_/_indoor_ children; the scan runs in the load worker's read, slot 5,
+  after the original read, for every whitelisted level, so the whitelist follows the tree transitively), when its stem starts with
+  a scene level's stem + "_", or when it is a sector level of a scene sector. Everything else is isolated as in v1 (empty level).
+- Overrides: a game path value swaps the path object of the ResourceLoader::load call (like the empty level). A local file
+  (absolute path, opened with _wfopen from UTF-8) is served through the handler the game gets for the original path: +0x34 and
+  +0x38 (stored / unpacked size) = file size, +0x3c (compression / crypto nibbles) = 0, and the worker's vslot 5 read
+  (worker, handler, buf, cap, offset, length) copies the local bytes instead of reading the pack (vslot 4 allocates its buffer from
+  the handler sizes and calls vslot 5). Handler addresses are reused: every load clears the mapping of the handler it returns.
+  Covers every file that comes through ResourceLoader::load (.palevel, .prefab, .meshinfo, .pami, tables, .paloc, .xml ...);
+  files of the texture / mesh streamer (.dds, .pam, .pamlod, .hkx of proxies, tree .pat / .imp) are NOT overridable this way.
+  Seen: sector_-46_-9_sub_3_26.palevel (the mill interior the save stands in) served as the 788-byte empty level -> the floor
+  is gone and the player stands 9 m lower (731.8 instead of 741.1), the rest of the castle unchanged.
+- Actors: Level (0) and SceneCollectSpawn (31) descs pass (they exist only for levels that load, i.e. the scene's; isolated
+  levels are empty and produce none). Every other blocked reason passes when the desc lies in a scene sector: desc +0x35c =
+  tile-local position (1000 m tiles), [desc +0xE0] +0x1E8 = the same point in world coordinates; the world point is used when
+  world - local is a whole number of tiles, otherwise the desc counts as outside. Seen at Calphade (scene = sector -46,-9):
+  NPCSchedule 118, FactionPatrol 5, Bird 24, Level 44 created, 39 descs outside refused; guards stand on the castle walls.
+- Vegetation: NOT gated. Trees and grass placed as tree/*.pat instances inside sector sub levels follow the level whitelist, but
+  the forest outside the scene stays: its placements are not in any level file (no level of rootlevel/ or sectorlevel/ around
+  Calphade contains a MassPlacementComponent; live MassPlacementComponent objects sit in a pool, 0x208 apart, each with a small
+  world box, e.g. -11597..-11584 / -2067..-2061) and the tree assets come through the streamer without a position. Open.
+- Direct first load: unchanged (fast travel after the first load). The client's stage reload cannot run during a load (the game
+  thread pump stops), and the server-side injection still ends in the (0, 1000, 0) reset.
+- Facing: the travel quaternion (0, sin(a/2), 0, cos(a/2)) turns the character to (-sin a, -cos a) (seen: a = 45 -> (-0.59,
+  -0.81), a = 90 -> -x), so play mode passes a = yaw + 180; with that, yaw 90 faces +x (seen).

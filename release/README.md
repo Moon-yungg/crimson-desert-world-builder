@@ -153,7 +153,8 @@ Liegt beim Start eine `bin64\cdmodkit\playmode.json` bereit (zum Beispiel vom "P
 startet das Spiel direkt in eine leere Welt: World Builder drückt im Titelbildschirm selbst "Fortsetzen" (das Spielfenster
 muss dafür im Vordergrund sein), nach dem Laden bringt dich die Schnellreise zum angegebenen Punkt, und es bleiben nur Terrain,
 Himmel, Wetter, deine Figur und die gewünschten Objekte oder das Projekt. NPCs, Tiere, Gebäude und Requisiten der Welt werden
-nicht erzeugt. Wälder und Gras gehören zum Terrain und bleiben. Speichern ist in dieser Sitzung gesperrt, dein Spielstand
+nicht erzeugt. Schickt der Editor seine offene Szene mit, laden genau deren Level mit Gebäuden, Requisiten und
+NPCs, der Rest der Welt bleibt leer. Wälder und Gras gehören zum Terrain und bleiben. Speichern ist in dieser Sitzung gesperrt, dein Spielstand
 bleibt unverändert. Die Datei wird beim Start sofort in `playmode.last.json` umbenannt; der nächste normale Start ist also
 wieder ganz normal. Beenden: Strg+Umschalt+Ende schließt das Spiel (im Dialog des Spiels die Leertaste gedrückt halten).
 Das Dateiformat beschreibt `HTTP_API.md` im Quellcode-Repository.

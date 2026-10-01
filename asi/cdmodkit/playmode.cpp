@@ -123,6 +123,16 @@ struct PmRequest {
     int isolateLevels = 2;           // 0 off, 1 sector levels, 2 sector levels + named location levels (towns, shops, quests, phases)
     std::vector<std::string> keepLevels;   // level path substrings that always load
     std::set<int> blockReasons;      // spawn reasons the actor gate drops
+    // v2: the editor's open scene is a whitelist - these levels (and the child levels they name) load normally, and level
+    // actors / NPCs inside these 256 m sectors pass the actor gate; everything else stays isolated as in v1
+    int version = 1;
+    bool hasScene = false;
+    std::set<std::string> sceneLevels;            // normalized game paths
+    std::set<std::string> sceneStems;             // their file names without extension (prefix rule for child levels)
+    std::set<std::pair<int, int>> sceneSectors;   // 256 m sector indices
+    bool keepTerrain = true;
+    std::map<std::string, std::string> overridePack;   // game path -> another game path (served by swapping the path)
+    std::map<std::string, std::string> overrideFile;   // game path -> local file (served from memory)
 };
 static PmRequest g_req;
 static std::atomic<bool> g_active{ false };       // a request was consumed this session
@@ -147,6 +157,14 @@ static void SetStatus(const std::string& s) { std::lock_guard<std::mutex> l(g_mx
 bool PlayModeActive() { return g_active.load(); }
 bool PlayModeIsolating() { return g_isolating.load(); }
 
+// paths inside the request are UTF-8 (user folders may be non-ASCII): opened through the wide API
+static std::string ReadFileUtf8Path(const std::string& path) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0); if (n <= 0) return {};
+    std::wstring w((size_t)n, L' '); MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &w[0], n);
+    FILE* f = _wfopen(w.c_str(), L"rb"); if (!f) return {};
+    std::string s; char buf[65536]; size_t k; while ((k = fread(buf, 1, sizeof buf, f)) > 0 && s.size() < (512u << 20)) s.append(buf, k);
+    fclose(f); return s;
+}
 static std::string ReadFileText(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb"); if (!f) return {};
     std::string s; char buf[8192]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0 && s.size() < (1u << 22)) s.append(buf, n);
@@ -176,6 +194,16 @@ static void DefaultBlockReasons(std::set<int>& r) {
     r = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 31, 38, 39 };
 }
 
+// game paths as the game asks for them: lower case, forward slashes, no leading slash
+static std::string NormPath(const std::string& in) {
+    std::string s = in; for (auto& c : s) { if (c == '\\') c = '/'; c = (char)tolower((unsigned char)c); }
+    while (!s.empty() && s[0] == '/') s.erase(0, 1);
+    return s;
+}
+static std::string StemOf(const std::string& normPath) {
+    const size_t sl = normPath.rfind('/'); std::string f = sl == std::string::npos ? normPath : normPath.substr(sl + 1);
+    const size_t dot = f.rfind('.'); return dot == std::string::npos ? f : f.substr(0, dot);
+}
 static bool ParseRequest(const std::string& text, PmRequest& r, std::string& err) {
     JVal j; if (!ParseJson(text, j) || j.t != JVal::Obj) { err = "not a JSON object"; return false; }
     r.enabled = j.get("enabled") ? j.get("enabled")->truthy(false) : true;
@@ -199,6 +227,25 @@ static bool ParseRequest(const std::string& text, PmRequest& r, std::string& err
     if (const JVal* v = j.get("blockReasons")) if (v->t == JVal::Arr) {
         r.blockReasons.clear();
         for (auto& k : v->a) { int id = k.t == JVal::Num ? (int)k.n : k.t == JVal::Str ? ReasonByName(k.s) : -1; if (id >= 0 && id < 256) r.blockReasons.insert(id); }
+    }
+    if (const JVal* v = j.get("version")) r.version = (int)v->num(1);
+    if (const JVal* sc = j.get("scene")) {
+        if (sc->t != JVal::Obj) { err = "scene must be an object"; return false; }
+        r.hasScene = true;
+        if (const JVal* lv = sc->get("levels")) { if (lv->t != JVal::Arr) { err = "scene.levels must be an array"; return false; }
+            for (auto& k : lv->a) if (k.t == JVal::Str && !k.s.empty()) { const std::string n = NormPath(k.s); r.sceneLevels.insert(n); r.sceneStems.insert(StemOf(n)); } }
+        if (const JVal* se = sc->get("sectors")) { if (se->t != JVal::Arr) { err = "scene.sectors must be an array"; return false; }
+            for (auto& k : se->a) if (k.t == JVal::Arr && k.a.size() >= 2) r.sceneSectors.insert({ (int)floor(k.a[0].num(0)), (int)floor(k.a[1].num(0)) }); }
+        if (const JVal* kt = sc->get("keepTerrain")) r.keepTerrain = kt->truthy(true);
+    }
+    if (const JVal* ov = j.get("overrides")) {
+        if (ov->t != JVal::Obj) { err = "overrides must be an object"; return false; }
+        for (auto& kv : ov->o) {
+            if (kv.second.t != JVal::Str || kv.second.s.empty()) { err = "overrides[" + kv.first + "] must be a path"; return false; }
+            const std::string& v = kv.second.s;
+            const bool local = (v.size() > 2 && v[1] == ':') || v.rfind("\\\\", 0) == 0;   // C:\... or \\server\...
+            if (local) r.overrideFile[NormPath(kv.first)] = v; else r.overridePack[NormPath(kv.first)] = NormPath(v);
+        }
     }
     if (const JVal* v = j.get("objects")) {
         if (v->t != JVal::Arr) { err = "objects must be an array"; return false; }
@@ -341,6 +388,7 @@ static void InstallSaveRequestGate() {
     Log("[playmode] save guard: %d of 5 save requests gated", ok);
 }
 
+static void LoadOverrideFiles();
 // ---- request load (at attach, before any game code ran) ------------------------------------------------------------------
 void PlayModeLoad() {
     const std::string path = ModDir() + "\\playmode.json", last = ModDir() + "\\playmode.last.json";
@@ -356,6 +404,8 @@ void PlayModeLoad() {
     Log("[playmode] REQUEST consumed: spawn %s (%.1f %.1f %.1f) yaw %.0f, isolate %d (actors %d, objects %d, radius %.0f), %zu objects, project \"%s\", auto continue %d, block save %d; blocked reasons: %s",
         r.hasSpawn ? "at" : "none", r.spawn.x, r.spawn.y, r.spawn.z, r.yaw, r.isolate, r.isolateActors, r.isolateObjects, r.radius, r.objects.size(), r.project.c_str(), r.autoContinue, r.blockSave, reasons.c_str());
     if (r.blockSave) InstallSaveGuard();
+    LoadOverrideFiles();
+    if (r.hasScene) Log("[playmode] scene: %zu levels, %zu sectors, keep terrain %d (request version %d)", r.sceneLevels.size(), r.sceneSectors.size(), r.keepTerrain, r.version);
     if (r.isolate) g_isolating = true;   // from the first load on: nothing of the world near the save position is created either
     SetStatus("waiting for the title screen");
 }
@@ -378,6 +428,44 @@ static bool DescReason(void* desc, int* reason, const char** cls) {
     uint8_t r = 0; if (!desc || !ReadBytes((uintptr_t)desc + 0xA, &r, 1)) return false;
     *reason = r; *cls = RttiName((uintptr_t)desc); return true;
 }
+// v2 scene: level actors come only from levels that load, i.e. from the scene's levels (isolated levels are empty), so
+// Level / SceneCollectSpawn pass; the rest passes when its position lies in one of the scene's sectors (offset found below).
+// Desc position (dumps of every reason, see DumpDescPositions): desc +0x35c = tile-local x, y, z (1000 m tiles) and
+// [desc +0xE0] +0x1E8 = the same point in world coordinates. The world point is used when both agree (world - local a
+// whole number of tiles), otherwise the desc counts as outside the scene.
+static bool DescWorldPos(void* d, float* out) {
+    float loc[3], w[3]; uintptr_t q = 0;
+    if (!ReadBytes((uintptr_t)d + 0x35c, loc, 12) || !ReadBytes((uintptr_t)d + 0xE0, &q, 8) || !q || !ReadBytes(q + 0x1E8, w, 12)) return false;
+    for (int i = 0; i < 3; i++) if (!std::isfinite(loc[i]) || !std::isfinite(w[i])) return false;
+    const float tx = (w[0] - loc[0]) / 1000.0f, tz = (w[2] - loc[2]) / 1000.0f;
+    if (fabsf(tx - roundf(tx)) > 0.001f || fabsf(tz - roundf(tz)) > 0.001f || fabsf(w[1] - loc[1]) > 0.01f) return false;
+    out[0] = w[0]; out[1] = w[1]; out[2] = w[2]; return true;
+}
+static std::atomic<long> g_actorsInScene{ 0 };
+static bool ActorInScene(void* d, int reason) {
+    if (!g_req.hasScene) return false;
+    if (reason == 0 || reason == 31) { ++g_actorsInScene; return true; }   // level actors exist only for levels that load, i.e. the scene's
+    if (g_req.sceneSectors.empty()) return false;
+    float p[3]; if (!DescWorldPos(d, p)) return false;
+    const bool in = g_req.sceneSectors.count({ (int)floorf(p[0] / 256.0f), (int)floorf(p[2] / 256.0f) }) != 0;
+    if (in) ++g_actorsInScene;
+    return in;
+}
+// Research: where a desc keeps its position. The first descs of every reason are logged with every float triple in
+// their first 0x800 bytes (and one pointer deep) that looks like a world position.
+static void DumpDescPositions(void* d, int reason) {
+    static std::atomic<int> s_n[256] = {}; if (reason < 0 || reason > 255 || s_n[reason]++ >= 3) return;
+    uint8_t b[0x800]; if (!ReadBytes((uintptr_t)d, b, sizeof b)) { memset(b, 0, sizeof b); ReadBytes((uintptr_t)d, b, 0x200); }
+    char line[1400]; int k = snprintf(line, sizeof line, "[playmode] desc %s reason %d (%s):", RttiName((uintptr_t)d) ? RttiName((uintptr_t)d) : "?", reason, ReasonName(reason));
+    auto scan = [&](const uint8_t* p, size_t n, const char* tag) {
+        for (size_t o = 0; o + 12 <= n && k < (int)sizeof line - 60; o += 4) { float f[3]; memcpy(f, p + o, 12);
+            if (std::isfinite(f[0]) && std::isfinite(f[1]) && std::isfinite(f[2]) && fabsf(f[0]) > 50 && fabsf(f[0]) < 20000 && f[1] > -300 && f[1] < 3000 && fabsf(f[1]) > 1 && fabsf(f[2]) > 50 && fabsf(f[2]) < 20000)
+                k += snprintf(line + k, sizeof line - k, " %s+%zx=(%.1f %.1f %.1f)", tag, o, f[0], f[1], f[2]); } };
+    scan(b, sizeof b, "");
+    for (size_t o = 0; o + 8 <= 0x200 && k < (int)sizeof line - 60; o += 8) { uintptr_t q; memcpy(&q, b + o, 8); if (q < 0x10000 || (q >> 47)) continue;
+        uint8_t c[0x200]; if (!ReadBytes(q, c, sizeof c)) continue; char t[16]; snprintf(t, sizeof t, "[%zx]", o); scan(c, sizeof c, t); }
+    Log("%s", line);
+}
 static int* __fastcall HookFieldCreate(void* field, int* result, void* list, void* x) {
     DescList* dl = (DescList*)list; uint32_t n = 0; void** data = nullptr;
     if (dl) { ReadBytes((uintptr_t)&dl->count, &n, 4); ReadBytes((uintptr_t)&dl->data, &data, 8); }
@@ -390,7 +478,8 @@ static int* __fastcall HookFieldCreate(void* field, int* result, void* list, voi
     std::vector<void*> keep; keep.reserve(n); int dropped = 0;
     for (uint32_t i = 0; i < n; i++) {
         void* d = nullptr; ReadBytes((uintptr_t)(data + i), &d, 8); int r = -1; const char* c = nullptr;
-        if (DescReason(d, &r, &c) && g_req.blockReasons.count(r)) { dropped++; std::lock_guard<std::mutex> l(g_censusMx); g_actorCensus[r].blocked++; continue; }
+        if (DescReason(d, &r, &c)) DumpDescPositions(d, r);
+        if (DescReason(d, &r, &c) && g_req.blockReasons.count(r) && !ActorInScene(d, r)) { dropped++; std::lock_guard<std::mutex> l(g_censusMx); g_actorCensus[r].blocked++; continue; }
         keep.push_back(d);
     }
     if (!dropped) { g_actorsAllowed += (long)n; return g_origFieldCreate(field, result, list, x); }
@@ -419,6 +508,86 @@ static bool PlayModeObjectBlocked(uintptr_t retRva, const std::string& prefab, c
     return false;
 }
 static void PlayModeObjectGateInstall() {}
+// ---- overrides and scene child levels: per-handler state for the load worker's read (cdmodkit.cpp HookWorkerRead slot 5) ----
+// A file override is served by the resource handler the game gets for the ORIGINAL path: its sizes (+0x34 stored, +0x38
+// unpacked) become the local file's size, its flags (+0x3c: low nibble compression, high nibble crypto) 0, and the read
+// (worker vslot 5 read(worker, handler, buf, cap, offset, length); vslot 4 allocates from the sizes and calls vslot 5) copies the
+// local bytes instead of reading the pack. Files the texture / mesh streamer reads (.dds, .pam, .pat, ...) do not pass here.
+static std::mutex g_ovMx;
+static std::map<std::string, std::shared_ptr<std::vector<uint8_t>>> g_overrideData;   // normalized game path -> bytes
+static std::map<uintptr_t, std::shared_ptr<std::vector<uint8_t>>> g_overrideHandlers; // live handler -> bytes
+static std::set<uintptr_t> g_scanHandlers;            // handlers of whitelisted levels: their read is scanned for child level names
+static std::set<std::string> g_childStems;            // level names found in whitelisted levels (lower case)
+static std::atomic<long> g_overridesServed{ 0 }, g_overrideReads{ 0 };
+static void LoadOverrideFiles() {
+    for (auto& kv : g_req.overrideFile) {
+        std::string t = ReadFileUtf8Path(kv.second);
+        if (t.empty()) { Log("[playmode] override %s: local file %s not readable, the game's file is used", kv.first.c_str(), kv.second.c_str()); continue; }
+        g_overrideData[kv.first] = std::make_shared<std::vector<uint8_t>>(t.begin(), t.end());
+        Log("[playmode] override %s <- %s (%zu bytes)", kv.first.c_str(), kv.second.c_str(), t.size());
+    }
+    for (auto& kv : g_req.overridePack) Log("[playmode] override %s <- game file %s", kv.first.c_str(), kv.second.c_str());
+}
+static bool SceneLevelWhitelisted(const std::string& norm, const std::string& stem, int* why) {
+    if (!g_req.hasScene) return false;
+    if (g_req.sceneLevels.count(norm)) { *why = 1; return true; }
+    { std::lock_guard<std::mutex> l(g_ovMx); if (g_childStems.count(stem)) { *why = 2; return true; } }
+    for (auto& s : g_req.sceneStems) if (stem.size() > s.size() && stem.compare(0, s.size(), s) == 0 && stem[s.size()] == '_') { *why = 3; return true; }
+    int x = 0, z = 0;
+    if (norm.find("/sectorlevel/") != std::string::npos) {
+        const size_t k = norm.rfind("/sector_");
+        if (k != std::string::npos && sscanf_s(norm.c_str() + k + 8, "%d_%d", &x, &z) == 2 && g_req.sceneSectors.count({ x, z })) { *why = 4; return true; }
+    }
+    return false;
+}
+// cdmodkit.cpp: the game path to load instead ("" = as asked); called before the loader runs
+std::string PlayModeSwapPath(const std::string& path);
+// after the loader returned a handler for 'path' (nullptr when not found)
+void PlayModeAfterResLoad(const std::string& path, uintptr_t handler) {
+    if (!g_active.load()) return;
+    const std::string norm = NormPath(path);
+    std::shared_ptr<std::vector<uint8_t>> data;
+    { std::lock_guard<std::mutex> l(g_ovMx);
+      if (handler) { g_overrideHandlers.erase(handler); g_scanHandlers.erase(handler); }   // handler memory is reused for other files
+      auto it = g_overrideData.find(norm); if (it != g_overrideData.end()) data = it->second; }
+    if (!handler) return;
+    if (data) {
+        const uint32_t sz = (uint32_t)data->size(); const uint8_t fl = 0;
+        if (WriteMem(handler + 0x34, &sz, 4) && WriteMem(handler + 0x38, &sz, 4) && WriteMem(handler + 0x3c, &fl, 1)) {
+            std::lock_guard<std::mutex> l(g_ovMx); g_overrideHandlers[handler] = data;
+            const long n = ++g_overridesServed; if (n <= 50) Log("[playmode] override served: %s (%u bytes, handler %p)", norm.c_str(), sz, (void*)handler);
+        }
+    }
+    int why = 0;
+    if (norm.size() > 8 && norm.compare(norm.size() - 8, 8, ".palevel") == 0 && SceneLevelWhitelisted(norm, StemOf(norm), &why)) { std::lock_guard<std::mutex> l(g_ovMx); g_scanHandlers.insert(handler); }
+}
+// worker vslot 5. Returns true when the read was served here (*ok = result); after = the original read ran (child level scan)
+bool PlayModeWorkerRead(uintptr_t handler, uint8_t* buf, uint32_t cap, uint32_t off, uint32_t len, bool after, bool* ok) {
+    if (!g_active.load() || !handler || !buf) return false;
+    if (!after) {
+        std::shared_ptr<std::vector<uint8_t>> data;
+        { std::lock_guard<std::mutex> l(g_ovMx); auto it = g_overrideHandlers.find(handler); if (it != g_overrideHandlers.end()) data = it->second; }
+        if (!data) return false;
+        const uint32_t size = (uint32_t)data->size(); uint32_t n = len ? len : cap;
+        if (off >= size) n = 0; else n = std::min(n, size - off); n = std::min(n, cap);
+        *ok = WriteMem((uintptr_t)buf, data->data() + off, n); ++g_overrideReads;
+        return true;
+    }
+    bool mine; { std::lock_guard<std::mutex> l(g_ovMx); mine = g_scanHandlers.erase(handler) != 0; }
+    if (!mine) return false;
+    const uint32_t n = std::min<uint32_t>(len ? len : cap, 64u << 20); std::vector<uint8_t> copy(n);
+    if (!ReadBytes((uintptr_t)buf, copy.data(), n)) return false;
+    int found = 0; std::string run;
+    for (uint32_t i = 0; i <= n; i++) {   // child levels are named in the level's string table (e.g. "Hernand_Build_0001_Phase00_00")
+        const char c = i < n ? (char)copy[i] : 0;
+        if (isalnum((unsigned char)c) || c == '_' || c == '-') { run += (char)tolower((unsigned char)c); continue; }
+        if (run.size() >= 6 && run.size() < 120) { std::lock_guard<std::mutex> l(g_ovMx); if (g_childStems.insert(run).second) found++; }
+        run.clear();
+    }
+    if (found) Log("[playmode] scene level handler %p: %d names noted as possible child levels", (void*)handler, found);
+    return false;
+}
+
 // ---- level gate: the world's level files (ResourceLoader::load in cdmodkit.cpp) ------------------------------------------------
 // Static world content (buildings, props, cliffs, trees) is not created through createSceneObjectFrom: it comes in with the
 // level files, leveldata/bin__/rootlevel/sectorlevel/sector_X_Z[_sub_A_B|_indoor..].palevel (256 m sectors) and the named levels
@@ -440,6 +609,7 @@ static bool LevelIsolated(const std::string& path) {
     const size_t slash = path.rfind('/'); const std::string file = path.substr(slash + 1);
     if (file == "rootlevel.palevel") return false;
     for (auto& k : g_req.keepLevels) if (path.find(k) != std::string::npos) return false;
+    { int why = 0; const std::string norm = NormPath(path); if (SceneLevelWhitelisted(norm, StemOf(norm), &why)) return false; }
     const bool sector = path.find("/sectorlevel/") != std::string::npos;
     if (!sector && g_req.isolateLevels < 2) return false;   // 1 = sector levels only, 2 = named location levels as well
     if (!sector) {   // the root's global children (loaded first, before any location): triggers, regions, game data, roads, sea mask
@@ -470,6 +640,14 @@ static void PlayModeCheckEmptyLevel() {
     if (ok) Log("[playmode] level gate: empty level %s (%zu bytes) is there", kEmptyLevel, data.size());
     else Log("[playmode] level gate OFF: the empty level %s could not be read (%s); buildings and props stay", kEmptyLevel, notFound ? "not in the packs" : "loader not ready");
 }
+std::string PlayModeSwapPath(const std::string& path) {
+    if (!g_active.load() || path.empty()) return {};
+    const std::string norm = NormPath(path);
+    auto it = g_req.overridePack.find(norm);
+    if (it != g_req.overridePack.end()) { const long n = ++g_overridesServed; if (n <= 50) Log("[playmode] override served: %s <- %s", norm.c_str(), it->second.c_str()); return it->second; }
+    if (g_overrideData.count(norm)) return {};   // served from memory after the load
+    return PlayModeOnResLoad(path) ? std::string(kEmptyLevel) : std::string();
+}
 bool PlayModeOnResLoad(const std::string& path) {
     if (!g_active.load() || path.empty()) return false;
     const size_t dot = path.rfind('.'); const std::string ext = dot == std::string::npos ? "" : path.substr(dot);
@@ -484,7 +662,9 @@ bool PlayModeOnResLoad(const std::string& path) {
         { std::lock_guard<std::mutex> l(s_mx); if (s_seen.size() < 400) f = s_seen.insert(path).second; }
         if (f) Log("[playmode] world file %s", path.c_str());
     }
-    if (first) Log("[playmode] level %s: %s", path.c_str(), block ? "ISOLATED" : "loaded");
+    if (first) { int why = 0; const std::string norm = NormPath(path); const bool wl = !block && SceneLevelWhitelisted(norm, StemOf(norm), &why);
+        static const char* kWhy[] = { "", "scene level", "child of a scene level", "scene level prefix", "scene sector" };
+        Log("[playmode] level %s: %s%s%s", path.c_str(), block ? "ISOLATED" : "loaded", wl ? " - " : "", wl ? kWhy[why] : ""); }
     return block;
 }
 static std::map<std::string, long> g_streamCensus;   // streamer reads by top folder / extension
@@ -565,7 +745,7 @@ bool PlayModeStageOverride(float* tf) {
     if (!g_active.load() || !g_req.hasSpawn || g_directFirstLoad.load()) return false;
     const int ph = g_phase.load(); if (ph != PhTitle && ph != PhLoading) return false;
     Log("[playmode] the game starts a stage reload to (%.1f %.1f %.1f) during its first load: redirected to (%.1f %.1f %.1f)", tf[7], tf[8], tf[9], g_req.spawn.x, g_req.spawn.y, g_req.spawn.z);
-    const float h = g_req.yaw * 3.14159265f / 360.0f;
+    const float h = (g_req.yaw + 180.0f) * 3.14159265f / 360.0f;   // editor yaw (0 = +z) to the game quaternion, see PlayModeTick
     tf[3] = 0; tf[4] = sinf(h); tf[5] = 0; tf[6] = cosf(h); tf[7] = g_req.spawn.x; tf[8] = g_req.spawn.y; tf[9] = g_req.spawn.z;
     g_directFirstLoad = true; return true;
 }
@@ -590,7 +770,7 @@ static void* __fastcall HookLoadingStart(void* handler, int* result, void* packe
         if (ph == PhTitle || ph == PhLoading) {
             alignas(16) uint8_t pkt[0x40] = {}; ReadBytes((uintptr_t)packet, pkt, sizeof pkt);   // the incoming request as template: same sender / session fields
             uint8_t buf[5 + 53] = {}; const uint16_t plen = 53; memcpy(buf + 3, &plen, 2);
-            const uint32_t a = 0, b = 1, c = 0; const float h = g_req.yaw * 3.14159265f / 360.0f;
+            const uint32_t a = 0, b = 1, c = 0; const float h = (g_req.yaw + 180.0f) * 3.14159265f / 360.0f;   // see the travel call in PlayModeTick
             const float pos[3] = { g_req.spawn.x, g_req.spawn.y, g_req.spawn.z }, quat[4] = { 0.0f, sinf(h), 0.0f, cosf(h) }, scale[3] = { 1, 1, 1 };
             memcpy(buf + 5, &a, 4); memcpy(buf + 9, &b, 4); memcpy(buf + 13, &c, 4); memcpy(buf + 17, pos, 12); memcpy(buf + 29, quat, 16); memcpy(buf + 45, scale, 12); buf[57] = 1;
             const uint16_t total = sizeof buf; memcpy(pkt + 0x10, &total, 2); uint8_t* bp = buf; memcpy(pkt + 0x18, &bp, 8);
@@ -666,7 +846,9 @@ void PlayModeTick() {
     }
     if (ph == PhInWorld) {
         static DWORD s_try = 0; if (now - s_try < 1000) return; s_try = now;
-        if (TravelTo(g_req.spawn, g_req.yaw)) { g_phase = PhTravel; s_since = 0; SetStatus("travelling to the spawn point (one loading screen)"); }
+        // spawn.yaw: 0 = facing +z, 90 = facing +x (the editor's camera yaw). The game's travel quaternion (0, sin(a/2), 0,
+        // cos(a/2)) turns the character to (-sin a, -cos a) (seen: a = 45 faces (-0.59, -0.81), a = 90 faces -x), so a = yaw + 180.
+        if (TravelTo(g_req.spawn, g_req.yaw + 180.0f)) { g_phase = PhTravel; s_since = 0; SetStatus("travelling to the spawn point (one loading screen)"); }
         return;
     }
     if (ph == PhTravel && stable && Dist2D(p, g_req.spawn) < 40.0f) { g_phase = PhArrived; SetStatus("arrived at the spawn point"); return; }
@@ -684,7 +866,8 @@ std::string PlayModeStatusJson(bool census) {
         ",\"spawn\":" + (g_req.hasSpawn ? "{\"x\":" + F(g_req.spawn.x) + ",\"y\":" + F(g_req.spawn.y) + ",\"z\":" + F(g_req.spawn.z) + ",\"yaw\":" + F(g_req.yaw) + "}" : "null") +
         ",\"loadedAt\":" + (g_haveLoadedAt ? "{\"x\":" + F(g_loadedAt.x) + ",\"y\":" + F(g_loadedAt.y) + ",\"z\":" + F(g_loadedAt.z) + "}" : "null") +
         ",\"counts\":{\"savesBlocked\":" + std::to_string(g_savesBlocked.load()) + ",\"saveRequestsSkipped\":" + std::to_string(g_saveReqsSkipped.load()) + ",\"actorsBlocked\":" + std::to_string(g_actorsBlocked.load()) +
-        ",\"actorsAllowed\":" + std::to_string(g_actorsAllowed.load()) + ",\"objectsBlocked\":" + std::to_string(g_objectsBlocked.load()) +
+        ",\"actorsAllowed\":" + std::to_string(g_actorsAllowed.load()) + ",\"actorsInScene\":" + std::to_string(g_actorsInScene.load()) +
+        ",\"overridesServed\":" + std::to_string(g_overridesServed.load()) + ",\"overrideReads\":" + std::to_string(g_overrideReads.load()) + ",\"objectsBlocked\":" + std::to_string(g_objectsBlocked.load()) +
         ",\"objectsAllowed\":" + std::to_string(g_objectsAllowed.load()) + ",\"createCalls\":" + std::to_string(CreateCalls()) +
         ",\"sceneObjects\":" + std::to_string(g_sceneUids.size()) + ",\"levelsBlocked\":" + std::to_string(g_levelsBlocked.load()) +
         ",\"levelsAllowed\":" + std::to_string(g_levelsAllowed.load()) + ",\"loadingStarts\":" + std::to_string(g_loadingStarts.load()) + "}";

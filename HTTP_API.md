@@ -68,4 +68,6 @@ Invoke-RestMethod "$base/api/objects/$($item.uid)" -Method Patch -ContentType 'a
   "objects": [ { "prefab": "/object/00_common/castle/cd_castle_mercenary_wall_09b_shield.prefab", "pos": [-11656.0, 731.0, -2166.0], "rot": [0, 0, 0], "scale": 1 } ] }
 ```
 
+Version 2 (`"version": 2`) shows the editor's scene instead of an empty world: `"scene": {"levels": [game paths], "sectors": [[sx, sz], ...], "keepTerrain": true}` lists the levels that load normally (their child levels follow) and the 256 m sectors whose NPCs and level actors stay; everything else is isolated as before. `"overrides": {"<game path>": "<absolute path of a local file>" or "<another game path>"}` serves edited files in place of the game's (files the game loads through its resource loader: levels, prefabs, tables, string tables; not textures or meshes). `spawn.yaw` 0 faces +z, 90 faces +x. Vegetation outside the scene (the procedural forest) is not removed yet.
+
 `"project": "Name"` loads a saved World Builder project instead of (or in addition to) `objects`. All keys and the details are in `notes/FORMATS.md` ("Play mode"). A launcher writes the file and starts the game with `steam://rungameid/3321460`; `GET /api/playmode` reports when the scene is `ready`.
