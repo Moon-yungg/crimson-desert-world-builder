@@ -825,9 +825,9 @@ static void* __fastcall HookResLoad(void* self, void** out, void* path, uint32_t
     if (!g_resLoader && self) { g_resLoader = self; Log("resource loader captured %p (%s)", self, RttiName((uintptr_t)self) ? RttiName((uintptr_t)self) : "?"); }
     // play mode: an isolated level is loaded from an empty level file, an override from another game file (playmode.cpp);
     // a local-file override keeps the original path and is served from memory by the read below
-    alignas(16) uint8_t swapped[64]; std::string asked;
+    alignas(16) uint8_t swapped[64]; std::string asked = PathText(path);
+    SceneInfoOnResLoad(asked);   // which levels are in the world (scene_info.cpp)
     if (PlayModeActive()) {
-        asked = PathText(path);
         const std::string swap = PlayModeSwapPath(asked);
         if (!swap.empty() && kRva_StringDataAlloc && kRva_PathNormalizeCtor) {
             auto sdAlloc = (uintptr_t(*)(int))(g_base + kRva_StringDataAlloc); auto normalize = (void*(*)(void*, const void*))(g_base + kRva_PathNormalizeCtor);

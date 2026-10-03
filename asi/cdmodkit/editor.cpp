@@ -668,6 +668,24 @@ namespace editor {
         }
     }
 
+    // "Scene: <level> (sector X,Z)" under the player position; the lookup runs once a second (scene_info.cpp)
+    static void DrawSceneLine(const PosInfo& p, bool havePos, bool wrapped) {
+        static std::string s_line; static DWORD s_at = 0;
+        const DWORD now = GetTickCount();
+        if (havePos && now - s_at > 1000) {
+            s_at = now;
+            const core::SceneInfo s = core::CurrentScene(p.world);
+            char b[512];
+            if (!s.ok) snprintf(b, sizeof b, T("Scene: %s"), s.error.c_str());
+            else if (s.current.name.empty()) snprintf(b, sizeof b, T("Scene: sector %d,%d"), s.sectorX, s.sectorZ);
+            else if (!s.area.empty() && s.area != s.current.name) snprintf(b, sizeof b, T("Scene: %s  |  %s  (sector %d,%d)"), s.current.name.c_str(), s.area.c_str(), s.sectorX, s.sectorZ);
+            else snprintf(b, sizeof b, T("Scene: %s  (sector %d,%d)"), s.current.name.c_str(), s.sectorX, s.sectorZ);
+            s_line = b;
+        }
+        if (!havePos || s_line.empty()) return;
+        if (wrapped) ImGui::TextWrapped("%s", s_line.c_str());
+        else ImGui::TextDisabled("%s", s_line.c_str());
+    }
     static void TrackFacing(const PosInfo& p, bool havePos) {
         { Vec3 fp, ff; if (core::FreeCamPose(&fp, &ff)) {   // flying: spawn spots and the placement start in front of the camera, not the character
             g_lastPlayer = fp; g_havePlayer = true; const float l = sqrtf(ff.x * ff.x + ff.z * ff.z); if (l > 0.05f) { g_fx = ff.x / l; g_fz = ff.z / l; } return; } }
@@ -5278,6 +5296,7 @@ namespace editor {
         }
         if (havePos) ImGui::TextDisabled(T(ICON_LOCATION_DOT "  %.1f  %.1f  %.1f   tile %d,%d"), p.world.x, p.world.y, p.world.z, p.tileX, p.tileZ);
         else ImGui::TextDisabled("%s", T("player position not available (load a save)"));
+        DrawSceneLine(p, havePos, false);
         if (g_compactPage == TabScene) {
             if (g_previewShown) { core::PreviewClear(); g_previewShown = false; }
             const int gp = core::GimmickPending();
@@ -5549,6 +5568,7 @@ namespace editor {
             g_selectMainTab = false;
             if (havePos) ImGui::TextWrapped(T(ICON_LOCATION_DOT "  %.1f  %.1f  %.1f   tile %d,%d"), p.world.x, p.world.y, p.world.z, p.tileX, p.tileZ);
             else ImGui::TextWrapped("%s", T("player position not available (load a save)"));
+            DrawSceneLine(p, havePos, true);
             SameLineOrWrap(false, 330);
             {   // game thread state: the mod runs its work on the game's simulation tick; the counter tells whether that tick is alive
                 static long s_lastTicks = 0; static DWORD s_lastChange = 0; const long ticks = core::PumpTicks(); const DWORD now = GetTickCount();

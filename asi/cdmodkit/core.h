@@ -307,6 +307,19 @@ namespace core {
     // length > 0: only [offset, offset+length) of the entry as stored (partial textures keep their LZ4 blocks); storedTotal = its full stored size
     bool GameReadFileRange(const std::string& packPath, std::vector<uint8_t>& out, uint32_t offset, uint32_t length, uint32_t* storedTotal = nullptr, bool* notFound = nullptr);
 
+    // The level ("scene") the player is in (scene_info.cpp): the game's level name table + the .palevel loads seen
+    struct SceneLevel { std::string name, path; bool sector = false; double loadedAgo = -1; };   // loadedAgo: s since its last load, -1 = not seen
+    struct SceneInfo {
+        bool ok = false; std::string error;
+        SceneLevel current;              // the smallest level around the player that was loaded (else the smallest)
+        std::string area, areaPath;      // the place around the player: the smallest named level that is no layer, without its quadtree cell ("" if none)
+        std::string sectorPath;          // its 256 m sector level
+        int sectorX = 0, sectorZ = 0;    // 256 m sector of the position
+        std::vector<SceneLevel> levels;  // every level whose box holds the position, smallest first
+    };
+    SceneInfo CurrentScene(const Vec3& pos);
+    void SceneInfoOnResLoad(const std::string& path);   // the resource loader hook: every requested path
+
     // Prefab index (embedded RCDATA, LZ4-compressed at build time): logical path, display name, category tree, tags
     struct PrefabInfo { std::string path, name, tags, mesh; int cat = 0; int meshes = 0, children = 0;
                         float sx = 0, sy = 0, sz = 0;                 // bounding box in m (0 = unknown)

@@ -173,6 +173,20 @@ static std::string Handle(const std::string& method, const std::string& path, co
         Vec3 p{}; if (!core::PlayerWorldPos(&p)) { status = 503; return Error("player is not in the world"); }
         return "{\"x\":" + Num(p.x) + ",\"y\":" + Num(p.y) + ",\"z\":" + Num(p.z) + "}";
     }
+    if (method == "GET" && path == "/api/levels") {   // the scene the player is in: {player, current, area, sector, levels[]} (scene_info.cpp)
+        Vec3 p{}; if (!core::PlayerWorldPos(&p)) { status = 503; return Error("player is not in the world"); }
+        const core::SceneInfo s = core::CurrentScene(p);
+        if (!s.ok) { status = 503; return Error(s.error.c_str()); }
+        auto level = [](const core::SceneLevel& l) {
+            return "{\"name\":" + Quote(l.name) + ",\"path\":" + Quote(l.path) + ",\"sector\":" + Bool(l.sector) +
+                   ",\"loadedAgo\":" + (l.loadedAgo < 0 ? std::string("null") : Num((float)l.loadedAgo)) + "}";
+        };
+        std::string out = "{\"player\":{\"x\":" + Num(p.x) + ",\"y\":" + Num(p.y) + ",\"z\":" + Num(p.z) + "},\"current\":" +
+                          (s.current.name.empty() ? std::string("null") : level(s.current)) + ",\"area\":" + Quote(s.area) + ",\"areaPath\":" + Quote(s.areaPath) + ",\"sectorPath\":" + Quote(s.sectorPath) +
+                          ",\"sector\":[" + Int(s.sectorX) + "," + Int(s.sectorZ) + "],\"levels\":[";
+        for (size_t i = 0; i < s.levels.size(); i++) out += (i ? "," : "") + level(s.levels[i]);
+        return out + "]}";
+    }
     if (method == "GET" && path == "/api/camera") {
         // pos + axis of the camera object; the axis sign is ambiguous, so "view" is the horizontal direction from the camera
         // towards the player (the third-person camera always looks over the character), which is what callers want

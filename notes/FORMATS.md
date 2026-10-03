@@ -29,7 +29,7 @@ Chunk (16 B):        "PARC" u16 kind    10 × 0x00   -> direkt danach Reflection
 ## Level-Verzeichnisse
 - `leveldata/bin__/rootlevel/*.palevel` (5.592) – benannte Level (Quests, Gimmicks, Straßen `roadlevel_*`, Phasen `*_phase00_00`).
 - `leveldata/bin__/rootlevel/sectorlevel/…` – Sektor-Level der offenen Welt.
-- `leveldata/rootlevel/sceneobjectphase/levelinfos/*.levelinfo` (15.659) – KEIN Reflection-Format; beginnt `02 00`, Einträge `u16 idx, 0xFFFF, u64, u64, u32` (vermutlich UID-Index). Noch offen.
+- `leveldata/rootlevel/sceneobjectphase/levelinfos/*.levelinfo` (15.659) – KEIN Reflection-Format: u16 version 2, u16 ?, u32 n, dann n x 20 B {u32[4] `_sceneObjectUuid`, u16 index, u16 parent (0xFFFF = root)} = Objektbaum des Scene-Object-Phasensystems (alle UUIDs sind Objekte des Levels), keine Level-Liste. Level, Phasen und die Level-Namenstabelle: Framework docs/formats/levels.md.
 - `.pas` (Splines), `.pastage` (Sequencer-Skripte), `.pai` (AI-Charts).
 
 ## EXE / RTTI
