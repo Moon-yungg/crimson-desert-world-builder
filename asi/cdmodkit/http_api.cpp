@@ -520,7 +520,12 @@ static std::string Handle(const std::string& method, const std::string& path, co
     }
     if (method == "POST" && (path == "/api/projects/save" || path == "/api/projects/load" || path == "/api/autoload")) {
         std::string name; if (!Name(arg, name)) { status = 400; return Error("invalid project name"); }
-        if (path == "/api/autoload") { core::SetAutoload(name, Flag(arg, "enabled")); return "{\"ok\":true}"; }
+        if (path == "/api/autoload") {
+            // a failed write answered ok before
+            const core::FileResult r = core::SetAutoload(name, Flag(arg, "enabled"));
+            if (!r.ok()) { status = 500; return Error(core::FileReasonCode(r.reason)); }
+            return "{\"ok\":true}";
+        }
         std::string out; if (!Ready(status, out)) return out;
         if (path == "/api/projects/save") {
             int scope = 0; if (!Integer(arg, "scope", scope) || scope > 3) { status = 400; return Error("scope must be 0..3"); }

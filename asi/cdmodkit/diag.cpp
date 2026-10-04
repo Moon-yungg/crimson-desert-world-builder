@@ -18,7 +18,7 @@
 
 namespace core {
 
-static bool InImage(uintptr_t p) { return p >= g_base && p < g_base + 0x17000000; }
+static bool InImage(uintptr_t p) { return g_base && p >= g_base && p < ImageEnd(); }
 
 static DWORD WINAPI FovTraceThread(LPVOID arg) {
     const int seconds = (int)(intptr_t)arg;

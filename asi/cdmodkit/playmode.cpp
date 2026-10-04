@@ -410,6 +410,15 @@ void PlayModeLoad() {
     SetStatus("waiting for the title screen");
 }
 
+// The request is consumed at attach (before the game reads its save) but its hooks need ResolveGame. When that fails (a game
+// patch) nothing of play mode runs, and a still active request blocked every save of an otherwise normal session.
+void PlayModeAbandon(const char* why) {
+    if (!g_active.exchange(false)) return;
+    g_isolating = false;
+    g_phase = PhExited;
+    SetStatus(std::string("off: ") + why + " (normal session, saving allowed)");
+}
+
 // ---- actor gate: ServerField slot 17 (field create) -----------------------------------------------------------------------
 // int* create(ServerField* field, int* result, {desc** data; u32 count}* list, void*). The game itself filters this list
 // (when a global switch is set it copies the passing descs into a local vector and, if none is left, stores an error code in

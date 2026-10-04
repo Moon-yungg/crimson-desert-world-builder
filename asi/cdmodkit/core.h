@@ -36,6 +36,17 @@ namespace core {
     constexpr int kResourceErrNames = 102;
     constexpr int kResourceLocales = 103;
     extern uintptr_t g_base;
+    // end of the game's image from its PE header (SizeOfImage); was a fixed 0x17000000, which a patch that grows the exe
+    // outruns and then valid vtables and functions failed InImage
+    inline uintptr_t ImageEnd() {
+        static uintptr_t end = 0;
+        if (!end && g_base) {
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_base);
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(g_base + dos->e_lfanew);
+            end = g_base + nt->OptionalHeader.SizeOfImage;
+        }
+        return end;
+    }
     extern bool      g_menuOpen;      // set by the editor UI
     extern bool      g_uiWantsMouse;  // cursor is over a World Builder window (ImGui WantCaptureMouse), updated every frame
     extern bool      g_uiWantsKeyboard; // a text field is active (ImGui WantTextInput)

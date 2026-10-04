@@ -39,6 +39,7 @@ namespace core {
     // play mode (playmode.cpp): an isolated start requested by bin64\cdmodkit\playmode.json; inert without the file
     void PlayModeLoad();                 // at attach: read + consume the request
     void PlayModeInstall();              // after ResolveGame: the hooks a consumed request needs
+    void PlayModeAbandon(const char* why);   // ResolveGame failed: a consumed request is dropped, saves stay allowed
     void PlayModeTick();                 // game thread pump
     bool PlayModeActive(); bool PlayModeIsolating();
     bool PlayModeOnCreate(uintptr_t retRva, const std::string& prefab, const float* xf, uint8_t f1, uint8_t f2, uint8_t f3, bool ours);   // true = do not create

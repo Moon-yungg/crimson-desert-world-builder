@@ -112,7 +112,7 @@ static bool ReadPtr(uintptr_t a, uintptr_t* out) {
 static uintptr_t Deref(uintptr_t p, unsigned off) { uintptr_t v = 0; return (p && ReadPtr(p + off, &v)) ? v : 0; }
 static bool Read32(uintptr_t a, uint32_t* out) { return ReadBytes(a, out, 4); }
 static bool ReadF3(uintptr_t a, float* out) { return ReadBytes(a, out, 12); }
-static bool InImage(uintptr_t p) { return p >= g_base && p < g_base + 0x17000000; }
+static bool InImage(uintptr_t p) { return g_base && p >= g_base && p < ImageEnd(); }
 
 static bool ReadCStr(uintptr_t a, char* out, size_t n) {
     if (!ReadBytes(a, out, n)) {
@@ -1809,7 +1809,9 @@ bool ProjectDirty(int id) { std::lock_guard<std::mutex> l(g_regMutex); return g_
 void MarkProjectDirty(int proj) { if (proj) { std::lock_guard<std::mutex> l(g_regMutex); g_projDirty.insert(proj); } }
 void AssignProject(int uid, int proj) {
     std::lock_guard<std::mutex> l(g_regMutex);
-    int i = IndexOfUidLocked(uid); if (i >= 0) g_reg[i].proj = proj;
+    // both projects change: the next save of the old one must drop the object, the new one must write it (neither
+    // was marked, so autosave and the dirty indicator missed the move)
+    int i = IndexOfUidLocked(uid); if (i >= 0 && g_reg[i].proj != proj) { MarkDirtyLocked(g_reg[i].proj); g_reg[i].proj = proj; MarkDirtyLocked(proj); }
 }
 
 struct LibraryNameLess {
@@ -6394,7 +6396,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     if (g_httpEnabled) httpapi::Start(g_httpPort);   // opt-in; before ResolveGame on purpose: /api/status reports a failed build, writes answer 503
     thumbgen::Start();           // background: renders prefab previews from the pack files into bin64\cdmodkit\thumbs
     g_buildOk = ResolveGame();
-    if (!g_buildOk) { Log("signature resolution failed; game functions will NOT be hooked or called"); return 0; }
+    if (!g_buildOk) { Log("signature resolution failed; game functions will NOT be hooked or called"); PlayModeAbandon("signature resolution failed"); return 0; }
     ReleaseHookGap();
     uintptr_t target = g_base + kRva_CreateSceneObjectFrom;
     {
