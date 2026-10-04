@@ -316,6 +316,21 @@ static std::string Handle(const std::string& method, const std::string& path, co
         if (!core::WriteMem(a, b.data(), b.size())) { status = 409; return Error("write failed"); }
         return "{\"written\":" + Int((int)b.size()) + "}";
     }
+    if (method == "POST" && path == "/api/research/readv") {   // research: {"list":"addr:len,addr:len,.."} (hex addr, <= 2000 reads, <= 4 MB) -> {"hex":["..",""]}, "" = unreadable
+        auto it = arg.find("list"); if (it == arg.end()) { status = 400; return Error("list required"); }
+        static const char* hx = "0123456789abcdef"; std::string out = "{\"hex\":["; size_t total = 0; int count = 0;
+        const char* p = it->second.c_str(); std::vector<uint8_t> b;
+        while (*p && count < 2000) {
+            char* e = nullptr; const uintptr_t a = (uintptr_t)strtoull(p, &e, 16); if (!e || *e != ':') break;
+            const size_t n = (size_t)std::clamp((long)strtol(e + 1, &e, 10), 1L, 65536L); p = *e == ',' ? e + 1 : e;
+            if (total + n > (4u << 20)) break;
+            if (count++) out += ',';
+            out += '"'; b.resize(n);
+            if (core::ReadMem(a, b.data(), n)) { total += n; for (uint8_t c : b) { out += hx[c >> 4]; out += hx[c & 15]; } }
+            out += '"';
+        }
+        return out + "]}";
+    }
     if (method == "POST" && path == "/api/research/peek") {   // research: {"addr":"0x34b0aceb700","bytes":256,"u16":0}
         auto it = arg.find("addr"); if (it == arg.end()) { status = 400; return Error("addr required"); }
         const uintptr_t a = (uintptr_t)strtoull(it->second.c_str(), nullptr, 0); float by = 256, u = 0; Number(arg, "bytes", by); Number(arg, "u16", u);
