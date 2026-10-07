@@ -72,6 +72,11 @@ namespace core {
     // the view + projection the renderer really uses through the renderer's camera object
     bool RenderCamera(Vec3* pos, Vec3* right, Vec3* up, Vec3* fwd, float* m00, float* m11);
     bool ReadMem(uintptr_t addr, void* out, size_t n); bool WriteMem(uintptr_t addr, const void* in, size_t n);   // research: guarded raw access
+    // research: hardware watch (mode 0 write, 1 read/write, 2 execute) with a JSON report; a guarded call of code at addr with
+    // six integer arguments (1 done, 0 faulted, 2 still queued on the game thread, -1 not code); scratch memory for calls
+    bool ResearchWatch(const uintptr_t addr[4], int seconds, int mode); std::string ResearchWatchReport(bool* running);
+    int ResearchCall(uintptr_t addr, const uint64_t args[6], bool gameThread, int timeoutMs, uint64_t* result, unsigned long* code);
+    uintptr_t ResearchAlloc(size_t bytes); bool ResearchFree(uintptr_t addr);
     void ResearchPeek(uintptr_t addr, int bytes, bool u16);   // research: log raw memory
     void ResearchFind(const std::vector<uint8_t>& pat, int maxHits);   // research: byte pattern search (logged)
     void SetFallWatch(bool on, uintptr_t addr = 0, bool breakpoints = true, uintptr_t probe = 0, unsigned probeLen = 0);   // research: log falls of the player, the code that moves it (addr: explicit field) and what changed in a probed object

@@ -14,6 +14,8 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <memory>
+#include <mutex>
 #include "MinHook.h"
 
 namespace core {
@@ -158,19 +160,23 @@ void InstallIoTrace() {
 // ---- camwatch: which code writes the renderer camera's pose (free-fly camera research) ----
 // Hardware write breakpoints (DR0..DR3) on the camera object's fields, set on every thread of the process except our own;
 // a vectored handler counts each writing instruction (the RIP after the write) with its call chain. Removed after the time.
-struct CwSite { volatile LONG64 rip; volatile LONG hits; volatile LONG slot; uintptr_t chain[8]; volatile LONG64 firstTick, lastTick; };
+// regs: rcx rdx r8 r9 rax rsp at the first hit of a site (exec watches: the arguments of the call)
+struct CwSite { volatile LONG64 rip; volatile LONG hits; volatile LONG slot; uintptr_t chain[8]; volatile LONG64 firstTick, lastTick; uintptr_t regs[6]; };
 static CwSite g_cwSites[48]; static volatile LONG g_cwActive = 0; static uintptr_t g_cwAddr[4] = {};
 static PVOID g_cwVeh = nullptr; static bool g_cwRw = false;   // g_cwRw: break on reads too (WatchAccessSync)
+static bool g_cwExec = false;   // execution breakpoints (RW 00, LEN 00): the VEH sets RF so the instruction then runs
 static LONG CALLBACK CamWatchVeh(EXCEPTION_POINTERS* ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !g_cwActive) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = ep->ContextRecord; const DWORD64 dr6 = c->Dr6;
     if (!(dr6 & 0xF)) return EXCEPTION_CONTINUE_SEARCH;
     int slot = 0; while (slot < 4 && !(dr6 & (1ull << slot))) slot++;
     const LONG64 rip = (LONG64)c->Rip;
+    if (g_cwExec) c->EFlags |= 0x10000;   // resume flag: without it the same breakpoint fires again at once
     for (auto& s : g_cwSites) {
         if (s.rip == rip && s.slot == slot) { InterlockedIncrement(&s.hits); s.lastTick = (LONG64)GetTickCount64(); break; }
         if (s.rip == 0 && InterlockedCompareExchange64(&s.rip, rip, 0) == 0) {
             s.slot = slot; s.hits = 1; s.firstTick = s.lastTick = (LONG64)GetTickCount64();
+            s.regs[0] = c->Rcx; s.regs[1] = c->Rdx; s.regs[2] = c->R8; s.regs[3] = c->R9; s.regs[4] = c->Rax; s.regs[5] = c->Rsp;
             CONTEXT u = *c;   // call chain via the unwind tables
             for (int i = 0; i < 8 && u.Rip; i++) {
                 s.chain[i] = (uintptr_t)u.Rip;
@@ -195,7 +201,7 @@ static void CwSetAll(bool on, bool quiet = false) {   // debug registers on ever
             if (GetThreadContext(t, &c)) {
                 c.Dr0 = on ? g_cwAddr[0] : 0; c.Dr1 = on ? g_cwAddr[1] : 0; c.Dr2 = on ? g_cwAddr[2] : 0; c.Dr3 = on ? g_cwAddr[3] : 0;
                 DWORD64 dr7 = 0;
-                if (on) for (int i = 0; i < 4; i++) if (g_cwAddr[i]) dr7 |= (1ull << (i * 2)) | ((g_cwRw ? 3ull : 1ull) << (16 + i * 4)) | (3ull << (18 + i * 4));   // local enable, break on write (or read/write), length 4 (LEN 11)
+                if (on) for (int i = 0; i < 4; i++) if (g_cwAddr[i]) dr7 |= (1ull << (i * 2)) | (g_cwExec ? 0ull : ((g_cwRw ? 3ull : 1ull) << (16 + i * 4)) | (3ull << (18 + i * 4)));   // local enable, break on write (or read/write), length 4 (LEN 11); exec: RW 00 LEN 00
                 c.Dr7 = dr7; c.Dr6 = 0;
                 if (SetThreadContext(t, &c)) n++;
             }
@@ -313,6 +319,82 @@ bool WatchWrites(const uintptr_t addr[4], int seconds, const char* tag) {
     CreateThread(nullptr, 0, WatchWritesThread, a, 0, nullptr);
     return true;
 }
+// HTTP research watch: mode 0 write, 1 read/write (4-byte aligned windows), 2 execute (code addresses). Runs for 'seconds'
+// on a helper thread; the report (one line per site: slot, rva, hits, first-hit registers, call chain) is logged and kept
+// for GET /api/research/watch.
+static std::mutex g_wrMu; static std::string g_wrReport; static volatile LONG g_wrRunning = 0;
+struct WgArgs { uintptr_t addr[4]; int seconds; int mode; };
+static std::string Rva(uintptr_t a) {
+    char b[40]; snprintf(b, sizeof b, InImage(a) ? "0x%llx" : "?0x%llx", (unsigned long long)(InImage(a) ? a - g_base : a)); return b;
+}
+static DWORD WINAPI WatchGenericThread(LPVOID p) {
+    WgArgs a = *(WgArgs*)p; delete (WgArgs*)p;
+    for (auto& s : g_cwSites) { s.rip = 0; s.hits = 0; s.slot = 0; memset(s.chain, 0, sizeof s.chain); memset(s.regs, 0, sizeof s.regs); }
+    for (int i = 0; i < 4; i++) g_cwAddr[i] = a.mode == 2 ? a.addr[i] : a.addr[i] & ~(uintptr_t)3;
+    if (!g_cwVeh) g_cwVeh = AddVectoredExceptionHandler(1, CamWatchVeh);
+    g_cwRw = a.mode == 1; g_cwExec = a.mode == 2;
+    CwSetAll(true, true); Sleep(a.seconds * 1000); CwSetAll(false, true);
+    InterlockedExchange(&g_cwActive, 0);
+    g_cwRw = false; g_cwExec = false;
+    std::string r = "[";
+    int n = 0;
+    for (const auto& s : g_cwSites) {
+        if (!s.rip) continue;
+        char line[900]; int k = snprintf(line, sizeof line, "%s{\"slot\":%ld,\"addr\":\"%s\",\"rip\":\"%s\",\"hits\":%ld,\"regs\":{\"rcx\":\"0x%llx\",\"rdx\":\"0x%llx\",\"r8\":\"0x%llx\",\"r9\":\"0x%llx\",\"rax\":\"0x%llx\",\"rsp\":\"0x%llx\"},\"chain\":[",
+            n++ ? "," : "", s.slot, Rva(g_cwAddr[s.slot]).c_str(), Rva((uintptr_t)s.rip).c_str(), s.hits,
+            (unsigned long long)s.regs[0], (unsigned long long)s.regs[1], (unsigned long long)s.regs[2], (unsigned long long)s.regs[3], (unsigned long long)s.regs[4], (unsigned long long)s.regs[5]);
+        for (int i = 0; i < 8 && s.chain[i]; i++) k += snprintf(line + k, sizeof line - k, "%s\"%s\"", i ? "," : "", Rva(s.chain[i]).c_str());
+        snprintf(line + k, sizeof line - k, "]}");
+        r += line;
+        Log("[rwatch] %s", line + (n > 1 ? 1 : 0));
+    }
+    r += "]";
+    Log("[rwatch] mode %d done: %d sites", a.mode, n);
+    { std::lock_guard<std::mutex> l(g_wrMu); g_wrReport = r; }
+    InterlockedExchange(&g_wrRunning, 0);
+    return 0;
+}
+bool ResearchWatch(const uintptr_t addr[4], int seconds, int mode) {
+    if (InterlockedCompareExchange(&g_cwActive, 1, 0) != 0) return false;
+    InterlockedExchange(&g_wrRunning, 1);
+    { std::lock_guard<std::mutex> l(g_wrMu); g_wrReport.clear(); }
+    WgArgs* a = new WgArgs{}; for (int i = 0; i < 4; i++) a->addr[i] = addr[i];
+    a->seconds = seconds < 1 ? 1 : seconds > 120 ? 120 : seconds; a->mode = mode < 0 || mode > 2 ? 0 : mode;
+    CreateThread(nullptr, 0, WatchGenericThread, a, 0, nullptr);
+    return true;
+}
+std::string ResearchWatchReport(bool* running) {
+    *running = g_wrRunning != 0;
+    std::lock_guard<std::mutex> l(g_wrMu); return g_wrReport;
+}
+
+// HTTP research call: a function at addr with up to six integer arguments (no floats), guarded; on the game thread (the
+// caller waits up to timeoutMs) or right on the HTTP thread. Arguments beyond what the callee takes are ignored by x64.
+typedef uint64_t(__fastcall* CallFn6)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static bool CallGuarded(uintptr_t addr, const uint64_t* a, uint64_t* out, DWORD* code) {
+    __try { *out = ((CallFn6)addr)(a[0], a[1], a[2], a[3], a[4], a[5]); return true; }
+    __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+struct CallState { uint64_t result = 0; DWORD code = 0; bool ok = false; HANDLE done = nullptr; ~CallState() { if (done) CloseHandle(done); } };
+int ResearchCall(uintptr_t addr, const uint64_t args[6], bool gameThread, int timeoutMs, uint64_t* result, unsigned long* code) {
+    *result = 0; *code = 0;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery((void*)addr, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+        !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) return -1;   // not code
+    uint64_t a[6]; memcpy(a, args, sizeof a);
+    if (!gameThread) { DWORD c = 0; const bool ok = CallGuarded(addr, a, result, &c); *code = c; Log("[call] %s on http thread -> 0x%llx%s", Rva(addr).c_str(), (unsigned long long)*result, ok ? "" : " (fault)"); return ok ? 1 : 0; }
+    auto st = std::make_shared<CallState>(); st->done = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    RunOnGameThread([st, addr, a]() mutable { DWORD c = 0; st->ok = CallGuarded(addr, a, &st->result, &c); st->code = c; SetEvent(st->done); });
+    if (WaitForSingleObject(st->done, timeoutMs < 100 ? 100 : timeoutMs > 30000 ? 30000 : timeoutMs) != WAIT_OBJECT_0) {
+        Log("[call] %s queued on the game thread, no answer within the timeout", Rva(addr).c_str()); return 2;   // still queued; runs later
+    }
+    *result = st->result; *code = st->code;
+    Log("[call] %s on game thread -> 0x%llx%s", Rva(addr).c_str(), (unsigned long long)*result, st->ok ? "" : " (fault)");
+    return st->ok ? 1 : 0;
+}
+uintptr_t ResearchAlloc(size_t bytes) { return (uintptr_t)VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); }
+bool ResearchFree(uintptr_t addr) { return VirtualFree((void*)addr, 0, MEM_RELEASE) != 0; }
+
 void CamWatch(int seconds, int mode) {
     if (InterlockedCompareExchange(&g_cwActive, 1, 0) != 0) { Log("[camwatch] already running"); return; }
     CreateThread(nullptr, 0, CamWatchThread, (LPVOID)(intptr_t)((seconds < 1 ? 1 : seconds > 30 ? 30 : seconds) + 100 * (mode == 1 ? 1 : 0)), 0, nullptr);

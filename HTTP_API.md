@@ -59,6 +59,13 @@ Object scale: the editor accepts 0.05–20.0; the HTTP object endpoints accept a
 during development. They read and **write arbitrary memory of the game process**, install hooks and call functions at
 given addresses. They are available whenever the HTTP API is on; only turn the API on when a program needs it.
 
+| Endpoint | Body | Result |
+| --- | --- | --- |
+| `POST /api/research/watch` | `{"a0":"0x..",.."a3","seconds":20,"mode":"write"\|"rw"\|"exec","rva":1}` | Hardware breakpoints on up to four addresses (`rw`: 4-byte aligned windows, `exec`: code addresses; `rva`: addresses relative to the exe). Without `mode` the old write watch that only logs. 202 when started, 409 while one runs |
+| `GET /api/research/watch` | | `{"running":..,"sites":[{"slot","addr","rip","hits","regs":{rcx,rdx,r8,r9,rax,rsp},"chain":[..]}]}`: every instruction that hit, its registers at the first hit (exec: the call's arguments) and its call chain, as RVAs |
+| `POST /api/research/call` | `{"addr":"0x..","rva":1,"a0".."a5":"0x..","thread":"game"\|"http","timeout":5000}` | Calls the function with up to six integer arguments (no floats), SEH-guarded, by default on the game thread: `{"ok","result","exception"}`, 202 `{"queued":true}` when the game thread did not run it within the timeout, 400 when the address is not executable |
+| `POST /api/research/alloc` | `{"bytes":4096}` or `{"free":"0x.."}` | Scratch memory (read/write) for call arguments and results |
+
 The HTTP `uid` is stable while the instance remains in the scene. The older C API uses scene-list indices, which may shift after an object is forgotten.
 
 Example in PowerShell:

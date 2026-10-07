@@ -425,7 +425,41 @@ static std::string Handle(const std::string& method, const std::string& path, co
         uintptr_t ad[4] = {}; const char* keys[4] = { "a0", "a1", "a2", "a3" };
         for (int i = 0; i < 4; i++) { auto it = arg.find(keys[i]); if (it != arg.end()) ad[i] = (uintptr_t)strtoull(it->second.c_str(), nullptr, 0); }
         float sec = 20; Number(arg, "seconds", sec);
-        return core::ResearchWatchWrites(ad, (int)sec) ? "{\"started\":true}" : "{\"started\":false}";
+        // "mode": write / rw / exec -> the reporting watch (GET /api/research/watch); "rva":1 takes a0..a3 relative to the exe
+        auto m = arg.find("mode");
+        if (m == arg.end()) return core::ResearchWatchWrites(ad, (int)sec) ? "{\"started\":true}" : "{\"started\":false}";
+        const int mode = m->second == "exec" ? 2 : m->second == "rw" ? 1 : m->second == "write" ? 0 : -1;
+        if (mode < 0) { status = 400; return Error("mode must be write, rw or exec"); }
+        if (Flag(arg, "rva")) for (auto& a : ad) if (a) a += (uintptr_t)GetModuleHandleA(nullptr);
+        if (!core::ResearchWatch(ad, (int)sec, mode)) { status = 409; return Error("a watch is already running"); }
+        status = 202; return "{\"started\":true,\"seconds\":" + Int((int)sec) + "}";
+    }
+    if (method == "GET" && path == "/api/research/watch") {   // research: the last reporting watch: {"running":..,"sites":[...]}
+        bool running = false; const std::string r = core::ResearchWatchReport(&running);
+        return std::string("{\"running\":") + (running ? "true" : "false") + ",\"sites\":" + (r.empty() ? "[]" : r) + "}";
+    }
+    if (method == "POST" && path == "/api/research/call") {   // research: {"addr":"0x..","rva":1,"a0".."a5":"0x..","thread":"game"|"http","timeout":5000}
+        auto it = arg.find("addr"); if (it == arg.end()) { status = 400; return Error("addr required"); }
+        uintptr_t addr = (uintptr_t)strtoull(it->second.c_str(), nullptr, 0);
+        if (Flag(arg, "rva")) addr += (uintptr_t)GetModuleHandleA(nullptr);
+        uint64_t a[6] = {}; const char* keys[6] = { "a0", "a1", "a2", "a3", "a4", "a5" };
+        for (int i = 0; i < 6; i++) { auto k = arg.find(keys[i]); if (k != arg.end()) a[i] = strtoull(k->second.c_str(), nullptr, 0); }
+        auto th = arg.find("thread"); const bool game = th == arg.end() || th->second != "http";
+        float timeout = 5000; Number(arg, "timeout", timeout);
+        if (game) { std::string out; if (!Ready(status, out)) return out; }
+        uint64_t result = 0; unsigned long code = 0;
+        const int r = core::ResearchCall(addr, a, game, (int)timeout, &result, &code);
+        if (r < 0) { status = 400; return Error("addr is not in executable memory"); }
+        if (r == 2) { status = 202; return "{\"queued\":true}"; }
+        char b[160]; snprintf(b, sizeof b, "{\"ok\":%s,\"result\":\"0x%llx\",\"exception\":\"0x%lx\"}", r == 1 ? "true" : "false", (unsigned long long)result, code);
+        return b;
+    }
+    if (method == "POST" && path == "/api/research/alloc") {   // research: {"bytes":4096} -> scratch memory for call arguments; {"free":"0x.."}
+        auto f = arg.find("free");
+        if (f != arg.end()) return core::ResearchFree((uintptr_t)strtoull(f->second.c_str(), nullptr, 0)) ? "{\"freed\":true}" : "{\"freed\":false}";
+        float by = 4096; Number(arg, "bytes", by);
+        const uintptr_t p = core::ResearchAlloc((size_t)std::clamp((int)by, 16, 1 << 24));
+        char b[64]; snprintf(b, sizeof b, "{\"addr\":\"0x%llx\"}", (unsigned long long)p); return b;
     }
     if (method == "POST" && path == "/api/research/points") {   // research: reload bin64\cdmodkit\debugpoints.txt ({"clear":1} removes them)
         return "{\"points\":" + Int(core::LoadDebugPoints(Flag(arg, "clear"))) + "}";
