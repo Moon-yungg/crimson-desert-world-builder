@@ -478,7 +478,7 @@ bool TerrainApply(Vec3 back) {
     int idle = 0; if (!g_applyStep.compare_exchange_strong(idle, 1)) return false;
     std::thread([back]() {
         SetApply(1, "preparing the fast travel");
-        TravelPrepare(); for (int i = 0; i < 240 && !TravelPrepared(); i++) Sleep(250);
+        for (int i = 0; i < 240 && !TravelPrepared(); i++) { TravelPrepare(); Sleep(250); }   // one game-tick check per second
         if (!TravelPrepared()) { SetApply(0, ""); Log("[terrain] apply: travel system not ready (%s)", TravelStatus().c_str()); return; }
         Vec3 away = back; const float d = 5000.0f; const float dirs[4][2] = { { d, 0 }, { -d, 0 }, { 0, d }, { 0, -d } }; bool found = false;
         for (auto& dv : dirs) if (TileExists(back.x + dv[0], back.z + dv[1])) { away = { back.x + dv[0], back.y + 300.0f, back.z + dv[1] }; found = true; break; }

@@ -30,6 +30,7 @@ namespace core {
 
     // helpers for optional modules (cdmodkit.cpp)
     uintptr_t SigScanUnique(const char* pat); uintptr_t VtableByName(const char* mangled); std::string PathObjText(void* path);
+    uintptr_t WorldRoot();   // the object behind the resolved world global (0 while unresolved or not loaded)
     void TerrainInstall(); void TravelInstall();
     // live terrain (terrain_live.cpp)
     void TerrainLiveInstall(); bool TerrainLiveAvailable(); bool TerrainLiveHasTexture(int tx, int tz);

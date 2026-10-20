@@ -112,7 +112,7 @@ namespace core {
     bool TerrainPreviewGrid(float x0, float z0, int nx, int nz, std::vector<float>* orig, std::vector<float>* edit);   // 2 m texel grid, NaN = not loaded
     // Travel (travel.cpp): the game's own fast travel to any position (loading screen; the world streams at the destination).
     bool TravelAvailable(); bool TravelPrepared(); void TravelPrepare(); std::string TravelStatus();
-    bool TravelTo(Vec3 pos, float yawDeg);   // false while the travel system is still being found (TravelPrepare runs then)
+    bool TravelTo(Vec3 pos, float yawDeg);   // false until a game-tick check found the stage manager (TravelPrepare queues one)
     void MarkProjectDirty(int proj);
     void GpuTrace(int seconds);   // research (gpu_research.cpp): log the game's copies into 16-bit textures for a while
     // research (terrain_research.cpp, rvas given at runtime)
