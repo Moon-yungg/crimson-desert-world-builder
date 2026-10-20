@@ -394,6 +394,29 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
   getHeight path), rebuild or patch the bounding-volume tree, find the patch's body transform; the render side (GPU height
   texture) is a separate problem.
 
+## Travel: stage manager without a memory scan (2026-10-20, build 1.0.0.2976, plugin travel.cpp)
+
+- Old way (up to v0.97): on first use of the travel tab a background thread walked all committed private RW memory for a
+  qword equal to the ClientSequencerStageManager vtable (0x55c9720) with a ClientChildOnlyInGameActor at +0x18, cached the
+  result in g_mgr and checked only its vtable before each call. Log of 2026-10-19/20: every scan took 33-48 s (status
+  "looking for the game's travel system"). Why "ready" did not work: the manager does not live for the whole session (the travels right after the first
+  scan worked, after ~15 minutes the same address no longer validated). The cached object stopped validating, TravelTo started a new scan, the scan found
+  nothing (the CAS only stores a hit, so g_mgr kept the stale address and the log line "manager scan: <old address>" looked
+  like a hit), and the status went back to "ready" because g_mgr was non-zero. Each click then said "preparing" and started
+  another 35-48 s scan: 5 scans in 8 minutes, no travel. Besides, TravelInstall set "ready" before any manager was known.
+- The game's own path (the only caller of 0xa9a860, rva 0x655110): player actor -> comps +0x68 -> transform +0x1A0 ->
+  vslot 40 (0x9f8560) returns a handle whose object is [[world root]+0xC8] (world root = the resolved WorldGlobal, rva 0x6d69190
+  on 2976) = ClientField (vtable 0x55bcea0), then ClientField vslot 9 (0x9a5be0, getStageManager: field id at +0x180, global
+  actor table [rva 0x6d69198]+0x10 lookup, actor comps +0x68 -> +0xA8 -> +0x18 = manager) -> rcx of 0xa9a860.
+- New way: the plugin does exactly that on the game tick for every travel: root +0xC8 -> [0], RTTI vtable must be ClientField
+  (otherwise the first 0x400 bytes of the root are tried for a pointer to a ClientField, i.e. 128 reads), then the getter,
+  guarded, result checked against the manager vtable. The getter is found at startup in the ClientField vtable by its
+  prologue (48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 83 EC 70 33 FF 44 8B 81 ?? ?? ?? ?? 48 8D 54 24 48 48 8B 0D), slot 9
+  first, then slots 0-63. Fallback when it is not found: the manager of the player's own last fast travel (hook on 0xa9a860),
+  and the status says so. TravelPrepare is a one-tick check (at most once a second), "ready" only after it found the manager.
+- Status 2026-10-20: chain and getter derived from the exe only, not yet seen in game. Log lines to look for: "[travel]
+  installed: ... ClientField getter slot 9", "[travel] ready", "fast travel to (...) via manager ...: started".
+
 ## Play mode: isolated start (2026-10-01, build 1.0.0.2976, plugin playmode.cpp)
 Request file `bin64\cdmodkit\playmode.json`, read at attach and renamed to `playmode.last.json` at once (a crash or a forced
 quit never traps the next start; without the file nothing below is installed). Format (every key optional):

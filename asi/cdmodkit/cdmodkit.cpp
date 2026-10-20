@@ -164,6 +164,7 @@ static uintptr_t FindPtrWithRtti(uintptr_t base, unsigned maxOff, const char* cl
     }
     return 0;
 }
+uintptr_t WorldRoot() { return kRva_WorldGlobal ? Deref(g_base + kRva_WorldGlobal, 0) : 0; }
 static uintptr_t UserActor() {
     uintptr_t root = Deref(g_base + kRva_WorldGlobal, 0);
     uintptr_t am = FindPtrWithRtti(root, 0x100, "ClientActorManager@");

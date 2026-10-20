@@ -4504,10 +4504,10 @@ namespace editor {
     static void TravelGo(Vec3 pos, const char* what) {
         pos.y += 0.5f;
         if (core::TravelTo(pos, 0.0f)) Note(T("travelling to %s"), what);
-        else Note(T("preparing the fast travel (first use of a session, up to half a minute) - try again in a moment"));
+        else Note(T("fast travel not possible right now (%s) - try again in a moment"), core::TravelStatus().c_str());
     }
     static void DrawTravel(const PosInfo& p, bool havePos, bool compact = false) {
-        LoadTp(); core::TravelPrepare();   // the first use of a session looks for the game's travel system in the background
+        LoadTp(); core::TravelPrepare();   // a check on the next game tick (at most once a second) that the stage manager can be fetched
         ImGui::TextWrapped(T("Travel uses the game's own fast travel: a loading screen, then you stand at the destination. Any distance works, the world is streamed in there."));
         ImGui::TextDisabled(T("status: %s"), core::TravelStatus().c_str());
         ImGui::Separator();
