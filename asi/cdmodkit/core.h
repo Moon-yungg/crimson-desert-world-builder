@@ -297,6 +297,11 @@ namespace core {
     void SetTimeFrozen(bool frozen);
     void ResetTimeControl();                    // restore the game's native time limits / progression
 
+    // Gameplay clock (NPC schedules, shops, quests; the lighting follows it). Separate from the visual override above.
+    bool GameClockAvailable();
+    bool GameClockNow(int* day, float* hour);   // false while no server tick runs (menu, loading)
+    bool SetGameClock(float hour);              // jumps forward to the next <hour> (whole minutes), like sleeping; runs on the server tick
+
     bool WeatherControlAvailable();
     bool WeatherRainAvailable();                // each control is on only when every field it writes was derived from game code
     bool WeatherCloudAvailable();

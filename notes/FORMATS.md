@@ -417,6 +417,29 @@ Add-to-Level-Pipeline (Plan B / spaeter): Funktionen um 0x3A6B2CF..0x3A6BFE2 (Pr
 - Status 2026-10-20: chain and getter derived from the exe only, not yet seen in game. Log lines to look for: "[travel]
   installed: ... ClientField getter slot 9", "[travel] ready", "fast travel to (...) via manager ...: started".
 
+## Gameplay clock (2026-10-21, build 1.0.0.2976, plugin cdmodkit.cpp; verified in game)
+- The visual time-of-day entity (environment.cpp) only follows this clock; the clock itself is what NPC schedules, shop/bank
+  refresh hours, quest delays and AICondition_CheckCurrentGameTime read.
+- GameTime struct, 32 bytes: u32 day, u32 hour, u32 minute, u32 second, u32 ms, u8 weekday (= day % 7), u16 scale (+0x16,
+  default 12), u64 anchor (+0x18, ms of the game's monotonic clock 0x1416b80 at which the fields were valid).
+- Ticks (0x20d3460): msOfDay = ((h*60+m)*60+s)*1000+ms; 03:00..21:00 maps 1:1 (minus 1.5 h), the night 21:00..03:00 is halved,
+  so one day = 75,600,000 ticks and nights pass twice as fast. ticks = day*75.6M + mapped. Inverse: 0x20d3360 (also sets weekday).
+- GetCurrentGameTime(entity, out) 0x20e55a0 (171 callers): a region with its own fixed time (+0x6a flag, time at +0x48) wins;
+  else global snapshot (server thread = TLS byte 0x1ec set: rva 0x6a6d238, client: 0x6a6d218); unless entity+0x17c is set it
+  advances by (now + offset - anchor) * scale ticks. Real length of a game day = 75.6M / 12 ms = 105 min.
+- Setters: 0x21a1cc0(fieldMgr, GameTime*) copies to fieldMgr+0x450 and to the thread's global. Callers: 0x2bc8970
+  (SetFieldTime worker), 0x2bc0a30 (advance by [obj+0x80] seconds: probably sleep/wait = "TimeWrap"), 0xa38b00 (client side).
+- TrocTrSetFieldTimeReq (vtable 0x5b24758, execute slot 2 = 0x29bfd70 -> .xtls 0x1049d430): payload = GameTime serialized
+  (5x u32, u8, u16, u64 = 31 bytes) + u8 respawnFlag + u32 key. Sender = player server actor; calls
+  0x2bc8970(sender[+0x68][+0x1a0], &time, flag, &key). flag != 0 additionally moves the player to the position of `key`
+  (bed/inn spawn point?), flag 0 only sets the time. Same handler shape as TrocTrSpawnCharacterCheatReq (byte +0x21 = no-op).
+- TrocTrSetFieldTimeAck (vtable 0x560af30, slot 2 -> 0xa41d560): payload u32 actor id + GameTime, calls the client setter
+  0xa38b00(clientMgr+0x1148, &time, 1, 0, 0). So a server-side set reaches the client (presumably sent by 0x299aed0).
+- Time jump (SetGameClock): on the server tick read the server global, build {day (+1 if the target hour is not later), h, m,
+  0, 0, weekday, same scale, anchor = 0x1416b80()} and run SetFieldTimeReq::execute with flag 0. Everything is resolved by
+  signature from GetCurrentGameTime (globals, clock call). Seen in game: result 0, server and client snapshot both at the new
+  time within ~150 ms, lighting follows. Live snapshot at load: day 40 15:31, weekday 5, scale 12.
+
 ## Play mode: isolated start (2026-10-01, build 1.0.0.2976, plugin playmode.cpp)
 Request file `bin64\cdmodkit\playmode.json`, read at attach and renamed to `playmode.last.json` at once (a crash or a forced
 quit never traps the next start; without the file nothing below is installed). Format (every key optional):

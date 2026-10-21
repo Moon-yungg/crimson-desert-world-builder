@@ -292,13 +292,20 @@ static std::string Handle(const std::string& method, const std::string& path, co
         return core::FreeCamActive() ? "{\"on\":true}" : "{\"on\":false}";
     }
     if (method == "POST" && path == "/api/time") {   // {"hour":18} sets the visual time (keeps running), {"freeze":1} holds it, {"native":1} back to the game clock
-        if (!core::TimeControlAvailable()) { status = 503; return Error("time control not available in this game build (see log)"); }
+        float ch = -1; Number(arg, "clock", ch);      // {"clock":7.5} jumps the gameplay clock forward to the next 07:30
+        if (ch >= 0) {
+            if (!core::GameClockAvailable()) { status = 503; return Error("game clock not available in this game build (see log)"); }
+            core::SetGameClock(ch);
+        }
+        int cd = 0; float cur0 = 0; const bool haveClock = core::GameClockNow(&cd, &cur0);
+        const std::string clock = haveClock ? ",\"clockDay\":" + std::to_string(cd) + ",\"clock\":" + std::to_string(cur0) : std::string(",\"clock\":null");
+        if (!core::TimeControlAvailable()) { if (ch >= 0) return "{\"queued\":true" + clock + "}"; status = 503; return Error("time control not available in this game build (see log)"); }
         float h = -1, fr = -1, nat = 0; Number(arg, "hour", h); Number(arg, "freeze", fr); Number(arg, "native", nat);
         if (nat != 0) core::ResetTimeControl();
         if (fr >= 0) core::SetTimeFrozen(fr != 0);
         if (h >= 0) core::SetTimeHour(h);
         float cur = 0; const bool have = core::TimeHour(&cur);
-        return "{\"hour\":" + (have ? std::to_string(cur) : std::string("null")) + ",\"frozen\":" + (core::TimeFrozen() ? "true" : "false") + "}";
+        return "{\"hour\":" + (have ? std::to_string(cur) : std::string("null")) + ",\"frozen\":" + (core::TimeFrozen() ? "true" : "false") + clock + "}";
     }
     if (method == "POST" && (path == "/api/research/read" || path == "/api/research/write")) {   // research: {"addr":"0x..","bytes":64} -> hex; write: {"addr":"0x..","hex":"0000803f"}
         auto it = arg.find("addr"); if (it == arg.end()) { status = 400; return Error("addr required"); }

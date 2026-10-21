@@ -5,6 +5,7 @@
 #include "i18n.h"
 #include <cstdio>
 #include <cmath>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <cstring>
@@ -762,6 +763,7 @@ extern volatile LONG g_queueCount;
 static uintptr_t kRva_ResLoad = 0;
 typedef void* (__fastcall* ResLoadFn)(void* self, void** out, void* path, uint32_t flags);
 static void ReleaseHookPiece(); static uintptr_t FindVtableByName(const char* mangled); static uintptr_t FindPatternCount(const char* pat, int* count);
+static void UpdateGameClock();
 static ResLoadFn g_origResLoad = nullptr; static void* g_resLoader = nullptr;
 // Research (/api/research/iotrace {"filter":"height"}): log the game's loads whose path contains the filter, plus the load
 // worker's read calls (vtable slots 4 / 5, hooked on first use from the worker the game uses) for those handlers.
@@ -4609,7 +4611,7 @@ template<int C, int N> static void* __fastcall VtThunk(void* a, void* b, void* c
     if (C == 3) { if (g_inGimmickReplay && GetCurrentThreadId() == g_spawnWindowThread) NoteReplayActor((uintptr_t)a, N); if (!g_trace || !g_inGimmickReplay) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); }
     if (C == 2 && N == 9 && g_gimmickReplayArmed) { if (InterlockedCompareExchange(&g_gimmickReplayArmed, 0, 1) == 1) ReplayGimmick(); }
     if (C == 2 && N == 9 && g_removeActorRequest) { const uintptr_t a = (uintptr_t)InterlockedExchangePointer((void* volatile*)&g_removeActorRequest, nullptr); if (a) RemoveSpawnedActor(a); }
-    if (C == 2 && N == 9) { g_serverFieldObj = (uintptr_t)a; g_serverFieldTick = GetTickCount(); ProcessServerJobs(); ProcessGimmickQueue(); }   // ServerField slot 9 runs ~18x per second on the server thread: armed replays run here, no game spawn needed
+    if (C == 2 && N == 9) { g_serverFieldObj = (uintptr_t)a; g_serverFieldTick = GetTickCount(); ProcessServerJobs(); ProcessGimmickQueue(); UpdateGameClock(); }   // ServerField slot 9 runs ~18x per second on the server thread: armed replays run here, no game spawn needed
     if (C == 2) { if (!g_trace) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); const LONG k = InterlockedIncrement(&g_vtCount[N]); g_vtCountThread[N] = GetCurrentThreadId(); if (k > 20) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h); }
     const bool log = g_trace && (C == 0 || C == 2 || Watched((uintptr_t)a) || (GetCurrentThreadId() == g_spawnWindowThread && GetTickCount() - g_spawnWindowTick < 500));
     if (!log) return ((Fn)g_vtOrig[C][N])(a, b, c, d, e, f, g, h);
@@ -5317,6 +5319,123 @@ static bool SpawnNpcNow(uint32_t key, Vec3 pos, int type, uint32_t extra, uintpt
     Log("[npc] spawn character %u at (%.2f %.2f %.2f) type %d: %s, result %d (%s), actor %p id 0x%08x",
         key, pos.x, pos.y, pos.z, type, ok ? "executed" : "FAULTED", res, DecodeErr((uint32_t)res).c_str(), (void*)actor, actorId);
     return ok && res == 0;
+}
+
+// ---- Gameplay clock: the time NPC schedules, shops, quests and the lighting follow (notes/FORMATS.md "Gameplay clock") ----
+// GameTime {u32 day, hour, minute, second, ms; u8 weekday; u16 scale (+0x16); u64 anchor (+0x18)}: the fields were valid at
+// `anchor` (ms of the game's monotonic clock) and advance by scale ticks per ms. A tick is a game ms by day; 21:00..03:00 is
+// halved, so a day is 75.6M ticks. The server thread reads its own global snapshot, the client thread another one.
+// TrocTrSetFieldTimeReq::execute (slot 2) takes {GameTime serialized, u8 respawn, u32 key}; respawn 0 only sets the time,
+// stores it in the field and the server global and answers the client (SetFieldTimeAck -> client clock + lighting).
+static const uint64_t kTicksPerDay = 75600000, kH = 3600000;
+static uint64_t GameTimeToTicks(const uint32_t f[5]) {   // 0x20d3460
+    const uint64_t msd = ((uint64_t)(f[1] * 60 + f[2]) * 60 + f[3]) * 1000 + f[4];
+    const uint64_t mapped = msd < 3 * kH ? msd / 2 : msd < 21 * kH ? msd - kH * 3 / 2 : (msd + 18 * kH) / 2;
+    return (uint64_t)f[0] * kTicksPerDay + mapped;
+}
+static void TicksToGameTime(uint64_t t, uint32_t f[5]) {   // 0x20d3360
+    const uint64_t day = t / kTicksPerDay, r = t - day * kTicksPerDay;
+    const uint64_t msd = r < kH * 3 / 2 ? r * 2 : r < kH * 39 / 2 ? r + kH * 3 / 2 : r * 2 - 18 * kH;
+    f[0] = (uint32_t)day; f[4] = (uint32_t)(msd % 1000); f[3] = (uint32_t)(msd / 1000 % 60); f[2] = (uint32_t)(msd / 60000 % 60); f[1] = (uint32_t)(msd / kH % 24);
+}
+static uintptr_t g_clockServerGlobal = 0, g_clockClientGlobal = 0, g_clockNowFn = 0;
+static uintptr_t g_clockHandler = 0; static void* g_clockExecute = nullptr;
+static std::atomic<uint64_t> g_clockTicks{ 0 };       // server clock in ticks, refreshed on the server tick (0 = unknown)
+static std::atomic<ULONGLONG> g_clockSeen{ 0 };
+static uint32_t g_clockSetDay = 0, g_clockSetMsd = 0; static ULONGLONG g_clockSetTick = 0;   // server thread: last jump, until the client follows
+static void InstallGameClock() {
+    // GetCurrentGameTime(entity, out): vmovups ymm0,[rip+server] (TLS server flag set) / [rip+client], then the clock call
+    int hits = 0;
+    const uintptr_t f = FindPatternCount("48 89 5C 24 10 57 48 83 EC 60 48 8B 01 48 8B FA 48 8D 54 24 70 48 8B D9 FF 50 60 B8 FF FF 00 00", &hits);
+    if (!f || hits != 1) { Log("[clock] game-time reader not found (%d matches): game clock off", hits); return; }
+    uint8_t b[0xb2] = {}; if (!ReadBytes(f, b, sizeof b)) return;
+    static const uint8_t ld[4] = { 0xC5, 0xFC, 0x10, 0x05 };
+    if (memcmp(b + 0x74, ld, 4) || memcmp(b + 0x7e, ld, 4) || b[0x7c] != 0xEB || b[0xad] != 0xE8 || b[0x86] != 0x80 || b[0x87] != 0xBB) {
+        Log("[clock] game-time reader layout changed: game clock off"); return;
+    }
+    int32_t d = 0;
+    memcpy(&d, b + 0x78, 4); const uintptr_t sg = f + 0x7c + d;
+    memcpy(&d, b + 0x82, 4); const uintptr_t cg = f + 0x86 + d;
+    const uintptr_t now = RelCallTarget(f + 0xad);
+    const uintptr_t vt = FindVtableByName(".?AVTrocTrSetFieldTimeReq@pa@@");
+    uintptr_t exec = 0; int n = 0; const uintptr_t handler = vt ? FindObjectWithVtable(vt, &n) : 0;
+    if (vt) ReadPtr(vt + 2 * 8, &exec);
+    if (!InImage(sg) || !InImage(cg) || !now || !InImage(exec) || !handler) {
+        Log("[clock] unresolved (server %p client %p clock %p handler %p execute %p): game clock off", (void*)sg, (void*)cg, (void*)now, (void*)handler, (void*)exec); return;
+    }
+    g_clockServerGlobal = sg; g_clockClientGlobal = cg; g_clockNowFn = now; g_clockHandler = handler; g_clockExecute = (void*)exec;
+    Log("[clock] game clock: reader rva 0x%llx, server rva 0x%llx, client rva 0x%llx, clock rva 0x%llx, SetFieldTime handler rva 0x%llx execute rva 0x%llx",
+        (unsigned long long)(f - g_base), (unsigned long long)(sg - g_base), (unsigned long long)(cg - g_base), (unsigned long long)(now - g_base),
+        (unsigned long long)(handler - g_base), (unsigned long long)(exec - g_base));
+}
+static bool CallClockNow(uint64_t* out) {
+    CDK_GUARD_BEGIN *out = ((uint64_t(__fastcall*)())g_clockNowFn)(); return true;
+    CDK_GUARD_FAIL { EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); } return false;
+    CDK_GUARD_END
+}
+static bool CallClockExecute(void* pkt, int* res) {
+    typedef void* (__fastcall* Exec)(void*, int*, void*);
+    CDK_GUARD_BEGIN ((Exec)g_clockExecute)((void*)g_clockHandler, res, pkt); return true;
+    CDK_GUARD_FAIL { EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); NpcUnwind(ep.ContextRecord); } return false;
+    CDK_GUARD_END
+}
+// server thread: the snapshot advanced to now, exactly as GetCurrentGameTime does it
+static bool ServerGameTime(uint8_t t[32], uint64_t* ticks, uint64_t* now) {
+    if (!g_clockServerGlobal || !ReadBytes(g_clockServerGlobal, t, 32) || !CallClockNow(now)) return false;
+    uint32_t f[5]; memcpy(f, t, 20); uint16_t scale = 0; uint64_t anchor = 0; memcpy(&scale, t + 0x16, 2); memcpy(&anchor, t + 0x18, 8);
+    if (f[1] >= 24 || f[2] >= 60 || f[3] >= 60 || f[4] >= 1000 || !scale) return false;   // no world loaded yet
+    *ticks = GameTimeToTicks(f) + (*now > anchor ? (*now - anchor) * scale : 0);
+    return true;
+}
+static void UpdateGameClock() {   // server tick
+    if (!g_clockServerGlobal) return;
+    const ULONGLONG tick = GetTickCount64();
+    if (tick - g_clockSeen.load(std::memory_order_relaxed) < 250 && !g_clockSetTick) return;
+    uint8_t t[32]; uint64_t ticks = 0, now = 0;
+    g_clockTicks.store(ServerGameTime(t, &ticks, &now) ? ticks : 0, std::memory_order_relaxed); g_clockSeen.store(tick, std::memory_order_relaxed);
+    if (!g_clockSetTick) return;
+    uint32_t c[5] = {}; if (!ReadBytes(g_clockClientGlobal, c, sizeof c)) return;   // does the client snapshot follow the jump?
+    const uint32_t cmsd = ((c[1] * 60 + c[2]) * 60 + c[3]) * 1000 + c[4];
+    if (c[0] == g_clockSetDay && cmsd >= g_clockSetMsd && cmsd < g_clockSetMsd + 60000) { Log("[clock] client clock followed: day %u %02u:%02u", c[0], c[1], c[2]); g_clockSetTick = 0; }
+    else if (tick - g_clockSetTick > 5000) { Log("[clock] client clock did NOT follow within 5 s (client day %u %02u:%02u)", c[0], c[1], c[2]); g_clockSetTick = 0; }
+}
+static bool SetGameClockNow(uint32_t targetMsd) {   // server tick
+    alignas(16) uint8_t pkt[0x40]; uintptr_t s = 0, vt = 0, cur = 0;
+    AcquireSRWLockShared(&g_npcLock); memcpy(pkt, g_pktTemplate, sizeof pkt); s = g_serverSession; vt = g_sessionVt; ReleaseSRWLockShared(&g_npcLock);
+    if (!s || !ReadPtr(s, &cur) || cur != vt) { Log("[clock] player actor not known yet: walk a few steps, then set the time again"); g_lastSender = 0; return false; }
+    uint8_t t[32]; uint64_t ticks = 0, now = 0;
+    if (!ServerGameTime(t, &ticks, &now)) { Log("[clock] server clock unreadable"); return false; }
+    uint32_t f[5]; TicksToGameTime(ticks, f);
+    const uint32_t msd = ((f[1] * 60 + f[2]) * 60 + f[3]) * 1000 + f[4];
+    const uint32_t day = f[0] + (targetMsd > msd ? 0 : 1);   // only forward, like sleeping: timers and cooldowns never run backwards
+    uint8_t buf[5 + 36] = {}; const uint16_t plen = 36; memcpy(buf + 3, &plen, 2);
+    const uint32_t nf[5] = { day, targetMsd / (uint32_t)kH, targetMsd / 60000 % 60, targetMsd / 1000 % 60, targetMsd % 1000 };
+    memcpy(buf + 5, nf, 20); buf[25] = (uint8_t)(day % 7); memcpy(buf + 26, t + 0x16, 2); memcpy(buf + 28, &now, 8);   // same scale, anchored now
+    // buf[36] respawn = 0, buf[37..40] key = 0
+    const uint16_t total = sizeof buf; memcpy(pkt + 0x10, &total, 2); uint8_t* bp = buf; memcpy(pkt + 0x18, &bp, 8);
+    int res = -1; const bool ok = CallClockExecute(pkt, &res);
+    uint32_t after[5] = {}; ReadBytes(g_clockServerGlobal, after, sizeof after);
+    Log("[clock] set day %u %02u:%02u -> day %u %02u:%02u: %s, result %d (%s); server now day %u %02u:%02u",
+        f[0], f[1], f[2], nf[0], nf[1], nf[2], ok ? "executed" : "FAULTED", res, DecodeErr((uint32_t)res).c_str(), after[0], after[1], after[2]);
+    if (!ok || res != 0) return false;
+    g_clockSetDay = day; g_clockSetMsd = targetMsd; g_clockSetTick = GetTickCount64(); g_clockSeen.store(0, std::memory_order_relaxed);
+    return true;
+}
+bool GameClockAvailable() { return g_clockExecute && g_npcExecute; }   // the player actor comes from the NPC spawn's packet capture
+bool GameClockNow(int* day, float* hour) {
+    const uint64_t t = g_clockTicks.load(std::memory_order_relaxed);
+    if (!t || GetTickCount64() - g_clockSeen.load(std::memory_order_relaxed) > 2000) return false;   // no server tick: menu / loading
+    uint32_t f[5]; TicksToGameTime(t, f);
+    if (day) *day = (int)f[0]; if (hour) *hour = f[1] + f[2] / 60.0f + f[3] / 3600.0f;
+    return true;
+}
+bool SetGameClock(float hour) {
+    if (!GameClockAvailable() || !std::isfinite(hour)) return false;
+    hour = fmodf(hour, 24.0f); if (hour < 0) hour += 24.0f;
+    const uint32_t msd = (uint32_t)(hour * 60.0f + 0.5f) % (24 * 60) * 60000;   // whole minutes
+    ResetTimeControl();   // a visual override would hide the jump: lighting follows the game clock again
+    RunOnServerTick([msd]() { SetGameClockNow(msd); });
+    return true;
 }
 // Research: where the player's SERVER actor keeps its position. Takes the client snapshot's tile-local x/y/z (and the world
 // position) and searches the server actor, every object it points to and every object those point to (0x800 bytes each) for
@@ -6421,6 +6540,7 @@ static DWORD WINAPI InitThread(LPVOID) {
         ResolveNativeCamera();   // gizmo projection and free camera use the renderer's own camera
         ResolveSetCamPose(); if (kRva_SetCamPose && g_natCamGlobal) { void* t14 = (void*)(g_base + kRva_SetCamPose); HookFn(t14, (void*)HookSetCamPose, (void**)&g_origSetCamPose, "camera pose (free camera)"); }
         InstallNpcSpawn();   // NPC spawn research: the game's spawn-character cheat request
+        InstallGameClock();   // gameplay clock jump: SetFieldTimeReq, sent with the player actor InstallNpcSpawn captures
         EnvironmentInstall(); // optional time-of-day / weather bridge; failures do not affect the editor or spawning
         TerrainInstall();     // optional terrain editing through the streamed height textures; failures only disable it
         TravelInstall();      // optional: the game's own fast travel to any position (travel tab, terrain apply)

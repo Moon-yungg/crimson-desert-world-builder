@@ -137,6 +137,33 @@ namespace editor {
     static void SetLabeledItemWidth(const char* label, float preferred) {
         ImGui::SetNextItemWidth(std::max(ImGui::GetFrameHeight(), std::min(preferred, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(T(label), nullptr, true).x - ImGui::GetStyle().ItemInnerSpacing.x)));
     }
+    // Hour slider shown as HH:MM like the clock lines (as decimal hours 3.28 looked like 3:28 but is 03:17). The ">" field
+    // takes "7:30" or "7.5"; ImGui shows a format without a conversion as is.
+    static bool ParseHour(const char* text, float* hour) {
+        int h = 0, m = 0; float d = 0.0f;
+        if (strchr(text, ':')) {
+            if (sscanf(text, "%d:%d", &h, &m) != 2 || h < 0 || h > 23 || m < 0 || m > 59) return false;
+            *hour = h + m / 60.0f; return true;
+        }
+        if (sscanf(text, "%f", &d) != 1 || !(d >= 0.0f && d < 24.0f)) return false;
+        *hour = d; return true;
+    }
+    static bool SliderHourEdit(const char* label, float* hour) {
+        const int total = (int)floorf(*hour * 60.0f + 0.5f) % (24 * 60);
+        char shown[16]; snprintf(shown, sizeof shown, "%02d:%02d", total / 60, total % 60);
+        bool changed = ImGui::SliderFloat(label, hour, 0.0f, 23.9833f, shown, ImGuiSliderFlags_NoInput); NoteSliderEnd(label);
+        static ImGuiID open = 0; static char text[16] = "";
+        const ImGuiID id = ImGui::GetID(label);
+        SameLineOrWrap(true, ImGui::GetFrameHeight());
+        ImGui::PushID(label);
+        if (ImGui::Button(open == id ? "v##hour" : ">##hour")) { open = open == id ? 0 : id; memcpy(text, shown, sizeof text); if (open) ImGui::SetKeyboardFocusHere(); }
+        if (open == id) {
+            SameLineOrWrap(true, 90.0f); ImGui::SetNextItemWidth(90.0f);
+            if (ImGui::InputText("##hhmm", text, sizeof text, ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsNoBlank) && ParseHour(text, hour)) { changed = true; open = 0; }
+        }
+        ImGui::PopID();
+        return changed;
+    }
     // Long translated action labels wrap inside their real hit rectangle; the original label/ID
     // and native button behavior remain unchanged. Ordinary-width controls use ImGui directly.
     static bool FittedButton(const char* label, bool fill = false) {
@@ -2907,7 +2934,7 @@ namespace editor {
 
             float target = core::TimeTargetHour();
             SetLabeledItemWidth("time of day", compact ? ImGui::GetContentRegionAvail().x : 420.0f * ui);
-            if (SliderFloatEdit(T("time of day"), &target, 0.0f, 23.9833f, "%.2f h"))
+            if (SliderHourEdit(T("time of day"), &target))
                 core::SetTimeHour(target);
 
             if (ImGui::Button(T("Dawn 06:00"))) core::SetTimeHour(6.0f);
@@ -2924,6 +2951,24 @@ namespace editor {
             SameLineForControl("use native time");
             if (ImGui::Button(T("use native time"))) core::ResetTimeControl();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Restore the game's normal visual time progression."));
+        }
+
+        ImGui::SeparatorText(T("Game clock"));
+        if (!core::GameClockAvailable()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), T("The game clock is not available in this game build (see the log)."));
+        } else {
+            static float clockTarget = 8.0f;
+            int day = 0; float hour = 0.0f;
+            if (core::GameClockNow(&day, &hour)) {
+                const int total = (int)floorf(hour * 60.0f) % (24 * 60);
+                ImGui::TextDisabled(T("Game clock: day %d, %02d:%02d"), day, total / 60, total % 60);
+            } else {
+                ImGui::TextDisabled(T("Game clock: waiting for the world..."));
+            }
+            SetLabeledItemWidth("clock hour", compact ? ImGui::GetContentRegionAvail().x : 420.0f * ui);
+            SliderHourEdit(T("clock hour"), &clockTarget);
+            if (ImGui::Button(T("jump game clock"))) core::SetGameClock(clockTarget);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T("Moves the real in-game clock forward to this hour, like sleeping: NPC schedules, shops and quests follow it. Only forward: an earlier hour means the next day."));
         }
         ImGui::PopTextWrapPos();
 
