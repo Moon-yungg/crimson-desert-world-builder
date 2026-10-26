@@ -26,6 +26,14 @@ typedef int      (*cdk_count_t)(void);                          // number of obj
 typedef int      (*cdk_get_t)(int id, char* prefabOut, int prefabCap, float* xyz, float* yawDeg, float* scale, int* hidden);  // 1 ok
 typedef void     (*cdk_log_t)(const char* text);                // writes to cdmodkit.log / console
 
+// Puppets (exports present since 2026-10-26; look them up with GetProcAddress, older builds lack them): an NPC of a
+// characterinfo row spawned by the game's own request, never saved, AI terminated once bound, moved by the caller.
+// Spawning needs the player to have walked a few steps after loading (0 until then).
+typedef int      (*cdk_puppet_spawn_t)(uint32_t characterKey, float x, float y, float z);   // puppet id, 0 = not now
+typedef int      (*cdk_puppet_state_t)(int id, float* xyz);    // 1 bound (xyz = live position), 0 spawning, -1 failed / gone
+typedef int      (*cdk_puppet_move_t)(int id, float x, float y, float z, const float* quatXyzw);  // quat may be NULL; 1 ok
+typedef int      (*cdk_puppet_remove_t)(int id);               // removes the actor; the id becomes invalid
+
 #ifdef __cplusplus
 }
 #endif

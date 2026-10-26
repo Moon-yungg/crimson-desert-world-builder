@@ -5732,6 +5732,200 @@ bool MoveManagedNpc(int uid, Vec3 world) {
     else QueueManagedNpcIfReady(uid);
     return true;
 }
+
+// ---- puppets for other mods (cdk_puppet_* in cdmodkit_api.h; the co-op mod's remote player) ----
+// An NPC spawned through the game's own request like SpawnNpc, outside the managed registry: no project, no undo, never
+// saved. Its AI is terminated once bound, and the caller drives its TransformSync snapshot (position, optional raw
+// quaternion) every frame; writes are coalesced into one per server tick. The actor joins g_managedNpcActors so the
+// managed reconcile does not claim it and RemoveSpawnedActor accepts it.
+struct Puppet { int id = 0; uint32_t key = 0; Vec3 spawnPos{}; DWORD requestTick = 0; uintptr_t actor = 0, transform = 0;
+                bool aiQueued = false, failed = false, writeQueued = false, clientQueued = false, haveRot = false; uint32_t actorId = 0;
+                Vec3 target{}; float rot[4] = { 0, 0, 0, 1 }; };
+static std::mutex g_puppetMutex; static std::vector<Puppet> g_puppets; static int g_nextPuppet = 1;
+static Puppet* PuppetLocked(int id) { for (auto& p : g_puppets) if (p.id == id) return &p; return nullptr; }
+// asynchronous spawns: the ServerNormalInGameActor constructed nearest the spawn point after the request (as the
+// managed reconcile does), at most 30 s late
+static void BindPuppetsLocked() {
+    const DWORD now = GetTickCount();
+    bool any = false; for (const auto& p : g_puppets) if (!p.actor && p.requestTick && !p.failed) any = true;
+    if (!any) return;
+    static RecentServerActor recent[4096]; unsigned n = 0;   // static: 64 KB, only touched under g_puppetMutex
+    AcquireSRWLockShared(&g_recentActorLock);
+    for (const auto& r : g_recentActors) if (r.actor && now - r.tick < 30000) recent[n++] = r;
+    ReleaseSRWLockShared(&g_recentActorLock);
+    for (auto& p : g_puppets) {
+        if (p.actor || !p.requestTick || p.failed) continue;
+        if (now - p.requestTick > 30000) { p.failed = true; Log("[puppet] #%d: no actor within 30 s", p.id); continue; }
+        uintptr_t best = 0, bestTf = 0; float bestD = 30.0f;
+        for (unsigned i = 0; i < n; ++i) {
+            const int dt = (int)(recent[i].tick - p.requestTick);
+            if (dt < -100 || IsManagedNpcActor(recent[i].actor)) continue;
+            const char* rn = RttiName(recent[i].actor); if (!rn || !strstr(rn, "ServerNormalInGameActor@")) continue;
+            const uintptr_t tf = FindActorTransform(recent[i].actor); PosInfo pi{};
+            if (!tf || !ReadTransformPos(tf, &pi, false)) continue;
+            const float dx = pi.world.x - p.spawnPos.x, dy = pi.world.y - p.spawnPos.y, dz = pi.world.z - p.spawnPos.z, d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d < bestD) { bestD = d; best = recent[i].actor; bestTf = tf; }
+        }
+        if (!best) continue;
+        p.actor = best; p.transform = bestTf;
+        { std::lock_guard<std::mutex> l(g_regMutex); g_managedNpcActors.insert(best); }
+        Log("[puppet] #%d bound actor %p (%.1f m from the spawn point)", p.id, (void*)best, bestD);
+    }
+}
+int PuppetSpawn(uint32_t key, Vec3 pos) {
+    if (!g_npcExecute || NpcState() < 2 || !key) return 0;
+    int id = 0;
+    { std::lock_guard<std::mutex> l(g_puppetMutex); Puppet p; p.id = id = g_nextPuppet++; p.key = key; p.spawnPos = pos; p.target = pos; g_puppets.push_back(p); }
+    RunOnServerTick([id, key, pos]() {
+        uintptr_t actor = 0;
+        const bool ok = SpawnNpcNow(key, pos, 1, 0, &actor);
+        std::lock_guard<std::mutex> l(g_puppetMutex); Puppet* p = PuppetLocked(id); if (!p) return;
+        if (!ok) { p->failed = true; return; }
+        p->requestTick = GetTickCount();
+        if (actor) { p->actor = actor; p->transform = FindActorTransform(actor); std::lock_guard<std::mutex> r(g_regMutex); g_managedNpcActors.insert(actor); }
+    });
+    return id;
+}
+// TrocTrMoveActorReq::execute's setter: (ServerTransformSyncActorComponent*, int* result, const transform*, u8 1); the
+// transform is {float3 world position, float4 quaternion, u32 0, float3 scale 1} (0x2C bytes, built that way in execute).
+// A position within 1 mm of the current one only sets the rotation. Optional: resolved by signature in ResolveGame.
+static uintptr_t kRva_ServerTransformSet = 0;
+static bool CallServerTransformSet(uintptr_t tf, const void* xf, int* res) {
+    typedef int* (__fastcall* SetFn)(void*, int*, const void*, uint8_t);
+    CDK_GUARD_BEGIN
+        ((SetFn)(g_base + kRva_ServerTransformSet))((void*)tf, res, xf, 1);
+        return true;
+    CDK_GUARD_FAIL { EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); NpcUnwind(ep.ContextRecord); }
+    CDK_GUARD_END
+    return false;
+}
+// The visible side of a puppet is a ClientNormalInGameActor with the same actor id; its client movement control rewrites
+// its TransformSync every frame (0x9ff500), so neither the server setter nor a raw write moves it (game 2026-10-26). The
+// client's TrocTrMoveForceAck::execute (0xb619c0) applies a forced move instead: client actor manager ([[g+0x6D69188]
+// +0x38]) lookup by id (0x8a67e0 -> handle {vptr, actor, u8 valid, u8 shared}, released by 0x1434880), then
+// 0x9fed30(client TransformSync, int* result, const SyncData*). SyncData is 0xF8 bytes: the ctor 0x2443e60 fills
+// 0..0xE0 (position float3 at +0, quaternion at +0xC, ...), execute zeroes +0xE8 (u8), +0xEC (u64), +0xF4 (u8) itself.
+// Research RVAs of 1.0.0.2976 only (stamp checked), no signatures yet.
+static bool g_clientForceOk = false;
+static constexpr uint32_t kClientForceStamp = 0x6ab28f00;
+static constexpr uintptr_t kRva_ClientWorld = 0x6D69188, kRva_ClientActorLookup = 0x8a67e0, kRva_HandleRelease = 0x1434880,
+                           kRva_SyncDataCtor = 0x2443e60, kRva_ClientForceApply = 0x9fed30;
+static void ResolveClientForce() {
+    auto dos = (IMAGE_DOS_HEADER*)g_base; auto nt = (IMAGE_NT_HEADERS64*)(g_base + dos->e_lfanew);
+    g_clientForceOk = nt->FileHeader.TimeDateStamp == kClientForceStamp;
+    Log("[puppet] client forced move %s (exe stamp 0x%08x)", g_clientForceOk ? "available" : "not available for this build", nt->FileHeader.TimeDateStamp);
+}
+struct ClientHandle { uintptr_t vptr, actor; uint8_t valid, shared, pad[6]; };
+static bool CallClientForce(uint32_t actorId, const float pos[3], const float quat[4], int* res, uintptr_t* actorOut) {
+    alignas(16) uint8_t data[0x100] = {}; ClientHandle h{};
+    CDK_GUARD_BEGIN
+        uintptr_t world = 0; if (!ReadBytes(g_base + kRva_ClientWorld, &world, 8) || !world) return false;
+        uintptr_t mgr = 0; if (!ReadBytes(world + 0x38, &mgr, 8) || !mgr) return false;
+        typedef void* (__fastcall* LookupFn)(uintptr_t, ClientHandle*, uint32_t);
+        typedef void (__fastcall* ReleaseFn)(ClientHandle*);
+        typedef void (__fastcall* CtorFn)(void*);
+        typedef int* (__fastcall* ApplyFn)(uintptr_t, int*, const void*);
+        ((LookupFn)(g_base + kRva_ClientActorLookup))(mgr, &h, actorId);
+        if (!h.valid || !h.actor) { ((ReleaseFn)(g_base + kRva_HandleRelease))(&h); *actorOut = 0; return true; }
+        *actorOut = h.actor;
+        uintptr_t comps = 0, tf = 0; ReadBytes(h.actor + 0x68, &comps, 8); if (comps) ReadBytes(comps + 0x1A0, &tf, 8);
+        if (tf) {
+            ((CtorFn)(g_base + kRva_SyncDataCtor))(data);
+            memcpy(data, pos, 12); memcpy(data + 0xC, quat, 16);
+            ((ApplyFn)(g_base + kRva_ClientForceApply))(tf, res, data);
+        }
+        ((ReleaseFn)(g_base + kRva_HandleRelease))(&h);
+        return true;
+    CDK_GUARD_FAIL { EXCEPTION_POINTERS ep = cdk::GuardInfo(); LogFault(&ep); NpcUnwind(ep.ContextRecord); }
+    CDK_GUARD_END
+    return false;
+}
+// The game frees actors on its own (out of range, loading): before every read or write the pointer must still be a
+// ServerNormalInGameActor with the same transform component, else its memory belongs to something else by now (game
+// 2026-10-26: a stale puppet actor read as a ServerVehicleActorComponent).
+static bool PuppetAliveLocked(Puppet& p) {
+    if (!p.actor) return true;
+    const char* rn = RttiName(p.actor);
+    if (rn && strstr(rn, "ServerNormalInGameActor@") && FindActorTransform(p.actor) == p.transform) return true;
+    Log("[puppet] #%d: actor %p is gone (%s)", p.id, (void*)p.actor, rn ? rn : "no RTTI");
+    { std::lock_guard<std::mutex> r(g_regMutex); g_managedNpcActors.erase(p.actor); }
+    p.failed = true; p.actor = 0; p.transform = 0;
+    return false;
+}
+// 1 bound (live = its position), 0 spawning, -1 failed or unknown
+int PuppetState(int id, Vec3* live) {
+    uintptr_t tf = 0;
+    {
+        std::lock_guard<std::mutex> l(g_puppetMutex); BindPuppetsLocked();
+        Puppet* p = PuppetLocked(id); if (!p || p->failed || !PuppetAliveLocked(*p)) return -1; if (!p->transform) return 0;
+        tf = p->transform;
+        if (!p->actorId) p->actorId = ManagedNpcActorId(p->actor);
+        if (!p->aiQueued) {   // once: the puppet must not walk off on its own
+            p->aiQueued = true; const uintptr_t actor = p->actor;
+            RunOnServerTick([id, actor]() {
+                bool before = false; const bool read = ReadNpcAiTerminated(actor, &before);
+                const bool ok = SetNpcAiTerminatedNow(actor, true);
+                Log("[puppet] #%d: AI terminate %s (flag before: %s)", id, ok ? "ok" : "FAILED", read ? (before ? "set" : "clear") : "unreadable");
+            });
+        }
+    }
+    PosInfo pi{}; if (live && ReadTransformPos(tf, &pi, false)) *live = pi.world;
+    return 1;
+}
+bool PuppetMove(int id, Vec3 world, const float* quat) {
+    std::lock_guard<std::mutex> l(g_puppetMutex);
+    Puppet* p = PuppetLocked(id); if (!p || !p->transform) return false;
+    p->target = world; p->haveRot = quat != nullptr; if (quat) memcpy(p->rot, quat, sizeof p->rot);
+    if (g_clientForceOk && p->actorId && !p->clientQueued) {   // the visible side, on the game (client) thread
+        p->clientQueued = true;
+        RunOnGameThread([id]() {
+            uint32_t actorId = 0; Vec3 w{}; float q[4] = { 0, 0, 0, 1 };
+            { std::lock_guard<std::mutex> l2(g_puppetMutex); Puppet* x = PuppetLocked(id); if (!x) return; x->clientQueued = false;
+              if (x->failed) return; actorId = x->actorId; w = x->target; if (x->haveRot) memcpy(q, x->rot, sizeof q); }
+            const float pos[3] = { w.x, w.y, w.z }; int res = 0; uintptr_t client = 0; static int s_logged = 0;
+            if (!CallClientForce(actorId, pos, q, &res, &client)) { Log("[puppet] #%d: client forced move faulted; disabled", id); g_clientForceOk = false; return; }
+            if (s_logged < 5 || res || !client) {
+                s_logged++;
+                PosInfo after{}; uintptr_t comps = 0, ctf = 0; if (client) { ReadBytes(client + 0x68, &comps, 8); if (comps) ReadBytes(comps + 0x1A0, &ctf, 8); }
+                const bool readOk = ctf && ReadTransformPos(ctf, &after, false);
+                Log("[puppet] #%d: client forced move id 0x%08x -> client actor %p (%s), result %d (%s), client now (%.2f %.2f %.2f)%s", id, actorId, (void*)client,
+                    client && RttiName(client) ? RttiName(client) : "-", res, DecodeErr((uint32_t)res).c_str(), after.world.x, after.world.y, after.world.z, readOk ? "" : " unreadable");
+            }
+        });
+    }
+    if (p->writeQueued) return true;
+    p->writeQueued = true;
+    RunOnServerTick([id]() {
+        uintptr_t tf = 0; Vec3 w{}; float q[4]; bool rot = false;
+        // checked and written under the lock on the server thread: the game cannot free the actor in between
+        std::lock_guard<std::mutex> l2(g_puppetMutex); Puppet* x = PuppetLocked(id); if (!x) return;
+        x->writeQueued = false;
+        if (x->failed || !PuppetAliveLocked(*x)) return;
+        tf = x->transform; w = x->target; rot = x->haveRot; memcpy(q, x->rot, sizeof q);
+        // The game's own path (TrocTrMoveActorReq::execute -> the server TransformSync setter) moves the actor and
+        // syncs it to the client side; a raw snapshot write only changes the server value (game 2026-10-26: the visible
+        // puppet ignored it). Fallback to the raw write when the setter was not found.
+        if (kRva_ServerTransformSet) {
+            struct Xf { float pos[3]; float rot[4]; uint32_t zero; float scale[3]; } xf{ { w.x, w.y, w.z }, { 0, 0, 0, 1 }, 0, { 1, 1, 1 } };
+            static_assert(sizeof(Xf) == 0x2C, "MoveActorReq transform layout");
+            if (rot) memcpy(xf.rot, q, sizeof q);
+            int res = 0; static int s_logged = 0;
+            if (!CallServerTransformSet(tf, &xf, &res)) { Log("[puppet] #%d: server transform setter faulted; raw writes from now on", id); kRva_ServerTransformSet = 0; return; }
+            if (s_logged < 5 || res) { s_logged++; Log("[puppet] #%d: server transform set (%.2f %.2f %.2f) -> result %d (%s)", id, w.x, w.y, w.z, res, DecodeErr((uint32_t)res).c_str()); }
+            return;
+        }
+        if (!WriteManagedNpcTransformNow(tf, w)) return;
+        if (rot) WriteBytes(tf + kOff_Tf_Pos + 0x28, q, sizeof q);   // snapshot quaternion, raw as the peer read it
+    });
+    return true;
+}
+bool PuppetRemove(int id) {
+    uintptr_t actor = 0;
+    { std::lock_guard<std::mutex> l(g_puppetMutex); for (auto it = g_puppets.begin(); it != g_puppets.end(); ++it) if (it->id == id) { if (PuppetAliveLocked(*it)) actor = it->actor; g_puppets.erase(it); break; } }
+    if (actor) RunOnServerTick([actor]() { RemoveSpawnedActor(actor); });   // RemoveSpawnedActor checks the RTTI again
+    return true;
+}
+
 bool SetManagedNpcControl(int uid, bool enabled, int behavior) {
     behavior = behavior == 1 ? 1 : 0; bool needSync = false, changed = false;
     { std::lock_guard<std::mutex> l(g_regMutex); const int i = NpcIndexOfUidLocked(uid); if (i < 0 || g_npcReg[i].hidden) return false;
@@ -6686,6 +6880,8 @@ static bool ResolveGame() {
     ok &= ResolveSig("StringDataAlloc", "48 89 5C 24 08 57 48 83 EC 20 65 48 8B 04 25 58 00 00 00 8B F9 41 B8 FD 01 00 00 83 C1 19 48 8B 10 41 80 3C 10 00 BA 10 00 00 00", &kRva_StringDataAlloc);
     ok &= ResolveSig("PrefabPathCtor", "48 89 5C 24 10 48 89 4C 24 08 55 56 57 48 83 EC 20 48 8B F9 E8 ?? ?? ?? ?? 90 48 8D 05 ?? ?? ?? ?? 48 89 01 33 ED 48 89 69 30 48 8D 41 38", &kRva_PrefabPathCtor);
     ResolveSig("ResourceLoader.load", "48 89 5C 24 18 48 89 54 24 10 55 56 57 41 56 41 57 48 81 EC 90 00 00 00 41 8B E9 4D 8B F0 48 8B F2 48 8B F9 45 33 FF", &kRva_ResLoad);   // optional: previews via the game's loader
+    ResolveClientForce();
+    ResolveSig("ServerTransformSet", "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 41 56 41 57 48 83 EC 50 45 0F B6 F1 49 8B E8 48 8B FA 48 8B F1 48 8B 59 08 48 8D 53 08 45 33 FF", &kRva_ServerTransformSet);   // optional: puppet moves (0x2bc5420 in 2976)
     ok &= ResolveSig("PathNormalizeCtor", "4C 8B DC 49 89 5B 10 49 89 4B 08 55 56 57 41 54 41 55 41 56 41 57 48 81 EC 40 01 00 00 48 8B DA 48 8B F9 4C 8D 2D ?? ?? ?? ??", &kRva_PathNormalizeCtor);
     // world global: `mov rax,[rip+d]; mov rcx,[rax+0x30]; mov rax,[rbx+0xa0]; cmp [rcx+0x58],rax` (take-or-steal check, 15 copies)
     uintptr_t ref = 0;
@@ -6858,6 +7054,10 @@ __declspec(dllexport) int cdk_get(int id, char* prefabOut, int prefabCap, float*
     return 1;
 }
 __declspec(dllexport) void cdk_log(const char* text) { core::Log("[api] %s", text ? text : ""); }
+__declspec(dllexport) int cdk_puppet_spawn(uint32_t characterKey, float x, float y, float z) { return core::PuppetSpawn(characterKey, { x, y, z }); }
+__declspec(dllexport) int cdk_puppet_state(int id, float* xyz) { Vec3 p{}; const int s = core::PuppetState(id, &p); if (s == 1 && xyz) { xyz[0] = p.x; xyz[1] = p.y; xyz[2] = p.z; } return s; }
+__declspec(dllexport) int cdk_puppet_move(int id, float x, float y, float z, const float* quatXyzw) { return core::PuppetMove(id, { x, y, z }, quatXyzw) ? 1 : 0; }
+__declspec(dllexport) int cdk_puppet_remove(int id) { return core::PuppetRemove(id) ? 1 : 0; }
 }
 
 void CdImguiAssert(const char* expr, const char* file, int line) {
