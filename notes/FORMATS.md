@@ -568,3 +568,41 @@ quit never traps the next start; without the file nothing below is installed). F
   thread pump stops), and the server-side injection still ends in the (0, 1000, 0) reset.
 - Facing: the travel quaternion (0, sin(a/2), 0, cos(a/2)) turns the character to (-sin a, -cos a) (seen: a = 45 -> (-0.59,
   -0.81), a = 90 -> -x), so play mode passes a = yaw + 180; with that, yaw 90 faces +x (seen).
+
+## Build of 2026-10-29 (DLC update, exe stamp 0x6ae2c6a6): what moved (static analysis only, not yet seen in game)
+- Protection: more functions now live in the protected `.code` section; their `.text1` entry is a bare `jmp` stub without a
+  `.pdata` entry (34k such stubs). The ClientSequencerStageManager vtable shows this (slots 0-4 are stubs).
+- `StringDataAlloc` 0x15fd760: a call (0x154faf0) inserted before the TLS read, allocator flag byte 0x1FD -> 0x1FE. 10k callers.
+- SceneObjectManager: `[[WorldGlobal] + 0xE0] + 0xF40`. The plugin used +0xEB0 (from build 2850) up to now, but the game's own 20 create
+  callers in 2976 already passed +0xF38 (checked against the old exe); create only reads [mgr+0x38]. The world object grew by 8 (+0x370 -> +0x378,
+  +0xF68 -> +0xF70, ...). WorldGlobal rva 0x71acbc0, createSceneObjectFrom 0x3e32650
+  (prologue unchanged). Now derived at startup from the game's own create callers (`mov rcx,[reg+off]; call create`, majority vote,
+  18 of 21 callers) - `ResolveSceneObjectMgrPath`; a failure turns the plugin off (BuildOk false).
+- FieldGimmickSaveData reshuffled (reflection setters): +0x378 key, +0x384 gimmickInfoKey, +0x310 levelOriginSceneObjectUuid,
+  +0x320 transform, +0x348 originSpawnTransform, +0x390 spawnReason hash, +0x3A8 fieldSaveDataReason (u8), +0x3A9 spawnStyle
+  (the "reason byte" -> desc+0xA, was +0x25C), +0x2E8 ownerLevelName, +0x380 stageKey, +0x370 npcScheduleKey; record ~0x3B0 bytes.
+  Builder (gimmick from save) 0x29bcda0, frame 0x690: desc = param - 0xD0 (was 0xC8), param reason hash +0x418 (was 0x3F8),
+  result +0x548, commit = desc vtable slot 0x30 (was 0x20), field create still ServerField slot 0x88. All of these are read from the
+  builder's instructions at startup (`ReadGimmickLayout`, log line "[gimmick] save layout: ..."); without them no replay runs.
+  The captured save copy is now 0x400 bytes (was 0x240). The item-drop replay keeps its 2976-only frame offsets and is gated off.
+- Spawn prepare 0x29bf0c0 (reads save+0x2E8 instead of +0x40), 41 callers; level caller 0x2d7f1e5 (reason 31 unchanged), two
+  drop-shaped callers (0x2ddc77e, 0x2d3726e: `lea rcx,[rbp+0x210/0x220]`), reason strings docking / catchspawn / drop /
+  discardfrominventory / inspect / housing / spawnbyprojectile.
+- Actor create inner 0x2a62d80 (frame 0xFA8, was 0xBC8), still 9 args, UUID check at info+0x1D8. SceneObjectServer pool create
+  0x29feac0 (vtable 0x5ec3c90; 11 other pools share the shape, the vtable store tells them apart).
+- GetCurrentGameTime 0x22a0b20: region test is now `movzx edx,[rsp+0x70]; cmp edx,0xffff`, so the global loads moved from +0x74 to
+  +0x70 (now located by bytes); server global 0x6e9a9b8, client 0x6e9a998, clock 0x15f3870, TLS server flag byte 0x1EB (was 0x1EC).
+- Travel: stage reload 0xba32b0 (same 0x1F0 frame, prologue saves rbx, key kept in ebx), sole caller 0x7205b2 (ClientField
+  vslot 9 getter 0xaa80a0 is still slot 9). Player comps +0x68 -> transform +0x1A0 -> vslot 40 unchanged (seen in game code).
+- Weather (environment.cpp): container gained 8 bytes in front: child node +0x20 (null default 0x48, was +0x18 / 0x40), atmosphere
+  slot +0x28; rain field 0x170, snow 0x16C (a pattern ending in 6C 01 now hits SNOW), wind speed 0x138 / blend 0x1AC / altitude 0x15C,
+  cloud 0xAC, mie 0x88, fog 0x9C; visual time lower/upper 0x3BC/0x3C0, current 0x3B8, set-time slot 0xF8. Summary reader stores
+  rsp-relative now (all later offsets +1..+4). Compositor 0x40b1480, its caller (hooked) 0x40b5820 with prologue `mov rax,rsp; push rbx`.
+- Puppet client forced move is pinned to exe stamp 0x6ab28f00 and is therefore off on this build.
+- Server TransformSync setter (TrocTrMoveActorReq path, 0x2e5b870): its transform argument was rebuilt (rotation +0xB0, position +0xC0,
+  was position +0, rotation +0xC); the plugin's 0x2C-byte struct no longer fits, so the setter is only used with the old layout and
+  puppets fall back to raw TransformSync writes. Component field +0x5B8 -> +0x5B0 (fields after the transform block moved -8, so
+  the play-mode destination at +0x550 is likely +0x548 now); the transform block at +0x98 is unchanged.
+- Cross-checked against the 2976 exe (D:\CrimsonDesertOld): every re-found function's instruction sequence is 88-100 % similar
+  to its old counterpart; the clock parser yields the documented 2976 globals on the old exe; setWorldTransform, setEnable,
+  camera pose, AI terminate, native camera ref and the removal loop are instruction-identical.

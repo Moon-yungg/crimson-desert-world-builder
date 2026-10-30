@@ -71,7 +71,9 @@ static void __fastcall HookStage(uintptr_t mgr, uint32_t key, uint32_t b, uint32
 }
 
 void TravelInstall() {
+    // 2976 prologue first; 2026-10-29 saves rbx instead of edx and keeps the key in ebx (same 0x1F0 frame, same global read)
     g_stageFn = SigScanUnique("44 89 4C 24 20 44 89 44 24 18 89 54 24 10 55 53 56 57 41 56 48 8D AC 24 10 FF FF FF 48 81 EC F0 01 00 00 48 8B F1 48 8D 54 24 48 48 8B 0D");
+    if (!g_stageFn) g_stageFn = SigScanUnique("48 89 5C 24 08 44 89 4C 24 20 44 89 44 24 18 55 56 57 41 56 41 57 48 8D AC 24 ?? ?? FF FF 48 81 EC ?? ?? 00 00 8B DA 4C 8B F1 48 8D 54 24 ?? 48 8B 0D");
     g_mgrVt = VtableByName(".?AVClientSequencerStageManager@pa@@");
     if (!g_stageFn || !g_mgrVt) { SetStatus(!g_stageFn ? "stage reload function not found" : "stage manager class not found"); Log("[travel] disabled: %s", TravelStatus().c_str()); return; }
     // the getter: slot 9 on 2976, any other slot of the field's vtable with the same prologue after a patch

@@ -73,7 +73,8 @@ static bool Resolve(bool quiet) {
     const uintptr_t pose = FindPattern("48 81 EC 88 00 00 00 C5 FC 10 02 C5 FC 11 41 48 C5 FC 10 4A 20 C5 FA 10 2D ?? ?? ?? ?? 48 8B 84 24 B8 00 00 00", &n3);
     const uintptr_t sxf = FindPattern("48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 57 48 81 EC E0 00 00 00 C5 F8 29 70 E8 C5 F8 29 78 D8 C5 78 29 40 C8 41 0F B6 E8", &n4);
     // the camera's own call of setWorldTransform: "mov rax,[rbx+0xE0] ... lea rcx,[rdx-0x28] ... call setWorldTransform"
-    const uintptr_t site = FindPattern("48 8B 83 E0 00 00 00 41 B1 01 89 54 24 78 45 0F B6 C1 C5 FC 11 44 24 50 C5 FB 11 4C 24 70 48 8B 50 08 33 C0 48 85 D2 48 8D 4A D8 48 0F 44 C8 48 8D 54 24 50 C5 F8 77 E8 ?? ?? ?? ??", &n5);
+    // (the field moved to +0xE8 with the 2026-10-29 update, so its offset is a wildcard)
+    const uintptr_t site = FindPattern("48 8B 83 ?? 00 00 00 41 B1 01 89 54 24 78 45 0F B6 C1 C5 FC 11 44 24 50 C5 FB 11 4C 24 70 48 8B 50 08 33 C0 48 85 D2 48 8D 4A D8 48 0F 44 C8 48 8D 54 24 50 C5 F8 77 E8 ?? ?? ?? ??", &n5);
     if (n != 1 || n1 != 1 || n2 != 1 || n3 != 1 || n4 != 1 || n5 != 1) {
         if (!quiet) Log("signatures not found (camera global %d, camera slots %d/%d, pose %d, setWorldTransform %d, camera call %d): fly mode off", n, n1, n2, n3, n4, n5);
         return false;

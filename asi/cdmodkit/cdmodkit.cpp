@@ -1246,10 +1246,40 @@ bool RestoreUid(int uid) {
 }
 
 // ---- our own spawn (must run on the game thread) ----
+static uint32_t g_somOff1 = 0xE0, g_somOff2 = 0xEB0;   // [[world]+off1]+off2 = SceneObjectManager (2976 values; ResolveSceneObjectMgrPath reads them from the game's callers)
 static uintptr_t SceneObjectMgr() {
     uintptr_t g = Deref(g_base + kRva_WorldGlobal, 0);
-    uintptr_t w = g ? Deref(g, 0xE0) : 0;
-    return w ? Deref(w, 0xEB0) : 0;
+    uintptr_t w = g ? Deref(g, g_somOff1) : 0;
+    return w ? Deref(w, g_somOff2) : 0;
+}
+// The game's callers of createSceneObjectFrom load the manager right before the call: "mov rcx,[reg+off2]; call create", and
+// (some of them) "mov rax,[rip+world]; mov rcx,[rax+off1]" a few instructions earlier. The majority wins (0xEB0 in 2976,
+// 0xF40 in 2026-10-29: the field moved, calling create with the old one would pass a wrong object).
+static bool ResolveSceneObjectMgrPath() {
+    const uintptr_t target = g_base + kRva_CreateSceneObjectFrom, world = g_base + kRva_WorldGlobal;
+    std::map<uint32_t, int> v1, v2;
+    auto dos = (IMAGE_DOS_HEADER*)g_base; auto nt = (IMAGE_NT_HEADERS64*)(g_base + dos->e_lfanew); auto sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        const uint8_t* b = (const uint8_t*)(g_base + sec[i].VirtualAddress); const size_t n = sec[i].Misc.VirtualSize;
+        for (size_t k = 0x80; k + 5 <= n; k++) {
+            if (b[k] != 0xE8) continue;
+            int32_t rel; memcpy(&rel, b + k + 1, 4); if ((uintptr_t)(b + k + 5) + (intptr_t)rel != target) continue;
+            const uint8_t* m = b + k - 7;   // mov rcx, [rax|rcx|rdi|r15 + disp32]
+            if (!((m[0] == 0x48 || m[0] == 0x49) && m[1] == 0x8B && (m[2] == 0x88 || m[2] == 0x89 || m[2] == 0x8F))) continue;
+            uint32_t off2; memcpy(&off2, m + 3, 4); v2[off2]++;
+            for (const uint8_t* q = b + k - 0x80; q + 14 <= m; q++) {   // mov rax,[rip+world]; mov rcx,[rax+off1]
+                if (q[0] != 0x48 || q[1] != 0x8B || q[2] != 0x05 || q[7] != 0x48 || q[8] != 0x8B || q[9] != 0x88) continue;
+                int32_t d; memcpy(&d, q + 3, 4); if ((uintptr_t)(q + 7) + (intptr_t)d != world) continue;
+                uint32_t off1; memcpy(&off1, q + 10, 4); v1[off1]++;
+            }
+        }
+    }
+    auto best = [](const std::map<uint32_t, int>& m, int* votes) { uint32_t o = 0; *votes = 0; for (auto& e : m) if (e.second > *votes) { o = e.first; *votes = e.second; } return o; };
+    int n1 = 0, n2 = 0; const uint32_t o1 = best(v1, &n1), o2 = best(v2, &n2);
+    Log("[spawn] scene object manager path: world +0x%x (%d callers) -> +0x%x (%d of %zu kinds)", o1, n1, o2, n2, v2.size());
+    if (n1 < 1 || n2 < 3 || o1 >= 0x1000 || o2 >= 0x4000 || (o1 & 7) || (o2 & 7)) return false;
+    g_somOff1 = o1; g_somOff2 = o2; return true;
 }
 static uint8_t g_flags[3] = { 1, 1, 0 };   // middle flag = schedule the add-to-level task (what every dynamic spawner in the game uses)
 
@@ -3482,10 +3512,19 @@ static GimmickSpawnFn g_origGimmickSpawn = nullptr;
 // refused as eErrNoDuplicateUniqueGimmick), so every spawn the game makes is kept in a ring, named by the scene object the
 // game creates for it right afterwards, and the editor picks which one to repeat: level gimmicks (torches, doors ...) stream
 // in through the same function while walking and depend on nothing but their GimmickInfoKey and transform.
-static const size_t kFrameBefore = 0x400, kFrameSize = 0x2000, kSaveSize = 0x240;   // the window is sized per capture (c.size), kFrameSize is the buffer
+static const size_t kFrameBefore = 0x400, kFrameSize = 0x2000, kSaveSize = 0x400;   // the window is sized per capture (c.size), kFrameSize is the buffer; the save data grew from ~0x260 to ~0x3B0 bytes in the 2026-10-29 build
 struct GimmickCapture { bool valid = false; int id = 0; DWORD when = 0; uintptr_t caller = 0; uintptr_t base = 0, param = 0, save = 0; size_t size = 0; char ownerPath[200] = {}; void* mgr = nullptr; void* owner = nullptr; void* out = nullptr; void* s5 = nullptr; void* s6 = nullptr; void* s7 = nullptr; void* s8 = nullptr; void* s9 = nullptr; void* s10 = nullptr; void* s11 = nullptr; void* s12 = nullptr;
     uint32_t k1 = 0, k2 = 0; float pos[3] = { 0, 0, 0 }; char name[96] = { 0 };
-    uint8_t frame[0x2000], bSave[0x240]; };
+    uint8_t frame[0x2000], bSave[kSaveSize]; };
+// FieldGimmickSaveData / spawn-param layout. The 2026-10-29 build reshuffled the save record (gimmickInfoKey 0x1C0 -> 0x384),
+// so ResolveGimmickFromSave reads these from the builder's own instructions; the defaults are build 2976's.
+struct GimmickLayout {
+    uint32_t saveKey = 0x1C0, saveStyle = 0x25C, saveReason = 0x220, saveUuid = 0x4C;   // save: gimmickInfoKey, spawnStyle byte (-> desc+0xA), spawnReason hash, origin uuid
+    uint32_t saveXf = 0x1CC, saveOriginXf = 0x1F4, saveFsdReason = 0x30;                 // not read by the builder: known per layout (logging, record transform)
+    uint32_t descBack = 0xC8, paramReason = 0x3F8, paramResult = 0x540, commitSlot = 0x20; // desc = param - descBack; reason hash and result int in the param block; desc vtable commit
+    bool known = false;   // read from this build's builder; without it no replay writes into a frame or record
+};
+static GimmickLayout g_gl;
 static const int kGimmickRing = 32;
 static GimmickCapture g_gring[kGimmickRing]; static int g_gringNext = 0, g_gringIds = 0; static std::mutex g_gringMutex;
 static volatile LONG g_gimmickReplayArmed = 0; static Vec3 g_gimmickReplayAt{}; static int g_gimmickReplayId = 0;
@@ -3570,10 +3609,10 @@ static std::string DecodeErr(uint32_t code) {
 struct GimmickCopy { uint8_t* frame = nullptr; uint8_t* save = nullptr; uint8_t* param = nullptr; uint8_t* desc = nullptr; uint8_t* out = nullptr; uint8_t* s5 = nullptr; uint8_t* s6 = nullptr; uint8_t* s8 = nullptr; };
 static void LogSpawnTransforms(const char* what, uintptr_t save, uintptr_t s8, uintptr_t s5) {
     float t[10] = {}, o[10] = {}, a[10] = {}, b[10] = {};
-    if (save) { ReadBytes(save + 0x1CC, t, 40); ReadBytes(save + 0x1F4, o, 40); }
+    if (save) { ReadBytes(save + g_gl.saveXf, t, 40); ReadBytes(save + g_gl.saveOriginXf, o, 40); }
     if (s8) ReadBytes(s8, a, 40);
     if (s5) ReadBytes(s5 + 0x28, b, 40);
-    Log("[gimmick] %s transforms: save+1CC pos (%.2f %.2f %.2f) scale %.2f | save+1F4 pos (%.2f %.2f %.2f) | s8 pos (%.2f %.2f %.2f) quat (%.2f %.2f %.2f %.2f) | s5+28 pos (%.2f %.2f %.2f)",
+    Log("[gimmick] %s transforms: save transform pos (%.2f %.2f %.2f) scale %.2f | save origin pos (%.2f %.2f %.2f) | s8 pos (%.2f %.2f %.2f) quat (%.2f %.2f %.2f %.2f) | s5+28 pos (%.2f %.2f %.2f)",
         what, t[7], t[8], t[9], t[0], o[7], o[8], o[9], a[7], a[8], a[9], a[3], a[4], a[5], a[6], b[7], b[8], b[9]);
 }
 // ---- interactive objects: the editor's gimmick prefabs spawned through the game's own spawn path -----------------------------
@@ -3647,7 +3686,7 @@ static GimmickCopy MakeCopy(const GimmickCapture& c, uint8_t* mem, Vec3 at) {
     };
     remap(g.frame, c.size); remap(g.save, kSaveSize);
     auto atp = [&](void* old) -> uint8_t* { return g.frame + ((uintptr_t)old - c.base); };
-    g.param = g.frame + (c.param - c.base); g.desc = g.param - 0xC8; g.out = atp(c.out); g.s5 = atp(c.s5); g.s6 = atp(c.s6); g.s8 = atp(c.s8);
+    g.param = g.frame + (c.param - c.base); g.desc = g.param - g_gl.descBack; g.out = atp(c.out); g.s5 = atp(c.s5); g.s6 = atp(c.s6); g.s8 = atp(c.s8);
     // The target position: the transform block s8 carries it at +0x1C (scale3 quat4 pos3); other blocks may hold a copy (the
     // housing / drop stack arg 5 at +0x44). Callers lay their frames out differently (level: s5 is the desc minus 0x10, and
     // s5+0x44 is the desc's self pointer, which a blind write turned into floats and crashed the create), so every further
@@ -3666,8 +3705,9 @@ static GimmickCopy MakeCopy(const GimmickCapture& c, uint8_t* mem, Vec3 at) {
     }
     return g;
 }
-// FieldGimmickSaveData (reflection offsets from the property setters): +0x28 key, +0x30 fieldSaveDataReason, +0x4C levelOriginSceneObjectUuid (16),
-// +0x1C0 gimmickInfoKey (u16), +0x1CC transform (scale3 quat4 pos3), +0x1F4 originSpawnTransform, +0x220 spawnReason hash
+// FieldGimmickSaveData (reflection offsets from the property setters), build 2976: +0x28 key, +0x30 fieldSaveDataReason, +0x4C levelOriginSceneObjectUuid (16),
+// +0x1C0 gimmickInfoKey (u16), +0x1CC transform (scale3 quat4 pos3), +0x1F4 originSpawnTransform, +0x220 spawnReason hash, +0x25C spawnStyle.
+// 2026-10-29: +0x378 key, +0x3A8 fieldSaveDataReason (u8), +0x310 uuid, +0x384 gimmickInfoKey, +0x320 transform, +0x348 origin, +0x390 hash, +0x3A9 style (g_gl)
 static const char* SpawnReasonOf(uintptr_t caller) {
     auto it = g_callerReason.find(caller); return it == g_callerReason.end() ? nullptr : it->second.c_str();
 }
@@ -3711,20 +3751,20 @@ static int RunSpawnSteps(const GimmickCapture& c, GimmickCopy& g, const char* wh
     FreshUuid(g.s5, what);
     void* r = g_origGimmickSpawn(g.param, g.out, c.mgr, ReplayOwner(c), g.s5, g.s6, c.s7, g.s8, c.s9, c.s10, c.s11, c.s12);
     int code0 = 0; memcpy(&code0, g.out, 4);
-    uint16_t key = 0; memcpy(&key, g.save + 0x1C0, 2); int reasonEnum = 0; memcpy(&reasonEnum, g.save + 0x30, 4);
-    Log("[gimmick] %s: prepare returned %p, out[0] = %d (%s); save: gimmickInfoKey %u, fieldSaveDataReason %d, uuid %08x..", what, r, code0, DecodeErr((uint32_t)code0).c_str(), key, reasonEnum, *(uint32_t*)(g.save + 0x4C));
+    uint16_t key = 0; memcpy(&key, g.save + g_gl.saveKey, 2); const int reasonEnum = g.save[g_gl.saveFsdReason];
+    Log("[gimmick] %s: prepare returned %p, out[0] = %d (%s); save: gimmickInfoKey %u, fieldSaveDataReason %d, uuid %08x..", what, r, code0, DecodeErr((uint32_t)code0).c_str(), key, reasonEnum, *(uint32_t*)(g.save + g_gl.saveUuid));
     if (code0) return code0;
     FreshKey(g.param, what);
     if (false) {   // (build 2949, caller 0x2aae2cb) the summon of a spawner gimmick (flags): the reason hash sits in its summon data, [[param+0x5D8]+0x58]+0x50; not classified at runtime yet
         uintptr_t o = 0; memcpy(&o, g.param + 0x5D8, 8); uintptr_t o2 = 0; uint32_t h = 0;
-        if (o && ReadPtr(o + 0x58, &o2) && o2 && ReadBytes(o2 + 0x50, &h, 4)) { memcpy(g.param + 0x3F8, &h, 4); memcpy(g.save + 0x220, &h, 4); Log("[gimmick] %s: summon reason hash 0x%08x from the summon data", what, h); }
+        if (o && ReadPtr(o + 0x58, &o2) && o2 && ReadBytes(o2 + 0x50, &h, 4)) { memcpy(g.param + g_gl.paramReason, &h, 4); memcpy(g.save + g_gl.saveReason, &h, 4); Log("[gimmick] %s: summon reason hash 0x%08x from the summon data", what, h); }
     }
-    if (const char* reason = SpawnReasonOf(c.caller)) { if (g_gameHash) { const uint32_t h = g_gameHash(reason, strlen(reason)); memcpy(g.param + 0x3F8, &h, 4); memcpy(g.save + 0x220, &h, 4); Log("[gimmick] %s: reason \"%s\" hash 0x%08x", what, reason, h); } }
+    if (const char* reason = SpawnReasonOf(c.caller)) { if (g_gameHash) { const uint32_t h = g_gameHash(reason, strlen(reason)); memcpy(g.param + g_gl.paramReason, &h, 4); memcpy(g.save + g_gl.saveReason, &h, 4); Log("[gimmick] %s: reason \"%s\" hash 0x%08x", what, reason, h); } }
     else Log("[gimmick] %s: caller rva 0x%llx has no known reason, hash left as captured", what, (unsigned long long)c.caller);
-    int* result = (int*)(g.param + 0x540); *result = 0;
+    int* result = (int*)(g.param + g_gl.paramResult); *result = 0;
     uintptr_t descVt = 0; memcpy(&descVt, g.desc, 8);
     typedef void* (__fastcall* DescCommitFn)(void* desc, int* result);
-    DescCommitFn commit = nullptr; if (!descVt || !ReadPtr(descVt + 0x20, (uintptr_t*)&commit) || !commit) { Log("[gimmick] %s: no commit slot", what); return -1; }
+    DescCommitFn commit = nullptr; if (!descVt || !ReadPtr(descVt + g_gl.commitSlot, (uintptr_t*)&commit) || !commit) { Log("[gimmick] %s: no commit slot", what); return -1; }
     commit(g.desc, result);
     Log("[gimmick] %s: commit result = %d (%s)", what, *result, DecodeErr((uint32_t)*result).c_str());
     if (*result) return *result;
@@ -3749,6 +3789,8 @@ static void ReplayGimmick() { g_lastActorCreated_ = 0; g_replayActor = 0; g_repl
 // mirrored words, the commit into an int at param+0x528, and the field create. Replaying it step by step, target taken from
 // the caller's own call instruction (research only).
 static void ReplayDrop(const GimmickCapture& c, uint8_t* mem) {
+    // the drop caller's frame offsets below were traced on build 2976 only; on another save layout they would write into the wrong words
+    if (!g_gl.known || g_gl.saveKey != 0x1C0) { Log("[gimmick] drop replay: frame offsets are known for build 2976 only (save layout differs), not replayed"); return; }
     GimmickCopy g = MakeCopy(c, mem, g_gimmickReplayAt);
     FreshUuid(g.s5, "drop replay");
     const LONG before = g_soCreated_;
@@ -3793,6 +3835,7 @@ static void ReplayDrop(const GimmickCapture& c, uint8_t* mem) {
     LogSpawnTransforms("drop replay after create", (uintptr_t)g.save, (uintptr_t)g.s8, (uintptr_t)g.s5);
 }
 static void ReplayGimmickBody() {
+    if (!g_gl.known) { Log("[gimmick] replay: spawn layout of this build not recognized (save-data builder), no replay"); return; }
     GimmickCapture c; if (!FindCapture(g_gimmickReplayId, c)) { Log("[gimmick] replay: capture %d is gone", g_gimmickReplayId); return; }
     static uint8_t* memA = nullptr; static uint8_t* memB = nullptr;
     if (!memA) memA = (uint8_t*)VirtualAlloc(nullptr, 0x2400, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -4156,12 +4199,43 @@ static void ProcessGimmickQueue() {   // server thread, one object per tick
 // flags save+0x28, uuid save+0x4C, reason hash save+0x220), runs the spawn prepare (0x278f490 in 2976, our HookGimmickSpawn) with a
 // default transform block (scale 1, identity rotation, position 0), commits the desc and hands it to ServerField slot 17 (field
 // create). Called with our own save record, the prepare hook swaps in position / rotation / scale: no captured template needed.
+// The save and frame offsets (build 2976 above) are read from the builder's instructions into g_gl (2026-10-29: key +0x384,
+// style +0x3A9, hash +0x390, uuid +0x310, desc = param - 0xD0, param reason +0x418, result +0x548, commit = desc slot 0x30).
 static uintptr_t FindVtableByName(const char* mangled);   // RTTI lookup (below)
 static volatile bool g_directArmed = false; static DWORD g_directThread = 0; static float g_directXf[10] = {};   // scale3 quat4 pos3
+static bool ReadGimmickLayout(uintptr_t f, GimmickLayout& L) {
+    uint8_t b[0x340] = {}; if (!ReadBytes(f, b, sizeof b)) return false;
+    auto d32 = [&](size_t i) { int32_t v; memcpy(&v, b + i, 4); return v; };
+    auto at = [&](size_t i, std::initializer_list<int> p) { size_t k = 0; for (int x : p) { if (x >= 0 && b[i + k] != (uint8_t)x) return false; k++; } return true; };
+    if (!at(0x33, { 0x44, 0x8B, 0x92 })) return false;
+    L.saveKey = (uint32_t)d32(0x36);   // mov r10d, [rdx + gimmickInfoKey]
+    int descRbp = 0, outRbp = 0, paramRbp = 0, got = 0;
+    for (size_t i = 0x3A; i + 24 < sizeof b; i++) {
+        if (!(got & 1) && at(i, { 0x45, 0x0F, 0xB6, 0x87, -1, -1, -1, -1, 0x48, 0x8D, 0x4D, -1, 0xE8 })) { L.saveStyle = (uint32_t)d32(i + 4); descRbp = (int8_t)b[i + 11]; got |= 1; }   // movzx r8d, byte [r15+style]; lea rcx, [rbp+desc]; call desc ctor
+        else if ((got & 1) && !(got & 2) && at(i, { 0xC4, 0xC1, 0x78, 0x10, 0x87 })) { L.saveUuid = (uint32_t)d32(i + 5); got |= 2; }   // vmovups xmm0, [r15+uuid]
+        else if ((got & 1) && !(got & 4) && at(i, { 0x48, 0x8D, 0x95, -1, -1, -1, -1, 0x48, 0x8D, 0x8D, -1, -1, -1, -1, 0xE8, -1, -1, -1, -1, 0x41, 0x8B, 0x8F, -1, -1, -1, -1, 0x89, 0x8D })) {
+            outRbp = d32(i + 3); paramRbp = d32(i + 10); L.saveReason = (uint32_t)d32(i + 22);   // lea rdx, [rbp+out]; lea rcx, [rbp+param]; call prepare; mov ecx, [r15+hash]; mov [rbp+x], ecx
+            L.paramReason = (uint32_t)(d32(i + 28) - paramRbp); got |= 4;
+        }
+        else if ((got & 4) && !(got & 8) && at(i, { 0x48, 0x8D, 0x95, -1, -1, -1, -1, 0x48, 0x8D, 0x4D, -1, 0xFF, 0x50 }) && d32(i + 3) == outRbp && (int8_t)b[i + 10] == descRbp) { L.commitSlot = b[i + 13]; got |= 8; }   // commit(desc, &result)
+    }
+    if (got != 15 || paramRbp <= descRbp || outRbp <= paramRbp) return false;
+    L.descBack = (uint32_t)(paramRbp - descRbp); L.paramResult = (uint32_t)(outRbp - paramRbp);
+    // fields the builder never reads: known per layout, else left out (0 = unknown)
+    if (L.saveKey == 0x1C0) { L.saveXf = 0x1CC; L.saveOriginXf = 0x1F4; L.saveFsdReason = 0x30; }
+    else if (L.saveKey == 0x384) { L.saveXf = 0x320; L.saveOriginXf = 0x348; L.saveFsdReason = 0x3A8; }
+    else { L.saveXf = 0; L.saveOriginXf = 0; L.saveFsdReason = 0; }
+    return L.saveKey + 4 <= kSaveSize && L.saveStyle < kSaveSize && L.saveReason + 4 <= kSaveSize && L.saveUuid + 16 <= kSaveSize && L.commitSlot && !(L.commitSlot & 7);   // the capture copies kSaveSize bytes of the record
+}
 static void ResolveGimmickFromSave() {
     int n = 0;
-    const uintptr_t f = FindPatternCount("48 89 5C 24 08 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8D AC 24 B0 FA FF FF 48 81 EC 50 06 00 00 41 8B F1 45 8B F0 4C 8B FA 4C 8B E1 44 8B 92 C0 01 00 00", &n);
+    const uintptr_t f = FindPatternCount("48 89 5C 24 08 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8D AC 24 ?? ?? FF FF 48 81 EC ?? ?? 00 00 41 8B F1 45 8B F0 4C 8B FA 4C 8B ?? 44 8B 92 ?? ?? 00 00", &n);
     if (!f || n != 1) { Log("[gimmick] save-data builder: %d matches, template-free spawn off", n); return; }
+    GimmickLayout L;
+    if (!ReadGimmickLayout(f, L)) { Log("[gimmick] save-data builder at rva 0x%llx: layout not recognized, template-free spawn off", (unsigned long long)(f - g_base)); return; }
+    L.known = true; g_gl = L;
+    Log("[gimmick] save layout: key +0x%x style +0x%x hash +0x%x uuid +0x%x transform +0x%x | desc = param - 0x%x, param hash +0x%x, result +0x%x, commit slot 0x%x",
+        L.saveKey, L.saveStyle, L.saveReason, L.saveUuid, L.saveXf, L.descBack, L.paramReason, L.paramResult, L.commitSlot);
     g_scopeAttacherVt = FindVtableByName(".?AV?$ScopeAttacher@VCommonActor@pa@@@pa@@");
     if (!g_scopeAttacherVt) { Log("[gimmick] ScopeAttacher<CommonActor> vtable not found, template-free spawn off"); return; }
     kRva_GimmickFromSave = f - g_base; Log("resolved %-20s rva 0x%llx (via signature), result holder vtable rva 0x%llx", "gimmick from save", (unsigned long long)kRva_GimmickFromSave, (unsigned long long)(g_scopeAttacherVt - g_base));
@@ -4191,10 +4265,10 @@ static bool DirectGimmickSpawn(uint32_t key, Vec3 pos, Rot rot, float scale, uin
     *soOut = *actOut = 0;
     void* field = (void*)g_serverFieldObj;
     if (!kRva_GimmickFromSave || !field) return false;
-    alignas(16) static uint8_t save[0x400]; memset(save, 0, sizeof save);
-    memcpy(save + 0x1C0, &key, 4); save[0x25C] = (uint8_t)LevelSpawnReason();
+    alignas(16) static uint8_t save[0x800]; memset(save, 0, sizeof save);
+    memcpy(save + g_gl.saveKey, &key, 4); save[g_gl.saveStyle] = (uint8_t)LevelSpawnReason();
     float xf[12]; MakeTransform(xf, pos, rot, scale, false);
-    memcpy(g_directXf, xf, 40); memcpy(save + 0x1CC, xf, 40);   // the record's own transform too (the builder does not read it)
+    memcpy(g_directXf, xf, 40); if (g_gl.saveXf) memcpy(save + g_gl.saveXf, xf, 40);   // the record's own transform too (the builder does not read it)
     g_directThread = GetCurrentThreadId(); g_directArmed = true;
     g_lastActorCreated_ = 0; g_replayActor = 0; g_replayActorCount = 0; g_replayCtorActor = 0; g_replayResultSo = 0; g_replayResultActor = 0; g_replayInnerSo = 0;
     g_inGimmickReplay = true; g_spawnWindowThread = GetCurrentThreadId(); g_spawnWindowTick = GetTickCount();
@@ -4354,7 +4428,8 @@ static void* __fastcall HookActorInner(void* a1, void* a2, void* a3, void* a4, v
 }
 static void ResolveActorInner() {
     int n = 0;
-    const uintptr_t f = FindPatternCount("48 8B C4 4C 89 48 20 4C 89 40 18 48 89 50 10 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 F8 F4 FF FF 48 81 EC C8 0B 00 00", &n);
+    const uintptr_t f = FindPatternCount("48 8B C4 4C 89 48 20 4C 89 40 18 48 89 50 10 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 ?? ?? FF FF 48 81 EC ?? ?? 00 00 "
+        "C5 F8 29 70 A8 C5 F8 29 78 98 C5 78 29 40 88 C5 78 29 88 78 FF FF FF C5 78 29 90 68 FF FF FF C5 78 29 98 58 FF FF FF C5 78 29 A0 48 FF FF FF C5 78 29 A8 38 FF FF FF C5 78 29 B0 28 FF FF FF 48 8B FA 4C 8B E1", &n);   // frame 0xBC8 (2976) -> 0xFA8 (2026-10-29): the nine xmm saves and the argument moves pin it
     if (!f || n != 1) { Log("[core] inner create: %d matches, not hooked", n); return; }
     kRva_ActorCreateInner = f - g_base; Log("resolved %-20s rva 0x%llx (via signature)", "actor create inner", (unsigned long long)kRva_ActorCreateInner);
 }
@@ -5346,17 +5421,19 @@ static uint32_t g_clockSetDay = 0, g_clockSetMsd = 0; static ULONGLONG g_clockSe
 static void InstallGameClock() {
     // GetCurrentGameTime(entity, out): vmovups ymm0,[rip+server] (TLS server flag set) / [rip+client], then the clock call
     int hits = 0;
-    const uintptr_t f = FindPatternCount("48 89 5C 24 10 57 48 83 EC 60 48 8B 01 48 8B FA 48 8D 54 24 70 48 8B D9 FF 50 60 B8 FF FF 00 00", &hits);
+    const uintptr_t f = FindPatternCount("48 89 5C 24 10 57 48 83 EC 60 48 8B 01 48 8B FA 48 8D 54 24 70 48 8B D9 FF 50 60", &hits);
     if (!f || hits != 1) { Log("[clock] game-time reader not found (%d matches): game clock off", hits); return; }
-    uint8_t b[0xb2] = {}; if (!ReadBytes(f, b, sizeof b)) return;
+    // vmovups ymm0,[rip+server]; jmp; vmovups ymm0,[rip+client]; cmp byte [rbx+0x17c],0 ... call clock (cmp + 0x27). At +0x74 in 2976,
+    // +0x70 in 2026-10-29 (the region test became movzx + cmp edx,0xffff): located by its bytes, not by a fixed offset.
+    uint8_t b[0x100] = {}; if (!ReadBytes(f, b, sizeof b)) return;
     static const uint8_t ld[4] = { 0xC5, 0xFC, 0x10, 0x05 };
-    if (memcmp(b + 0x74, ld, 4) || memcmp(b + 0x7e, ld, 4) || b[0x7c] != 0xEB || b[0xad] != 0xE8 || b[0x86] != 0x80 || b[0x87] != 0xBB) {
-        Log("[clock] game-time reader layout changed: game clock off"); return;
-    }
+    size_t k = 0x40;
+    for (; k + 0x2c <= sizeof b; k++) if (!memcmp(b + k, ld, 4) && b[k + 8] == 0xEB && !memcmp(b + k + 10, ld, 4) && b[k + 18] == 0x80 && b[k + 19] == 0xBB) break;
+    if (k + 0x2c > sizeof b || b[k + 18 + 0x27] != 0xE8) { Log("[clock] game-time reader layout changed: game clock off"); return; }
     int32_t d = 0;
-    memcpy(&d, b + 0x78, 4); const uintptr_t sg = f + 0x7c + d;
-    memcpy(&d, b + 0x82, 4); const uintptr_t cg = f + 0x86 + d;
-    const uintptr_t now = RelCallTarget(f + 0xad);
+    memcpy(&d, b + k + 4, 4); const uintptr_t sg = f + k + 8 + d;
+    memcpy(&d, b + k + 14, 4); const uintptr_t cg = f + k + 18 + d;
+    const uintptr_t now = RelCallTarget(f + k + 18 + 0x27);
     const uintptr_t vt = FindVtableByName(".?AVTrocTrSetFieldTimeReq@pa@@");
     uintptr_t exec = 0; int n = 0; const uintptr_t handler = vt ? FindObjectWithVtable(vt, &n) : 0;
     if (vt) ReadPtr(vt + 2 * 8, &exec);
@@ -5966,9 +6043,17 @@ static void* __fastcall HookSoServerCreate() {
 }
 static void ResolveSoServerCreate() {
     int n = 0;
-    const uintptr_t f = FindPatternCount("48 89 5C 24 08 57 48 83 EC 20 48 8D 3D 9F 8E 53 04 48 89 7C 24 38 48 8B 05 93 8E 53 04 48 8B CF FF 50 08 90 48 8D 0D", &n);   // research only: the displacements make it build-specific, no match = not hooked
+    // pool lock, allocate, unlock, ctor, then the vtables at +0 / +0x28 / +0x40 (research only; no match = not hooked). Other pools
+    // share the shape, so the first vtable store must be SceneObjectServer's.
+    static const char* kPat = "48 89 5C 24 08 57 48 83 EC 20 48 8D 3D ?? ?? ?? ?? 48 89 7C 24 38 48 8B 05 ?? ?? ?? ?? 48 8B CF FF 50 08 90 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? "
+        "48 8B D8 48 8B 05 ?? ?? ?? ?? 48 8B CF FF 50 10 48 89 5C 24 40 48 85 DB 74 ?? 48 8B CB E8 ?? ?? ?? ?? 90 "
+        "48 8D 05 ?? ?? ?? ?? 48 89 03 48 8D 05 ?? ?? ?? ?? 48 89 43 28 48 8D 05 ?? ?? ?? ?? 48 89 43 40";
+    const uintptr_t f = FindPatternCount(kPat, &n);
     if (!f || n != 1) { Log("[vt] SceneObjectServer create: %d matches, not hooked", n); return; }
-    kRva_SoServerCreate = f - g_base; Log("resolved %-20s rva 0x%llx (via signature)", "SceneObjectServer new", (unsigned long long)kRva_SoServerCreate);
+    const uintptr_t lea = f + ParsePattern(kPat).size() - 32; int32_t d = 0;   // the +0 vtable store: lea rax,[rip+d]; mov [rbx],rax
+    const uintptr_t vt = FindVtableByName(".?AVSceneObjectServer@pa@@");
+    if (!vt || !ReadBytes(lea + 3, &d, 4) || lea + 7 + d != vt) { Log("[vt] SceneObjectServer create: the matched pool builds another class, not hooked"); return; }
+    kRva_SoServerCreate = f - g_base; Log("resolved %-20s rva 0x%llx (via signature + vtable)", "SceneObjectServer new", (unsigned long long)kRva_SoServerCreate);
 }
 
 // ---- scene object lookup by UUID (research) --------------------------------------------------------------------------
@@ -6007,7 +6092,7 @@ static void ResolveSpawnCallers() {
             if (ret + (intptr_t)rel != target) continue;
             found++; const uint8_t* at = (const uint8_t*)ret;
             if (matches(at, "8B 00 85 C0 74 ?? 41 89 06 48 8D 4D C0 E8")) g_callerLevel = ret - g_base;          // mov eax,[rax]; test; je; mov [r14],eax; lea rcx,[rbp-0x40]; call
-            else if (matches(at, "48 8D 55 10 48 8D 8D 08 02 00 00 E8")) g_callerDrop = ret - g_base;           // lea rdx,[rbp+0x10]; lea rcx,[rbp+0x208]; call register
+            else if (matches(at, "48 8D 55 ?? 48 8D 8D ?? 02 00 00 E8")) g_callerDrop = ret - g_base;           // lea rdx,[rbp+0x10]; lea rcx,[rbp+0x208 (2976) / 0x210]; call register
             for (size_t j = 0; j < 0x90 && at + j + 7 <= b + n; j++) {   // a reason string: lea rcx,[rip+disp] to a short identifier, hashed right after the call
                 if (at[j] != 0x48 || at[j + 1] != 0x8D || at[j + 2] != 0x0D) continue;
                 int32_t d; memcpy(&d, at + j + 3, 4); const uintptr_t str = (uintptr_t)(at + j + 7) + (intptr_t)d;
@@ -6024,7 +6109,7 @@ static void ResolveGimmickSpawn() {
     int n = 0;
     { int m = 0; const uintptr_t h = FindPatternCount("48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 8D 9A CD 1D BA DE 48 8B FA 44 8B CB 44 8B DB F6 C1 03", &m);
       if (h && m == 1) { g_gameHash = (GameHashFn)h; Log("resolved %-20s rva 0x%llx (via signature)", "string hash", (unsigned long long)(h - g_base)); if (g_traceHooks) { Log("[gimmick] earlier replay codes: 0x20D51DB5 = %s, 0x615A8292 = %s", DecodeErr(0x20D51DB5).c_str(), DecodeErr(0x615A8292).c_str()); FindStringsForHash(0x20D51DB5); } } else Log("[gimmick] string hash: %d matches", m); }
-    const uintptr_t f = FindPatternCount("48 8B C4 48 89 58 18 48 89 50 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 68 C1 48 81 EC B0 00 00 00 C5 F8 29 70 B8 C5 F8 29 78 A8 49 8B D9 49 8B F0 4C 8B FA 4C 8B F1 48 8B 49 18 48 83 C1 40", &n);
+    const uintptr_t f = FindPatternCount("48 8B C4 48 89 58 18 48 89 50 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 68 C1 48 81 EC B0 00 00 00 C5 F8 29 70 B8 C5 F8 29 78 A8 49 8B D9 49 8B F0 4C 8B FA 4C 8B F1 48 8B 49 18", &n);   // then add rcx, save field (0x40 in 2976, 0x2E8 now)
     if (!f || n != 1) { Log("[gimmick] spawn function: %d matches, not hooked (research feature only)", n); return; }
     kRva_GimmickSpawn = f - g_base; kRva_GimmickSpawn_ = kRva_GimmickSpawn;
     Log("resolved %-20s rva 0x%llx (via signature)", "gimmick spawn", (unsigned long long)kRva_GimmickSpawn);
@@ -6877,11 +6962,16 @@ static bool ResolveGame() {
     bool ok = true;
     ok &= ResolveSig("setWorldTransform", "48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 57 48 81 EC E0 00 00 00 C5 F8 29 70 E8 C5 F8 29 78 D8 C5 78 29 40 C8 41 0F B6 E8", &kRva_SetWorldTransform);
     ok &= ResolveSig("setEnable", "40 57 48 83 EC 20 4C 8B 89 40 01 00 00 48 8B F9 44 0F B6 C2 4D 85 C9 74 76 0F B6 81 50 01 00 00 84 C0 74 5A", &kRva_SetEnable);
-    ok &= ResolveSig("StringDataAlloc", "48 89 5C 24 08 57 48 83 EC 20 65 48 8B 04 25 58 00 00 00 8B F9 41 B8 FD 01 00 00 83 C1 19 48 8B 10 41 80 3C 10 00 BA 10 00 00 00", &kRva_StringDataAlloc);
+    ok &= ResolveSig("StringDataAlloc", "48 89 5C 24 08 57 48 83 EC 20 8B F9 E8 ?? ?? ?? ?? 65 48 8B 04 25 58 00 00 00 8D 4F 19 41 B8 ?? 01 00 00 48 8B 10 41 80 3C 10 00 BA 10 00 00 00", &kRva_StringDataAlloc);   // 2026-10-29: a call before the TLS read, flag 0x1FD -> 0x1FE
     ok &= ResolveSig("PrefabPathCtor", "48 89 5C 24 10 48 89 4C 24 08 55 56 57 48 83 EC 20 48 8B F9 E8 ?? ?? ?? ?? 90 48 8D 05 ?? ?? ?? ?? 48 89 01 33 ED 48 89 69 30 48 8D 41 38", &kRva_PrefabPathCtor);
     ResolveSig("ResourceLoader.load", "48 89 5C 24 18 48 89 54 24 10 55 56 57 41 56 41 57 48 81 EC 90 00 00 00 41 8B E9 4D 8B F0 48 8B F2 48 8B F9 45 33 FF", &kRva_ResLoad);   // optional: previews via the game's loader
     ResolveClientForce();
     ResolveSig("ServerTransformSet", "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 41 56 41 57 48 83 EC 50 45 0F B6 F1 49 8B E8 48 8B FA 48 8B F1 48 8B 59 08 48 8D 53 08 45 33 FF", &kRva_ServerTransformSet);   // optional: puppet moves (0x2bc5420 in 2976)
+    if (kRva_ServerTransformSet) {   // 2026-10-29 rebuilt its transform argument (position +0xC0, rotation +0xB0, was +0 / +0xC): our 0x2C-byte one only fits the old layout
+        uint8_t code[0x200] = {}; bool oldLayout = false; static const uint8_t posSub[5] = { 0xC5, 0xF2, 0x5C, 0x6D, 0x00 };   // vsubss xmm5, xmm1, [rbp+0]
+        if (ReadBytes(g_base + kRva_ServerTransformSet, code, sizeof code)) for (size_t k = 0; k + 5 <= sizeof code && !oldLayout; k++) oldLayout = !memcmp(code + k, posSub, 5);
+        if (!oldLayout) { Log("[puppet] server transform setter takes a different transform layout in this build: not used, raw TransformSync writes instead"); kRva_ServerTransformSet = 0; }
+    }
     ok &= ResolveSig("PathNormalizeCtor", "4C 8B DC 49 89 5B 10 49 89 4B 08 55 56 57 41 54 41 55 41 56 41 57 48 81 EC 40 01 00 00 48 8B DA 48 8B F9 4C 8D 2D ?? ?? ?? ??", &kRva_PathNormalizeCtor);
     // world global: `mov rax,[rip+d]; mov rcx,[rax+0x30]; mov rax,[rbx+0xa0]; cmp [rcx+0x58],rax` (take-or-steal check, 15 copies)
     uintptr_t ref = 0;
@@ -6900,6 +6990,7 @@ static bool ResolveGame() {
     else { ok = false; g_buildMsg = "createSceneObjectFrom: name string not referenced"; Log("RESOLVE FAILED createSceneObjectFrom"); }
     uint8_t head[4] = {0}; ReadBytes(g_base + kRva_CreateSceneObjectFrom, head, 4);
     if (ok && !(head[0] == 0x4C && head[1] == 0x89 && head[2] == 0x4C && head[3] == 0x24)) { ok = false; g_buildMsg = "createSceneObjectFrom prologue unexpected"; Log("RESOLVE FAILED: create prologue %02x %02x %02x %02x", head[0], head[1], head[2], head[3]); }
+    if (ok && !ResolveSceneObjectMgrPath()) { ok = false; g_buildMsg = "scene object manager path not found in the game's callers"; Log("RESOLVE FAILED scene object manager path"); }
     ResolveProbeCollectorVtable();   // optional: only snap to ground depends on it
     ResolveGimmickSpawn(); ResolveSpawnCallers();           // research: traced only, nothing depends on it
     ResolveActorCore();              // research: traced only

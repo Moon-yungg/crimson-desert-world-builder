@@ -51,7 +51,7 @@ static ptrdiff_t g_envGetEntityVt = -1;              // envMgr vtable slot retur
 static ptrdiff_t g_entityWeatherState = -1;          // entity field the tick passes to the weather getters
 static ptrdiff_t g_entityParticleMgr = -1;           // entity field the tick passes to SetEffectIntensity
 static ptrdiff_t g_weatherNodeContainer = -1;        // weatherState -> node container
-static constexpr ptrdiff_t kWeatherChildSlot = 0x18; // fixed by the getter signatures (lea rax,[rdx+18h])
+static ptrdiff_t g_weatherChildSlot = -1; // container -> child node, from the rain getter (lea rax,[rdx+child]): 0x18 in 2976, 0x20 in 2026-10-29
 static ptrdiff_t g_weatherAtmosphereSlot = -1;       // container -> atmosphere node
 
 enum WeatherField { FRain, FSnow, FWindSpeed, FWindAltitude, FWindBlend, FCloud, FMie, FFog, FCount };
@@ -328,10 +328,10 @@ static uintptr_t ResolveWeatherTick() {
 
 // Node getter shape shared by the rain and snow getters: weatherState->container->child, field at +34.
 static const char* kNodeGetterShape =
-    "48 8B 51 ?? 4C 8B D1 48 85 D2 B9 40 00 00 00 48 8D 42 18 48 0F 44 C1 41 80 7A 31 00 4C 8B 08 4D 8D 81 ?? ?? 00 00";
+    "48 8B 51 ?? 4C 8B D1 48 85 D2 B9 ?? 00 00 00 48 8D 42 ?? 48 0F 44 C1 41 80 7A 31 00 4C 8B 08 4D 8D 81 ?? ?? 00 00";
 // Wind getter: blend at +41, speed at +52, their null-node defaults (field+0x28) at +24 / +15.
 static const char* kWindGetterShape =
-    "48 8B 41 ?? 41 B8 40 00 00 00 48 85 C0 41 B9 ?? ?? 00 00 48 8D 50 18 B8 ?? ?? 00 00 49 0F 44 D0 4C 8B 02 4D 85 C0 "
+    "48 8B 41 ?? 41 B8 ?? 00 00 00 48 85 C0 41 B9 ?? ?? 00 00 48 8D 50 ?? B8 ?? ?? 00 00 49 0F 44 D0 4C 8B 02 4D 85 C0 "
     "49 8D 90 ?? ?? 00 00 48 0F 44 D0 49 8D 80 ?? ?? 00 00 49 0F 44 C1";
 
 static bool ResolveRainGetter() {
@@ -339,6 +339,9 @@ static bool ResolveRainGetter() {
     static const char* rainPatterns[] = {
         "48 8B 51 60 4C 8B D1 48 85 D2 B9 40 00 00 00 48 8D 42 18 48 0F 44 C1 41 80 7A 31 00 4C 8B 08 4D 8D 81 6C 01 00 00",
         "48 8B 51 58 4C 8B D1 48 85 D2 B9 40 00 00 00 48 8D 42 18 48 0F 44 C1 41 80 7A 31 00 4C 8B 08 4D 8D 81 6C 01 00 00",
+        // 2026-10-29: the container gained 8 bytes in front (child +0x20, null default 0x48) and rain moved to 0x170. A variant
+        // ending in 6C 01 here would hit the SNOW getter (0x16C now) and swap rain and snow: do not add one.
+        "48 8B 51 60 4C 8B D1 48 85 D2 B9 48 00 00 00 48 8D 42 20 48 0F 44 C1 41 80 7A 31 00 4C 8B 08 4D 8D 81 70 01 00 00",
     };
     const uintptr_t getter = FirstUnique(rainPatterns, sizeof(rainPatterns) / sizeof(rainPatterns[0]));
     if (!getter) { Log("[environment] rain getter not uniquely resolved"); return false; }
@@ -349,8 +352,14 @@ static bool ResolveRainGetter() {
         Log("[environment] weather container offset rejected: 0x%02x", container);
         return false;
     }
+    const uint8_t child = code[18];   // lea rax,[rdx+child]; the null default (mov ecx,imm) is child + 0x28
+    if (Disp32(code + 11) != child + 0x28 || child < 0x10 || child > 0x40 || (child & 7)) {
+        Log("[environment] weather child slot rejected: 0x%02x (default 0x%x)", child, static_cast<unsigned>(Disp32(code + 11)));
+        return false;
+    }
     g_rainGetter = getter;
     g_weatherNodeContainer = container;
+    g_weatherChildSlot = child;
     g_fieldOff[FRain] = Disp32(code + 34);
     return true;
 }
@@ -359,7 +368,7 @@ static bool ResolveRainGetter() {
 static ptrdiff_t NodeGetterField(uintptr_t fn) {
     if (!MatchesAt(fn, kNodeGetterShape)) return -1;
     uint8_t code[38] = {};
-    if (!ReadBytes(fn, code, sizeof(code)) || code[3] != g_weatherNodeContainer) return -1;
+    if (!ReadBytes(fn, code, sizeof(code)) || code[3] != g_weatherNodeContainer || code[18] != g_weatherChildSlot) return -1;
     const int32_t field = Disp32(code + 34);
     return field > 0 && field < 0x400 ? field : -1;
 }
@@ -370,6 +379,7 @@ static bool ParseWindGetter(uintptr_t fn, ptrdiff_t& speed, ptrdiff_t& blend, pt
     if (!MatchesAt(fn, kWindGetterShape)) return false;
     uint8_t code[0x90] = {};
     if (!ReadBytes(fn, code, sizeof(code)) || code[3] != g_weatherNodeContainer) return false;
+    if (code[22] != g_weatherChildSlot || Disp32(code + 6) != g_weatherChildSlot + 0x28) return false;
     const int32_t b = Disp32(code + 41), s = Disp32(code + 52);
     if (Disp32(code + 24) != b + 0x28 || Disp32(code + 15) != s + 0x28) return false;
     size_t ret = 0;
@@ -582,6 +592,7 @@ static bool ResolveTimeLayout() {
         "40 57 48 83 EC 20 83 7A 08 02 48 8B FA 72 ?? 48 8B 09 48 89 5C 24 30 48 8B 01 FF 50 40 48 8B 0F 48 8B D8 48 8B 49 08 FF 15 ?? ?? ?? ?? C5 FB 5A C8 C5 FA 11 8B C4 03 00 00",
         "40 57 48 83 EC 20 83 7A 08 02 48 8B FA 72 ?? 48 8B 09 48 89 5C 24 30 48 8B 01 FF 50 40 48 8B 0F 48 8B D8 48 8B 49 08 FF 15 ?? ?? ?? ?? C5 FB 5A C8 C5 FA 11 8B D4 03 00 00",
         "40 57 48 83 EC 20 83 7A 08 02 48 8B FA 72 ?? 48 8B 09 48 89 5C 24 30 48 8B 01 FF 50 40 48 8B 0F 48 8B D8 48 8B 49 08 FF 15 ?? ?? ?? ?? C5 FB 5A C8 C5 FA 11 8B CC 03 00 00",
+        "40 57 48 83 EC 20 83 7A 08 02 48 8B FA 72 ?? 48 8B 09 48 89 5C 24 30 48 8B 01 FF 50 60 48 8B 0F 48 8B D8 48 8B 49 08 FF 15 ?? ?? ?? ?? C5 FB 5A C8 C5 FA 11 8B BC 03 00 00",   // 2026-10-29
     };
     static const char* upperPatterns[] = {
         "40 57 48 83 EC 20 83 7A 08 02 48 8B FA 72 ?? 48 8B 09 48 89 5C 24 30 48 8B 01 FF 50 60 48 8B 0F 48 8B D8 48 8B 49 08 FF 15 ?? ?? ?? ?? C5 FB 5A C8 C5 FA 11 8B B8 03 00 00",
@@ -589,6 +600,7 @@ static bool ResolveTimeLayout() {
         "40 57 48 83 EC 20 83 7A 08 02 48 8B FA 72 ?? 48 8B 09 48 89 5C 24 30 48 8B 01 FF 50 40 48 8B 0F 48 8B D8 48 8B 49 08 FF 15 ?? ?? ?? ?? C5 FB 5A C8 C5 FA 11 8B C8 03 00 00",
         "40 57 48 83 EC 20 83 7A 08 02 48 8B FA 72 ?? 48 8B 09 48 89 5C 24 30 48 8B 01 FF 50 40 48 8B 0F 48 8B D8 48 8B 49 08 FF 15 ?? ?? ?? ?? C5 FB 5A C8 C5 FA 11 8B D8 03 00 00",
         "40 57 48 83 EC 20 83 7A 08 02 48 8B FA 72 ?? 48 8B 09 48 89 5C 24 30 48 8B 01 FF 50 40 48 8B 0F 48 8B D8 48 8B 49 08 FF 15 ?? ?? ?? ?? C5 FB 5A C8 C5 FA 11 8B D0 03 00 00",
+        "40 57 48 83 EC 20 83 7A 08 02 48 8B FA 72 ?? 48 8B 09 48 89 5C 24 30 48 8B 01 FF 50 60 48 8B 0F 48 8B D8 48 8B 49 08 FF 15 ?? ?? ?? ?? C5 FB 5A C8 C5 FA 11 8B C0 03 00 00",   // 2026-10-29
     };
     const uintptr_t lowHit = FirstUnique(lowerPatterns, sizeof(lowerPatterns) / sizeof(lowerPatterns[0]));
     const uintptr_t highHit = FirstUnique(upperPatterns, sizeof(upperPatterns) / sizeof(upperPatterns[0]));
@@ -643,21 +655,30 @@ static bool ResolveTimeLayout() {
 // Atmosphere fields from the weather summary reader: it reads container->atmosphere, calls the rain and snow getters,
 // then reads cloud (plain), mie aerosol (min/scaled) and the fog term (max with it), each with its null-node default.
 static void ResolveAtmosphere() {
-    const uintptr_t hit = ScanUnique(
-        "48 8B 41 ?? 48 8D 50 ?? 41 B8 ?? 00 00 00 48 85 C0 49 0F 44 D0 48 8B 1A E8 ?? ?? ?? ?? C5 FA 11 45 ?? 49 8B 4B ?? "
-        "E8 ?? ?? ?? ?? C5 FA 11 45 ?? 49 8B 4B ?? E8 ?? ?? ?? ?? C5 FA 11 45 ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 85 DB "
-        "48 0F 44 C1 C5 FA 10 00 C5 FA 11 45 ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 0F 44 C1 C5 FA 10 00 C5 FA 5D 0D ?? ?? ?? ?? "
-        "C5 F2 59 15 ?? ?? ?? ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 0F 44 C1 C5 FA 10 00 C5 FA 5F CA",
-        "weather summary reader");
-    uint8_t code[150] = {};
+    // Two layouts: 2976 stores the floats rbp-relative (C5 FA 11 45 ib), 2026-10-29 rsp-relative (C5 FA 11 44 24 ib), which
+    // shifts every later offset. Each layout carries its own offsets: call2, cloud, mie, fog (defaults are field + 0x28 at +5).
+    struct Layout { const char* pattern; size_t call2, cloud, mie, fog; };
+    static const Layout layouts[] = {
+        { "48 8B 41 ?? 48 8D 50 ?? 41 B8 ?? 00 00 00 48 85 C0 49 0F 44 D0 48 8B 1A E8 ?? ?? ?? ?? C5 FA 11 45 ?? 49 8B 4B ?? "
+          "E8 ?? ?? ?? ?? C5 FA 11 45 ?? 49 8B 4B ?? E8 ?? ?? ?? ?? C5 FA 11 45 ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 85 DB "
+          "48 0F 44 C1 C5 FA 10 00 C5 FA 11 45 ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 0F 44 C1 C5 FA 10 00 C5 FA 5D 0D ?? ?? ?? ?? "
+          "C5 F2 59 15 ?? ?? ?? ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 0F 44 C1 C5 FA 10 00 C5 FA 5F CA", 38, 65, 93, 129 },
+        { "48 8B 41 ?? 48 8D 50 ?? 41 B8 ?? 00 00 00 48 85 C0 49 0F 44 D0 48 8B 1A E8 ?? ?? ?? ?? C5 FA 11 44 24 ?? 49 8B 4B ?? "
+          "E8 ?? ?? ?? ?? C5 FA 11 44 24 ?? 49 8B 4B ?? E8 ?? ?? ?? ?? C5 FA 11 44 24 ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 85 DB "
+          "48 0F 44 C1 C5 FA 10 00 C5 FA 11 44 24 ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 0F 44 C1 C5 FA 10 00 C5 FA 5D 0D ?? ?? ?? ?? "
+          "C5 F2 59 15 ?? ?? ?? ?? 48 8D 83 ?? ?? 00 00 B9 ?? ?? 00 00 48 0F 44 C1 C5 FA 10 00 C5 FA 5F CA", 39, 68, 97, 133 },
+    };
+    uintptr_t hit = 0; const Layout* L = nullptr;
+    for (const Layout& l : layouts) if ((hit = ScanUnique(l.pattern, "weather summary reader")) != 0) { L = &l; break; }
+    uint8_t code[160] = {};
     if (!hit || !ReadBytes(hit, code, sizeof(code))) { Log("[environment] atmosphere fields not derived; cloud control disabled"); return; }
     const uintptr_t call1 = hit + 24 + 5 + static_cast<intptr_t>(Disp32(code + 25));
-    const uintptr_t call2 = hit + 38 + 5 + static_cast<intptr_t>(Disp32(code + 39));
+    const uintptr_t call2 = hit + L->call2 + 5 + static_cast<intptr_t>(Disp32(code + L->call2 + 1));
     const ptrdiff_t slot = code[7];
-    const int32_t cloud = Disp32(code + 65), mie = Disp32(code + 93), fog = Disp32(code + 129);
+    const int32_t cloud = Disp32(code + L->cloud), mie = Disp32(code + L->mie), fog = Disp32(code + L->fog);
     const bool ok = code[3] == g_weatherNodeContainer && Disp32(code + 10) == slot + 0x28 &&
                     call1 == g_rainGetter && (!g_snowGetter || call2 == g_snowGetter) &&
-                    Disp32(code + 70) == cloud + 0x28 && Disp32(code + 98) == mie + 0x28 && Disp32(code + 134) == fog + 0x28;
+                    Disp32(code + L->cloud + 5) == cloud + 0x28 && Disp32(code + L->mie + 5) == mie + 0x28 && Disp32(code + L->fog + 5) == fog + 0x28;
     if (!ok) { Log("[environment] weather summary reader did not validate; cloud control disabled"); return; }
     g_weatherAtmosphereSlot = slot;
     g_fieldOff[FCloud] = cloud;
@@ -666,9 +687,14 @@ static void ResolveAtmosphere() {
 }
 
 static bool ResolveWeatherCompose() {
-    const uintptr_t compositor = ScanUnique(
+    static const char* compositorPatterns[] = {
         "48 8B C4 C5 FA 11 48 10 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 88 48 81 EC",
-        "weather compositor");
+        // 2026-10-29: lea rbp,[rax-disp32] frame, then the xmm saves and the weatherState+0x31 test
+        "48 8B C4 C5 FA 11 48 10 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 ?? ?? FF FF 48 81 EC ?? ?? 00 00 "
+        "C5 F8 29 70 A8 C5 F8 29 78 98 C5 78 29 40 88 C5 78 29 88 ?? ?? FF FF 48 8B F1 80 79 31 00 0F 85",
+    };
+    const uintptr_t compositor = FirstUnique(compositorPatterns, sizeof(compositorPatterns) / sizeof(compositorPatterns[0]));
+    if (!compositor) Log("[environment] weather compositor not uniquely resolved");
     if (!compositor) return false;
 
     // The signature above names the internal compositor. Its single native caller
@@ -686,9 +712,12 @@ static bool ResolveWeatherCompose() {
         return false;
     }
     uint8_t prologue[8] = {};
-    if (!ReadBytes(compose, prologue, sizeof(prologue)) ||
-        prologue[0] != 0x48 || prologue[1] != 0x89 || prologue[2] != 0x5C || prologue[3] != 0x24 ||
-        prologue[5] != 0x55 || prologue[6] != 0x56 || prologue[7] != 0x57) {
+    const bool read = ReadBytes(compose, prologue, sizeof(prologue));
+    const bool oldShape = prologue[0] == 0x48 && prologue[1] == 0x89 && prologue[2] == 0x5C && prologue[3] == 0x24 &&
+                          prologue[5] == 0x55 && prologue[6] == 0x56 && prologue[7] == 0x57;      // mov [rsp+x],rbx; push rbp/rsi/rdi
+    const bool newShape = prologue[0] == 0x48 && prologue[1] == 0x8B && prologue[2] == 0xC4 && prologue[3] == 0x53 &&
+                          prologue[4] == 0x55 && prologue[5] == 0x56 && prologue[6] == 0x57;      // 2026-10-29: mov rax,rsp; push rbx/rbp/rsi/rdi
+    if (!read || !(oldShape || newShape)) {
         Log("[environment] weather compose caller validation failed at rva 0x%llx",
             static_cast<unsigned long long>(compose - g_base));
         return false;
@@ -830,7 +859,7 @@ static long long __fastcall HookWeatherCompose(long long weatherState, float dt)
 
     uintptr_t parent = 0, child = 0, atmosphere = 0;
     if (!ReadPointer(static_cast<uintptr_t>(weatherState) + g_weatherNodeContainer, parent) ||
-        !ReadPointer(parent + kWeatherChildSlot, child)) {
+        g_weatherChildSlot < 0 || !ReadPointer(parent + g_weatherChildSlot, child)) {
         return result;
     }
     if (g_weatherAtmosphereSlot >= 0) ReadPointer(parent + g_weatherAtmosphereSlot, atmosphere);
