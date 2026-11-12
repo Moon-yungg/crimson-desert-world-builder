@@ -23,3 +23,7 @@ notes/rtti_dump.txt
 
 # game data table dumps (scripts/staticinfo_dump.py): derived from the game files, not published
 notes/staticinfo/
+
+# local scratch output
+/.tmp
+aqtinstall.log
